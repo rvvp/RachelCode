@@ -1,0 +1,24 @@
+[Unit]
+Description=Rachel Replenishment Web Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rachelcode
+Group=rachelcode
+WorkingDirectory=/opt/rachelcode/app
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/rachelcode/venv/bin/python /opt/rachelcode/app/replenishment_app.py --host 0.0.0.0 --port 8877 --db /data/rachelcode/replenishment/replenishment.db --no-seed-demo --scheduler
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/data/rachelcode
+
+[Install]
+WantedBy=multi-user.target
