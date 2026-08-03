@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
+.coverage
 data/*.db
 replenishment_data/*.db
 replenishment_data/*.db-shm
@@ -12,3 +14,12 @@ backups/
 data/uploads/
 logs/
 dist/
+tmp/
+.run-*.log
+
+# Runtime business data, downloaded platform reports, and browser profiles.
+replenishment_data/
+
+# Generated visual QA and presentation video assets are not application code.
+screenshots/
+videos/

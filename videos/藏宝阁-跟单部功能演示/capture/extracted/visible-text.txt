@@ -1,9 +1,0 @@
-[div] Sianna
-[div] 藏寶閣
-[span] 供应链 · 商品 · 运营
-[span] 多部门协同管理资料，流程加速，效率加倍
-[strong] 开启寻宝之旅
-[div] MYTENO
-[h2] 思安娜的藏宝阁
-[span] 用户名
-[button] 进入后台
