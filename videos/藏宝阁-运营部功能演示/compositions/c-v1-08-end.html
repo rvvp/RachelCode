@@ -1,0 +1,24 @@
+<template id="c-v1-08-template">
+  <div data-hf-id="hf-c08-root" id="c-v1-08-root" data-composition-id="c-v1-08" data-width="1920" data-height="1080" data-start="0" data-duration="12.4">
+    <link rel="stylesheet" href="compositions/shared.css">
+    <div data-hf-id="hf-c08-panel" class="end-panel">
+      <div data-hf-id="hf-c08-eyebrow" class="end-eyebrow">从渠道资料接收，到平台账单提交</div>
+      <div data-hf-id="hf-c08-rule" class="end-rule"></div>
+      <h1 data-hf-id="hf-c08-title" class="end-title">权限清楚，协作清晰可查</h1>
+      <div data-hf-id="hf-c08-subtitle" class="end-subtitle">思安娜的藏宝阁 · 运营部功能演示</div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true }); const root = '#c-v1-08-root';
+      tl.fromTo(`${root} .end-panel`, { opacity: 0 }, { opacity: 1, duration: 0.8, ease: 'power2.out' }, 0)
+        .fromTo(`${root} .end-eyebrow`, { opacity: 0, y: 18 }, { opacity: 1, y: 0, duration: 0.55, ease: 'power3.out' }, 0.5)
+        .fromTo(`${root} .end-rule`, { opacity: 0, scaleX: 0 }, { opacity: 1, scaleX: 1, duration: 0.55, ease: 'power3.out' }, 0.8)
+        .fromTo(`${root} .end-title`, { opacity: 0, y: 28 }, { opacity: 1, y: 0, duration: 0.7, ease: 'power3.out' }, 1.05)
+        .fromTo(`${root} .end-subtitle`, { opacity: 0, y: 18 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power2.out' }, 1.45)
+        .to(`${root} .end-title`, { scale: 1.018, duration: 8.8, ease: 'none' }, 2.0)
+        .to(`${root} .end-panel`, { opacity: 0, duration: 0.55 }, 11.85);
+      window.__timelines['c-v1-08'] = tl;
+    </script>
+  </div>
+</template>

@@ -1,0 +1,332 @@
+{
+  "login": {
+    "pageHeight": 1120,
+    "loginPanel": {
+      "x": 1112,
+      "y": 107.5,
+      "width": 380,
+      "height": 387
+    },
+    "username": {
+      "x": 1147,
+      "y": 239.5,
+      "width": 310,
+      "height": 50
+    },
+    "loginButton": {
+      "x": 1147,
+      "y": 404.5,
+      "width": 310,
+      "height": 51
+    }
+  },
+  "modules": {
+    "url": "/modules",
+    "pageHeight": 1142,
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "targets": {
+      "productCard": {
+        "x": 264,
+        "y": 187.5,
+        "width": 688,
+        "height": 202.9
+      },
+      "productEnter": {
+        "x": 291,
+        "y": 332.5,
+        "width": 82,
+        "height": 31
+      },
+      "billingCard": {
+        "x": 968,
+        "y": 187.5,
+        "width": 688,
+        "height": 202.9
+      },
+      "billingEnter": {
+        "x": 995,
+        "y": 332.5,
+        "width": 82,
+        "height": 31
+      }
+    }
+  },
+  "products": {
+    "url": "/products",
+    "pageHeight": 2211,
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "targets": {
+      "workspaceCard": {
+        "x": 264,
+        "y": 240.5,
+        "width": 798.1,
+        "height": 312
+      },
+      "searchCard": {
+        "x": 1078.1,
+        "y": 240.5,
+        "width": 577.9,
+        "height": 312
+      },
+      "overviewCard": {
+        "x": 264,
+        "y": 568.5,
+        "width": 1392,
+        "height": 238.6
+      },
+      "listCard": {
+        "x": 264,
+        "y": 825.1,
+        "width": 1392,
+        "height": 1322
+      },
+      "newProduct": {
+        "x": 475,
+        "y": 385.5,
+        "width": 70,
+        "height": 48
+      },
+      "importExcel": {
+        "x": 557,
+        "y": 385.5,
+        "width": 79.9,
+        "height": 48
+      },
+      "exportExcel": {
+        "x": 648.9,
+        "y": 385.5,
+        "width": 124.9,
+        "height": 48
+      },
+      "bulkSubmit": {
+        "x": 1471,
+        "y": 848.1,
+        "width": 162,
+        "height": 51
+      },
+      "firstCheckbox": {
+        "x": 302,
+        "y": 1031.6,
+        "width": 13,
+        "height": 13
+      },
+      "firstView": {
+        "x": 2407.9,
+        "y": 1027.3,
+        "width": 40,
+        "height": 23.8
+      }
+    }
+  },
+  "productsOperations": {
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "targets": {
+      "firstView": {
+        "x": 1447.9,
+        "y": 237.3,
+        "width": 40,
+        "height": 23.8
+      },
+      "firstEdit": {
+        "x": 1491.9,
+        "y": 237.3,
+        "width": 40,
+        "height": 23.8
+      },
+      "firstDelete": {
+        "x": 1535.9,
+        "y": 237.3,
+        "width": 40,
+        "height": 23.8
+      },
+      "firstLog": {
+        "x": 1122,
+        "y": 58.3,
+        "width": 96,
+        "height": 45
+      }
+    }
+  },
+  "newProduct": {
+    "url": "/products/new",
+    "pageHeight": 2160,
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "targets": {
+      "introCard": {
+        "x": 264,
+        "y": 240.5,
+        "width": 853.7,
+        "height": 387.9
+      },
+      "reminderCard": {
+        "x": 1137.7,
+        "y": 240.5,
+        "width": 518.3,
+        "height": 387.9
+      },
+      "formCard": {
+        "x": 264,
+        "y": 650.5,
+        "width": 1392,
+        "height": 1427.5
+      },
+      "basicSection": {
+        "x": 291,
+        "y": 763.4,
+        "width": 1338,
+        "height": 374.9
+      }
+    }
+  },
+  "productDetail": {
+    "url": "/products/18",
+    "pageHeight": 3269,
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "targets": {
+      "detailCard": {
+        "x": 291,
+        "y": 267.5,
+        "width": 1062,
+        "height": 76.4
+      },
+      "status": null,
+      "version": null,
+      "days": null,
+      "log": {
+        "x": 1559,
+        "y": 267.5,
+        "width": 70,
+        "height": 31
+      }
+    }
+  },
+  "billingHome": {
+    "url": "/billing",
+    "pageHeight": 1080,
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "targets": {
+      "monthlyBoard": {
+        "x": 264,
+        "y": 240.5,
+        "width": 1392,
+        "height": 329.9
+      },
+      "brandCard": {
+        "x": 264,
+        "y": 588.5,
+        "width": 688,
+        "height": 179.9
+      },
+      "supplierCard": {
+        "x": 968,
+        "y": 588.5,
+        "width": 688,
+        "height": 179.9
+      },
+      "save": {
+        "x": 1429,
+        "y": 498.5,
+        "width": 200,
+        "height": 45
+      }
+    }
+  },
+  "brandBills": {
+    "url": "/billing/brand-bills",
+    "pageHeight": 1213,
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "targets": {
+      "billCard": {
+        "x": 264,
+        "y": 240.5,
+        "width": 1392,
+        "height": 307.4
+      },
+      "status": {
+        "x": 291,
+        "y": 325.5,
+        "width": 656,
+        "height": 34
+      },
+      "currentBill": {
+        "x": 291,
+        "y": 389.5,
+        "width": 656,
+        "height": 135.4
+      },
+      "history": {
+        "x": 1000,
+        "y": 325.5,
+        "width": 629,
+        "height": 160.2
+      },
+      "dashboard": {
+        "x": 291,
+        "y": 592.9,
+        "width": 1338,
+        "height": 529.1
+      }
+    }
+  },
+  "supplierSettlements": {
+    "url": "/billing/supplier-settlements",
+    "pageHeight": 1336,
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "targets": {
+      "settlementCard": {
+        "x": 291,
+        "y": 267.5,
+        "width": 667.3,
+        "height": 46
+      },
+      "billImport": {
+        "x": 291,
+        "y": 350.5,
+        "width": 667.3,
+        "height": 34
+      },
+      "supplierManagement": {
+        "x": 291,
+        "y": 656.9,
+        "width": 667.3,
+        "height": 34
+      },
+      "billQuery": {
+        "x": 1030.3,
+        "y": 267.5,
+        "width": 598.6,
+        "height": 34
+      },
+      "querySummary": {
+        "x": 1030.3,
+        "y": 600.5,
+        "width": 598.6,
+        "height": 38
+      }
+    }
+  }
+}

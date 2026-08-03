@@ -1,0 +1,66 @@
+<template id="a-v2-05-template">
+  <div data-hf-id="hf-sbrt" id="a-v2-05-root" data-composition-id="a-v2-05" data-width="1920" data-height="1080" data-start="0" data-duration="17.4">
+    <link rel="stylesheet" href="compositions/shared.css">
+    <div data-hf-id="hf-nmux" class="scene-shell">
+      <header data-hf-id="hf-ex6i" class="scene-header">
+        <div data-hf-id="hf-mqlw" class="chapter-number">05</div>
+        <div data-hf-id="hf-40xz" class="chapter-copy"><div data-hf-id="hf-uysy" class="chapter-kicker">板块一 · 资料列表</div><h1 data-hf-id="hf-ks6n" class="chapter-title">从勾选到流转，一次完成</h1></div>
+        <div data-hf-id="hf-j6uc" class="chapter-context">列表支持批量选择、部门字段配置和行内操作。</div>
+      </header>
+      <div data-hf-id="hf-vd0x" class="browser-stage">
+        <div data-hf-id="hf-xvsz" class="page-layer page-products">
+          <img data-hf-id="hf-im43" class="page-image" src="capture/screenshots/a-pages/02-a-products-full.png" alt="商品资料列表">
+          <div data-hf-id="hf-z5fs" class="target-box overview-target green" style="left:13.75%;top:25.71%;width:72.50%;height:10.79%;"></div>
+          <div data-hf-id="hf-ns4h" class="target-box list-target" style="left:13.75%;top:37.32%;width:72.50%;height:59.79%;"></div>
+          <div data-hf-id="hf-pdun" class="target-box bulk-target green" style="left:76.61%;top:38.36%;width:8.44%;height:2.31%;"></div>
+          <div data-hf-id="hf-efkp" class="target-box checkbox-target" style="left:15.73%;top:46.66%;width:0.68%;height:0.59%;"></div>
+        </div>
+        <div data-hf-id="hf-1qbt" class="page-layer page-operations">
+          <img data-hf-id="hf-f92d" class="page-image" src="capture/screenshots/a-pages/02-a-products-operations.png" alt="资料列表操作列">
+          <div data-hf-id="hf-q9zn" class="target-box operations-target" style="left:75.10%;top:17.20%;width:10.10%;height:11.20%;"></div>
+        </div>
+        <div data-hf-id="hf-poi3" class="pointer"></div><div data-hf-id="hf-4h88" class="click-pulse"></div>
+        <div data-hf-id="hf-08z3" class="guide guide-bulk">勾选一条或按住 Shift 连续选择，再批量提交给商品部。</div>
+        <div data-hf-id="hf-sg2k" class="guide guide-operations">每条资料都可查看、编辑、删除或打开日志。</div>
+        <div data-hf-id="hf-7fax" class="scroll-track"><div data-hf-id="hf-v7fl" class="scroll-thumb" style="height:44%;"></div></div>
+      </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true }); const root = '#a-v2-05-root';
+      tl.set(`${root} .page-products`, { y: -440 }, 0)
+        .set(`${root} .page-operations, ${root} .target-box, ${root} .pointer, ${root} .guide`, { opacity: 0 }, 0)
+        .set(`${root} .scroll-thumb`, { y: 190 }, 0)
+        .fromTo(`${root} .scene-shell`, { opacity: 0 }, { opacity: 1, duration: 0.5 }, 0)
+        .fromTo(`${root} .scene-header`, { opacity: 0, y: -16 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out' }, 0.12)
+        .fromTo(`${root} .browser-stage`, { opacity: 0, y: 22 }, { opacity: 1, y: 0, duration: 0.65, ease: 'power3.out' }, 0.24)
+        .to(`${root} .overview-target, ${root} .list-target`, { opacity: 1, duration: 0.3 }, 0.9)
+        .to(`${root} .page-products`, { y: -700, duration: 1.45, ease: 'power2.inOut' }, 2.1)
+        .to(`${root} .scroll-thumb`, { y: 300, duration: 1.45, ease: 'power2.inOut' }, 2.1)
+        .to(`${root} .overview-target`, { opacity: 0, duration: 0.25 }, 2.2)
+        .fromTo(`${root} .pointer`, { opacity: 0, x: 800, y: 520 }, { opacity: 1, x: 286, y: 276, duration: 0.95, ease: 'power2.inOut' }, 3.3)
+        .to(`${root} .checkbox-target, ${root} .bulk-target`, { opacity: 1, duration: 0.25 }, 3.5)
+        .set(`${root} .click-pulse`, { x: 290, y: 280 }, 4.3)
+        .fromTo(`${root} .click-pulse`, { opacity: 0.8, scale: 0.45 }, { opacity: 0, scale: 1.55, duration: 0.5 }, 4.3)
+        .to(`${root} .pointer`, { x: 1390, y: 95, duration: 1.25, ease: 'power2.inOut' }, 5.0)
+        .to(`${root} .guide-bulk`, { opacity: 1, y: -8, duration: 0.4 }, 5.45)
+        .set(`${root} .click-pulse`, { x: 1394, y: 99 }, 7.15)
+        .fromTo(`${root} .click-pulse`, { opacity: 0.8, scale: 0.45 }, { opacity: 0, scale: 1.55, duration: 0.5 }, 7.15)
+        .to(`${root} .guide-bulk`, { opacity: 0, duration: 0.25 }, 11.7)
+        .to(`${root} .page-products`, { opacity: 0, duration: 0.45 }, 12.05)
+        .to(`${root} .page-operations`, { opacity: 1, duration: 0.45 }, 12.05)
+        .to(`${root} .operations-target`, { opacity: 1, duration: 0.3 }, 12.55)
+        .to(`${root} .pointer`, { x: 1365, y: 222, duration: 1.0, ease: 'power2.inOut' }, 12.65)
+        .to(`${root} .guide-operations`, { opacity: 1, y: -8, duration: 0.4 }, 13.15)
+        .to(`${root} .pointer`, { x: 1410, y: 222, duration: 0.4, ease: 'power2.inOut' }, 14.1)
+        .to(`${root} .pointer`, { x: 1455, y: 222, duration: 0.4, ease: 'power2.inOut' }, 14.7)
+        .to(`${root} .pointer`, { x: 1500, y: 222, duration: 0.4, ease: 'power2.inOut' }, 15.3)
+        .to(`${root} .pointer`, { x: 1365, y: 222, duration: 0.45, ease: 'power2.inOut' }, 15.9)
+        .set(`${root} .click-pulse`, { x: 1369, y: 226 }, 16.4)
+        .fromTo(`${root} .click-pulse`, { opacity: 0.8, scale: 0.45 }, { opacity: 0, scale: 1.55, duration: 0.5 }, 16.4)
+        .to(`${root} .scene-shell`, { opacity: 0, duration: 0.45 }, 16.95);
+      window.__timelines['a-v2-05'] = tl;
+    </script>
+  </div>
+</template>

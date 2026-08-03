@@ -1,0 +1,69 @@
+<template id="b-v1-07-template">
+  <div data-hf-id="hf-b07-root" id="b-v1-07-root" data-composition-id="b-v1-07" data-width="1920" data-height="1080" data-start="0" data-duration="21.9">
+    <link rel="stylesheet" href="compositions/shared.css">
+    <div data-hf-id="hf-b07-shell" class="scene-shell">
+      <header data-hf-id="hf-b07-header" class="scene-header">
+        <div data-hf-id="hf-b07-number" class="chapter-number">07</div>
+        <div data-hf-id="hf-b07-copy" class="chapter-copy"><div data-hf-id="hf-b07-kicker" class="chapter-kicker">板块二 · 品牌月账单</div><h1 data-hf-id="hf-b07-title" class="chapter-title">账单流转与月销看板，分区完成</h1></div>
+        <div data-hf-id="hf-b07-context" class="chapter-context">上方管理当月账单，下方汇总各渠道销售表现。</div>
+      </header>
+      <div data-hf-id="hf-b07-stage" class="browser-stage">
+        <div data-hf-id="hf-b07-billing-page" data-layout-allow-overflow class="page-layer page-billing">
+          <img data-hf-id="hf-b07-billing-image" class="page-image" src="capture/screenshots/b-pages/04-b-billing-full.png" alt="商品部账单与结算首页">
+          <div data-hf-id="hf-b07-entry" class="target-box brand-entry-target green" style="left:50.42%;top:44.52%;width:35.83%;height:16.66%;"></div>
+        </div>
+        <div data-hf-id="hf-b07-brand-page" data-layout-allow-overflow class="page-layer page-brand">
+          <img data-hf-id="hf-b07-brand-image" class="page-image" src="capture/screenshots/b-pages/06-b-brand-bills-full.png" alt="商品部品牌月账单页面">
+          <div data-hf-id="hf-b07-status" class="target-box status-target" style="left:35.94%;top:25.25%;width:13.33%;height:3.15%;"></div>
+          <div data-hf-id="hf-b07-current" class="target-box current-target" style="left:15.16%;top:30.26%;width:34.17%;height:16.28%;"></div>
+          <div data-hf-id="hf-b07-history" class="target-box history-target" style="left:52.08%;top:25.25%;width:32.76%;height:12.45%;"></div>
+          <div data-hf-id="hf-b07-submit" class="target-box submit-target green" style="left:42.66%;top:42.50%;width:6.67%;height:4.12%;"></div>
+          <div data-hf-id="hf-b07-dashboard" class="target-box dashboard-target green" style="left:15.16%;top:51.82%;width:69.69%;height:41.11%;"></div>
+        </div>
+        <div data-hf-id="hf-b07-pointer" class="pointer"></div><div data-hf-id="hf-b07-pulse" data-layout-allow-overflow class="click-pulse"></div>
+        <div data-hf-id="hf-b07-bill-guide" class="guide guide-bill">上传、删除、提交给跟单部和历史查询，都集中在上方账单卡片。</div>
+        <div data-hf-id="hf-b07-dashboard-guide" class="guide guide-dashboard">Excel 导入月销看板，按平台、店铺及两地仓库汇总销量、销额与占比。</div>
+        <div data-hf-id="hf-b07-submit-guide" class="guide guide-submit">核对完成后，提交品牌月账单给跟单部进入下一环节。</div>
+        <div data-hf-id="hf-b07-scroll" class="scroll-track"><div data-hf-id="hf-b07-thumb" class="scroll-thumb" style="height:70%;"></div></div>
+      </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true }); const root = '#b-v1-07-root';
+      tl.set(`${root} .page-brand, ${root} .target-box, ${root} .pointer, ${root} .guide`, { opacity: 0 }, 0)
+        .fromTo(`${root} .scene-shell`, { opacity: 0 }, { opacity: 1, duration: 0.5 }, 0)
+        .fromTo(`${root} .scene-header`, { opacity: 0, y: -16 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out' }, 0.12)
+        .fromTo(`${root} .browser-stage`, { opacity: 0, y: 22 }, { opacity: 1, y: 0, duration: 0.65, ease: 'power3.out' }, 0.24)
+        .to(`${root} .brand-entry-target`, { opacity: 1, duration: 0.25 }, 0.65)
+        .fromTo(`${root} .pointer`, { opacity: 0, x: 820, y: 500 }, { opacity: 1, x: 1080, y: 535, duration: 0.75, ease: 'power2.inOut' }, 0.75)
+        .set(`${root} .click-pulse`, { x: 1084, y: 539 }, 1.55)
+        .fromTo(`${root} .click-pulse`, { opacity: 0.8, scale: 0.45 }, { opacity: 0, scale: 1.55, duration: 0.5 }, 1.55)
+        .to(`${root} .page-billing`, { opacity: 0, duration: 0.4 }, 1.85)
+        .to(`${root} .page-brand`, { opacity: 1, duration: 0.4 }, 1.85)
+        .to(`${root} .status-target, ${root} .current-target, ${root} .history-target`, { opacity: 1, duration: 0.3 }, 2.35)
+        .to(`${root} .pointer`, { x: 715, y: 325, duration: 0.8, ease: 'power2.inOut' }, 2.5)
+        .to(`${root} .pointer`, { x: 505, y: 470, duration: 0.8, ease: 'power2.inOut' }, 3.45)
+        .to(`${root} .pointer`, { x: 1240, y: 390, duration: 0.95, ease: 'power2.inOut' }, 4.45)
+        .to(`${root} .guide-bill`, { opacity: 1, y: -8, duration: 0.4 }, 4.95)
+        .to(`${root} .status-target, ${root} .current-target, ${root} .history-target, ${root} .guide-bill`, { opacity: 0, duration: 0.28 }, 7.2)
+        .to(`${root} .page-brand`, { y: -250, duration: 1.2, ease: 'power2.inOut' }, 7.3)
+        .to(`${root} .scroll-thumb`, { y: 150, duration: 1.2, ease: 'power2.inOut' }, 7.3)
+        .to(`${root} .dashboard-target`, { opacity: 1, duration: 0.3 }, 8.35)
+        .to(`${root} .pointer`, { x: 1420, y: 415, duration: 0.9, ease: 'power2.inOut' }, 8.45)
+        .to(`${root} .guide-dashboard`, { opacity: 1, y: -8, duration: 0.4 }, 8.95)
+        .to(`${root} .pointer`, { x: 680, y: 640, duration: 1.1, ease: 'power2.inOut' }, 11.3)
+        .to(`${root} .pointer`, { x: 1260, y: 640, duration: 1.1, ease: 'power2.inOut' }, 13.4)
+        .to(`${root} .dashboard-target, ${root} .guide-dashboard`, { opacity: 0, duration: 0.28 }, 16.25)
+        .to(`${root} .page-brand`, { y: 0, duration: 1.2, ease: 'power2.inOut' }, 16.35)
+        .to(`${root} .scroll-thumb`, { y: 0, duration: 1.2, ease: 'power2.inOut' }, 16.35)
+        .to(`${root} .submit-target`, { opacity: 1, duration: 0.3 }, 17.4)
+        .to(`${root} .pointer`, { x: 790, y: 515, duration: 0.85, ease: 'power2.inOut' }, 17.5)
+        .to(`${root} .guide-submit`, { opacity: 1, y: -8, duration: 0.4 }, 18.05)
+        .set(`${root} .click-pulse`, { x: 794, y: 519 }, 19.15)
+        .fromTo(`${root} .click-pulse`, { opacity: 0.8, scale: 0.45 }, { opacity: 0, scale: 1.55, duration: 0.5 }, 19.15)
+        .to(`${root} .scene-shell`, { opacity: 0, duration: 0.45 }, 21.45);
+      window.__timelines['b-v1-07'] = tl;
+    </script>
+  </div>
+</template>

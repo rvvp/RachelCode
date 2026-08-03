@@ -1,0 +1,51 @@
+<template id="c-v1-05-template">
+  <div data-hf-id="hf-c05-root" id="c-v1-05-root" data-composition-id="c-v1-05" data-width="1920" data-height="1080" data-start="0" data-duration="16.4">
+    <link rel="stylesheet" href="compositions/shared.css">
+    <div data-hf-id="hf-c05-shell" class="scene-shell">
+      <header data-hf-id="hf-c05-header" class="scene-header">
+        <div data-hf-id="hf-c05-number" class="chapter-number">05</div>
+        <div data-hf-id="hf-c05-copy" class="chapter-copy"><div data-hf-id="hf-c05-kicker" class="chapter-kicker">板块一 · 只读详情</div><h1 data-hf-id="hf-c05-title" class="chapter-title">开放字段清晰呈现，敏感字段自动隐藏</h1></div>
+        <div data-hf-id="hf-c05-context" class="chapter-context">详情页和导出文件使用同一套字段可见范围。</div>
+      </header>
+      <div data-hf-id="hf-c05-stage" class="browser-stage">
+        <div data-hf-id="hf-c05-page" data-layout-allow-overflow class="page-layer page-detail">
+          <img data-hf-id="hf-c05-image" class="page-image" src="capture/screenshots/c-pages/03-c-product-detail-full.png" alt="运营部商品资料只读详情">
+          <div data-hf-id="hf-c05-notice" class="target-box notice-target" style="left:15.16%;top:7.90%;width:69.69%;height:1.95%;"></div>
+          <div data-hf-id="hf-c05-chips" class="target-box chips-target green" style="left:15.16%;top:9.70%;width:54.80%;height:1.45%;"></div>
+          <div data-hf-id="hf-c05-fields" class="target-box fields-target" style="left:15.16%;top:11.30%;width:69.69%;height:25.40%;"></div>
+        </div>
+        <div data-hf-id="hf-c05-pointer" class="pointer"></div>
+        <div data-hf-id="hf-c05-status-guide" class="guide guide-status">状态、修改版本、历时天数和发起人都在详情顶部。</div>
+        <div data-hf-id="hf-c05-fields-guide" class="guide guide-fields">只显示管理员开放字段；未开放的供应商、成本等内容自动隐藏。</div>
+        <div data-hf-id="hf-c05-readonly-guide" class="guide guide-readonly">页面始终只读，查看不会改变任何资料。</div>
+        <div data-hf-id="hf-c05-scroll" class="scroll-track"><div data-hf-id="hf-c05-thumb" class="scroll-thumb" style="height:30%;"></div></div>
+      </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true }); const root = '#c-v1-05-root';
+      tl.set(`${root} .target-box, ${root} .pointer, ${root} .guide`, { opacity: 0 }, 0)
+        .fromTo(`${root} .scene-shell`, { opacity: 0 }, { opacity: 1, duration: 0.5 }, 0)
+        .fromTo(`${root} .scene-header`, { opacity: 0, y: -16 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out' }, 0.12)
+        .fromTo(`${root} .browser-stage`, { opacity: 0, y: 22 }, { opacity: 1, y: 0, duration: 0.65, ease: 'power3.out' }, 0.24)
+        .to(`${root} .chips-target`, { opacity: 1, duration: 0.3 }, 0.9)
+        .fromTo(`${root} .pointer`, { opacity: 0, x: 800, y: 500 }, { opacity: 1, x: 420, y: 285, duration: 0.9, ease: 'power2.inOut' }, 1.0)
+        .to(`${root} .guide-status`, { opacity: 1, y: -8, duration: 0.4 }, 1.45)
+        .to(`${root} .pointer`, { x: 790, y: 285, duration: 1.1, ease: 'power2.inOut' }, 3.6)
+        .to(`${root} .fields-target`, { opacity: 1, duration: 0.3 }, 5.3)
+        .to(`${root} .pointer`, { x: 1120, y: 480, duration: 1.0, ease: 'power2.inOut' }, 5.45)
+        .to(`${root} .chips-target, ${root} .guide-status`, { opacity: 0, duration: 0.28 }, 7.35)
+        .to(`${root} .notice-target`, { opacity: 1, duration: 0.3 }, 7.45)
+        .to(`${root} .pointer`, { x: 820, y: 245, duration: 0.8, ease: 'power2.inOut' }, 7.55)
+        .to(`${root} .guide-fields`, { opacity: 1, y: -8, duration: 0.4 }, 8.0)
+        .to(`${root} .page-detail`, { y: -135, duration: 1.2, ease: 'power2.inOut' }, 10.15)
+        .to(`${root} .scroll-thumb`, { y: 42, duration: 1.2, ease: 'power2.inOut' }, 10.15)
+        .to(`${root} .pointer`, { x: 480, y: 545, duration: 0.9, ease: 'power2.inOut' }, 11.25)
+        .to(`${root} .guide-fields`, { opacity: 0, duration: 0.25 }, 13.1)
+        .to(`${root} .guide-readonly`, { opacity: 1, y: -8, duration: 0.4 }, 13.2)
+        .to(`${root} .scene-shell`, { opacity: 0, duration: 0.45 }, 15.95);
+      window.__timelines['c-v1-05'] = tl;
+    </script>
+  </div>
+</template>

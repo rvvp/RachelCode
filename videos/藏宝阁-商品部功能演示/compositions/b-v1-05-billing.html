@@ -1,0 +1,58 @@
+<template id="b-v1-05-template">
+  <div data-hf-id="hf-5pjg" id="b-v1-05-root" data-composition-id="b-v1-05" data-width="1920" data-height="1080" data-start="0" data-duration="20.3">
+    <link rel="stylesheet" href="compositions/shared.css">
+    <div data-hf-id="hf-nmux" class="scene-shell">
+      <header data-hf-id="hf-ex6i" class="scene-header">
+        <div data-hf-id="hf-lxzu" class="chapter-number">05</div>
+        <div data-hf-id="hf-40xz" class="chapter-copy"><div data-hf-id="hf-luz5" class="chapter-kicker">板块二 · 账单与结算</div><h1 data-hf-id="hf-83tc" class="chapter-title">月度看板提示下一项工作</h1></div>
+        <div data-hf-id="hf-16el" class="chapter-context">平台收集进度、品牌账单状态和当前节点集中呈现。</div>
+      </header>
+      <div data-hf-id="hf-vd0x" class="browser-stage">
+        <div data-hf-id="hf-v4g2" data-layout-allow-overflow class="page-layer page-modules">
+          <img data-hf-id="hf-8e7w" class="page-image" src="capture/screenshots/b-pages/01-b-home-full.png" alt="商品部藏宝阁首页">
+          <div data-hf-id="hf-y3ug" class="target-box billing-enter-target green" style="left:51.82%;top:29.12%;width:4.27%;height:2.71%;"></div>
+        </div>
+        <div data-hf-id="hf-jubk" data-layout-allow-overflow class="page-layer page-billing">
+          <img data-hf-id="hf-y35t" class="page-image" src="capture/screenshots/b-pages/04-b-billing-full.png" alt="商品部账单与结算月度看板">
+          <div data-hf-id="hf-ulpc" class="target-box board-target" style="left:13.75%;top:22.27%;width:72.50%;height:20.40%;"></div>
+          <div data-hf-id="hf-ybkv" class="target-box platform-target" style="left:13.75%;top:44.52%;width:35.83%;height:16.66%;"></div>
+          <div data-hf-id="hf-s6uy" class="target-box brand-target green" style="left:50.42%;top:44.52%;width:35.83%;height:16.66%;"></div>
+        </div>
+        <div data-hf-id="hf-poi3" class="pointer"></div><div data-hf-id="hf-4h88" data-layout-allow-overflow class="click-pulse"></div>
+        <div data-hf-id="hf-bwux" class="guide guide-board">月份、平台账单、品牌月账单和当前节点四项信息等宽呈现。</div>
+        <div data-hf-id="hf-1nmc" class="guide guide-status">不完整、申请退回、待整理或已提交，都会显示在当前节点。</div>
+        <div data-hf-id="hf-61m5" class="guide guide-entries">下方进入平台账单收集，或继续制作品牌月账单。</div>
+        <div data-hf-id="hf-7fax" class="scroll-track"><div data-hf-id="hf-gz1n" class="scroll-thumb" style="height:86%;"></div></div>
+      </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true }); const root = '#b-v1-05-root';
+      tl.set(`${root} .page-billing, ${root} .target-box, ${root} .pointer, ${root} .guide`, { opacity: 0 }, 0)
+        .fromTo(`${root} .scene-shell`, { opacity: 0 }, { opacity: 1, duration: 0.5 }, 0)
+        .fromTo(`${root} .scene-header`, { opacity: 0, y: -16 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out' }, 0.12)
+        .fromTo(`${root} .browser-stage`, { opacity: 0, y: 22 }, { opacity: 1, y: 0, duration: 0.65, ease: 'power3.out' }, 0.24)
+        .to(`${root} .billing-enter-target`, { opacity: 1, duration: 0.25 }, 0.75)
+        .fromTo(`${root} .pointer`, { opacity: 0, x: 800, y: 500 }, { opacity: 1, x: 940, y: 315, duration: 0.8, ease: 'power2.inOut' }, 0.85)
+        .set(`${root} .click-pulse`, { x: 944, y: 319 }, 1.75)
+        .fromTo(`${root} .click-pulse`, { opacity: 0.8, scale: 0.45 }, { opacity: 0, scale: 1.55, duration: 0.5 }, 1.75)
+        .to(`${root} .page-modules`, { opacity: 0, duration: 0.45 }, 2.05)
+        .to(`${root} .page-billing`, { opacity: 1, duration: 0.45 }, 2.05)
+        .to(`${root} .board-target`, { opacity: 1, duration: 0.3 }, 2.65)
+        .to(`${root} .pointer`, { x: 1410, y: 275, duration: 1.0, ease: 'power2.inOut' }, 2.8)
+        .to(`${root} .guide-board`, { opacity: 1, y: -8, duration: 0.4 }, 3.3)
+        .to(`${root} .pointer`, { x: 1420, y: 330, duration: 1.0, ease: 'power2.inOut' }, 5.4)
+        .to(`${root} .guide-board`, { opacity: 0, duration: 0.25 }, 7.35)
+        .to(`${root} .guide-status`, { opacity: 1, y: -8, duration: 0.4 }, 7.45)
+        .to(`${root} .pointer`, { x: 1435, y: 390, duration: 0.85, ease: 'power2.inOut' }, 9.0)
+        .to(`${root} .board-target, ${root} .guide-status`, { opacity: 0, duration: 0.3 }, 15.0)
+        .to(`${root} .platform-target, ${root} .brand-target`, { opacity: 1, duration: 0.3 }, 15.1)
+        .to(`${root} .pointer`, { x: 420, y: 540, duration: 1.0, ease: 'power2.inOut' }, 15.25)
+        .to(`${root} .pointer`, { x: 1080, y: 540, duration: 1.0, ease: 'power2.inOut' }, 16.7)
+        .to(`${root} .guide-entries`, { opacity: 1, y: -8, duration: 0.4 }, 17.4)
+        .to(`${root} .scene-shell`, { opacity: 0, duration: 0.45 }, 19.85);
+      window.__timelines['b-v1-05'] = tl;
+    </script>
+  </div>
+</template>

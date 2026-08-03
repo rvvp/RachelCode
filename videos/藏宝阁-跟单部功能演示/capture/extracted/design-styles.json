@@ -1,0 +1,130 @@
+{
+  "typography": [
+    {
+      "role": "heading",
+      "fontFamily": "Avenir Next",
+      "fontSize": "25px",
+      "fontWeight": "750",
+      "lineHeight": "normal",
+      "letterSpacing": "normal",
+      "color": "#241B14",
+      "sampleText": "思安娜的藏宝阁"
+    },
+    {
+      "role": "body",
+      "fontFamily": "Avenir Next",
+      "fontSize": "17px",
+      "fontWeight": "750",
+      "lineHeight": "29.75px",
+      "letterSpacing": "normal",
+      "color": "#945B29",
+      "sampleText": "供应链 · 商品 · 运营多部门协同管理资料，流程加速，效率加倍开启寻宝之旅"
+    },
+    {
+      "role": "label",
+      "fontFamily": "Avenir Next",
+      "fontSize": "16px",
+      "fontWeight": "400",
+      "lineHeight": "normal",
+      "letterSpacing": "normal",
+      "color": "#241B14",
+      "sampleText": "用户名"
+    }
+  ],
+  "spacing": {
+    "observed": [
+      10,
+      14,
+      18,
+      24,
+      26,
+      112
+    ],
+    "baseUnit": 8
+  },
+  "radius": [
+    "10px"
+  ],
+  "shadows": [
+    {
+      "value": "rgba(88, 56, 31, 0.08) 0px 16px 32px 0px",
+      "count": 1
+    },
+    {
+      "value": "rgba(143, 82, 29, 0.18) 0px 12px 24px 0px",
+      "count": 1
+    }
+  ],
+  "buttons": [
+    {
+      "label": "进入后台",
+      "background": "#BC6C25",
+      "backgroundImage": "",
+      "backdropFilter": "",
+      "color": "#FFFFFF",
+      "padding": "13px 15px",
+      "borderRadius": "10px",
+      "border": "1px solid rgba(91, 58, 29, 0.14)",
+      "boxShadow": "rgba(143, 82, 29, 0.18) 0px 12px 24px 0px",
+      "fontSize": "16px",
+      "fontWeight": "700",
+      "height": "51px"
+    }
+  ],
+  "cards": [
+    {
+      "label": "card",
+      "background": "#FFFBF5",
+      "backgroundImage": "",
+      "backdropFilter": "blur(14px)",
+      "color": "#241B14",
+      "padding": "38px 34px",
+      "borderRadius": "8px",
+      "border": "",
+      "boxShadow": "rgba(88, 56, 31, 0.08) 0px 16px 32px 0px",
+      "fontSize": "16px",
+      "fontWeight": "400",
+      "height": "387px"
+    }
+  ],
+  "nav": null,
+  "chips": [],
+  "statCells": [],
+  "tabs": [],
+  "backgrounds": [
+    {
+      "value": "radial-gradient(circle at 12% 10%, rgba(228, 177, 108, 0.28), rgba(0, 0, 0, 0) 24%), radial-gradient(circle at 88% 16%, rgba(56, 111, 100, 0.14), rgba(0, 0, 0, 0) 20%), radial-gradient(circle at 78% 88%, rgba(181, 106, 45, 0.16), rgba(0, 0, 0, 0) 22%), linear-gradient(rgb(251, 247, 241) 0%, rgb(246, 241, 232) 54%, rgb(244, 237, 227) 100%)",
+      "area": 2150400
+    },
+    {
+      "value": "linear-gradient(rgba(226, 185, 133, 0.28) 0%, rgba(248, 238, 222, 0.12) 58%, rgba(210, 167, 116, 0.2) 100%)",
+      "area": 1436544
+    },
+    {
+      "value": "linear-gradient(rgba(255, 255, 255, 0.14) 1px, rgba(0, 0, 0, 0) 1px), linear-gradient(90deg, rgba(255, 255, 255, 0.14) 1px, rgba(0, 0, 0, 0) 1px)",
+      "area": 2150400
+    },
+    {
+      "value": "linear-gradient(110deg, rgb(252, 249, 243) 0%, rgb(250, 244, 234) 39%, rgb(243, 230, 212) 67%, rgb(234, 214, 189) 100%)",
+      "area": 1436544
+    },
+    {
+      "value": "radial-gradient(circle, rgba(232, 183, 126, 0.18), rgba(0, 0, 0, 0) 72%)",
+      "area": 147060
+    },
+    {
+      "value": "radial-gradient(circle, rgba(255, 255, 255, 0.16), rgba(0, 0, 0, 0) 72%)",
+      "area": 234520
+    }
+  ],
+  "glass": [
+    {
+      "backdropFilter": "blur(14px)",
+      "background": "rgba(255, 251, 245, 0.94)",
+      "border": "",
+      "borderRadius": "8px",
+      "boxShadow": "rgba(88, 56, 31, 0.08) 0px 16px 32px 0px",
+      "area": 147060
+    }
+  ]
+}

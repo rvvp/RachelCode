@@ -1,0 +1,52 @@
+<template id="a-v2-06-template">
+  <div data-hf-id="hf-wbee" id="a-v2-06-root" data-composition-id="a-v2-06" data-width="1920" data-height="1080" data-start="0" data-duration="16.7">
+    <link rel="stylesheet" href="compositions/shared.css">
+    <div data-hf-id="hf-nmux" class="scene-shell">
+      <header data-hf-id="hf-ex6i" class="scene-header">
+        <div data-hf-id="hf-ljot" class="chapter-number">06</div>
+        <div data-hf-id="hf-40xz" class="chapter-copy"><div data-hf-id="hf-pc7w" class="chapter-kicker">板块一 · 资料详情</div><h1 data-hf-id="hf-r19p" class="chapter-title">状态、版本和历史，集中追溯</h1></div>
+        <div data-hf-id="hf-nwx9" class="chapter-context">一条资料对应一套完整状态、字段内容和修改记录。</div>
+      </header>
+      <div data-hf-id="hf-vd0x" class="browser-stage">
+        <div data-hf-id="hf-pic8" class="page-layer page-detail">
+          <img data-hf-id="hf-hezp" class="page-image" src="capture/screenshots/a-pages/04-a-product-detail-full.png" alt="商品资料详情页">
+          <div data-hf-id="hf-dglg" class="target-box chips-target green" style="left:15.16%;top:10.55%;width:54.80%;height:2.30%;"></div>
+          <div data-hf-id="hf-67j0" class="target-box log-target" style="left:81.20%;top:8.18%;width:3.65%;height:0.95%;"></div>
+          <div data-hf-id="hf-ox9p" class="target-box fields-target" style="left:13.75%;top:12.10%;width:72.50%;height:42.80%;"></div>
+        </div>
+        <div data-hf-id="hf-poi3" class="pointer"></div><div data-hf-id="hf-4h88" class="click-pulse"></div>
+        <div data-hf-id="hf-v19u" class="guide guide-status">当前状态、修改版本、历时天数和发起人，均在详情顶部。</div>
+        <div data-hf-id="hf-0jlw" class="guide guide-trace">进入日志或历史版本即可追溯；已完成资料也能重新发起修改。</div>
+        <div data-hf-id="hf-7fax" class="scroll-track"><div data-hf-id="hf-bnzg" class="scroll-thumb" style="height:30%;"></div></div>
+      </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true }); const root = '#a-v2-06-root';
+      tl.set(`${root} .target-box, ${root} .pointer, ${root} .guide`, { opacity: 0 }, 0)
+        .fromTo(`${root} .scene-shell`, { opacity: 0 }, { opacity: 1, duration: 0.5 }, 0)
+        .fromTo(`${root} .scene-header`, { opacity: 0, y: -16 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out' }, 0.12)
+        .fromTo(`${root} .browser-stage`, { opacity: 0, y: 22 }, { opacity: 1, y: 0, duration: 0.65, ease: 'power3.out' }, 0.24)
+        .to(`${root} .chips-target`, { opacity: 1, duration: 0.3 }, 1.05)
+        .fromTo(`${root} .pointer`, { opacity: 0, x: 800, y: 500 }, { opacity: 1, x: 385, y: 332, duration: 0.9, ease: 'power2.inOut' }, 1.2)
+        .to(`${root} .guide-status`, { opacity: 1, y: -8, duration: 0.4 }, 1.65)
+        .to(`${root} .pointer`, { x: 520, y: 332, duration: 0.55, ease: 'power2.inOut' }, 2.8)
+        .to(`${root} .pointer`, { x: 650, y: 332, duration: 0.55, ease: 'power2.inOut' }, 3.55)
+        .to(`${root} .pointer`, { x: 790, y: 332, duration: 0.55, ease: 'power2.inOut' }, 4.3)
+        .to(`${root} .guide-status, ${root} .chips-target`, { opacity: 0, duration: 0.3 }, 7.5)
+        .to(`${root} .log-target`, { opacity: 1, duration: 0.25 }, 6.8)
+        .to(`${root} .pointer`, { x: 1470, y: 250, duration: 1.15, ease: 'power2.inOut' }, 7.0)
+        .set(`${root} .click-pulse`, { x: 1474, y: 254 }, 8.35)
+        .fromTo(`${root} .click-pulse`, { opacity: 0.8, scale: 0.45 }, { opacity: 0, scale: 1.55, duration: 0.5 }, 8.35)
+        .to(`${root} .guide-trace`, { opacity: 1, y: -8, duration: 0.4 }, 8.5)
+        .to(`${root} .log-target`, { opacity: 0, duration: 0.25 }, 11.1)
+        .to(`${root} .fields-target`, { opacity: 1, duration: 0.3 }, 11.15)
+        .to(`${root} .page-detail`, { y: -360, duration: 1.55, ease: 'power2.inOut' }, 11.3)
+        .to(`${root} .scroll-thumb`, { y: 105, duration: 1.55, ease: 'power2.inOut' }, 11.3)
+        .to(`${root} .pointer`, { x: 1050, y: 430, duration: 1.0, ease: 'power2.inOut' }, 12.7)
+        .to(`${root} .scene-shell`, { opacity: 0, duration: 0.45 }, 16.25);
+      window.__timelines['a-v2-06'] = tl;
+    </script>
+  </div>
+</template>

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+data/*.db
+replenishment_data/*.db
+replenishment_data/*.db-shm
+replenishment_data/*.db-wal
+replenishment_data/*.key
+.DS_Store
+.env
+backups/
+data/uploads/
+logs/
+dist/

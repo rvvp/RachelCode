@@ -1,0 +1,79 @@
+<template id="c-v1-07-template">
+  <div data-hf-id="hf-c07-root" id="c-v1-07-root" data-composition-id="c-v1-07" data-width="1920" data-height="1080" data-start="0" data-duration="27.1">
+    <link rel="stylesheet" href="compositions/shared.css">
+    <style>
+      #c-v1-07-root .platform-menu { position:absolute; z-index:16; left:37.35%; top:37.7%; width:220px; padding:8px; border:1px solid rgba(94,67,40,.16); border-radius:11px; background:#fffdf9; box-shadow:0 14px 30px rgba(88,56,31,.17); font-size:18px; font-weight:700; }
+      #c-v1-07-root .platform-menu div { padding:9px 12px; border-radius:8px; }
+      #c-v1-07-root .platform-menu div:first-child { color:#7f3b08; background:#f7eadb; }
+      #c-v1-07-root .platform-menu div + div { border-top:1px solid rgba(94,67,40,.10); }
+      #c-v1-07-root .platform-note { position:absolute; z-index:16; left:37.35%; top:58.5%; width:330px; padding:10px 14px; border-radius:10px; background:rgba(56,111,100,.92); color:#fff; font-size:18px; font-weight:700; }
+    </style>
+    <div data-hf-id="hf-c07-shell" class="scene-shell">
+      <header data-hf-id="hf-c07-header" class="scene-header">
+        <div data-hf-id="hf-c07-number" class="chapter-number">07</div>
+        <div data-hf-id="hf-c07-copy" class="chapter-copy"><div data-hf-id="hf-c07-kicker" class="chapter-kicker">板块二 · 平台账单</div><h1 data-hf-id="hf-c07-title" class="chapter-title">按账单属性选择平台并提交文件</h1></div>
+        <div data-hf-id="hf-c07-context" class="chapter-context">一个账号可负责多个平台，但不能越权处理未分配平台。</div>
+      </header>
+      <div data-hf-id="hf-c07-stage" class="browser-stage">
+        <div data-hf-id="hf-c07-empty-page" data-layout-allow-overflow class="page-layer page-empty">
+          <img data-hf-id="hf-c07-empty-image" class="page-image" src="capture/screenshots/c-pages/05-c-platform-empty-full.png" alt="运营部平台账单上传页面">
+          <div data-hf-id="hf-c07-select" class="target-box select-target green" style="left:38.17%;top:41.02%;width:10.83%;height:4.20%;"></div>
+          <div data-hf-id="hf-c07-upload" class="target-box upload-target" style="left:73.95%;top:45.79%;width:9.70%;height:13.30%;"></div>
+          <div data-hf-id="hf-c07-submit" class="target-box submit-target green" style="left:74.06%;top:51.07%;width:9.69%;height:4.19%;"></div>
+        </div>
+        <div data-hf-id="hf-c07-submitted-page" data-layout-allow-overflow class="page-layer page-submitted">
+          <img data-hf-id="hf-c07-submitted-image" class="page-image" src="capture/screenshots/c-pages/06-c-platform-submitted-full.png" alt="平台账单已提交与退回申请状态">
+          <div data-hf-id="hf-c07-return" class="target-box return-target" style="left:50.02%;top:39.15%;width:10.75%;height:9.60%;"></div>
+          <div data-hf-id="hf-c07-file" class="target-box file-target green" style="left:61.75%;top:43.10%;width:10.75%;height:10.40%;"></div>
+          <div data-hf-id="hf-c07-history" class="target-box history-target" style="left:73.95%;top:60.75%;width:9.80%;height:6.15%;"></div>
+        </div>
+        <div data-hf-id="hf-c07-menu" class="platform-menu"><div data-hf-id="hf-c07-tmall">天猫</div><div data-hf-id="hf-c07-jd">京东</div><div data-hf-id="hf-c07-douyin">抖音</div><div data-hf-id="hf-c07-mini">小程序</div></div>
+        <div data-hf-id="hf-c07-note" class="platform-note">账号未分配“唯品”，因此选项中不会出现。</div>
+        <div data-hf-id="hf-c07-pointer" class="pointer"></div><div data-hf-id="hf-c07-pulse" data-layout-allow-overflow class="click-pulse"></div>
+        <div data-hf-id="hf-c07-attribute-guide" class="guide guide-attribute">可选平台由管理员设置的“账单属性”决定。</div>
+        <div data-hf-id="hf-c07-upload-guide" class="guide guide-upload">每个平台上传一至三份文件；提交前可以删除重选，确认后不能下载。</div>
+        <div data-hf-id="hf-c07-return-guide" class="guide guide-return">发现错误可申请退回；审批后上传新版本，原文件保留历史记录。</div>
+        <div data-hf-id="hf-c07-scroll" class="scroll-track"><div data-hf-id="hf-c07-thumb" class="scroll-thumb" style="height:86%;"></div></div>
+      </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true }); const root = '#c-v1-07-root';
+      tl.set(`${root} .page-submitted, ${root} .target-box, ${root} .pointer, ${root} .guide, ${root} .platform-menu, ${root} .platform-note`, { opacity: 0 }, 0)
+        .fromTo(`${root} .scene-shell`, { opacity: 0 }, { opacity: 1, duration: 0.5 }, 0)
+        .fromTo(`${root} .scene-header`, { opacity: 0, y: -16 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out' }, 0.12)
+        .fromTo(`${root} .browser-stage`, { opacity: 0, y: 22 }, { opacity: 1, y: 0, duration: 0.65, ease: 'power3.out' }, 0.24)
+        .to(`${root} .select-target`, { opacity: 1, duration: 0.3 }, 0.75)
+        .fromTo(`${root} .pointer`, { opacity: 0, x: 800, y: 500 }, { opacity: 1, x: 735, y: 430, duration: 0.8, ease: 'power2.inOut' }, 0.9)
+        .set(`${root} .click-pulse`, { x: 739, y: 434 }, 1.75)
+        .fromTo(`${root} .click-pulse`, { opacity: 0.8, scale: 0.45 }, { opacity: 0, scale: 1.55, duration: 0.5 }, 1.75)
+        .to(`${root} .platform-menu`, { opacity: 1, y: 6, duration: 0.3 }, 2.0)
+        .to(`${root} .guide-attribute`, { opacity: 1, y: -8, duration: 0.4 }, 2.25)
+        .to(`${root} .pointer`, { x: 750, y: 480, duration: 0.55, ease: 'power2.inOut' }, 4.95)
+        .to(`${root} .pointer`, { x: 750, y: 530, duration: 0.55, ease: 'power2.inOut' }, 6.1)
+        .to(`${root} .pointer`, { x: 750, y: 580, duration: 0.55, ease: 'power2.inOut' }, 7.25)
+        .to(`${root} .pointer`, { x: 750, y: 630, duration: 0.55, ease: 'power2.inOut' }, 8.4)
+        .to(`${root} .platform-note`, { opacity: 1, y: -5, duration: 0.35 }, 8.8)
+        .to(`${root} .platform-menu, ${root} .platform-note, ${root} .guide-attribute, ${root} .select-target`, { opacity: 0, duration: 0.3 }, 11.15)
+        .to(`${root} .upload-target, ${root} .submit-target`, { opacity: 1, duration: 0.3 }, 11.3)
+        .to(`${root} .pointer`, { x: 1455, y: 450, duration: 1.0, ease: 'power2.inOut' }, 11.45)
+        .to(`${root} .guide-upload`, { opacity: 1, y: -8, duration: 0.4 }, 12.0)
+        .to(`${root} .pointer`, { x: 1455, y: 515, duration: 0.7, ease: 'power2.inOut' }, 13.5)
+        .to(`${root} .pointer`, { x: 1545, y: 515, duration: 0.7, ease: 'power2.inOut' }, 14.65)
+        .to(`${root} .pointer`, { x: 1495, y: 575, duration: 0.8, ease: 'power2.inOut' }, 15.9)
+        .set(`${root} .click-pulse`, { x: 1499, y: 579 }, 17.1)
+        .fromTo(`${root} .click-pulse`, { opacity: 0.8, scale: 0.45 }, { opacity: 0, scale: 1.55, duration: 0.5 }, 17.1)
+        .to(`${root} .upload-target, ${root} .submit-target, ${root} .guide-upload`, { opacity: 0, duration: 0.3 }, 18.55)
+        .to(`${root} .page-empty`, { opacity: 0, duration: 0.4 }, 18.7)
+        .to(`${root} .page-submitted`, { opacity: 1, duration: 0.4 }, 18.7)
+        .to(`${root} .return-target, ${root} .file-target, ${root} .history-target`, { opacity: 1, duration: 0.3 }, 19.2)
+        .to(`${root} .pointer`, { x: 1015, y: 440, duration: 0.9, ease: 'power2.inOut' }, 19.3)
+        .to(`${root} .guide-return`, { opacity: 1, y: -8, duration: 0.4 }, 19.85)
+        .to(`${root} .pointer`, { x: 1455, y: 655, duration: 1.0, ease: 'power2.inOut' }, 22.2)
+        .to(`${root} .pointer`, { x: 1240, y: 525, duration: 0.9, ease: 'power2.inOut' }, 24.15)
+        .to(`${root} .scene-shell`, { opacity: 0, duration: 0.45 }, 26.65);
+      window.__timelines['c-v1-07'] = tl;
+    </script>
+  </div>
+</template>

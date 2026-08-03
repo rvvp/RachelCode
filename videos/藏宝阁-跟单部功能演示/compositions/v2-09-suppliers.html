@@ -1,0 +1,66 @@
+<template id="a-v2-09-template">
+  <div data-hf-id="hf-o8bm" id="a-v2-09-root" data-composition-id="a-v2-09" data-width="1920" data-height="1080" data-start="0" data-duration="25">
+    <link rel="stylesheet" href="compositions/shared.css">
+    <div data-hf-id="hf-nmux" class="scene-shell">
+      <header data-hf-id="hf-ex6i" class="scene-header">
+        <div data-hf-id="hf-ria8" class="chapter-number">09</div>
+        <div data-hf-id="hf-40xz" class="chapter-copy"><div data-hf-id="hf-4oej" class="chapter-kicker">板块二 · 供应商结算</div><h1 data-hf-id="hf-uy52" class="chapter-title">导入、管理、查询与汇总，同屏完成</h1></div>
+        <div data-hf-id="hf-etfg" class="chapter-context">页面按业务顺序组织，查询结果只展示金额和数量。</div>
+      </header>
+      <div data-hf-id="hf-vd0x" class="browser-stage">
+        <div data-hf-id="hf-jubk" class="page-layer page-billing">
+          <img data-hf-id="hf-86ka" class="page-image" src="capture/screenshots/a-pages/05-a-billing-home-full.png" alt="账单与结算首页">
+          <div data-hf-id="hf-pcu5" class="target-box supplier-entry-target green" style="left:50.42%;top:54.49%;width:35.83%;height:16.66%;"></div>
+        </div>
+        <div data-hf-id="hf-cv6e" class="page-layer page-suppliers">
+          <img data-hf-id="hf-3r90" class="page-image" src="capture/screenshots/a-pages/07-a-supplier-settlements-full.png" alt="供应商结算页面">
+          <div data-hf-id="hf-a2a3" class="target-box import-target" style="left:15.16%;top:26.20%;width:34.75%;height:18.70%;"></div>
+          <div data-hf-id="hf-a6lt" class="target-box manage-target" style="left:15.16%;top:49.17%;width:34.75%;height:42.70%;"></div>
+          <div data-hf-id="hf-vnt4" class="target-box query-target" style="left:53.66%;top:20.02%;width:31.18%;height:22.50%;"></div>
+          <div data-hf-id="hf-pw1j" class="target-box summary-target green" style="left:53.66%;top:44.95%;width:31.18%;height:14.00%;"></div>
+        </div>
+        <div data-hf-id="hf-poi3" class="pointer"></div><div data-hf-id="hf-4h88" class="click-pulse"></div>
+        <div data-hf-id="hf-8p1c" class="guide guide-import">选择月份导入账单；首次导入后三十天内可删除后重新上传。</div>
+        <div data-hf-id="hf-51os" class="guide guide-manage">供应商主档支持单个录入、Excel 导入、查询与编辑。</div>
+        <div data-hf-id="hf-zvki" class="guide guide-query">按月份和供应商编号查询，汇总金额与数量，需要时导出明细。</div>
+        <div data-hf-id="hf-7fax" class="scroll-track"><div data-hf-id="hf-dyej" class="scroll-thumb" style="height:68%;"></div></div>
+      </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true }); const root = '#a-v2-09-root';
+      tl.set(`${root} .page-suppliers, ${root} .target-box, ${root} .pointer, ${root} .guide`, { opacity: 0 }, 0)
+        .fromTo(`${root} .scene-shell`, { opacity: 0 }, { opacity: 1, duration: 0.5 }, 0)
+        .fromTo(`${root} .scene-header`, { opacity: 0, y: -16 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out' }, 0.12)
+        .fromTo(`${root} .browser-stage`, { opacity: 0, y: 22 }, { opacity: 1, y: 0, duration: 0.65, ease: 'power3.out' }, 0.24)
+        .to(`${root} .supplier-entry-target`, { opacity: 1, duration: 0.25 }, 0.75)
+        .fromTo(`${root} .pointer`, { opacity: 0, x: 800, y: 500 }, { opacity: 1, x: 980, y: 680, duration: 0.85, ease: 'power2.inOut' }, 0.85)
+        .set(`${root} .click-pulse`, { x: 984, y: 684 }, 1.8)
+        .fromTo(`${root} .click-pulse`, { opacity: 0.8, scale: 0.45 }, { opacity: 0, scale: 1.55, duration: 0.5 }, 1.8)
+        .to(`${root} .page-billing`, { opacity: 0, duration: 0.45 }, 2.1)
+        .to(`${root} .page-suppliers`, { opacity: 1, duration: 0.45 }, 2.1)
+        .to(`${root} .import-target`, { opacity: 1, duration: 0.3 }, 2.75)
+        .to(`${root} .pointer`, { x: 640, y: 420, duration: 1.0, ease: 'power2.inOut' }, 2.9)
+        .to(`${root} .pointer`, { x: 770, y: 505, duration: 0.75, ease: 'power2.inOut' }, 4.1)
+        .to(`${root} .guide-import`, { opacity: 1, y: -8, duration: 0.4 }, 4.5)
+        .to(`${root} .import-target, ${root} .guide-import`, { opacity: 0, duration: 0.3 }, 9.8)
+        .to(`${root} .page-suppliers`, { y: -205, duration: 1.35, ease: 'power2.inOut' }, 9.9)
+        .to(`${root} .scroll-thumb`, { y: 125, duration: 1.35, ease: 'power2.inOut' }, 9.9)
+        .to(`${root} .manage-target`, { opacity: 1, duration: 0.3 }, 11.0)
+        .to(`${root} .pointer`, { x: 520, y: 470, duration: 0.9, ease: 'power2.inOut' }, 11.1)
+        .to(`${root} .guide-manage`, { opacity: 1, y: -8, duration: 0.4 }, 11.55)
+        .to(`${root} .pointer`, { x: 790, y: 520, duration: 0.75, ease: 'power2.inOut' }, 12.7)
+        .to(`${root} .pointer`, { x: 540, y: 750, duration: 0.85, ease: 'power2.inOut' }, 13.6)
+        .to(`${root} .manage-target, ${root} .guide-manage`, { opacity: 0, duration: 0.3 }, 14.55)
+        .to(`${root} .query-target, ${root} .summary-target`, { opacity: 1, duration: 0.3 }, 14.65)
+        .to(`${root} .pointer`, { x: 1130, y: 320, duration: 1.0, ease: 'power2.inOut' }, 14.8)
+        .to(`${root} .pointer`, { x: 1410, y: 470, duration: 0.85, ease: 'power2.inOut' }, 16.2)
+        .to(`${root} .guide-query`, { opacity: 1, y: -8, duration: 0.4 }, 16.7)
+        .to(`${root} .pointer`, { x: 1280, y: 620, duration: 0.85, ease: 'power2.inOut' }, 18.8)
+        .to(`${root} .pointer`, { x: 1460, y: 630, duration: 0.75, ease: 'power2.inOut' }, 21.0)
+        .to(`${root} .scene-shell`, { opacity: 0, duration: 0.45 }, 24.55);
+      window.__timelines['a-v2-09'] = tl;
+    </script>
+  </div>
+</template>
