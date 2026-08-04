@@ -11488,7 +11488,12 @@ class CatalogApplication:
                     """
                 )
             groups.append(
-                f'<section class="panel" style="margin-top:18px;"><h2>{html.escape(group)}</h2><div class="form-grid">{"".join(checkboxes)}</div></section>'
+                f"""
+                <div class="c-field-group" style="padding:18px 0; border-bottom:1px solid rgba(91,58,29,0.10);">
+                  <h3 style="margin:0 0 14px;">{html.escape(group)}</h3>
+                  <div class="form-grid">{"".join(checkboxes)}</div>
+                </div>
+                """
             )
         content = f"""
         <section class="hero">
@@ -11545,9 +11550,13 @@ class CatalogApplication:
                 <button class="ghost-button" type="submit" name="disable_token" value="1">停用令牌</button>
               </div>
             </section>
-            {''.join(groups)}
-            <section class="panel" style="margin-top:18px;">
-              <button type="submit">保存字段开放设置</button>
+            <section class="panel c-field-access-card" style="margin-top:18px;">
+              <h2>运营部可见字段</h2>
+              <p class="meta">勾选后，运营部将在资料列表、详情、Excel 导出和只读接口中看到对应字段。</p>
+              {''.join(groups)}
+              <div class="tools" style="margin-top:18px; margin-bottom:0; justify-content:flex-end;">
+                <button type="submit">保存字段开放设置</button>
+              </div>
             </section>
           </form>
         </section>

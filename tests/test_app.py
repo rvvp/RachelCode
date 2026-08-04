@@ -4137,6 +4137,8 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn('name="field_keys__size_chart"', settings_body)
         self.assertNotIn('name="field_keys__size_f"', settings_body)
         self.assertNotIn('name="field_keys__total_quantity"', settings_body)
+        self.assertEqual(settings_body.count('class="panel c-field-access-card"'), 1)
+        self.assertGreater(settings_body.count('class="c-field-group"'), 1)
 
     def test_admin_can_save_apply_and_delete_c_field_template(self):
         admin_cookie = self.login("admin_reviewer", "demo123")
