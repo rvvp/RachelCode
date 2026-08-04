@@ -94,6 +94,7 @@ SESSIONS: dict[str, int] = {}
 LIST_LAYOUT_VIRTUAL_FIELDS: tuple[FieldDef, ...] = ()
 LIST_LAYOUT_VIRTUAL_FIELD_MAP = {}
 LIST_LAYOUT_HIDDEN_FIELD_KEYS = {
+    "size_chart",
     "size_f",
     "size_s",
     "size_m",
@@ -2393,13 +2394,25 @@ class CatalogApplication:
         raw_value = db.get_setting(self.db_path, "c_visible_field_keys") or ""
         keys = self.normalize_field_keys(raw_value.split(","))
         if not keys:
-            keys = [field.key for field in visible_fields_for_department("C")]
-        if "launch_channel" not in keys:
-            keys.append("launch_channel")
+            keys = [field.key for field in self.c_field_available_fields() if field.visible_to_c]
         return keys
 
+    def c_field_available_fields(self):
+        source_user = {"department": "A"}
+        fields = self.configured_list_layout_fields(source_user)
+        available_keys = {field.key for field in fields}
+        for field_key in CATALOG_EXPORT_FIELD_ORDER:
+            if field_key not in B_STAGE_FIELD_KEYS or field_key in available_keys:
+                continue
+            field = PRODUCT_FIELD_MAP.get(field_key)
+            if not field or field.key in LIST_LAYOUT_HIDDEN_FIELD_KEYS:
+                continue
+            fields.append(field)
+            available_keys.add(field.key)
+        return fields
+
     def normalize_field_keys(self, values) -> list[str]:
-        valid_keys = {field.key for field in PRODUCT_FIELDS}
+        valid_keys = {field.key for field in self.c_field_available_fields()}
         normalized = []
         seen = set()
         for value in values:
@@ -11455,8 +11468,11 @@ class CatalogApplication:
                 </div>
                 """
             )
+        available_groups: dict[str, list[FieldDef]] = {}
+        for field in self.c_field_available_fields():
+            available_groups.setdefault(field.group, []).append(field)
         groups = []
-        for group, fields in FIELDS_BY_GROUP.items():
+        for group, fields in available_groups.items():
             checkboxes = []
             for field in fields:
                 checked = "checked" if field.key in selected else ""

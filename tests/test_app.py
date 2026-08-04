@@ -4105,6 +4105,39 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("launch_price", first_item)
         self.assertNotIn("brand_name", first_item)
 
+    def test_c_field_settings_sync_with_current_a_list_fields(self):
+        db.set_setting(
+            self.db_path,
+            "list_layout_fields_A",
+            "shooting_date,style_code,material",
+        )
+        db.set_setting(self.db_path, "list_layout_customized_A", "1")
+        db.set_setting(
+            self.db_path,
+            "c_visible_field_keys",
+            "shooting_date,style_code,size_chart,size_f,total_quantity",
+        )
+
+        self.assertEqual(
+            self.app.configured_c_field_keys(),
+            ["shooting_date", "style_code"],
+        )
+
+        admin_cookie = self.login("admin_reviewer", "demo123")
+        settings_page = self.request("/settings/c-fields", cookie=admin_cookie)
+        settings_body = settings_page["body"].decode("utf-8")
+
+        self.assertIn('name="field_keys__shooting_date"', settings_body)
+        self.assertIn('name="field_keys__style_code"', settings_body)
+        self.assertIn('name="field_keys__material"', settings_body)
+        self.assertIn('name="field_keys__launch_price"', settings_body)
+        self.assertIn('name="field_keys__launch_channel"', settings_body)
+        self.assertIn('name="field_keys__completion_flag"', settings_body)
+        self.assertNotIn('name="field_keys__supplier"', settings_body)
+        self.assertNotIn('name="field_keys__size_chart"', settings_body)
+        self.assertNotIn('name="field_keys__size_f"', settings_body)
+        self.assertNotIn('name="field_keys__total_quantity"', settings_body)
+
     def test_admin_can_save_apply_and_delete_c_field_template(self):
         admin_cookie = self.login("admin_reviewer", "demo123")
 

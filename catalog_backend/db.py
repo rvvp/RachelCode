@@ -18,6 +18,7 @@ LOGIN_LOCK_MINUTES = 15
 UTC = timezone.utc
 LIST_LAYOUT_VIRTUAL_KEYS = ("completion_flag",)
 LIST_LAYOUT_HIDDEN_KEYS = (
+    "size_chart",
     "size_f",
     "size_s",
     "size_m",
