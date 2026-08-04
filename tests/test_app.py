@@ -4138,7 +4138,11 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn('name="field_keys__size_f"', settings_body)
         self.assertNotIn('name="field_keys__total_quantity"', settings_body)
         self.assertEqual(settings_body.count('class="panel c-field-access-card"'), 1)
-        self.assertGreater(settings_body.count('class="c-field-group"'), 1)
+        self.assertEqual(settings_body.count('class="form-grid c-field-access-grid"'), 1)
+        self.assertNotIn('class="c-field-group"', settings_body)
+        self.assertNotIn("商品基础", settings_body)
+        self.assertNotIn("价格与供应", settings_body)
+        self.assertNotIn("材质与合规", settings_body)
 
     def test_admin_can_save_apply_and_delete_c_field_template(self):
         admin_cookie = self.login("admin_reviewer", "demo123")

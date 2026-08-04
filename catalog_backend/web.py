@@ -11468,31 +11468,18 @@ class CatalogApplication:
                 </div>
                 """
             )
-        available_groups: dict[str, list[FieldDef]] = {}
+        field_checkboxes = []
         for field in self.c_field_available_fields():
-            available_groups.setdefault(field.group, []).append(field)
-        groups = []
-        for group, fields in available_groups.items():
-            checkboxes = []
-            for field in fields:
-                checked = "checked" if field.key in selected else ""
-                checkboxes.append(
-                    f"""
-                    <label class="field" style="padding:12px; border:1px solid rgba(91,58,29,0.12); border-radius:14px;">
-                      <span style="display:flex; gap:10px; align-items:center;">
-                        <input type="checkbox" name="field_keys__{field.key}" value="{field.key}" {checked} style="width:auto;">
-                        <strong>{html.escape(field.label)}</strong>
-                      </span>
-                      <span class="meta">字段标识：{html.escape(field.key)}</span>
-                    </label>
-                    """
-                )
-            groups.append(
+            checked = "checked" if field.key in selected else ""
+            field_checkboxes.append(
                 f"""
-                <div class="c-field-group" style="padding:18px 0; border-bottom:1px solid rgba(91,58,29,0.10);">
-                  <h3 style="margin:0 0 14px;">{html.escape(group)}</h3>
-                  <div class="form-grid">{"".join(checkboxes)}</div>
-                </div>
+                <label class="field" style="padding:12px; border:1px solid rgba(91,58,29,0.12); border-radius:14px;">
+                  <span style="display:flex; gap:10px; align-items:center;">
+                    <input type="checkbox" name="field_keys__{field.key}" value="{field.key}" {checked} style="width:auto;">
+                    <strong>{html.escape(field.label)}</strong>
+                  </span>
+                  <span class="meta">字段标识：{html.escape(field.key)}</span>
+                </label>
                 """
             )
         content = f"""
@@ -11553,7 +11540,9 @@ class CatalogApplication:
             <section class="panel c-field-access-card" style="margin-top:18px;">
               <h2>运营部可见字段</h2>
               <p class="meta">勾选后，运营部将在资料列表、详情、Excel 导出和只读接口中看到对应字段。</p>
-              {''.join(groups)}
+              <div class="form-grid c-field-access-grid" style="margin-top:18px;">
+                {''.join(field_checkboxes)}
+              </div>
               <div class="tools" style="margin-top:18px; margin-bottom:0; justify-content:flex-end;">
                 <button type="submit">保存字段开放设置</button>
               </div>
