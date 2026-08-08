@@ -2139,7 +2139,7 @@ class CatalogApplication:
 
     def products_return_path(self, query: dict) -> str:
         params = {}
-        for key in ("q", "department", "status", "lifecycle_status"):
+        for key in ("q", "supplier", "department", "status", "lifecycle_status", "page"):
             value = str(query.get(key, "")).strip()
             if value:
                 params[key] = value
@@ -2151,6 +2151,9 @@ class CatalogApplication:
         keyword = str(query.get("q", "")).strip()
         if not keyword:
             return ""
+        supplier = ""
+        if user.get("department") in {"A", "EXECUTIVE"} or is_admin(user):
+            supplier = str(query.get("supplier", "")).strip()
         exact_matches = []
         for product in db.list_products(
             self.db_path,
@@ -2158,6 +2161,7 @@ class CatalogApplication:
             str(query.get("department", "")).strip(),
             str(query.get("status", "")).strip(),
             str(query.get("lifecycle_status", "")).strip(),
+            supplier,
         ):
             if not can_see_product(user, product):
                 continue
@@ -4711,8 +4715,9 @@ class CatalogApplication:
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 10px;
     }}
-    .products-filter-form .products-search-field {{
-      grid-column: 1 / -1;
+    .products-filter-form .products-search-field,
+    .products-filter-form .products-supplier-field {{
+      min-width: 0;
     }}
     .products-filter-form .filter-department-context {{
       display: flex;
@@ -4741,6 +4746,52 @@ class CatalogApplication:
       gap: 18px;
       min-width: 0;
       margin-bottom: 18px;
+    }}
+    .products-pagination {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }}
+    .products-pagination-top {{
+      margin: 0 0 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid rgba(94, 67, 40, 0.1);
+    }}
+    .products-pagination-summary {{
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+    }}
+    .products-pagination-links {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 6px;
+      flex-wrap: wrap;
+    }}
+    .products-pagination-links .pill {{
+      min-width: 38px;
+      min-height: 36px;
+      padding: 8px 12px;
+      justify-content: center;
+      box-shadow: none;
+    }}
+    .pagination-page-current {{
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }}
+    .pagination-disabled {{
+      opacity: 0.42;
+      cursor: default;
+    }}
+    .pagination-gap {{
+      min-width: 24px;
+      color: var(--muted);
+      text-align: center;
     }}
     .products-c-dashboard {{
       display: grid;
@@ -8280,19 +8331,27 @@ class CatalogApplication:
         brand_name = self.brand_config["brand_name"]
         console_eyebrow = self.brand_config["brand_console_eyebrow"]
         keyword = query.get("q", "").strip()
+        supplier_search_enabled = user.get("department") in {"A", "EXECUTIVE"} or is_admin(user)
+        supplier_filter = query.get("supplier", "").strip() if supplier_search_enabled else ""
         department_filter = query.get("department", "").strip()
         if not is_admin(user):
             department_filter = ""
             query = {**query, "department": ""}
         status_filter = query.get("status", "").strip()
         lifecycle_filter = query.get("lifecycle_status", "").strip()
-        return_to_path = self.products_return_path(query)
         bulk_enabled = not is_department_monitor(user) and (
             is_admin(user) or user.get("department") in {"A", "B", "C"}
         )
         source_status_filter = "" if user.get("department") == "C" else status_filter
         products = self.visible_products_for_user(
-            db.list_products(self.db_path, keyword, department_filter, source_status_filter, lifecycle_filter),
+            db.list_products(
+                self.db_path,
+                keyword,
+                department_filter,
+                source_status_filter,
+                lifecycle_filter,
+                supplier_filter,
+            ),
             user,
         )
         if user.get("department") == "C" and status_filter:
@@ -8300,6 +8359,86 @@ class CatalogApplication:
                 product for product in products
                 if self.c_effective_status(product, user) == status_filter
             ]
+        total_products = len(products)
+        page_size = 100
+        try:
+            requested_page = max(1, int(str(query.get("page", "1") or "1")))
+        except ValueError:
+            requested_page = 1
+        total_pages = max(1, (total_products + page_size - 1) // page_size)
+        current_page = min(requested_page, total_pages)
+        page_start = (current_page - 1) * page_size
+        products = products[page_start:page_start + page_size]
+        query = {
+            **query,
+            "supplier": supplier_filter,
+            "page": str(current_page) if current_page > 1 else "",
+        }
+        return_to_path = self.products_return_path(query)
+
+        pagination_params = {}
+        for key in ("q", "supplier", "department", "status", "lifecycle_status", "monitor_department"):
+            value = str(query.get(key, "")).strip()
+            if value:
+                pagination_params[key] = value
+
+        def products_page_href(page_number: int) -> str:
+            params = dict(pagination_params)
+            if page_number > 1:
+                params["page"] = str(page_number)
+            query_string = urlencode(params)
+            return f"/products{'?' + query_string if query_string else ''}#products-list"
+
+        page_numbers = sorted(
+            {1, total_pages}
+            | set(range(max(1, current_page - 2), min(total_pages, current_page + 2) + 1))
+        )
+        page_links = []
+        previous_number = 0
+        for page_number in page_numbers:
+            if previous_number and page_number - previous_number > 1:
+                page_links.append('<span class="pagination-gap" aria-hidden="true">...</span>')
+            if page_number == current_page:
+                page_links.append(
+                    f'<span class="pill pagination-page-current" aria-current="page">{page_number}</span>'
+                )
+            else:
+                page_links.append(
+                    f'<a class="pill pagination-page-link" href="{html.escape(products_page_href(page_number), quote=True)}">{page_number}</a>'
+                )
+            previous_number = page_number
+        previous_link = (
+            f'<a class="pill pagination-page-link" href="{html.escape(products_page_href(current_page - 1), quote=True)}">上一页</a>'
+            if current_page > 1
+            else '<span class="pill pagination-disabled" aria-disabled="true">上一页</span>'
+        )
+        next_link = (
+            f'<a class="pill pagination-page-link" href="{html.escape(products_page_href(current_page + 1), quote=True)}">下一页</a>'
+            if current_page < total_pages
+            else '<span class="pill pagination-disabled" aria-disabled="true">下一页</span>'
+        )
+        pagination_controls = f"""
+          <span class="products-pagination-summary">共 {total_products} 条，第 {current_page} / {total_pages} 页，每页 100 条</span>
+          <div class="products-pagination-links">
+            {previous_link}
+            {''.join(page_links)}
+            {next_link}
+          </div>
+        """
+        pagination_top_markup = (
+            f"""
+            <nav class="products-pagination products-pagination-top" aria-label="资料列表顶部分页">
+              {pagination_controls}
+            </nav>
+            """
+            if total_pages > 1
+            else ""
+        )
+        pagination_bottom_markup = f"""
+        <nav class="products-pagination products-pagination-bottom" aria-label="资料列表底部分页">
+          {pagination_controls}
+        </nav>
+        """
         configured_list_fields = self.configured_list_layout_fields(user)
         stats = db.department_stats(self.db_path)
         workflow_stats = db.status_stats(self.db_path)
@@ -8571,7 +8710,16 @@ class CatalogApplication:
         filter_intro = (
             "按款号、商品名称或品牌筛选资料。"
             if user["department"] == "C"
-            else "输入款号会在精确且唯一命中时直接打开资料详情；输入商品名称、品牌或模糊关键词时，仍保留列表筛选结果。"
+            else (
+                "可按款号、商品名称、品牌或供应商模糊搜索；款号精确且唯一命中时会直接打开资料详情。"
+                if supplier_search_enabled
+                else "输入款号会在精确且唯一命中时直接打开资料详情；输入商品名称、品牌或模糊关键词时，仍保留列表筛选结果。"
+            )
+        )
+        supplier_filter_markup = (
+            f'<input class="products-supplier-field" name="supplier" value="{html.escape(supplier_filter)}" placeholder="供应商名称，支持模糊搜索">'
+            if supplier_search_enabled
+            else ""
         )
         if user["department"] == "C" and not is_department_monitor(user):
             c_note = ""
@@ -8604,7 +8752,8 @@ class CatalogApplication:
             {notice_block}
             {c_note}
             <form class="products-filter-form" method="get" action="/products#products-search-filter">
-                <input class="products-search-field" name="q" value="{html.escape(keyword)}" placeholder="输入款号直达详情，或按名称/品牌搜索">
+                <input class="products-search-field" name="q" value="{html.escape(keyword)}" placeholder="款号、商品名称或品牌">
+                {supplier_filter_markup}
                 {department_filter_markup}
                 {status_filter_markup}
                 <button class="products-filter-submit" type="submit">筛选</button>
@@ -8614,7 +8763,7 @@ class CatalogApplication:
         {insights_before_list}
         {overview_close}
         <div class="products-main-stack">
-          <section class="panel">
+          <section id="products-list" class="panel query-anchor">
           <div class="list-intro">
             <div class="list-intro-main">
               <div class="eyebrow">Catalog Table</div>
@@ -8623,6 +8772,7 @@ class CatalogApplication:
             </div>
             {bulk_tools_markup}
           </div>
+          {pagination_top_markup}
           <form id="products-export-form" method="get" action="/export.xlsx">
             <input type="hidden" name="selected" id="export-selected-products" value="">
           </form>
@@ -8650,6 +8800,7 @@ class CatalogApplication:
             </table>
           </div>
           </form>
+          {pagination_bottom_markup}
           <script>
             (() => {{
               const bulkForm = document.getElementById("products-bulk-form");

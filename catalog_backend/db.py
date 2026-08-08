@@ -2420,8 +2420,10 @@ def list_products(
     department: str = "",
     status: str = "",
     lifecycle_status: str = "",
+    supplier: str = "",
 ) -> list[dict]:
     like_query = f"%{query.strip()}%"
+    supplier_query = f"%{supplier.strip()}%"
     with get_connection(db_path) as connection:
         rows = connection.execute(
             """
@@ -2439,6 +2441,7 @@ def list_products(
             AND (? = '' OR p.owner_department = ?)
             AND (? = '' OR p.status = ?)
             AND (? = '' OR p.lifecycle_status = ?)
+            AND (? = '' OR COALESCE(p.supplier, '') LIKE ?)
             ORDER BY p.updated_at DESC, p.id DESC
             """,
             (
@@ -2452,6 +2455,8 @@ def list_products(
                 status.strip(),
                 lifecycle_status.strip(),
                 lifecycle_status.strip(),
+                supplier.strip(),
+                supplier_query,
             ),
         ).fetchall()
         return [dict(row) for row in rows]

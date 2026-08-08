@@ -2840,6 +2840,67 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('class="table-initiator-cell"', body)
         self.assertIn("张三", body)
 
+    def test_a_products_page_can_fuzzy_search_by_supplier(self):
+        with db.get_connection(self.db_path) as connection:
+            connection.execute(
+                "UPDATE products SET supplier = ? WHERE id = ?",
+                ("广州享馨服装有限公司", 1),
+            )
+            connection.execute(
+                "UPDATE products SET supplier = ? WHERE id = ?",
+                ("杭州云锦供应链有限公司", 2),
+            )
+
+        a_cookie = self.login("a_editor", "demo123")
+        response = self.request("/products?supplier=%E4%BA%AB%E9%A6%A8", cookie=a_cookie)
+        body = response["body"].decode("utf-8")
+
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertIn('name="supplier" value="享馨"', body)
+        self.assertIn('<a class="table-id-link" href="/products/1">#1</a>', body)
+        self.assertNotIn('<a class="table-id-link" href="/products/2">#2</a>', body)
+        self.assertIn("共 1 条，第 1 / 1 页，每页 100 条", body)
+
+        b_cookie = self.login("b_editor", "demo123")
+        b_body = self.request("/products", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertNotIn('name="supplier"', b_body)
+
+    def test_products_list_paginates_100_rows_and_preserves_supplier_filter(self):
+        a_user = next(item for item in db.list_users(self.db_path) if item["username"] == "a_editor")
+        with db.get_connection(self.db_path) as connection:
+            for index in range(101):
+                db.create_product(
+                    connection,
+                    {
+                        "product_name": f"分页测试商品 {index + 1}",
+                        "style_code": f"PAGE-{index + 1:03d}",
+                        "supplier": "分页供应商有限公司",
+                    },
+                    int(a_user["id"]),
+                    "A",
+                )
+
+        a_cookie = self.login("a_editor", "demo123")
+        first_response = self.request(
+            "/products?supplier=%E5%88%86%E9%A1%B5",
+            cookie=a_cookie,
+        )
+        first_body = first_response["body"].decode("utf-8")
+        self.assertEqual(first_body.count('<tr class="catalog-row">'), 100)
+        self.assertIn("共 101 条，第 1 / 2 页，每页 100 条", first_body)
+        self.assertIn("supplier=%E5%88%86%E9%A1%B5&amp;page=2#products-list", first_body)
+        self.assertIn('aria-label="资料列表顶部分页"', first_body)
+        self.assertIn('aria-label="资料列表底部分页"', first_body)
+
+        second_response = self.request(
+            "/products?supplier=%E5%88%86%E9%A1%B5&page=2",
+            cookie=a_cookie,
+        )
+        second_body = second_response["body"].decode("utf-8")
+        self.assertEqual(second_body.count('<tr class="catalog-row">'), 1)
+        self.assertIn("共 101 条，第 2 / 2 页，每页 100 条", second_body)
+        self.assertIn("supplier=%E5%88%86%E9%A1%B5#products-list", second_body)
+
     def test_c_viewer_products_page_does_not_error_when_no_published_products(self):
         with db.get_connection(self.db_path) as connection:
             connection.execute("UPDATE products SET status = 'draft'")
