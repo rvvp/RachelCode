@@ -321,6 +321,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('value="pending"', a_form)
         self.assertIn('value="published"', a_form)
         self.assertNotIn('value="received"', a_form)
+        self.assertLess(a_form.index('name="lifecycle_status"'), a_form.index(">跟单部</div>"))
 
         b_form = filter_form(self.request("/products", cookie=self.login("b_editor", "demo123"))["body"].decode("utf-8"))
         self.assertIn(">商品部</div>", b_form)
@@ -328,6 +329,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('value="published"', b_form)
         self.assertNotIn('value="draft"', b_form)
         self.assertNotIn('value="received"', b_form)
+        self.assertLess(b_form.index(">商品部</div>"), b_form.index('name="lifecycle_status"'))
 
         c_form = filter_form(self.request("/products", cookie=self.login("c_viewer", "demo123"))["body"].decode("utf-8"))
         self.assertIn(">运营部</div>", c_form)

@@ -8628,7 +8628,6 @@ class CatalogApplication:
                 <option value="pending" {"selected" if status_filter == "pending" else ""}>待商品部填写</option>
                 <option value="published" {"selected" if status_filter == "published" else ""}>已完成</option>
               </select>
-              {lifecycle_filter_markup}
             """
         elif user["department"] == "B":
             status_filter_markup = f"""
@@ -8637,7 +8636,6 @@ class CatalogApplication:
                 <option value="pending" {"selected" if status_filter == "pending" else ""}>待完成</option>
                 <option value="published" {"selected" if status_filter == "published" else ""}>已完成</option>
               </select>
-              {lifecycle_filter_markup}
             """
         else:
             status_filter_markup = f"""
@@ -8648,7 +8646,6 @@ class CatalogApplication:
                 <option value="published" {"selected" if status_filter == "published" else ""}>已完成</option>
                 <option value="received" {"selected" if status_filter == "received" else ""}>已接收</option>
               </select>
-              {lifecycle_filter_markup}
             """
         department_filter_markup = (
             f"""
@@ -8664,6 +8661,12 @@ class CatalogApplication:
                 <div class="filter-department-context" aria-label="当前部门">{html.escape(department_label(user.get("department")))}</div>
             '''
         )
+        if user["department"] == "A":
+            filter_controls_markup = lifecycle_filter_markup + status_filter_markup + department_filter_markup
+        elif user["department"] == "C":
+            filter_controls_markup = department_filter_markup + status_filter_markup
+        else:
+            filter_controls_markup = department_filter_markup + status_filter_markup + lifecycle_filter_markup
         editor_dashboard = user["department"] in {"A", "B", "EXECUTIVE"} or is_admin(user)
         stats_description = (
             "先掌握接收进度，再进入资料列表处理待接收资料。"
@@ -8754,8 +8757,7 @@ class CatalogApplication:
             <form class="products-filter-form" method="get" action="/products#products-search-filter">
                 <input class="products-search-field" name="q" value="{html.escape(keyword)}" placeholder="款号、商品名称或品牌">
                 {supplier_filter_markup}
-                {department_filter_markup}
-                {status_filter_markup}
+                {filter_controls_markup}
                 <button class="products-filter-submit" type="submit">筛选</button>
             </form>
           </section>
