@@ -120,7 +120,7 @@ class CatalogApplication:
     def build_brand_config(self, overrides: dict) -> dict:
         config = {
             "brand_name": "思安娜的\n藏寶閣",
-            "brand_mark": "Sianna",
+            "brand_mark": "Sienna",
             "brand_tagline": "让商品资料从分散表格进入统一底库",
             "brand_subtitle": "面向跟单部、商品部与运营部协作的内部资料后台，支持跟单部主体填写、商品部补充品类、图片、上新价格、上新渠道和资料完成，运营部只读开放与结构化调用。",
             "brand_eyebrow": "Siana Treasure Pavilion",
@@ -976,7 +976,7 @@ class CatalogApplication:
                 raise ValueError("图片链接必须是有效的 HTTP 或 HTTPS 地址。")
             request = Request(
                 source,
-                headers={"User-Agent": "Sianna-Catalog-Export/1.0", "Accept": "image/*"},
+                headers={"User-Agent": "Sienna-Catalog-Export/1.0", "Accept": "image/*"},
             )
             with urlopen(request, timeout=8) as response:
                 content = response.read(MAX_IMAGE_BYTES + 1)

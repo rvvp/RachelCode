@@ -67,7 +67,7 @@ def parse_args():
     parser.add_argument("--bootstrap-admin-name", default=os.environ.get("CATALOG_BOOTSTRAP_ADMIN_NAME", "系统管理员"), help="首次初始化时创建管理员显示名称")
     parser.add_argument("--bootstrap-admin-no-force-reset", action="store_true", default=not env_flag("CATALOG_BOOTSTRAP_ADMIN_FORCE_RESET", True), help="初始化管理员后不强制首次改密")
     parser.add_argument("--brand-name", default=env_text("CATALOG_BRAND_NAME", "思安娜的\n藏寶閣"), help="系统品牌名称")
-    parser.add_argument("--brand-mark", default=env_text("CATALOG_BRAND_MARK", "Sianna"), help="系统品牌简称")
+    parser.add_argument("--brand-mark", default=env_text("CATALOG_BRAND_MARK", "Sienna"), help="系统品牌简称")
     parser.add_argument("--brand-tagline", default=env_text("CATALOG_BRAND_TAGLINE", "让商品资料从分散表格进入统一底库"), help="登录页主文案")
     parser.add_argument("--brand-subtitle", default=env_text("CATALOG_BRAND_SUBTITLE", "面向跟单部、商品部与运营部协作的内部资料后台，支持跟单部主体填写、商品部补充品类、图片、上新价格、上新渠道和资料完成，运营部只读开放与结构化调用。"), help="登录页副文案")
     parser.add_argument("--brand-eyebrow", default=env_text("CATALOG_BRAND_EYEBROW", "Siana Treasure Pavilion"), help="登录页英文副标题")

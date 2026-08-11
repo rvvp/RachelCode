@@ -481,7 +481,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('class="login-mytteno"', body)
         self.assertIn(">MYTENO</div>", body)
         self.assertIn('class="login-brand-kicker"', body)
-        self.assertIn(">Sianna</div>", body)
+        self.assertIn(">Sienna</div>", body)
         self.assertIn('class="login-brand-main"', body)
         self.assertIn("思安娜的藏宝阁", body)
         self.assertNotIn("请输入账号与密码", body)
@@ -3311,15 +3311,16 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("<th>资料完成</th><th>送拍时间</th><th>送检时间</th>", body)
         self.assertIn("<th>送拍时间</th>", body)
         self.assertIn("<th>送检时间</th>", body)
-        self.assertIn("<th>检测报告</th><th>尺寸表</th><th>发货仓库</th>", body)
+        self.assertIn("<th>检测报告</th><th>发货仓库</th>", body)
         self.assertIn("<th>品牌名称</th><th>年份季节</th><th>款色</th>", body)
-        self.assertIn("<th>款色</th><th>款号</th><th>颜色名称</th>", body)
+        self.assertIn("<th>款色</th><th>款号</th><th>供应商款号</th><th>颜色名称</th>", body)
+        self.assertIn("<th>供应商</th><th>供应商编号</th><th>合作模式</th>", body)
         self.assertIn("<th>合作模式</th>", body)
         self.assertIn("<th>供应链经理</th>", body)
         self.assertIn("<th>含税价</th>", body)
         self.assertIn("<th>成分(英文)</th>", body)
         self.assertIn("<th>69码</th>", body)
-        self.assertIn("<th>尺寸表</th><th>发货仓库</th><th>品牌名称</th>", body)
+        self.assertIn("<th>发货仓库</th><th>品牌名称</th>", body)
         self.assertNotIn("<th>图片</th>", body)
         self.assertNotIn("<th>上新价格</th>", body)
         self.assertNotIn("<th>F</th>", body)
@@ -3330,6 +3331,42 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn("<th>2XL</th>", body)
         self.assertNotIn("<th>3XL</th>", body)
         self.assertNotIn("<th>合计</th>", body)
+
+    def test_supplier_product_fields_backfill_existing_a_and_b_list_layouts(self):
+        db.set_setting(
+            self.db_path,
+            "list_layout_fields_A",
+            "brand_name,style_code,color_name,supplier,cooperation_mode",
+        )
+        db.set_setting(self.db_path, "list_layout_customized_A", "1")
+        db.set_setting(
+            self.db_path,
+            "list_layout_fields_B",
+            "style_code,supplier,launch_channel",
+        )
+        db.set_setting(self.db_path, "list_layout_customized_B", "1")
+
+        init_db(self.db_path)
+
+        self.assertEqual(
+            db.get_setting(self.db_path, "list_layout_fields_A"),
+            "brand_name,style_code,supplier_style_code,color_name,supplier,supplier_code,cooperation_mode",
+        )
+        self.assertEqual(
+            db.get_setting(self.db_path, "list_layout_fields_B"),
+            "style_code,supplier_style_code,supplier,supplier_code,launch_channel",
+        )
+
+    def test_supplier_product_fields_do_not_override_hidden_layout_anchors(self):
+        db.set_setting(self.db_path, "list_layout_fields_A", "brand_name,product_name")
+        db.set_setting(self.db_path, "list_layout_customized_A", "1")
+
+        init_db(self.db_path)
+
+        self.assertEqual(
+            db.get_setting(self.db_path, "list_layout_fields_A"),
+            "brand_name,product_name",
+        )
 
     def test_list_layout_settings_can_hide_completion_flag_when_department_does_not_select_it(self):
         a_cookie = self.login("a_editor", "demo123")
@@ -3442,11 +3479,13 @@ class CatalogAppTests(unittest.TestCase):
                 "图片",
                 "款色",
                 "款号",
+                "供应商款号",
                 "颜色\n名称",
                 "商品名称",
                 "品类",
                 "是否有配饰",
                 "供应商",
+                "供应商编号",
                 "合作模式",
                 "供应链经理",
                 "含税价",
@@ -3477,11 +3516,13 @@ class CatalogAppTests(unittest.TestCase):
                 "",
                 "VESQ21SWH0220",
                 "VESQ21SWH0",
+                "SUP-VESQ21SWH0",
                 "灰色",
                 "两件套（罩衫）",
                 "套装",
                 "",
                 "",
+                "SUP-001",
                 "联营",
                 "王主管",
                 "699",
@@ -3509,11 +3550,28 @@ class CatalogAppTests(unittest.TestCase):
         first = products[0]
         self.assertEqual(first["shooting_date"], "2026-06-18")
         self.assertEqual(first["inspection_date"], "2026-06-20")
+        self.assertEqual(first["supplier_style_code"], "SUP-VESQ21SWH0")
+        self.assertEqual(first["supplier_code"], "SUP-001")
         self.assertEqual(first["cooperation_mode"], "联营")
         self.assertEqual(first["supply_chain_manager"], "王主管")
         self.assertEqual(first["tax_included_price"], 699.0)
         self.assertEqual(first["composition_en"], "SHELL: LYOCELL 83.7%NYLON 16.3%")
         self.assertEqual(first["size_69"], 12)
+
+    def test_supplier_product_fields_persist_when_a_editor_saves(self):
+        with db.get_connection(self.db_path) as connection:
+            db.update_product(
+                connection,
+                1,
+                self.a_complete_fields_payload(
+                    supplier_style_code="GYS-KH-001",
+                    supplier_code="GYS-001",
+                ),
+            )
+
+        product = db.get_product(self.db_path, 1)
+        self.assertEqual(product["supplier_style_code"], "GYS-KH-001")
+        self.assertEqual(product["supplier_code"], "GYS-001")
 
     def test_composition_field_is_removed_and_legacy_header_maps_to_material(self):
         from catalog_backend.excel import parse_workbook, workbook_bytes
@@ -3525,6 +3583,8 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn("成分", headers)
         self.assertIn("材质", headers)
         self.assertIn("成分(英文)", headers)
+        self.assertEqual(headers[headers.index("款号") + 1], "供应商款号")
+        self.assertEqual(headers[headers.index("供应商") + 1], "供应商编号")
 
         workbook = Workbook()
         worksheet = workbook.active

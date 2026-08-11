@@ -807,6 +807,7 @@ def init_db(
         migrate_deprecated_composition_to_material(connection)
         backfill_non_customized_list_layout_defaults(connection)
         backfill_list_layout_virtual_fields(connection)
+        backfill_supplier_product_list_layout_fields(connection)
         backfill_placeholder_product_dates(connection)
         backfill_product_completion_timestamps(connection)
         backfill_billing_month_platform_snapshots(connection)
@@ -884,6 +885,33 @@ def backfill_list_layout_virtual_fields(connection: sqlite3.Connection) -> None:
             "UPDATE app_settings SET setting_value = ?, updated_at = ? WHERE setting_key = ?",
             (",".join(values), utc_now(), setting_key),
         )
+
+
+def backfill_supplier_product_list_layout_fields(connection: sqlite3.Connection) -> None:
+    insertions = (
+        ("style_code", "supplier_style_code"),
+        ("supplier", "supplier_code"),
+    )
+    for department in ("A", "B"):
+        setting_key = f"list_layout_fields_{department}"
+        row = connection.execute(
+            "SELECT setting_value FROM app_settings WHERE setting_key = ?",
+            (setting_key,),
+        ).fetchone()
+        if not row:
+            continue
+        values = [item.strip() for item in str(row["setting_value"] or "").split(",") if item.strip()]
+        changed = False
+        for anchor_key, new_key in insertions:
+            if anchor_key not in values or new_key in values:
+                continue
+            values.insert(values.index(anchor_key) + 1, new_key)
+            changed = True
+        if changed:
+            connection.execute(
+                "UPDATE app_settings SET setting_value = ?, updated_at = ? WHERE setting_key = ?",
+                (",".join(values), utc_now(), setting_key),
+            )
 
 
 def backfill_product_completion_timestamps(connection: sqlite3.Connection) -> None:
@@ -1090,11 +1118,13 @@ def seed_default_settings(connection: sqlite3.Connection) -> None:
             "image_url",
             "style_color",
             "style_code",
+            "supplier_style_code",
             "color_name",
             "product_name",
             "category",
             "has_accessories",
             "supplier",
+            "supplier_code",
             "cooperation_mode",
             "supply_chain_manager",
             "tax_included_price",
@@ -1121,11 +1151,13 @@ def seed_default_settings(connection: sqlite3.Connection) -> None:
             "image_url",
             "style_color",
             "style_code",
+            "supplier_style_code",
             "color_name",
             "product_name",
             "category",
             "has_accessories",
             "supplier",
+            "supplier_code",
             "cooperation_mode",
             "supply_chain_manager",
             "tax_included_price",
