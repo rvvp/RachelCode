@@ -154,9 +154,9 @@ CATALOG_BOOTSTRAP_ADMIN_NAME='系统管理员' \
 常用配置项：
 
 - `CATALOG_BRAND_NAME`
-  系统名称，例如 `思安娜商品资料中心`
+  系统名称，例如 `思安娜的藏寶閣`
 - `CATALOG_BRAND_MARK`
-  头部角标简称，例如 `SA`
+  头部角标简称，例如 `Sienna`
 - `CATALOG_BRAND_TAGLINE`
   登录页主文案
 - `CATALOG_BRAND_SUBTITLE`
@@ -175,12 +175,12 @@ CATALOG_BOOTSTRAP_ADMIN_NAME='系统管理员' \
 例如：
 
 ```bash
-CATALOG_BRAND_NAME="思安娜商品资料中心" \
-CATALOG_BRAND_MARK="SA" \
+CATALOG_BRAND_NAME="思安娜的\n藏寶閣" \
+CATALOG_BRAND_MARK="Sienna" \
 CATALOG_BRAND_TAGLINE="让商品资料从分散表格进入统一底库" \
 CATALOG_BRAND_SUBTITLE="面向商品、运营与渠道协作的内部资料后台，支持 A 主体填写、B 补充渠道价格、C 只读开放与结构化调用。" \
-CATALOG_BRAND_EYEBROW="Siana Merchandise Console" \
-CATALOG_CONSOLE_EYEBROW="Unified Catalog Workspace" \
+CATALOG_BRAND_EYEBROW="Sienna Treasure Pavilion" \
+CATALOG_CONSOLE_EYEBROW="Sienna Treasure Workspace" \
 CATALOG_BRAND_ACCENT="#bc6c25" \
 CATALOG_BRAND_ACCENT_STRONG="#7f3b08" \
 CATALOG_BRAND_ACCENT_DEEP="#355f52" \

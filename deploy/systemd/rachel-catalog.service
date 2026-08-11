@@ -9,6 +9,7 @@ User=rachelcode
 Group=rachelcode
 WorkingDirectory=/opt/rachelcode/app
 Environment=PYTHONUNBUFFERED=1
+Environment=CATALOG_BRAND_MARK=Sienna
 ExecStart=/opt/rachelcode/venv/bin/python /opt/rachelcode/app/app.py --host 0.0.0.0 --port 8765 --db /data/rachelcode/catalog/catalog.db --uploads /data/rachelcode/catalog/uploads --no-seed-demo --no-seed-samples
 Restart=on-failure
 RestartSec=3

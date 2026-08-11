@@ -109,6 +109,8 @@ BILLING_MONTH_STATUS_COLORS = {
     "partial_to_b": "#7f5d2a",
     "submitted_to_b": "#2f6f4f",
 }
+BRAND_TITLE_ASSET_URL = "/assets/cangbaoge-weibei-mask.png?v=1"
+BRAND_TITLE_ASSET_PATH = Path(__file__).resolve().parent / "assets" / "cangbaoge-weibei-mask.png"
 
 
 class CatalogApplication:
@@ -123,14 +125,16 @@ class CatalogApplication:
             "brand_mark": "Sienna",
             "brand_tagline": "让商品资料从分散表格进入统一底库",
             "brand_subtitle": "面向跟单部、商品部与运营部协作的内部资料后台，支持跟单部主体填写、商品部补充品类、图片、上新价格、上新渠道和资料完成，运营部只读开放与结构化调用。",
-            "brand_eyebrow": "Siana Treasure Pavilion",
-            "brand_console_eyebrow": "Siana Treasure Workspace",
+            "brand_eyebrow": "Sienna Treasure Pavilion",
+            "brand_console_eyebrow": "Sienna Treasure Workspace",
             "accent": "#bc6c25",
             "accent_strong": "#7f3b08",
             "accent_deep": "#355f52",
         }
         for key, value in overrides.items():
             clean_value = str(value).strip().replace("\\n", "\n")
+            if key == "brand_mark" and clean_value.casefold() in {"sianna", "siana"}:
+                clean_value = "Sienna"
             if clean_value:
                 config[key] = clean_value
         return config
@@ -157,6 +161,8 @@ class CatalogApplication:
                 return self.redirect(start_response, "/modules" if user else "/login")
             if path == "/healthz" and method == "GET":
                 return self.handle_healthz(start_response)
+            if path == "/assets/cangbaoge-weibei-mask.png" and method == "GET":
+                return self.handle_brand_title_asset(start_response)
             if path == "/login":
                 if method == "GET":
                     return self.html_response(start_response, self.render_login())
@@ -1056,6 +1062,21 @@ class CatalogApplication:
         start_response(
             "200 OK",
             [("Content-Type", "application/json; charset=utf-8"), ("Content-Length", str(len(payload)))],
+        )
+        return [payload]
+
+    def handle_brand_title_asset(self, start_response):
+        if not BRAND_TITLE_ASSET_PATH.is_file():
+            start_response("404 Not Found", [("Content-Length", "0")])
+            return [b""]
+        payload = BRAND_TITLE_ASSET_PATH.read_bytes()
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(payload))),
+                ("Cache-Control", "public, max-age=604800, immutable"),
+            ],
         )
         return [payload]
 
@@ -2930,7 +2951,7 @@ class CatalogApplication:
         brand_secondary_markup = ""
         if len(brand_lines) > 1:
             brand_secondary_markup = "".join(
-                f'<div class="brand-subline brand-subline-seal">{html.escape(line)}</div>'
+                self.brand_title_markup(line, "brand-subline brand-subline-seal")
                 for line in brand_lines[1:]
             )
         brand_mark_text = brand_mark
@@ -2968,6 +2989,7 @@ class CatalogApplication:
           </div>
         </details>
         """
+
         action_links = [
             '<li class="nav-chip"><a href="/modules">首页</a></li>',
             f'<li class="nav-chip nav-chip-dropdown">{board_guide}</li>',
@@ -3003,6 +3025,19 @@ class CatalogApplication:
           </div>
         </nav>
         """
+
+    @staticmethod
+    def brand_title_markup(title: str, class_name: str) -> str:
+        clean_title = str(title or "").strip()
+        escaped_title = html.escape(clean_title)
+        if clean_title not in {"藏宝阁", "藏寶閣"}:
+            return f'<div class="{html.escape(class_name, quote=True)}">{escaped_title}</div>'
+        return (
+            f'<div class="{html.escape(class_name, quote=True)} brand-title-art" '
+            f'role="img" aria-label="{escaped_title}">'
+            f'<span class="brand-title-art-fallback" aria-hidden="true">{escaped_title}</span>'
+            "</div>"
+        )
 
     @staticmethod
     def monitor_department_available_for_path(department: str, path: str) -> bool:
@@ -3373,6 +3408,23 @@ class CatalogApplication:
     .brand-subline-seal {{
       font-family: "WeibeiSC-Bold", "魏碑-简", "WeibeiTC-Bold", "魏碑-繁", serif;
       font-variant-east-asian: traditional;
+    }}
+    @supports ((-webkit-mask-image: url("")) or (mask-image: url(""))) {{
+      .brand-title-art {{
+        position: relative;
+        width: 132px;
+        height: 44px;
+        color: #6d3410;
+      }}
+      .brand-title-art::before {{
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: currentColor;
+        -webkit-mask: url("{BRAND_TITLE_ASSET_URL}") center / contain no-repeat;
+        mask: url("{BRAND_TITLE_ASSET_URL}") center / contain no-repeat;
+      }}
+      .brand-title-art-fallback {{ visibility: hidden; }}
     }}
     .meta {{
       color: var(--muted);
@@ -5113,6 +5165,13 @@ class CatalogApplication:
       color: #7f3b08;
       text-shadow: none;
     }}
+    @supports ((-webkit-mask-image: url("")) or (mask-image: url(""))) {{
+      .login-page .login-brand-main.brand-title-art {{
+        width: 228px;
+        height: 76px;
+        color: #7f3b08;
+      }}
+    }}
     .login-brand-intro {{
       max-width: 390px;
       margin: 12px 0 0;
@@ -6708,6 +6767,7 @@ class CatalogApplication:
         min-height: calc(100vh - 28px);
       }}
       .login-page .login-shell {{
+        grid-template-columns: minmax(0, 1fr);
         gap: 34px;
         padding: 42px 24px 74px;
       }}
@@ -6751,6 +6811,16 @@ class CatalogApplication:
       }}
       .login-brand-main {{
         font-size: 56px;
+      }}
+      @supports ((-webkit-mask-image: url("")) or (mask-image: url(""))) {{
+        .login-page .login-brand-main.brand-title-art {{
+          width: 168px;
+          height: 56px;
+        }}
+        .brand-subline.brand-title-art {{
+          width: 108px;
+          height: 36px;
+        }}
       }}
       .brand-subline {{
         font-size: 36px;
@@ -8291,6 +8361,11 @@ class CatalogApplication:
         brand_mark = self.brand_config["brand_mark"]
         brand_lines = [line.strip() for line in brand_name.splitlines() if line.strip()]
         brand_secondary = brand_lines[1] if len(brand_lines) > 1 else ""
+        brand_secondary_markup = (
+            self.brand_title_markup(brand_secondary, "login-brand-main")
+            if brand_secondary
+            else ""
+        )
         error_block = f'<div class="warning">{html.escape(error)}</div>' if error else ""
         content = f"""
         <div class="login-page">
@@ -8298,7 +8373,7 @@ class CatalogApplication:
             <section class="login-showcase">
               <div class="login-brand-lockup">
                 <div class="login-brand-kicker">{html.escape(brand_mark)}</div>
-                {f'<div class="login-brand-main">{html.escape(brand_secondary)}</div>' if brand_secondary else ""}
+                {brand_secondary_markup}
                 <p class="login-brand-intro"><span>供应链 · 商品 · 运营</span><span>多部门协同管理资料，流程加速，效率加倍</span><strong>开启寻宝之旅</strong></p>
               </div>
               <div class="login-mytteno" aria-hidden="true">MYTENO</div>

@@ -482,7 +482,8 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn(">MYTENO</div>", body)
         self.assertIn('class="login-brand-kicker"', body)
         self.assertIn(">Sienna</div>", body)
-        self.assertIn('class="login-brand-main"', body)
+        self.assertIn('class="login-brand-main brand-title-art"', body)
+        self.assertIn('/assets/cangbaoge-weibei-mask.png?v=1', body)
         self.assertIn("思安娜的藏宝阁", body)
         self.assertNotIn("请输入账号与密码", body)
         self.assertIn("供应链 · 商品 · 运营", body)
@@ -494,6 +495,23 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('name="username"', body)
         self.assertIn('name="password"', body)
 
+    def test_brand_title_asset_is_publicly_available(self):
+        response = self.request("/assets/cangbaoge-weibei-mask.png")
+        self.assertTrue(response["status"].startswith("200"))
+        headers = dict(response["headers"])
+        self.assertEqual(headers["Content-Type"], "image/png")
+        self.assertIn("immutable", headers["Cache-Control"])
+        self.assertTrue(response["body"].startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_legacy_brand_mark_override_is_normalized(self):
+        for legacy_mark in ("Sianna", "Siana"):
+            app = CatalogApplication(
+                self.db_path,
+                self.upload_dir,
+                brand_config={"brand_mark": legacy_mark},
+            )
+            self.assertEqual(app.brand_config["brand_mark"], "Sienna")
+
     def test_modules_home_shows_first_and_second_modules(self):
         cookie = self.login("a_editor", "demo123")
         response = self.request("/modules", cookie=cookie)
@@ -501,7 +519,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('class="modules-home"', body)
         self.assertIn('<div class="detail-grid">', body)
         self.assertIn('class="modules-home-watermark"', body)
-        self.assertIn("玲珑晓楼阁，远山含黛色", body)
+        self.assertIn("远山含黛色，玲珑晓楼阁", body)
         self.assertIn('font-family: "STXingkaiSC-Light"', body)
         self.assertIn('V1 行书版：行楷细体', body)
         self.assertIn("板块一", body)

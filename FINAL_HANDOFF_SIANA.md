@@ -4,10 +4,10 @@
 
 当前目录已经是一套可直接运行的本地交付版，系统品牌默认配置为：
 
-- 系统名称：`思安娜商品资料中心`
-- 头部简称：`SA`
-- 登录页英文副标题：`Siana Merchandise Console`
-- 后台英文副标题：`Unified Catalog Workspace`
+- 系统名称：`思安娜的藏寶閣`
+- 头部简称：`Sienna`
+- 登录页英文副标题：`Sienna Treasure Pavilion`
+- 后台英文副标题：`Sienna Treasure Workspace`
 
 当前默认配置已经写入：
 
