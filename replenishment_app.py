@@ -22,7 +22,7 @@ def env_flag(name: str, default: bool) -> bool:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="智能补货中心（独立服务）")
+    parser = argparse.ArgumentParser(description="货品监控中心（独立服务）")
     parser.add_argument("--host", default=os.environ.get("REPLENISH_HOST", "127.0.0.1"), help="监听地址")
     parser.add_argument("--port", type=int, default=int(os.environ.get("REPLENISH_PORT", "8877")), help="监听端口")
     parser.add_argument(
@@ -44,7 +44,7 @@ def main() -> None:
     scheduler = SchedulerThread(args.db) if args.scheduler else None
     if scheduler:
         scheduler.start()
-    print("智能补货中心已启动（独立服务）")
+    print("货品监控中心已启动（独立服务）")
     print(f"访问地址: http://{args.host}:{args.port}")
     print(f"独立数据库: {args.db}")
     print("店铺工作区: 马天奴唯品会 / 马天奴天猫官方旗舰店 / BNX唯品会")
@@ -52,6 +52,7 @@ def main() -> None:
     if args.seed_demo:
         print(f"商品部: merch / {DEMO_PASSWORD}")
         print(f"跟单部: followup / {DEMO_PASSWORD}")
+        print(f"运营部执行视图: ops / {DEMO_PASSWORD}")
         print(f"管理层: manager / {DEMO_PASSWORD}")
         print(f"管理员: admin / {DEMO_PASSWORD}")
     try:

@@ -9,6 +9,7 @@ User=rachelcode
 Group=rachelcode
 WorkingDirectory=/opt/rachelcode/app
 Environment=PYTHONUNBUFFERED=1
+Environment=REPLENISH_PUBLIC_BASE_URL=https://sienna.tiger8.com.cn
 ExecStart=/opt/rachelcode/venv/bin/python /opt/rachelcode/app/replenishment_app.py --host 0.0.0.0 --port 8877 --db /data/rachelcode/replenishment/replenishment.db --no-seed-demo --scheduler
 Restart=on-failure
 RestartSec=3

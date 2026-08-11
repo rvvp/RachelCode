@@ -14,6 +14,7 @@ from replenishment_center import db
 SKU_HEADERS = ["款号", "款名", "颜色", "尺码", "品类", "供应商", "供应周期(天)", "最小起订量", "装箱倍数", "默认尺码占比", "核心尺码"]
 SALES_HEADERS = ["日期", "平台", "店铺", "款号", "颜色", "尺码", "销售数量", "退货数量"]
 INVENTORY_HEADERS = ["快照时间", "平台", "店铺", "款号", "颜色", "尺码", "实物库存", "锁定库存", "残次库存", "在途数量", "预计到货日期"]
+COST_HEADERS = ["款号", "颜色", "尺码", "单位成本", "生效日期", "版本说明"]
 
 
 def _text(value) -> str:
@@ -195,6 +196,86 @@ def data_template_bytes() -> bytes:
     return output.getvalue()
 
 
+def import_cost_workbook(db_path: str | Path, file_obj, user_id: int | None = None) -> dict:
+    workbook = load_workbook(file_obj, data_only=True)
+    sheet = workbook["商品成本"] if "商品成本" in workbook.sheetnames else workbook.active
+    settings = db.get_settings(db_path)
+    counts = {"matched": 0, "missing": 0}
+    effective_from = ""
+    with db.get_connection(db_path) as connection:
+        sku_lookup = {
+            (_text(row["style_code"]), _text(row["color_name"]), _text(row["size_name"])): row
+            for row in connection.execute("SELECT * FROM skus WHERE store_id = ?", (settings["store_id"],))
+        }
+        for row_no, row in _rows(sheet, COST_HEADERS):
+            key = (_text(row["款号"]), _text(row["颜色"]), _text(row["尺码"]))
+            sku = sku_lookup.get(key)
+            if not sku:
+                counts["missing"] += 1
+                continue
+            cost = _number(row["单位成本"], integer=False)
+            if cost < 0:
+                raise ValueError(f"商品成本第 {row_no} 行的单位成本不能小于 0。")
+            effective = _date_text(row["生效日期"]) if row["生效日期"] not in (None, "") else db.local_today().isoformat()
+            effective_from = max(effective_from, effective)
+            connection.execute(
+                "INSERT INTO sku_cost_versions(sku_id, unit_cost, effective_from, source, version_label, created_by, created_at) VALUES (?, ?, ?, 'excel', ?, ?, ?)",
+                (sku["id"], cost, effective, _text(row["版本说明"]), user_id, db.utc_now()),
+            )
+            counts["matched"] += 1
+        db._audit(connection, user_id, "cost_import", "sku_cost_versions", None, str(counts))
+    return counts
+
+
+def cost_template_bytes() -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "商品成本"
+    sheet.append(COST_HEADERS)
+    sheet.append(["MTN260701", "雾灰", "M", 189, date.today(), "2026Q3初始成本"])
+    _style_sheet(sheet)
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+def pricing_workbook_bytes(plan: dict, items: list[dict], *, internal: bool = False) -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "运营执行明细"
+    headers = ["批次编号", "平台", "店铺", "款号", "货号", "款名", "颜色", "尺码", "当前售价", "建议售价", "调价动作", "执行备注"]
+    sheet.append(headers)
+    decision_labels = {"markdown": "下调", "margin_protect": "上调", "manual": "按规则", "hold": "维持", "excluded": "不进入执行"}
+    for item in items:
+        if not internal and not item.get("include_flag", 1):
+            continue
+        sheet.append([
+            plan["batch_no"], plan["platform_name"], plan["store_name"], item["style_code"], item.get("outer_sku_id") or "",
+            item["style_name"], item["color_name"], item["size_name"], item["current_price"], item["confirmed_price"],
+            decision_labels.get(item["decision"], item["decision"]), item["reason"],
+        ])
+    _style_sheet(sheet)
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    if internal:
+        internal_sheet = workbook.create_sheet("商品部测算")
+        internal_sheet.append(["款号", "货号", "尺码", "单位成本", "当前毛利率", "建议毛利率", "毛利保护价", "14天销量", "库存支撑天数", "判断说明"])
+        for item in items:
+            internal_sheet.append([
+                item["style_code"], item.get("outer_sku_id") or "", item["size_name"], item["unit_cost"] if item["unit_cost"] is not None else "成本缺失",
+                item["current_margin"], item["proposed_margin"], item["floor_price"], item["sales_14"],
+                round(item["coverage_days"], 1) if item["coverage_days"] is not None else "-", item["reason"],
+            ])
+        _style_sheet(internal_sheet)
+        internal_sheet.freeze_panes = "A2"
+        internal_sheet.auto_filter.ref = internal_sheet.dimensions
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
 def plan_workbook_bytes(plan: dict, items: list[dict]) -> bytes:
     workbook = Workbook()
     sheet = workbook.active
@@ -202,7 +283,7 @@ def plan_workbook_bytes(plan: dict, items: list[dict]) -> bytes:
     headers = [
         "计划编号", "平台", "店铺", "款号", "货号", "款名", "颜色", "尺码", "核心尺码", "命中条件", "连续有销量天数",
         "近7天销量", "近14天销量", "可售库存", "在途", "预计可售天数", "风险",
-        "系统建议", "商品部确认", "调整原因", "跟单确认", "预计下单日期", "预计到货日期", "跟单状态", "跟单备注",
+        "系统建议", "商品部确认", "调整原因", "跟单确认", "预计下单日期", "预计到货日期", "实际到仓日期", "实际到货数", "到货差异", "跟单状态", "跟单备注",
     ]
     sheet.append(headers)
     risk_labels = {"critical": "7天内缺货", "warning": "14天内缺货", "watch": "库存关注", "healthy": "健康", "no_sales": "暂无销量"}
@@ -222,7 +303,9 @@ def plan_workbook_bytes(plan: dict, items: list[dict]) -> bytes:
                 item["sellable"], item["inbound"], round(item["coverage_days"], 1) if item["coverage_days"] is not None else "-",
                 risk_labels.get(item["risk_level"], item["risk_level"]), item["suggested_qty"], item["confirmed_qty"],
                 item["adjustment_reason"], item["followup_qty"] if item["followup_qty"] is not None else "",
-                item["expected_order_date"], item["expected_arrival_date"], followup_labels.get(item["followup_status"], item["followup_status"]),
+                item["expected_order_date"], item["expected_arrival_date"], item.get("actual_arrival_date", ""), item.get("actual_arrived_qty", 0),
+                {"major": "重大差异", "general": "一般差异", "none": "-"}.get(item.get("arrival_variance_level"), "-"),
+                followup_labels.get(item["followup_status"], item["followup_status"]),
                 item["followup_note"],
             ]
         )

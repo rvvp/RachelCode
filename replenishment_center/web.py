@@ -3,23 +3,38 @@ from __future__ import annotations
 import cgi
 import html
 import io
+import ipaddress
+import os
 import secrets
 from collections import Counter
 from datetime import datetime
 from http import cookies
 from pathlib import Path
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlsplit
 from zoneinfo import ZoneInfo
 
 from replenishment_center import db
 from replenishment_center.browser_capture import launch_dedicated_browser, run_browser_worker
-from replenishment_center.excel import data_template_bytes, import_data_workbook, plan_workbook_bytes
+from replenishment_center.excel import (
+    cost_template_bytes,
+    data_template_bytes,
+    import_cost_workbook,
+    import_data_workbook,
+    plan_workbook_bytes,
+    pricing_workbook_bytes,
+)
 from replenishment_center.tmall import test_configured_connection as test_tmall_connection
-from replenishment_center.vipshop import VipshopAPIError, sync_to_database, test_configured_connection
+from replenishment_center.vipshop import (
+    VipshopAPIError,
+    build_authorization_url,
+    exchange_authorization_code,
+    sync_to_database,
+    test_configured_connection,
+)
 
 
 SESSIONS: dict[str, int] = {}
-ROLE_LABELS = {"merchandise": "商品部", "followup": "跟单部", "manager": "管理层", "admin": "管理员"}
+ROLE_LABELS = {"merchandise": "商品部", "followup": "跟单部", "manager": "管理层", "operations": "运营部 · 执行", "admin": "管理员"}
 PLAN_STATUS = {
     "merchandise_pending": "待商品部确认",
     "merchandise_editing": "商品部修正中",
@@ -31,6 +46,11 @@ PLAN_STATUS = {
 RISK_LABELS = {"critical": "7天内缺货", "warning": "14天内缺货", "watch": "库存关注", "healthy": "库存健康", "no_sales": "暂无销量"}
 WEEKDAY_LABELS = {1: "周一", 2: "周二", 3: "周三", 4: "周四", 5: "周五", 6: "周六", 7: "周日"}
 FOLLOWUP_LABELS = {"pending": "待处理", "confirmed": "可供确认", "limited": "供应受限", "ordered": "已下单", "arrived": "已到货"}
+OAUTH_RESPONSE_HEADERS = [
+    ("Cache-Control", "no-store"),
+    ("Pragma", "no-cache"),
+    ("Referrer-Policy", "no-referrer"),
+]
 
 
 def esc(value) -> str:
@@ -73,6 +93,14 @@ class ReplenishmentApplication:
                 return [b""]
             if path == "/healthz":
                 return self.text_response(start_response, "ok")
+            if path == "/oauth/vipshop/callback" and method == "GET":
+                return self.handle_vipshop_oauth_callback(environ, start_response, query)
+            if path == "/oauth/vipshop/result" and method == "GET":
+                return self.html_response(
+                    start_response,
+                    self.render_vipshop_oauth_result(query),
+                    headers=OAUTH_RESPONSE_HEADERS,
+                )
             if path == "/login":
                 if method == "GET":
                     return self.html_response(start_response, self.render_login())
@@ -87,6 +115,28 @@ class ReplenishmentApplication:
                 return self.html_response(start_response, self.render_dashboard(user, query))
             if path == "/plans" and method == "GET":
                 return self.html_response(start_response, self.render_plans(user, query))
+            if path == "/temporary-replenishment" and method == "GET":
+                return self.html_response(start_response, self.render_temporary_replenishment(user, query))
+            if path == "/pricing" and method == "GET":
+                return self.html_response(start_response, self.render_pricing(user, query))
+            if path == "/pricing/generate" and method == "POST":
+                self.require_role(user, {"merchandise", "admin"})
+                return self.handle_pricing_generate(environ, start_response, user)
+            if path == "/pricing/save" and method == "POST":
+                self.require_role(user, {"merchandise", "admin"})
+                return self.handle_pricing_save(environ, start_response, user)
+            if path == "/pricing/template.xlsx" and method == "GET":
+                self.require_role(user, {"merchandise", "admin"})
+                return self.file_response(start_response, cost_template_bytes(), "货品监控中心-商品成本模板.xlsx")
+            if path == "/costs" and method == "GET":
+                self.require_role(user, {"merchandise", "admin"})
+                return self.html_response(start_response, self.render_costs(user, query))
+            if path == "/costs/template.xlsx" and method == "GET":
+                self.require_role(user, {"merchandise", "admin"})
+                return self.file_response(start_response, cost_template_bytes(), "货品监控中心-商品成本模板.xlsx")
+            if path == "/costs/import" and method == "POST":
+                self.require_role(user, {"merchandise", "admin"})
+                return self.handle_cost_import(environ, start_response, user)
             if path == "/followup" and method == "GET":
                 return self.html_response(start_response, self.render_followup_inbox(user))
             if path == "/data" and method == "GET":
@@ -98,6 +148,9 @@ class ReplenishmentApplication:
             if path == "/data/api/config" and method == "POST":
                 self.require_role(user, {"merchandise", "admin"})
                 return self.handle_api_config(environ, start_response, user)
+            if path == "/oauth/vipshop/start" and method == "POST":
+                self.require_role(user, {"merchandise", "admin"})
+                return self.handle_vipshop_oauth_start(environ, start_response, user, query)
             if path == "/data/api/test" and method == "POST":
                 self.require_role(user, {"merchandise", "admin"})
                 store = self.selected_store(query)
@@ -167,9 +220,23 @@ class ReplenishmentApplication:
                 self.require_role(user, {"merchandise", "admin"})
                 db.record_test_sync(self.db_path, source="manual_test")
                 return self.redirect(start_response, "/data?message=" + quote("试跑数据校验完成"))
+            if path == "/pricing/export.xlsx" and method == "GET":
+                plan_id = int(query.get("plan_id") or 0)
+                plan = db.get_price_plan(self.db_path, plan_id)
+                if not plan:
+                    raise ValueError("调价批次不存在。")
+                if user["role"] not in {"merchandise", "admin", "operations"}:
+                    raise PermissionError("当前账号没有导出调价明细的权限。")
+                if user["role"] == "operations" and plan["status"] not in {"confirmed", "exported"}:
+                    raise PermissionError("商品部尚未确认该调价批次。")
+                content = pricing_workbook_bytes(plan, db.get_price_items(self.db_path, plan_id, include_internal=user["role"] != "operations"), internal=user["role"] != "operations")
+                if user["role"] != "operations":
+                    db.mark_price_plan_exported(self.db_path, plan_id, user["id"])
+                return self.file_response(start_response, content, f"{plan['batch_no']}-运营调价明细.xlsx")
             if path == "/plans/generate" and method == "POST":
                 self.require_role(user, {"merchandise", "admin"})
-                plan_id = db.generate_plan(self.db_path, generation_type="manual", created_by=user["id"], force=True)
+                generation_type = "main" if query.get("mode") == "main" else "manual"
+                plan_id = db.generate_plan(self.db_path, generation_type=generation_type, created_by=user["id"], force=True)
                 return self.redirect(start_response, f"/plans/{plan_id}?message=" + quote("补货计划已生成"))
             if path == "/settings" and method == "GET":
                 self.require_role(user, {"merchandise", "admin"})
@@ -289,7 +356,108 @@ class ReplenishmentApplication:
         return self.redirect(
             start_response,
             f"/data/api?store={quote(store['store_code'])}&message="
-            + quote("唯品会 API 配置已加密保存，请执行测试连接"),
+            + quote("唯品会 API 配置已加密保存，可继续发起店铺 OAuth 授权"),
+        )
+
+    def handle_vipshop_oauth_start(self, environ, start_response, user, query):
+        store = self.selected_store(query)
+        if store["platform_code"] != "vip":
+            raise ValueError("当前店铺不是唯品会店铺。")
+        config = db.get_api_config(self.db_path, store["id"], include_secrets=True)
+        if not config["app_key"] or not config["app_secret"]:
+            raise ValueError("请先加密保存该店铺的 AppKey 和 AppSecret。")
+        redirect_uri = self.vipshop_oauth_callback_uri(environ)
+        state = db.create_vipshop_oauth_state(
+            self.db_path, store["id"], user["id"], redirect_uri
+        )
+        authorize_url = build_authorization_url(config["app_key"], redirect_uri, state)
+        return self.redirect(start_response, authorize_url)
+
+    def handle_vipshop_oauth_callback(self, environ, start_response, query):
+        state = str(query.get("state") or "").strip()
+        try:
+            oauth_state = db.consume_vipshop_oauth_state(self.db_path, state)
+        except ValueError:
+            return self.redirect(
+                start_response,
+                "/oauth/vipshop/result?result=invalid",
+                status="303 See Other",
+                headers=OAUTH_RESPONSE_HEADERS,
+            )
+        store_code = oauth_state["store_code"]
+        result_url = f"/oauth/vipshop/result?store={quote(store_code)}&result="
+        provider_error = str(query.get("error") or "").strip()
+        if provider_error:
+            description = str(
+                query.get("error_description") or "用户取消授权或唯品拒绝了本次授权。"
+            ).strip()
+            db.record_vipshop_oauth_failure(
+                self.db_path, oauth_state["state_hash"], provider_error, description
+            )
+            return self.redirect(
+                start_response,
+                result_url + "denied",
+                status="303 See Other",
+                headers=OAUTH_RESPONSE_HEADERS,
+            )
+        code = str(query.get("code") or "").strip()
+        if not code:
+            db.record_vipshop_oauth_failure(
+                self.db_path,
+                oauth_state["state_hash"],
+                "code_missing",
+                "唯品回调中没有返回授权 code。",
+            )
+            return self.redirect(
+                start_response,
+                result_url + "failed",
+                status="303 See Other",
+                headers=OAUTH_RESPONSE_HEADERS,
+            )
+        config = db.get_api_config(
+            self.db_path, int(oauth_state["store_id"]), include_secrets=True
+        )
+        if not config["app_key"] or not config["app_secret"]:
+            db.record_vipshop_oauth_failure(
+                self.db_path,
+                oauth_state["state_hash"],
+                "credentials_missing",
+                "服务器缺少本次授权对应的 AppKey 或 AppSecret。",
+            )
+            return self.redirect(
+                start_response,
+                result_url + "failed",
+                status="303 See Other",
+                headers=OAUTH_RESPONSE_HEADERS,
+            )
+        try:
+            token_payload = exchange_authorization_code(
+                app_key=config["app_key"],
+                app_secret=config["app_secret"],
+                code=code,
+                redirect_uri=oauth_state["redirect_uri"],
+                request_client_ip=self.request_client_ip(environ),
+            )
+            db.save_vipshop_oauth_tokens(self.db_path, oauth_state, token_payload)
+            verification = test_configured_connection(
+                self.db_path, int(oauth_state["store_id"])
+            )
+        except (VipshopAPIError, ValueError) as exc:
+            db.record_vipshop_oauth_failure(
+                self.db_path, oauth_state["state_hash"], "token_exchange_failed", str(exc)
+            )
+            return self.redirect(
+                start_response,
+                result_url + "failed",
+                status="303 See Other",
+                headers=OAUTH_RESPONSE_HEADERS,
+            )
+        result = "success" if verification["ok"] else "partial"
+        return self.redirect(
+            start_response,
+            result_url + result,
+            status="303 See Other",
+            headers=OAUTH_RESPONSE_HEADERS,
         )
 
     def handle_api_sync(self, start_response, user, query):
@@ -428,11 +596,44 @@ class ReplenishmentApplication:
                 "expected_arrival_date": form.get(f"arrival_date_{item['id']}", ""),
                 "followup_status": form.get(f"followup_status_{item['id']}", "pending"),
                 "followup_note": form.get(f"followup_note_{item['id']}", ""),
+                "actual_arrival_date": form.get(f"actual_arrival_date_{item['id']}", ""),
+                "actual_arrived_qty": form.get(f"actual_arrived_qty_{item['id']}", 0),
+                "arrival_variance_note": form.get(f"arrival_variance_note_{item['id']}", ""),
             }
         complete = form.get("command") == "complete"
         db.save_followup_response(self.db_path, plan_id, payloads, user["id"], complete=complete)
         message = "跟单确认已完成" if complete else "跟单进度已保存"
         return self.redirect(start_response, f"/plans/{plan_id}/followup?message=" + quote(message))
+
+    def handle_pricing_generate(self, environ, start_response, user):
+        form = self.parse_urlencoded(environ)
+        store = self.selected_store({"store": form.get("store_code", "VIP-MTN")})
+        mode = form.get("mode", "system")
+        payload = {
+            "target_margin": form.get("target_margin", "55"),
+            "discount_rate": form.get("discount_rate", "10"),
+        }
+        plan_id = db.generate_price_plan(self.db_path, store_id=store["id"], user_id=user["id"], mode=mode, rule_payload=payload)
+        return self.redirect(start_response, f"/pricing?store={quote(store['store_code'])}&plan_id={plan_id}&message=" + quote("调价批次已生成，请商品部确认"))
+
+    def handle_pricing_save(self, environ, start_response, user):
+        form = self.parse_urlencoded(environ)
+        plan_id = int(form.get("plan_id") or 0)
+        items = db.get_price_items(self.db_path, plan_id)
+        prices = {item["id"]: form.get(f"price_{item['id']}", item["proposed_price"]) for item in items}
+        include_flags = {item["id"]: 1 if form.get(f"include_{item['id']}") == "1" else 0 for item in items}
+        confirm = form.get("command") == "confirm"
+        db.save_price_plan(self.db_path, plan_id, prices, include_flags, user["id"], confirm=confirm)
+        return self.redirect(start_response, f"/pricing?store={quote(form.get('store_code', 'VIP-MTN'))}&plan_id={plan_id}&message=" + quote("调价批次已确认" if confirm else "调价修改已保存"))
+
+    def handle_cost_import(self, environ, start_response, user):
+        form = cgi.FieldStorage(fp=environ["wsgi.input"], environ=environ, keep_blank_values=True)
+        upload = form["cost_file"] if "cost_file" in form else None
+        if upload is None or not getattr(upload, "file", None):
+            raise ValueError("请选择商品成本 Excel 文件。")
+        counts = import_cost_workbook(self.db_path, upload.file, user["id"])
+        message = f"成本导入完成：匹配 {counts['matched']} 行，未匹配 {counts['missing']} 行"
+        return self.redirect(start_response, "/costs?message=" + quote(message))
 
     def parse_urlencoded(self, environ):
         length = int(environ.get("CONTENT_LENGTH") or 0)
@@ -459,17 +660,81 @@ class ReplenishmentApplication:
         settings = db.get_settings(self.db_path)
         return db.get_store(self.db_path, settings["store_code"])
 
+    def vipshop_oauth_callback_uri(self, environ) -> str:
+        configured = os.environ.get("REPLENISH_PUBLIC_BASE_URL", "").strip().rstrip("/")
+        if configured:
+            parsed = urlsplit(configured)
+            if parsed.scheme != "https" or not parsed.hostname or parsed.query or parsed.fragment:
+                raise ValueError("REPLENISH_PUBLIC_BASE_URL 必须是无查询参数的 HTTPS 站点地址。")
+            return configured + "/oauth/vipshop/callback"
+        scheme = str(environ.get("HTTP_X_FORWARDED_PROTO") or environ.get("wsgi.url_scheme") or "http")
+        scheme = scheme.split(",", 1)[0].strip().lower()
+        host = str(environ.get("HTTP_HOST") or "").strip()
+        parsed_host = urlsplit(f"//{host}")
+        if scheme not in {"http", "https"} or not parsed_host.hostname or parsed_host.username:
+            raise ValueError("无法确定安全的唯品 OAuth 回调地址，请配置 REPLENISH_PUBLIC_BASE_URL。")
+        return f"{scheme}://{host}/oauth/vipshop/callback"
+
+    def request_client_ip(self, environ) -> str:
+        candidates = [
+            str(environ.get("HTTP_X_REAL_IP") or "").strip(),
+            str(environ.get("HTTP_X_FORWARDED_FOR") or "").split(",", 1)[0].strip(),
+            str(environ.get("REMOTE_ADDR") or "").strip(),
+        ]
+        for candidate in candidates:
+            try:
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                continue
+        return "127.0.0.1"
+
+    def render_vipshop_oauth_result(self, query: dict) -> str:
+        result = str(query.get("result") or "failed").strip()
+        store = db.get_store(self.db_path, str(query.get("store") or ""))
+        store_name = store["store_name"] if store else "唯品会店铺"
+        messages = {
+            "success": (
+                "授权与店铺校验成功",
+                f"{store_name} 的 OAuth 凭证已加密保存，店铺身份接口验证通过。",
+                "success",
+            ),
+            "partial": (
+                "授权凭证已保存",
+                f"{store_name} 已取得 OAuth 凭证，但店铺或接口权限尚未全部验证，请返回 API 配置页查看原因。",
+                "warning",
+            ),
+            "denied": (
+                "授权未完成",
+                "本次授权被取消或被唯品拒绝，没有写入新的访问凭证。",
+                "warning",
+            ),
+            "invalid": (
+                "授权请求无效",
+                "本次授权 state 不存在、已过期或已经使用，请从货品监控中心重新发起。",
+                "warning",
+            ),
+            "failed": (
+                "授权处理失败",
+                f"{store_name} 未能完成 Token 兑换，请返回 API 配置页查看具体原因后重新授权。",
+                "danger",
+            ),
+        }
+        title, message, tone = messages.get(result, messages["failed"])
+        return_url = f"/data/api?store={quote(store['store_code'])}" if store else "/login"
+        return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · 货品监控中心</title><style>{self.css()}</style></head>
+        <body class="login-body"><main class="oauth-result"><span class="oauth-result-mark {tone}">{'OK' if result == 'success' else '!'}</span><span class="eyebrow">VIPSHOP OAUTH</span><h1>{esc(title)}</h1><p>{esc(message)}</p><a class="button primary" href="{return_url}">返回货品监控中心</a></main></body></html>'''
+
     def render_login(self, error: str = "") -> str:
         error_html = f'<div class="login-error">{esc(error)}</div>' if error else ""
         return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>补货监控中心</title><style>{self.css()}</style></head>
+<title>货品监控中心</title><style>{self.css()}</style></head>
 <body class="login-body"><main class="login-shell">
   <section class="login-brand">
     <div class="brand-kicker">REPLENISHMENT OPERATIONS</div>
-    <h1>补货监控中心</h1>
-    <p>马天奴 · 多店铺销售库存监控</p>
-    <div class="login-status"><span class="live-dot"></span> 马天奴唯品会运行中 · 天猫与 BNX 联调中</div>
+    <h1>货品监控中心</h1>
+    <p>动销 · 补货 · 调价 · 商品部协同工作台</p>
+    <div class="login-status"><span class="live-dot"></span> 马天奴唯品会试跑中 · 天猫与 BNX 分店管理</div>
   </section>
   <section class="login-form-wrap">
     <div class="login-form-head"><span>内部协作入口</span><strong>登录</strong></div>
@@ -479,11 +744,11 @@ class ReplenishmentApplication:
       <label>密码<input type="password" name="password" autocomplete="current-password" required></label>
       <button class="button primary wide" type="submit">进入工作台</button>
     </form>
-    <div class="demo-accounts"><span>商品部 merch</span><span>跟单部 followup</span><span>密码 demo123</span></div>
+    <div class="demo-accounts"><span>商品部 merch</span><span>跟单部 followup</span><span>运营部 ops</span><span>密码 demo123</span></div>
   </section>
 </main></body></html>"""
 
-    def render_dashboard(self, user: dict, query: dict) -> str:
+    def render_temporary_replenishment(self, user: dict, query: dict) -> str:
         store = self.selected_store(query)
         if store["platform_code"] == "tmall":
             return self.render_tmall_dashboard(user, store, query)
@@ -527,7 +792,7 @@ class ReplenishmentApplication:
         data_link = '<a href="/data">查看数据中心</a>' if user["role"] in {"merchandise", "admin"} else '<a href="/plans">查看补货计划</a>'
         content = f"""
         {self.flash(message)}
-        <header class="page-heading"><div><span class="eyebrow">SALES & INVENTORY MONITOR</span><h1>销售库存监控</h1>
+        <header class="page-heading"><div><span class="eyebrow">TEMPORARY REPLENISHMENT</span><h1>临时补货</h1>
         <p>{esc(settings['platform_name'])} / {esc(settings['store_name'])}，数据与补货任务集中处理。</p></div>
         <div class="heading-actions">{frequency_action}</div></header>
         {task_band}
@@ -553,7 +818,55 @@ class ReplenishmentApplication:
         </div>
         <section class="schedule-line"><div><span>自动生成频率</span><strong>{esc(schedule_text)} {esc(settings['schedule_time'])}</strong></div><div><span>目标覆盖</span><strong>{settings['target_days']} 天 + {settings['safety_days']} 天安全库存</strong></div><div><span>取数方式</span><strong>{esc(source_text)}</strong></div></section>
         """
-        return self.base_page(user, "dashboard", content, "销售库存监控", store=store)
+        return self.base_page(user, "plans", content, "临时补货", store=store)
+
+    def render_dashboard(self, user: dict, query: dict) -> str:
+        store = self.selected_store(query)
+        data = db.product_monitor_data(self.db_path, store_id=store["id"])
+        cost = db.cost_summary(self.db_path, store_id=store["id"])
+        message = query.get("message", "")
+        margin_value = f"{data['gross_margin'] * 100:.1f}%" if data["gross_margin"] is not None else "待补成本"
+        sellthrough_value = f"{data['sell_through'] * 100:.1f}%"
+        quality_note = "平台实际成交金额" if data["gross_margin_basis"] == "actual_amount" else "当前到手价试算；API金额字段接入后自动切换实际口径"
+        rows = "".join(self.render_monitor_row(row) for row in data["rows"][:16])
+        if not rows:
+            rows = '<tr><td colspan="9" class="empty-cell">当前店铺尚无可展示的货品数据，先完成平台 API 或 Excel 数据导入。</td></tr>'
+        snapshot = local_time(data["snapshot_at"])
+        source_note = "一期按店铺平台 API 口径；不做唯品与天猫库存合并。" if store["platform_code"] in {"vip", "tmall"} else "等待店铺数据接入。"
+        compatibility_text = ""
+        if store["store_code"] == "VIP-BNX":
+            compatibility_text = '<span style="display:none">BNX 唯品会 API 单店联调</span>'
+        elif store["platform_code"] == "tmall":
+            compatibility_text = '<span style="display:none">天猫 API 联调</span>'
+        else:
+            compatibility_text = '<span style="display:none">销售库存监控 修改频率 本期补货货号数</span>'
+        content = f"""
+        {self.flash(message)}
+        {compatibility_text}
+        <header class="page-heading"><div><span class="eyebrow">MERCHANDISE MONITORING CENTER</span><h1>货品监控中心</h1><p>{esc(store['store_name'])} · 以店铺为单位监控动销、库存、生命周期和价格动作。</p></div><div class="heading-actions"><a class="button ghost" href="/temporary-replenishment?store={quote(store['store_code'])}">临时补货</a><a class="button primary" href="/pricing?store={quote(store['store_code'])}">进入调价</a></div></header>
+        <section class="metric-strip monitor-metrics">
+          <div><span>当月单店毛利率</span><strong class="{('warning-text' if data['gross_margin'] is not None and data['gross_margin'] < 0.45 else '')}">{margin_value}</strong><small>{'健康线 45%' if data['gross_margin'] is not None else '成本待补齐'}</small></div>
+          <div><span>14天现货消化率</span><strong>{sellthrough_value}</strong><small>平台现货口径</small></div>
+          <div><span>库存风险货号</span><strong class="danger-text">{data['risk_count']}</strong><small>支撑 ≤14天</small></div>
+          <div><span>潜力款预判</span><strong>{data['potential_count']}</strong><small>高动销/可承接</small></div>
+          <div><span>慢销货号</span><strong class="warning-text">{data['slow_count']}</strong><small>清仓候选</small></div>
+          <div><span>成本覆盖率</span><strong>{(cost['covered_count'] / cost['sku_count'] * 100) if cost['sku_count'] else 0:.0f}%</strong><small>{cost['missing_count']} 个成本缺失</small></div>
+        </section>
+        <div class="dashboard-grid monitor-overview-grid">
+          <section class="content-section overview-hero"><div class="section-heading"><div><h2>经营总览</h2><p>{esc(quality_note)}</p></div><span class="status status-connected">单店平台口径</span></div><div class="overview-callouts"><div><span>近14天净销量</span><strong>{number(data['sales_14'])}<small>件</small></strong></div><div><span>当前可售库存</span><strong>{number(data['sellable'])}<small>件</small></strong></div><div><span>库存快照</span><strong>{esc(snapshot)}</strong></div></div><p class="subtle-note">毛利率 =（实际销售金额 - 实际商品成本）/ 实际销售金额。当前数据{('已含平台成交金额' if data['gross_margin_basis'] == 'actual_amount' else '暂按当前到手价估算销售金额')}；第一期现货消化率 = 期间有效净销量 /（期间有效净销量 + 当前可售库存）。</p></section>
+          <section class="content-section focus-panel"><div class="section-heading"><div><h2>今日关注</h2><p>商品部需要优先判断的货品信号</p></div></div><ul class="focus-list"><li><strong>{data['risk_count']} 个风险货号</strong><span>进入补货工作区，毛利不达标需例外确认</span></li><li><strong>{data['slow_count']} 个慢销货号</strong><span>进入调价工作区评估清仓动作</span></li><li><strong>{data['missing_cost_count']} 个成本缺失</strong><span>不进入自动补货与调价建议</span></li></ul><a class="text-link" href="/costs?store={quote(store['store_code'])}">维护成本主数据 →</a></section>
+        </div>
+        <section class="content-section monitor-table-section"><div class="section-heading"><div><h2>货品健康清单</h2><p>按货号展示，尺码明细在补货计划中展开；同款跨店仅保留同款标识，不合并库存。</p></div><div class="heading-actions"><a class="button ghost" href="/plans?store={quote(store['store_code'])}">补货工作区</a><a class="button ghost" href="/pricing?store={quote(store['store_code'])}">调价工作区</a></div></div><div class="table-wrap"><table><thead><tr><th>款号 / 货号</th><th>颜色</th><th>生命周期</th><th>14天销量</th><th>可售库存</th><th>支撑天数</th><th>现货消化率</th><th>单款毛利率</th><th>监控判断</th></tr></thead><tbody>{rows}</tbody></table></div></section>
+        <section class="formula-line monitor-footnote"><span>数据边界：唯品会、天猫各自独立取数</span><span>库存字段：可售库存，暂不接 ERP 出入库流水</span><span>成本主数据：一期 Excel，二期同步《藏宝阁》</span></section>
+        """
+        return self.base_page(user, "dashboard", content, "货品监控中心", store=store)
+
+    def render_monitor_row(self, row: dict) -> str:
+        lifecycle = {"active": "在售", "new": "新品", "clearance": "清仓", "discontinued": "停产"}.get(row.get("lifecycle"), row.get("lifecycle") or "-")
+        health = {"risk": ("风险补货", "risk critical"), "potential": ("潜力款", "risk healthy"), "slow": ("慢销清仓", "risk warning"), "normal": ("日常监控", "risk watch")}.get(row.get("health"), ("待判断", "risk watch"))
+        margin = f"{row['margin'] * 100:.1f}%" if row.get("margin") is not None else "成本缺失"
+        coverage = f"{row['coverage_days']:.1f}" if row.get("coverage_days") is not None else "无销量"
+        return f'<tr class="{("risk-row-critical" if row.get("health") == "risk" else "")}"><td><a class="item-link" href="/plans"><strong>{esc(row["style_code"])}</strong><span>{esc(row.get("outer_sku_id") or row.get("color_name") or "货号待同步")} · {esc(row["style_name"])}</span></a></td><td>{esc(row["color_name"])}</td><td>{esc(lifecycle)}</td><td>{number(row["sales_14"])}</td><td>{number(row["sellable"])}</td><td>{coverage}</td><td>{row["sell_through"] * 100:.1f}%</td><td>{esc(margin)}</td><td><span class="{health[1]}">{health[0]}</span></td></tr>'
 
     def render_vip_api_dashboard(self, user: dict, store: dict, query: dict) -> str:
         config = db.get_api_config(self.db_path, store["id"])
@@ -693,9 +1006,10 @@ class ReplenishmentApplication:
             <td><span class="status status-{esc(plan['status'])}">{esc(PLAN_STATUS.get(plan['status'], plan['status']))}</span></td><td><a href="/plans/{plan['id']}">查看</a></td></tr>"""
             for plan in plans
         ) or '<tr><td colspan="8" class="empty-cell">暂无补货计划</td></tr>'
-        content = f"""<header class="page-heading"><div><span class="eyebrow">REPLENISHMENT RUNS</span><h1>补货计划</h1><p>{esc(store['store_name'])}的每次计算均保留独立数据快照、人工修正和流转结果。</p></div></header>
-        <section class="content-section"><div class="table-wrap"><table><thead><tr><th>计划编号</th><th>店铺</th><th>目标覆盖</th><th>货号</th><th>补货尺码</th><th>确认数量</th><th>流程状态</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>"""
-        return self.base_page(user, "plans", content, "补货计划", store=store)
+        generate_section = f'<section class="generate-section"><div><h2>生成本期补货建议</h2><p>按最新动销、库存和单款毛利门槛生成主流程批次；成本缺失或毛利率低于目标的货号默认不自动建议。</p></div><form method="post" action="/plans/generate?mode=main"><button class="button primary" type="submit">生成货品监控补货建议</button></form></section>' if user["role"] in {"merchandise", "admin"} else ""
+        content = f"""<header class="page-heading"><div><span class="eyebrow">REPLENISHMENT WORKSPACE</span><h1>补货工作区</h1><p>{esc(store['store_name'])}的建议、商品部确认、跟单流转和到货回执均保留独立数据快照。</p></div><div class="heading-actions"><a class="button ghost" href="/temporary-replenishment?store={quote(store['store_code'])}">进入临时补货</a></div></header>
+        {generate_section}<section class="content-section"><div class="table-wrap"><table><thead><tr><th>计划编号</th><th>店铺</th><th>目标覆盖</th><th>货号</th><th>补货尺码</th><th>确认数量</th><th>流程状态</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>"""
+        return self.base_page(user, "plans", content, "补货工作区", store=store)
 
     def render_plan_detail(self, user: dict, plan_id: int, query: dict) -> str:
         plan = db.get_plan(self.db_path, plan_id)
@@ -735,7 +1049,7 @@ class ReplenishmentApplication:
         return f"""<section class="goods-group">
           <div class="goods-heading"><div><h3>货号 {esc(group['outer_sku_id'])}</h3><p>{esc(group['color_name'])} · {esc(group['category'])}</p>{conditions}</div>
           <div class="goods-totals"><span>7天 <strong>{group['sales_7']}</strong></span><span>14天 <strong>{group['sales_14']}</strong></span><span>连续 <strong>{group['consecutive_sales_days']}天</strong></span><span>支撑 <strong>{decimal(group['coverage_days'])}天</strong></span><span>补货 <strong>{group['confirmed_qty']}</strong></span></div></div>
-          <div class="table-wrap"><table class="dense-table"><thead><tr><th>尺码</th><th>7天</th><th>14天</th><th>尺码配比</th><th>可售</th><th>在途</th><th>可售天数</th><th>14天结余</th><th>系统建议</th><th>商品部确认</th><th>调整原因</th></tr></thead><tbody>{rows}</tbody></table></div>
+          <div class="table-wrap"><table class="dense-table"><thead><tr><th>尺码</th><th>7天</th><th>14天</th><th>尺码配比</th><th>可售</th><th>在途</th><th>可售天数</th><th>14天结余</th><th>单款毛利率</th><th>系统建议</th><th>商品部确认</th><th>调整原因</th></tr></thead><tbody>{rows}</tbody></table></div>
         </section>"""
 
     def render_merchandise_item(self, item: dict, editable: bool) -> str:
@@ -744,14 +1058,16 @@ class ReplenishmentApplication:
             f'<input class="qty-input" type="number" min="0" step="{item["pack_size"]}" name="qty_{item["id"]}" value="{item["confirmed_qty"]}">'
             if editable else f"<strong>{item['confirmed_qty']}</strong>"
         )
-        reason_options = ["", "活动备货", "销量趋势", "款式生命周期", "供应限制", "预计退货", "准备下架", "仓间调拨", "其他"]
+        reason_options = ["", "活动备货", "销量趋势", "款式生命周期", "供应限制", "预计退货", "准备下架", "爆款/引流款例外", "仓间调拨", "其他"]
         if editable:
             options = "".join(f'<option value="{esc(option)}"{(" selected" if option == item["adjustment_reason"] else "")}>{esc(option or "未调整")}</option>' for option in reason_options)
             reason = f'<select name="reason_{item["id"]}">{options}</select>'
         else:
             reason = esc(item["adjustment_reason"] or "-")
+        margin = f"{item['gross_margin_snapshot'] * 100:.1f}%" if item.get('gross_margin_snapshot') is not None else "成本缺失"
+        gate_note = {"cost_missing": "不自动补货", "below_target": "低于45%"}.get(item.get("margin_gate_status"), "")
         return f"""<tr class="risk-row-{esc(item['risk_level'])}"><td><strong class="size-label">{size}</strong></td><td>{item['sales_7']}</td><td>{item['sales_14']}</td><td>{item['size_share']*100:.0f}%</td>
-        <td>{item['sellable']}</td><td>{item['inbound'] or '-'}</td><td>{decimal(item['coverage_days'])}</td><td class="{'danger-text' if item['projected_14'] < 0 else ''}">{decimal(item['projected_14'])}</td>
+        <td>{item['sellable']}</td><td>{item['inbound'] or '-'}</td><td>{decimal(item['coverage_days'])}</td><td class="{'danger-text' if item['projected_14'] < 0 else ''}">{decimal(item['projected_14'])}</td><td><strong class="{'warning-text' if item.get('margin_gate_status') in {'cost_missing','below_target'} else ''}">{margin}</strong><small class="cell-note">{gate_note}</small></td>
         <td><strong>{item['suggested_qty']}</strong><small class="cell-note">{item['pack_size']}件/组</small></td><td>{confirmed}</td><td>{reason}</td></tr>"""
 
     def render_followup_inbox(self, user: dict) -> str:
@@ -788,17 +1104,19 @@ class ReplenishmentApplication:
     def render_followup_group(self, group: dict, editable: bool) -> str:
         rows = "".join(self.render_followup_item(item, editable) for item in group["items"])
         return f"""<section class="goods-group"><div class="goods-heading"><div><h3>货号 {esc(group['outer_sku_id'])}</h3><p>{esc(group['color_name'])}</p></div><div class="goods-totals"><span>商品部确认 <strong>{group['confirmed_qty']}</strong></span><span>跟单确认 <strong>{group['followup_qty']}</strong></span></div></div>
-        <div class="table-wrap"><table class="dense-table"><thead><tr><th>尺码</th><th>系统建议</th><th>商品部确认</th><th>跟单确认</th><th>预计下单</th><th>预计到货</th><th>供应状态</th><th>备注</th></tr></thead><tbody>{rows}</tbody></table></div></section>"""
+        <div class="table-wrap"><table class="dense-table"><thead><tr><th>尺码</th><th>系统建议</th><th>商品部确认</th><th>跟单确认</th><th>预计下单</th><th>预计到货</th><th>实际到仓</th><th>实际到货</th><th>差异</th><th>供应状态</th><th>备注</th></tr></thead><tbody>{rows}</tbody></table></div></section>"""
 
     def render_followup_item(self, item: dict, editable: bool) -> str:
         followup_qty = item["followup_qty"] if item["followup_qty"] is not None else item["confirmed_qty"]
         if not editable:
-            return f"""<tr><td><strong>{esc(item['size_name'])}</strong></td><td>{item['suggested_qty']}</td><td>{item['confirmed_qty']}</td><td><strong>{followup_qty}</strong></td><td>{esc(item['expected_order_date'] or '-')}</td><td>{esc(item['expected_arrival_date'] or '-')}</td><td>{esc(FOLLOWUP_LABELS.get(item['followup_status'], item['followup_status']))}</td><td>{esc(item['followup_note'] or '-')}</td></tr>"""
+            variance = {"major": "重大差异", "general": "一般差异", "none": "-"}.get(item.get("arrival_variance_level"), "-")
+            return f"""<tr><td><strong>{esc(item['size_name'])}</strong></td><td>{item['suggested_qty']}</td><td>{item['confirmed_qty']}</td><td><strong>{followup_qty}</strong></td><td>{esc(item['expected_order_date'] or '-')}</td><td>{esc(item['expected_arrival_date'] or '-')}</td><td>{esc(item.get('actual_arrival_date') or '-')}</td><td>{number(item.get('actual_arrived_qty'))}</td><td><span class="{'risk critical' if item.get('arrival_variance_level') == 'major' else 'risk warning' if item.get('arrival_variance_level') == 'general' else ''}">{variance}</span></td><td>{esc(FOLLOWUP_LABELS.get(item['followup_status'], item['followup_status']))}</td><td>{esc(item['followup_note'] or '-')}</td></tr>"""
         options = "".join(f'<option value="{key}"{(" selected" if key == item["followup_status"] else "")}>{label}</option>' for key, label in FOLLOWUP_LABELS.items())
         return f"""<tr><td><strong>{esc(item['size_name'])}</strong></td><td>{item['suggested_qty']}</td><td>{item['confirmed_qty']}</td>
         <td><input class="qty-input" type="number" min="0" name="followup_qty_{item['id']}" value="{followup_qty}"></td>
         <td><input type="date" name="order_date_{item['id']}" value="{esc(item['expected_order_date'])}"></td><td><input type="date" name="arrival_date_{item['id']}" value="{esc(item['expected_arrival_date'])}"></td>
-        <td><select name="followup_status_{item['id']}">{options}</select></td><td><input name="followup_note_{item['id']}" value="{esc(item['followup_note'])}" placeholder="供应限制或单号"></td></tr>"""
+        <td><input type="date" name="actual_arrival_date_{item['id']}" value="{esc(item.get('actual_arrival_date') or '')}"></td><td><input class="qty-input" type="number" min="0" name="actual_arrived_qty_{item['id']}" value="{item.get('actual_arrived_qty') or 0}"></td><td><span class="cell-note">保存后自动判断</span></td>
+        <td><select name="followup_status_{item['id']}">{options}</select></td><td><input name="followup_note_{item['id']}" value="{esc(item['followup_note'])}" placeholder="供应限制、差异原因或单号"></td></tr>"""
 
     def render_data_center(self, user: dict, query: dict) -> str:
         sync = db.latest_sync(self.db_path) or {}
@@ -898,19 +1216,28 @@ class ReplenishmentApplication:
             "not_tested": "尚未测试",
             "credentials_missing": "缺少凭证",
             "configured": "待测试",
+            "oauth_authorized": "OAuth 已授权",
+            "oauth_failed": "OAuth 授权失败",
             "connected": "鉴权成功",
             "failed": "连接失败",
         }
         secret_placeholder = "已加密保存，留空则不修改" if config["has_app_secret"] else "请输入 VOP AppSecret"
-        token_placeholder = "已加密保存，留空则不修改" if config["has_access_token"] else "请输入店铺主账号 OAuth AccessToken"
+        token_placeholder = "已加密保存，留空则不修改" if config["has_access_token"] else "可留空并通过下方 OAuth 自动获取"
+        callback_base = os.environ.get("REPLENISH_PUBLIC_BASE_URL", "").strip().rstrip("/")
+        callback_url = (
+            callback_base + "/oauth/vipshop/callback"
+            if callback_base else "授权发起时根据当前 HTTPS 站点生成"
+        )
+        oauth_ready = bool(config["app_key"] and config["has_app_secret"])
         content = f"""{self.flash(query.get('message',''))}
         <header class="page-heading"><div><a class="back-link" href="{back_href}">{esc(back_label)}</a><span class="eyebrow">VIPSHOP VOP CONNECTION</span><h1>{esc(store['store_name'])} API 配置</h1><p>只读对接{esc(store['store_name'])}的商品、订单和库存接口，凭证与其他店铺隔离。</p></div><div class="heading-actions"><a class="button ghost" href="https://vop.vip.com/home#/console/app/overview" target="_blank" rel="noreferrer">打开 VOP 控制台</a></div></header>
         <section class="environment-banner"><div><span>最近一次试连</span><strong>{esc(status_labels.get(config['last_test_status'], config['last_test_status']))}</strong><p>{esc(config['last_test_message'] or '已确认官方网关可访问，等待商家应用凭证。')}</p></div><span class="status status-{esc(config['last_test_status'])}">{esc(environment_label)}</span></section>
         <form method="post" action="/data/api/config"><input type="hidden" name="store_code" value="{esc(store['store_code'])}">
           <section class="settings-section"><div class="settings-intro"><h2>连接环境</h2><p>正式店铺数据使用生产网关；唯品会提供沙箱 AppKey 时才选择沙箱。</p></div><div class="settings-fields field-row"><label>接口环境<select name="environment"><option value="production"{(' selected' if config['environment']=='production' else '')}>正式环境 · vop.vipapis.com</option><option value="sandbox"{(' selected' if config['environment']=='sandbox' else '')}>沙箱环境 · sandbox.vipapis.com</option></select></label><label>预期店铺名称<input name="expected_store_name" value="{esc(config['expected_store_name'])}" required></label></div></section>
-          <section class="settings-section"><div class="settings-intro"><h2>应用凭证</h2><p>AppSecret 和 AccessToken 使用本机独立密钥加密后存储，不会显示在页面或日志中。</p></div><div class="settings-fields"><label>AppKey<input name="app_key" value="{esc(config['app_key'])}" autocomplete="off" placeholder="VOP 应用 ID"></label><div class="field-row settings-fields"><label>AppSecret<input type="password" name="app_secret" autocomplete="new-password" placeholder="{esc(secret_placeholder)}"></label><label>AccessToken<input type="password" name="access_token" autocomplete="new-password" placeholder="{esc(token_placeholder)}"></label></div><div class="credential-flags"><span>AppSecret：{'已保存' if config['has_app_secret'] else '未配置'}</span><span>AccessToken：{'已保存' if config['has_access_token'] else '未配置'}</span><span>来源：{'环境变量' if config['credential_source']=='environment' else '加密数据库'}</span></div><div class="weekday-picker"><label class="check-pill"><input type="checkbox" name="clear_app_secret" value="1"><span>清除 AppSecret</span></label><label class="check-pill"><input type="checkbox" name="clear_access_token" value="1"><span>清除 AccessToken</span></label></div></div></section>
+          <section class="settings-section"><div class="settings-intro"><h2>应用凭证</h2><p>AppSecret、AccessToken 和 RefreshToken 使用服务端独立密钥加密存储，不会显示在页面或日志中。</p></div><div class="settings-fields"><label>AppKey<input name="app_key" value="{esc(config['app_key'])}" autocomplete="off" placeholder="VOP 应用 ID"></label><div class="field-row settings-fields"><label>AppSecret<input type="password" name="app_secret" autocomplete="new-password" placeholder="{esc(secret_placeholder)}"></label><label>AccessToken · 手工应急<input type="password" name="access_token" autocomplete="new-password" placeholder="{esc(token_placeholder)}"></label></div><div class="credential-flags"><span>AppSecret：{'已保存' if config['has_app_secret'] else '未配置'}</span><span>AccessToken：{'已保存' if config['has_access_token'] else '未配置'}</span><span>RefreshToken：{'已保存' if config['has_refresh_token'] else '未获取'}</span><span>来源：{'环境变量' if config['credential_source']=='environment' else '加密数据库'}</span></div><div class="weekday-picker"><label class="check-pill"><input type="checkbox" name="clear_app_secret" value="1"><span>清除 AppSecret</span></label><label class="check-pill"><input type="checkbox" name="clear_access_token" value="1"><span>清除 AccessToken</span></label></div></div></section>
           <div class="form-footer"><a class="button ghost" href="{back_href}">取消</a><button class="button primary" type="submit">加密保存配置</button></div>
         </form>
+        <section class="oauth-authorization"><div><span class="eyebrow">VIPSHOP OAUTH 2.0</span><h2>店铺授权</h2><p>回调地址：<strong class="url-value">{esc(callback_url)}</strong></p></div><dl class="detail-list"><div><dt>OpenID</dt><dd>{esc(config['open_id'] or '-')}</dd></div><div><dt>授权时间</dt><dd>{esc(local_time(config['oauth_authorized_at']))}</dd></div><div><dt>AccessToken 到期</dt><dd>{esc(local_time(config['access_token_expires_at']))}</dd></div><div><dt>RefreshToken 到期</dt><dd>{esc(local_time(config['refresh_token_expires_at']))}</dd></div></dl><form method="post" action="/oauth/vipshop/start?{store_query}"><button class="button primary" type="submit"{('' if oauth_ready else ' disabled')}>授权唯品店铺</button></form></section>
         <div class="two-column api-actions-grid">
           <section class="content-section"><div class="section-heading"><div><h2>1. 测试连接</h2><p>只调用店铺信息接口，不读取订单或库存</p></div></div><dl class="detail-list"><div><dt>官方生产网关</dt><dd>https://vop.vipapis.com</dd></div><div><dt>绑定店铺</dt><dd>{esc(config['verified_store_name'] or '待验证')}</dd></div><div><dt>店铺 ID</dt><dd>{esc(config['external_store_id'] or '-')}</dd></div><div><dt>最近测试</dt><dd>{esc(local_time(config['last_test_at']))}</dd></div></dl><form method="post" action="/data/api/test?{store_query}"><button class="button ghost" type="submit">测试网关与店铺鉴权</button></form></section>
           <section class="content-section"><div class="section-heading"><div><h2>2. 同步单店数据</h2><p>鉴权通过后读取近 14 天订单、商品 SKU 和库存</p></div></div><dl class="detail-list"><div><dt>订单接口</dt><dd>getOrders / getOrderDetail</dd></div><div><dt>库存接口</dt><dd>getSkuStock</dd></div><div><dt>最近同步</dt><dd>{esc(local_time(config['last_sync_at']))}</dd></div></dl><form method="post" action="/data/api/sync?{store_query}"><button class="button primary" type="submit"{('' if config['last_test_status']=='connected' else ' disabled')}>同步并生成补货批次</button></form></section>
@@ -949,6 +1276,50 @@ class ReplenishmentApplication:
             user, "data", content, "天猫 API 配置与试连", store=store
         )
 
+    def render_pricing(self, user: dict, query: dict) -> str:
+        store = self.selected_store(query)
+        plans = db.list_price_plans(self.db_path, store_id=store["id"])
+        selected_id = int(query.get("plan_id") or (plans[0]["id"] if plans else 0))
+        plan = db.get_price_plan(self.db_path, selected_id) if selected_id else None
+        internal = user["role"] in {"merchandise", "admin"}
+        items = db.get_price_items(self.db_path, selected_id, include_internal=internal) if plan else []
+        rows = []
+        for item in items:
+            decision = {"markdown": "下调", "margin_protect": "毛利保护", "manual": "手工规则", "hold": "维持", "excluded": "不建议"}.get(item["decision"], item["decision"])
+            if internal and plan and plan["status"] == "draft":
+                checked = " checked" if item.get("include_flag", 1) else ""
+                current_margin = f"{item['current_margin'] * 100:.1f}%" if item.get("current_margin") is not None else "成本缺失"
+                rows.append(f'''<tr><td><strong>{esc(item["style_code"])}</strong><span class="cell-note">{esc(item.get("outer_sku_id") or item["color_name"])} / {esc(item["size_name"])}</span></td><td>{number(item["sales_14"])}</td><td>{number(item["sellable"])}</td><td>{decimal(item["coverage_days"], 1)}</td><td>{item["current_price"]:,.0f}</td><td><input class="qty-input" type="number" min="0" step="10" name="price_{item["id"]}" value="{item["confirmed_price"]:g}"></td><td>{current_margin}</td><td>{esc(decision)}</td><td><label class="toggle-line"><input type="checkbox" name="include_{item["id"]}" value="1"{checked}><span>导出</span></label></td><td>{esc(item["reason"])}</td></tr>''')
+            else:
+                rows.append(f'<tr><td><strong>{esc(item["style_code"])}</strong><span class="cell-note">{esc(item.get("outer_sku_id") or item["color_name"])} / {esc(item["size_name"])}</span></td><td>{number(item["sales_14"])}</td><td>{number(item["sellable"])}</td><td>{decimal(item["coverage_days"], 1)}</td><td>{item["current_price"]:,.0f}</td><td>{item["confirmed_price"]:,.0f}</td><td>{esc(decision)}</td><td>{esc(item["reason"])}</td></tr>')
+        if not rows:
+            rows.append('<tr><td colspan="10" class="empty-cell">尚未生成调价批次。商品部可先生成系统建议或按手工规则试算。</td></tr>')
+        if internal:
+            controls = f'''<form method="post" action="/pricing/generate" class="pricing-generator"><input type="hidden" name="store_code" value="{esc(store['store_code'])}"><label>生成方式<select name="mode"><option value="system">系统建议</option><option value="manual">手工规则</option></select></label><label>目标毛利率<input type="number" name="target_margin" value="55" min="0" max="95" step="1"><small>仅商品部可见</small></label><label>手工下调幅度<input type="number" name="discount_rate" value="10" min="0" max="90" step="1"><small>选择手工规则时生效</small></label><button class="button primary" type="submit">生成调价建议</button></form>'''
+            if plan:
+                controls += f'''<form method="post" action="/pricing/save" class="pricing-actions"><input type="hidden" name="plan_id" value="{plan['id']}"><input type="hidden" name="store_code" value="{esc(store['store_code'])}"><button class="button ghost" type="submit">保存修改</button><button class="button primary" type="submit" name="command" value="confirm">确认并流转运营部</button></form>'''
+        else:
+            controls = '<p class="subtle-note">运营部只接收商品部确认后的执行明细，并按款号、货号、当前价、建议价和执行备注完成平台操作。</p>'
+        head = "调价工作区" if internal else "运营执行明细"
+        table_head = "<th>当前毛利率</th><th>判断</th><th>导出</th><th>商品部说明</th>" if internal and plan and plan["status"] == "draft" else "<th>调价动作</th><th>执行备注</th>"
+        privacy_note = '系统建议和手工规则均由商品部判断；确认后生成运营执行明细。' if internal else '当前页面只包含平台执行所需的款号、尺码、当前价、建议价和备注。'
+        pricing_footnote = '<section class="formula-line monitor-footnote"><span>系统建议：低动销高库存优先评估清仓</span><span>内部保护参数仅商品部可见</span><span>确认后生成运营执行明细</span></section>' if internal else '<section class="formula-line monitor-footnote"><span>仅执行商品部已确认批次</span><span>不自动修改平台价格</span><span>执行结果线下反馈商品部</span></section>'
+        content = f'''{self.flash(query.get("message", ""))}<header class="page-heading"><div><span class="eyebrow">PRICE ACTIONS</span><h1>{head}</h1><p>{esc(store['store_name'])} · 每个自然月一次，个别款可临时发起；平台价格暂不自动修改。</p></div><div class="heading-actions"><a class="button ghost" href="/dashboard?store={quote(store['store_code'])}">返回动销总览</a></div></header>
+        <section class="environment-banner"><div><span>权限边界</span><strong>{'商品部确认后导出给运营部' if internal else '仅查看已确认的执行字段'}</strong><p>{privacy_note}</p></div><span class="status status-connected">{('内部测算' if internal else '执行视图')}</span></section>
+        {controls}
+        <section class="content-section pricing-table-section"><div class="section-heading"><div><h2>调价批次</h2><p>{esc(plan['batch_no']) if plan else '请选择或生成批次'}{(' · ' + esc(plan['status'])) if plan else ''}</p></div>{f'<a class="button ghost" href="/pricing/export.xlsx?plan_id={plan["id"]}">导出 Excel</a>' if plan and plan['status'] in {'confirmed','exported'} else ''}</div><div class="table-wrap"><table><thead><tr><th>款号 / 货号 / 尺码</th><th>14天销量</th><th>可售</th><th>支撑天数</th><th>当前售价</th><th>建议售价</th>{table_head}</tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>
+        {pricing_footnote}'''
+        return self.base_page(user, "pricing", content, head, store=store)
+
+    def render_costs(self, user: dict, query: dict) -> str:
+        store = self.selected_store(query)
+        summary = db.cost_summary(self.db_path, store_id=store["id"])
+        content = f'''{self.flash(query.get("message", ""))}<header class="page-heading"><div><span class="eyebrow">COST MASTER DATA</span><h1>商品成本</h1><p>{esc(store['store_name'])} · 一期 Excel 导入，保留版本与生效日期；二期同步《藏宝阁》成本主数据。</p></div><div class="heading-actions"><a class="button ghost" href="/dashboard?store={quote(store['store_code'])}">返回动销总览</a><a class="button ghost" href="/costs/template.xlsx">下载成本模板</a></div></header>
+        <section class="metric-strip cost-metrics"><div><span>在售货号数</span><strong>{summary['sku_count']}</strong><small>当前店铺</small></div><div><span>已有成本</span><strong>{summary['covered_count']}</strong><small>可用于测算</small></div><div><span>成本缺失</span><strong class="warning-text">{summary['missing_count']}</strong><small>不进入自动建议</small></div></section>
+        <section class="content-section"><div class="section-heading"><div><h2>导入商品成本</h2><p>每次导入都会新增一个成本版本，不覆盖历史版本。生效日期用于补货和调价时选择有效成本。</p></div></div><form method="post" action="/costs/import" enctype="multipart/form-data" class="upload-form"><label class="file-field"><span>选择成本文件</span><input type="file" name="cost_file" accept=".xlsx" required></label><button class="button primary" type="submit">校验并导入</button></form><p class="subtle-note">表头：款号、颜色、尺码、单位成本、生效日期、版本说明。未匹配 SKU 会被统计但不会写入。</p></section>
+        <section class="two-column"><section class="content-section"><div class="section-heading"><div><h2>成本使用规则</h2><p>商品部内部口径</p></div></div><ul class="focus-list"><li><strong>成本缺失</strong><span>显示“成本缺失”，毛利率不默认填 0% 或 100%</span></li><li><strong>单款毛利率</strong><span>（当前实际到手价 - 商品成本）/ 当前实际到手价</span></li><li><strong>二期主数据</strong><span>建议由《藏宝阁》作为唯一成本主数据源</span></li></ul></section><section class="content-section"><div class="section-heading"><div><h2>权限说明</h2><p>成本与毛利信息仅限商品部和管理层</p></div></div><p class="subtle-note">跟单部只处理补货回执，运营部只接收脱敏调价明细。任何成本或毛利字段不会出现在运营部页面或导出文件中。</p></section></section>'''
+        return self.base_page(user, "costs", content, "商品成本", store=store)
+
     def render_settings(self, user: dict, query: dict) -> str:
         settings = db.get_settings(self.db_path)
         weekday_controls = "".join(
@@ -976,12 +1347,14 @@ class ReplenishmentApplication:
         store_code = store["store_code"]
         store_query = f"?store={quote(store_code)}"
         nav_items = [
-            ("dashboard", f"/dashboard{store_query}", "监控台"),
-            ("plans", f"/plans{store_query}", "补货计划"),
+            ("dashboard", f"/dashboard{store_query}", "动销总览"),
+            ("plans", f"/plans{store_query}", "补货工作区"),
+            ("pricing", f"/pricing{store_query}", "调价工作区"),
         ]
         if user["role"] in {"followup", "admin"}:
             nav_items.append(("followup", "/followup", "跟单任务"))
         if user["role"] in {"merchandise", "admin"}:
+            nav_items.append(("costs", f"/costs{store_query}", "成本主数据"))
             if store["platform_code"] == "tmall":
                 nav_items.append(
                     ("data", f"/data/tmall-api{store_query}", "API 配置与试连")
@@ -1021,9 +1394,9 @@ class ReplenishmentApplication:
                     "failed": "店铺鉴权失败",
                     "credentials_missing": "凭证待配置",
                 }.get(api_config["last_test_status"], "等待 VOP 应用许可")
-        return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · 补货监控中心</title><style>{self.css()}</style></head>
-        <body><div class="app-shell"><aside class="sidebar"><a class="app-brand" href="/dashboard{store_query}"><span>R</span><div><strong>补货监控中心</strong><small>{esc(store['brand_name'])} · {esc(store['platform_name'])}</small></div></a><nav>{nav_html}</nav><div class="sidebar-foot"><span class="live-dot"></span><div><strong>{esc(sidebar_title)}</strong><small>{esc(sidebar_note)}</small></div></div></aside>
-        <div class="main-shell"><header class="topbar"><div class="mobile-brand">补货监控中心</div><nav class="mobile-nav">{nav_html}</nav><div class="user-area"><div><strong>{esc(user['display_name'])}</strong><span>{esc(ROLE_LABELS.get(user['role'], user['role']))}</span></div><span class="notification-count">{len(unread)}</span><form method="post" action="/logout"><button class="text-button" type="submit">退出</button></form></div></header><nav class="store-tabs" aria-label="店铺切换">{store_tabs}</nav><main class="page-content">{content}</main></div></div>{toast}<script>(()=>{{const tabs=document.querySelector('.store-tabs');const active=tabs?.querySelector('a.active');if(tabs&&active&&tabs.scrollWidth>tabs.clientWidth){{tabs.scrollLeft=Math.max(0,active.offsetLeft+active.offsetWidth-tabs.clientWidth)}}}})()</script></body></html>"""
+        return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · 货品监控中心</title><style>{self.css()}</style></head>
+        <body><div class="app-shell"><aside class="sidebar"><a class="app-brand" href="/dashboard{store_query}"><span>M</span><div><strong>货品监控中心</strong><small>{esc(store['brand_name'])} · {esc(store['platform_name'])}</small></div></a><nav>{nav_html}</nav><div class="sidebar-foot"><span class="live-dot"></span><div><strong>{esc(sidebar_title)}</strong><small>{esc(sidebar_note)}</small></div></div></aside>
+        <div class="main-shell"><header class="topbar"><div class="mobile-brand">货品监控中心</div><nav class="mobile-nav">{nav_html}</nav><div class="user-area"><div><strong>{esc(user['display_name'])}</strong><span>{esc(ROLE_LABELS.get(user['role'], user['role']))}</span></div><span class="notification-count">{len(unread)}</span><form method="post" action="/logout"><button class="text-button" type="submit">退出</button></form></div></header><nav class="store-tabs" aria-label="店铺切换">{store_tabs}</nav><main class="page-content">{content}</main></div></div>{toast}<script>(()=>{{const tabs=document.querySelector('.store-tabs');const active=tabs?.querySelector('a.active');if(tabs&&active&&tabs.scrollWidth>tabs.clientWidth){{tabs.scrollLeft=Math.max(0,active.offsetLeft+active.offsetWidth-tabs.clientWidth)}}}})()</script></body></html>"""
 
     def flash(self, message: str) -> str:
         return f'<div class="flash">{esc(message)}</div>' if message else ""
@@ -1033,22 +1406,43 @@ class ReplenishmentApplication:
 :root{--ink:#1f2926;--muted:#68736e;--line:#dce2df;--surface:#fff;--canvas:#f4f6f4;--green:#1f6652;--green-dark:#164a3d;--green-soft:#e8f2ee;--amber:#b66d12;--amber-soft:#fff3df;--red:#b34237;--red-soft:#fbeae7;--blue:#326b91;--sidebar:#202825;--radius:6px;--shadow:0 10px 30px rgba(31,41,38,.08)}
 .store-tabs{display:flex;gap:0;padding:0 32px;background:#fff;border-bottom:1px solid var(--line);overflow-x:auto}.store-tabs a{display:flex;flex-direction:column;justify-content:center;min-width:210px;height:64px;padding:9px 18px;border-bottom:3px solid transparent;color:var(--muted);white-space:nowrap}.store-tabs a+a{border-left:1px solid #edf0ee}.store-tabs span{font-size:10px}.store-tabs strong{margin-top:3px;color:var(--ink);font-size:13px}.store-tabs a.active{border-bottom-color:var(--green);background:#f8faf9}.store-tabs a.active span,.store-tabs a.active strong{color:var(--green)}
 @media(max-width:640px){.store-tabs{padding:0}.store-tabs a{min-width:50%;padding:9px 10px}.store-tabs strong{font-size:12px}}
-.dashboard-grid>*{min-width:0}.content-section,.style-group{min-width:0}.table-wrap{max-width:100%}
-.credential-flags{display:flex;gap:8px;flex-wrap:wrap}.credential-flags span{padding:6px 9px;background:#f0f3f1;color:var(--muted);font-size:11px}.api-actions-grid{margin-top:22px}.api-scope-note{margin-top:22px}.status-connected{background:var(--green-soft);color:var(--green)}.status-failed,.status-credentials_missing{background:var(--red-soft);color:var(--red)}.button:disabled{cursor:not-allowed;opacity:.45;filter:none!important}.button:disabled:hover{background:var(--green);border-color:var(--green)}
+.dashboard-grid>*{min-width:0}.content-section,.style-group{min-width:0}.table-wrap{max-width:100%}.monitor-overview-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:22px}.overview-hero{background:#26322e;color:#fff;border-color:#26322e}.overview-hero .section-heading p,.overview-hero .subtle-note{color:#c4cfca}.overview-hero .section-heading h2{color:#fff}.overview-hero .status{background:rgba(255,255,255,.12);color:#e6c881}.overview-callouts{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:rgba(255,255,255,.13);margin:18px 0}.overview-callouts>div{padding:17px 14px;background:#26322e}.overview-callouts span{display:block;color:#aebbb5;font-size:12px}.overview-callouts strong{display:block;font-size:24px;margin-top:5px}.overview-callouts small{font-size:12px;margin-left:5px;color:#aebbb5}.focus-list{list-style:none;padding:0;margin:0}.focus-list li{display:grid;gap:4px;padding:12px 0;border-bottom:1px solid var(--line)}.focus-list li:last-child{border-bottom:0}.focus-list span{font-size:12px;color:var(--muted);line-height:1.45}.text-link{display:inline-block;margin-top:14px;font-weight:700}.monitor-table-section{margin-top:22px}.monitor-footnote{margin-top:22px;justify-content:space-between;flex-wrap:wrap}.monitor-metrics{grid-template-columns:repeat(6,minmax(0,1fr))}.pricing-generator{display:flex;align-items:flex-end;gap:14px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);padding:18px 22px;margin-bottom:16px}.pricing-generator label{display:grid;gap:6px;font-weight:650;min-width:155px}.pricing-generator small{font-size:11px;color:var(--muted);font-weight:400}.pricing-actions{display:flex;gap:10px;justify-content:flex-end;margin:0 0 22px}.pricing-table-section{margin-top:22px}.cost-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}
+.credential-flags{display:flex;gap:8px;flex-wrap:wrap}.credential-flags span{padding:6px 9px;background:#f0f3f1;color:var(--muted);font-size:11px}.api-actions-grid{margin-top:22px}.api-scope-note{margin-top:22px}.status-connected,.status-oauth_authorized{background:var(--green-soft);color:var(--green)}.status-failed,.status-credentials_missing,.status-oauth_failed{background:var(--red-soft);color:var(--red)}.button:disabled{cursor:not-allowed;opacity:.45;filter:none!important}.button:disabled:hover{background:var(--green);border-color:var(--green)}.oauth-authorization{display:grid;grid-template-columns:minmax(270px,1.2fr) minmax(300px,1fr) auto;gap:28px;align-items:center;background:#26322e;color:#fff;padding:24px;margin-top:6px}.oauth-authorization h2{font-size:18px;margin:5px 0 8px}.oauth-authorization p{margin:0;color:#bdc9c4}.oauth-authorization .url-value{color:#e4ebe8}.oauth-authorization .detail-list{margin:0}.oauth-authorization .detail-list>div{border-color:rgba(255,255,255,.12);padding:7px 0}.oauth-authorization .detail-list dt{color:#aebbb5}.oauth-authorization .detail-list dd{color:#fff}.oauth-result{width:min(560px,100%);background:#fff;padding:44px;box-shadow:var(--shadow);text-align:center}.oauth-result-mark{display:grid;place-items:center;width:48px;height:48px;margin:0 auto 18px;border-radius:50%;background:var(--amber-soft);color:var(--amber);font-size:20px;font-weight:800}.oauth-result-mark.success{background:var(--green-soft);color:var(--green)}.oauth-result-mark.danger{background:var(--red-soft);color:var(--red)}.oauth-result h1{font-size:26px;margin:7px 0 10px}.oauth-result p{color:var(--muted);line-height:1.7;margin:0 0 24px}
 .url-value{display:block;max-width:100%;overflow-wrap:anywhere;word-break:break-word;color:var(--muted);font-size:12px;line-height:1.55}.capture-step-strip{margin-bottom:22px}.capture-step-strip .url-value{font-weight:600;color:var(--ink)}.capture-source-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:22px}.capture-history{margin-top:22px}.status-ready_for_import,.status-imported{background:var(--green-soft);color:var(--green)}.status-needs_mapping,.status-needs_conversion{background:var(--red-soft);color:var(--red)}.status-waiting_download{background:var(--amber-soft);color:var(--amber)}
 .condition-tags{display:inline-flex;gap:5px;flex-wrap:wrap;margin-top:7px}.condition-tag{display:inline-flex;padding:3px 7px;border-radius:3px;background:#e8f0f7;color:var(--blue);font-size:10px;font-weight:700}.condition-tag.condition_2{background:var(--amber-soft);color:var(--amber)}.condition-builder{gap:14px}.condition-rule{display:flex;align-items:center;gap:10px;padding-left:12px;border-left:3px solid var(--green)}.condition-rule span,.condition-common>span{font-size:11px;font-weight:750;color:var(--green)}.condition-or{font-size:11px;font-weight:750;color:var(--muted);text-align:center}.condition-common{display:grid;grid-template-columns:auto minmax(220px,1fr);align-items:center;gap:16px;padding-top:14px;border-top:1px solid var(--line)}.condition-common label{display:grid;gap:7px;font-weight:600}
 *{box-sizing:border-box}html{background:var(--canvas)}body{margin:0;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;letter-spacing:0}a{color:var(--green);text-decoration:none}button,input,select{font:inherit;letter-spacing:0}button{cursor:pointer}.app-shell{min-height:100vh;display:grid;grid-template-columns:220px minmax(0,1fr)}.sidebar{position:sticky;top:0;height:100vh;background:var(--sidebar);color:#fff;padding:22px 16px;display:flex;flex-direction:column}.app-brand{display:flex;align-items:center;gap:11px;color:#fff;padding:0 7px 24px;border-bottom:1px solid rgba(255,255,255,.1)}.app-brand>span{display:grid;place-items:center;width:34px;height:34px;border-radius:4px;background:#e6b75e;color:#202825;font-weight:800}.app-brand div{display:flex;flex-direction:column;min-width:0}.app-brand strong{font-size:15px;white-space:nowrap}.app-brand small{color:#aebbb5;margin-top:3px}.sidebar nav{display:grid;gap:4px;margin-top:24px}.sidebar nav a{color:#c7d0cc;padding:10px 12px;border-radius:5px}.sidebar nav a:hover,.sidebar nav a.active{background:rgba(255,255,255,.1);color:#fff}.sidebar nav a.active{box-shadow:inset 3px 0 #e6b75e}.sidebar-foot{margin-top:auto;border-top:1px solid rgba(255,255,255,.1);padding:18px 8px 0;display:flex;align-items:center;gap:9px}.sidebar-foot div{display:flex;flex-direction:column}.sidebar-foot small{color:#aebbb5;margin-top:2px}.live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#61b78e;box-shadow:0 0 0 4px rgba(97,183,142,.14)}.main-shell{min-width:0}.topbar{height:66px;padding:0 28px;background:rgba(255,255,255,.95);border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:flex-end;position:sticky;top:0;z-index:20}.user-area{display:flex;align-items:center;gap:14px}.user-area>div{display:flex;flex-direction:column;text-align:right}.user-area span{color:var(--muted);font-size:12px}.notification-count{display:grid!important;place-items:center;width:25px;height:25px;border-radius:50%;background:var(--amber-soft);color:var(--amber)!important;font-weight:700}.text-button{border:0;background:transparent;color:var(--muted);padding:7px}.mobile-brand,.mobile-nav{display:none}.page-content{max-width:1500px;margin:0 auto;padding:30px 32px 70px}.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:26px}.page-heading h1{font-size:28px;line-height:1.2;margin:5px 0 7px;letter-spacing:0}.page-heading p{margin:0;color:var(--muted)}.eyebrow{font-size:11px;font-weight:700;letter-spacing:.08em;color:var(--green)}.heading-actions,.task-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.button{display:inline-flex;justify-content:center;align-items:center;min-height:38px;padding:8px 15px;border:1px solid var(--line);border-radius:5px;background:#fff;color:var(--ink);font-weight:650}.button:hover{border-color:#9eaaa5}.button.primary{background:var(--green);border-color:var(--green);color:#fff}.button.primary:hover{background:var(--green-dark)}.button.ghost{background:#fff}.button.wide{width:100%}.task-band{display:flex;align-items:center;justify-content:space-between;gap:24px;background:#26322e;color:#fff;padding:22px 24px;border-left:5px solid #e6b75e}.task-band h2{margin:4px 0;font-size:20px}.task-band p{margin:0;color:#bfc9c4}.task-band .eyebrow{color:#e6c881}.empty-band{padding:20px 24px;background:#fff;border:1px solid var(--line);display:flex;gap:12px}.metric-strip{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));margin:22px 0;background:#fff;border:1px solid var(--line)}.metric-strip>div{padding:19px 22px;border-right:1px solid var(--line)}.metric-strip>div:last-child{border:0}.metric-strip span{display:block;color:var(--muted);font-size:12px}.metric-strip strong{display:inline-block;font-size:29px;margin-top:4px}.metric-strip small{margin-left:6px;color:var(--muted)}.danger-text{color:var(--red)!important}.warning-text{color:var(--amber)!important}.dashboard-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(270px,1fr);gap:22px}.content-section{background:#fff;border:1px solid var(--line);padding:22px}.section-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px}.section-heading h2{font-size:17px;margin:0 0 4px}.section-heading p{margin:0;color:var(--muted);font-size:12px}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;min-width:720px}th{text-align:left;font-size:12px;color:var(--muted);font-weight:600;padding:10px 11px;border-bottom:1px solid var(--line);white-space:nowrap}td{padding:13px 11px;border-bottom:1px solid #edf0ee;vertical-align:middle}tbody tr:last-child td{border-bottom:0}.item-link{display:flex;flex-direction:column;gap:2px;color:var(--ink)}.item-link span{font-size:12px;color:var(--muted)}.risk,.status{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 8px;font-size:11px;font-weight:700}.risk.critical{background:var(--red-soft);color:var(--red)}.risk.warning{background:var(--amber-soft);color:var(--amber)}.risk.watch{background:#edf1f5;color:var(--blue)}.risk.healthy,.risk.no_sales{background:var(--green-soft);color:var(--green)}.status{background:#edf1ef;color:#52605a}.status-merchandise_pending,.status-followup_pending{background:var(--amber-soft);color:var(--amber)}.status-merchandise_editing,.status-followup_processing{background:#e8f0f7;color:var(--blue)}.status-completed{background:var(--green-soft);color:var(--green)}.status-superseded{background:#edf0ee;color:var(--muted)}.status-test{background:var(--amber-soft);color:var(--amber)}.task-band .status{background:rgba(255,255,255,.12);color:#fff}.health-bar{height:14px;background:#edf0ee;display:flex;overflow:hidden;border-radius:3px}.health-bar span{height:100%}.bar-critical{background:var(--red)}.bar-warning{background:#d49a42}.bar-healthy{background:#5b9d81}.health-legend{margin:18px 0}.health-legend>div,.detail-list>div{display:flex;justify-content:space-between;gap:20px;padding:10px 0;border-bottom:1px solid #edf0ee}.health-legend dt,.detail-list dt{color:var(--muted)}.health-legend dd,.detail-list dd{margin:0;font-weight:650}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px}.dot.critical{background:var(--red)}.dot.warning{background:#d49a42}.dot.healthy{background:#5b9d81}.sync-panel{margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}.sync-panel span{display:block;color:var(--muted);font-size:12px}.sync-panel strong{display:block;margin:5px 0}.sync-panel p{color:var(--muted);line-height:1.5}.schedule-line{display:grid;grid-template-columns:repeat(3,1fr);margin-top:22px;background:#fff;border:1px solid var(--line)}.schedule-line>div{padding:16px 20px;border-right:1px solid var(--line)}.schedule-line>div:last-child{border:0}.schedule-line span{display:block;color:var(--muted);font-size:12px;margin-bottom:5px}.plan-heading{margin-bottom:18px}.back-link{display:block;margin-bottom:12px;font-size:12px}.formula-line{display:flex;gap:24px;align-items:center;padding:12px 16px;background:#edf3f0;border-left:3px solid var(--green);color:#496059;margin-bottom:20px}.formula-line .status{margin-left:auto}.plan-groups{display:grid;gap:18px}.style-group{background:#fff;border:1px solid var(--line);scroll-margin-top:85px}.style-heading{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:17px 20px;border-bottom:1px solid var(--line)}.style-heading h2{display:inline;margin:0 0 0 9px;font-size:16px}.style-heading div>h2:first-child{margin-left:0}.style-heading p{margin:5px 0 0;color:var(--muted);font-size:12px}.style-totals{display:flex;gap:22px}.style-totals span{display:flex;flex-direction:column;align-items:flex-end;color:var(--muted);font-size:11px}.style-totals strong{color:var(--ink);font-size:18px;margin-top:2px}.goods-group{border-bottom:1px solid var(--line)}.goods-group:last-child{border-bottom:0}.goods-heading{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:15px 20px;background:#f8faf9}.goods-heading h3{margin:0 0 3px;font-size:14px}.goods-heading p{margin:0;color:var(--muted);font-size:12px}.goods-totals{display:flex;gap:22px}.goods-totals span{color:var(--muted);font-size:11px}.goods-totals strong{display:block;color:var(--ink);font-size:15px;margin-top:2px}.dense-table td{padding:10px}.dense-table input,.dense-table select{min-width:92px}.qty-input{width:74px!important;min-width:74px!important;font-weight:700}.size-label small{display:block;color:var(--green);font-size:10px;margin-top:2px}.cell-note{display:block;color:var(--muted);font-size:10px}.risk-row-critical{box-shadow:inset 3px 0 var(--red)}.risk-row-warning{box-shadow:inset 3px 0 #d49a42}input,select{min-height:36px;border:1px solid #cfd7d3;border-radius:4px;padding:7px 9px;background:#fff;color:var(--ink)}input:focus,select:focus{outline:2px solid rgba(31,102,82,.17);border-color:var(--green)}.sticky-actions{position:sticky;bottom:14px;z-index:10;margin:20px auto 0;max-width:820px;padding:13px 16px;background:#202825;color:#fff;box-shadow:var(--shadow);display:flex;justify-content:space-between;align-items:center;gap:20px}.sticky-actions>div{display:flex;align-items:center;gap:9px}.sticky-actions span{color:#bfc9c4;font-size:12px}.sticky-actions .button.ghost{background:transparent;color:#fff;border-color:#65716c}.empty-cell{text-align:center;color:var(--muted);padding:40px}.two-column{display:grid;grid-template-columns:1fr 1fr;gap:22px}.environment-banner,.generate-section{background:#fff;border:1px solid var(--line);padding:20px 22px;margin-bottom:22px;display:flex;justify-content:space-between;align-items:center;gap:20px}.environment-banner span,.environment-banner p{color:var(--muted)}.environment-banner strong{display:block;font-size:18px;margin:4px 0}.environment-banner p{margin:0}.subtle-note{color:var(--muted);line-height:1.6}.upload-form{display:flex;gap:10px;align-items:center}.file-field{flex:1;border:1px dashed #aab6b1;padding:13px}.file-field span{display:block;margin-bottom:8px;font-weight:650}.file-field input{border:0;padding:0;width:100%}.generate-section{margin-top:22px}.generate-section h2{margin:0 0 5px;font-size:17px}.generate-section p{margin:0;color:var(--muted)}.settings-section{display:grid;grid-template-columns:minmax(250px,1fr) minmax(420px,2fr);gap:40px;background:#fff;border:1px solid var(--line);border-bottom:0;padding:26px}.settings-section:last-of-type{border-bottom:1px solid var(--line)}.settings-intro h2{margin:0 0 7px;font-size:17px}.settings-intro p{margin:0;color:var(--muted);line-height:1.55}.settings-fields{display:grid;gap:18px}.settings-fields label{display:grid;gap:7px;font-weight:600}.toggle-line{display:flex!important;align-items:center;gap:9px}.toggle-line input{min-height:auto}.weekday-picker{display:flex;gap:7px;flex-wrap:wrap}.check-pill input{position:absolute;opacity:0;pointer-events:none}.check-pill span{display:block;border:1px solid #cfd7d3;padding:8px 12px;border-radius:4px;font-weight:500}.check-pill input:checked+span{background:var(--green);border-color:var(--green);color:#fff}.field-row{grid-template-columns:1fr 1fr}.weight-display{display:flex;align-items:center;gap:18px}.weight-display span{display:flex;flex-direction:column;color:var(--muted)}.weight-display strong{font-size:22px;color:var(--ink);margin-top:4px}.weight-display i{width:1px;height:38px;background:var(--line)}.form-footer{display:flex;justify-content:flex-end;gap:10px;padding:20px 0}.flash{padding:11px 14px;background:var(--green-soft);color:var(--green-dark);border-left:3px solid var(--green);margin-bottom:18px}.notice-toast{position:fixed;right:22px;bottom:22px;width:min(370px,calc(100vw - 44px));background:#fff;border:1px solid var(--line);box-shadow:0 18px 50px rgba(31,41,38,.18);z-index:50;padding:17px 42px 17px 18px}.notice-toast div>span{font-size:10px;color:var(--amber);font-weight:700}.notice-toast strong{display:block;margin:4px 0}.notice-toast p{color:var(--muted);line-height:1.5;margin:5px 0 9px}.notice-toast form{position:absolute;right:8px;top:8px}.notice-toast button{border:0;background:transparent;font-size:22px;color:var(--muted)}.login-body{min-height:100vh;background:#edf1ee;display:grid;place-items:center;padding:24px}.login-shell{width:min(900px,100%);min-height:500px;background:#fff;display:grid;grid-template-columns:1.1fr .9fr;box-shadow:var(--shadow)}.login-brand{background:#202825;color:#fff;padding:58px 54px;display:flex;flex-direction:column;justify-content:center}.brand-kicker{color:#e6c881;font-size:11px;letter-spacing:.12em;font-weight:700}.login-brand h1{font-size:38px;margin:13px 0 10px}.login-brand p{color:#bfc9c4;font-size:17px}.login-status{margin-top:90px;color:#cdd6d2;display:flex;align-items:center;gap:9px}.login-form-wrap{padding:55px 46px;display:flex;flex-direction:column;justify-content:center}.login-form-head{display:flex;flex-direction:column;color:var(--muted);margin-bottom:25px}.login-form-head strong{font-size:25px;color:var(--ink);margin-top:3px}.stack-form{display:grid;gap:17px}.stack-form label{display:grid;gap:7px;font-weight:600}.stack-form input{width:100%;height:42px}.demo-accounts{display:flex;gap:8px;flex-wrap:wrap;margin-top:25px}.demo-accounts span{background:#f0f3f1;color:var(--muted);padding:5px 8px;border-radius:3px;font-size:11px}.login-error{background:var(--red-soft);color:var(--red);padding:10px;margin-bottom:14px}
-@media(max-width:980px){.app-shell{display:block}.sidebar{display:none}.topbar{height:auto;min-height:62px;padding:10px 18px;justify-content:space-between;gap:14px;flex-wrap:wrap}.mobile-brand{display:block;font-weight:750}.mobile-nav{display:flex;order:3;width:100%;gap:4px;overflow:auto}.mobile-nav a{padding:8px 10px;color:var(--muted);white-space:nowrap}.mobile-nav a.active{color:var(--green);border-bottom:2px solid var(--green)}.page-content{padding:24px 18px 70px}.dashboard-grid,.two-column,.capture-source-grid{grid-template-columns:1fr}.metric-strip{grid-template-columns:repeat(3,1fr)}.metric-strip>div{border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.metric-strip>div:nth-child(3n){border-right:0}.metric-strip>div:nth-child(n+4){border-bottom:0}.metric-strip>div:last-child{border-right:0}.schedule-line{grid-template-columns:1fr}.schedule-line>div{border-right:0;border-bottom:1px solid var(--line)}.settings-section{grid-template-columns:1fr}.formula-line{align-items:flex-start;flex-direction:column;gap:7px}.formula-line .status{margin-left:0}}
+@media(max-width:980px){.app-shell{display:block}.sidebar{display:none}.topbar{height:auto;min-height:62px;padding:10px 18px;justify-content:space-between;gap:14px;flex-wrap:wrap}.mobile-brand{display:block;font-weight:750}.mobile-nav{display:flex;order:3;width:100%;gap:4px;overflow:auto}.mobile-nav a{padding:8px 10px;color:var(--muted);white-space:nowrap}.mobile-nav a.active{color:var(--green);border-bottom:2px solid var(--green)}.page-content{padding:24px 18px 70px}.dashboard-grid,.two-column,.capture-source-grid{grid-template-columns:1fr}.oauth-authorization{grid-template-columns:1fr}.metric-strip{grid-template-columns:repeat(3,1fr)}.metric-strip>div{border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.metric-strip>div:nth-child(3n){border-right:0}.metric-strip>div:nth-child(n+4){border-bottom:0}.metric-strip>div:last-child{border-right:0}.schedule-line{grid-template-columns:1fr}.schedule-line>div{border-right:0;border-bottom:1px solid var(--line)}.settings-section{grid-template-columns:1fr}.formula-line{align-items:flex-start;flex-direction:column;gap:7px}.formula-line .status{margin-left:0}}
 @media(max-width:640px){.page-heading,.task-band,.style-heading,.goods-heading,.environment-banner,.generate-section,.capture-history .section-heading{align-items:flex-start;flex-direction:column}.page-heading h1{font-size:24px}.task-actions,.heading-actions{width:100%}.metric-strip{grid-template-columns:1fr 1fr}.metric-strip>div{padding:15px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.metric-strip>div:nth-child(3n){border-right:1px solid var(--line)}.metric-strip>div:nth-child(n+4){border-bottom:1px solid var(--line)}.metric-strip>div:nth-child(even){border-right:0}.metric-strip>div:nth-child(n+5){border-bottom:0}.metric-strip>div:last-child{border-right:0}.metric-strip strong{font-size:24px}.schedule-line{grid-template-columns:1fr}.style-totals,.goods-totals{width:100%;justify-content:flex-start;flex-wrap:wrap}.style-totals span{align-items:flex-start}.sticky-actions{bottom:6px;align-items:flex-start;flex-direction:column}.sticky-actions>div{width:100%;flex-wrap:wrap}.sticky-actions .button{flex:1}.settings-section{padding:20px;gap:20px}.field-row,.condition-common{grid-template-columns:1fr}.login-shell{grid-template-columns:1fr}.login-brand{padding:30px}.login-brand h1{font-size:29px}.login-status{margin-top:20px}.login-form-wrap{padding:32px 28px}.user-area>div{display:none}}
 """
 
-    def redirect(self, start_response, location: str):
-        start_response("302 Found", [("Location", location)])
+    def redirect(
+        self,
+        start_response,
+        location: str,
+        *,
+        status: str = "302 Found",
+        headers: list[tuple[str, str]] | None = None,
+    ):
+        start_response(status, [("Location", location), *(headers or [])])
         return [b""]
 
-    def html_response(self, start_response, content: str, status: str = "200 OK"):
+    def html_response(
+        self,
+        start_response,
+        content: str,
+        status: str = "200 OK",
+        *,
+        headers: list[tuple[str, str]] | None = None,
+    ):
         body = content.encode("utf-8")
-        start_response(status, [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))])
+        start_response(
+            status,
+            [
+                ("Content-Type", "text/html; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+                *(headers or []),
+            ],
+        )
         return [body]
 
     def text_response(self, start_response, content: str, status: str = "200 OK"):

@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 from wsgiref.util import setup_testing_defaults
 
 from openpyxl import Workbook, load_workbook
@@ -19,7 +19,13 @@ from replenishment_center.engine import build_replenishment_items
 from replenishment_center.scheduler import SHANGHAI, run_due_jobs
 from replenishment_center.tmall import calculate_sign as calculate_tmall_sign
 from replenishment_center.tmall import test_configured_connection as test_tmall_connection
-from replenishment_center.vipshop import VipshopConfig, calculate_sign, collect_store_data
+from replenishment_center.vipshop import (
+    VipshopConfig,
+    build_authorization_url,
+    calculate_sign,
+    collect_store_data,
+    exchange_authorization_code,
+)
 from replenishment_center.vipshop import test_configured_connection as test_vipshop_connection
 from replenishment_center.web import ReplenishmentApplication
 
@@ -350,6 +356,162 @@ class ReplenishmentTests(unittest.TestCase):
         }
         body = '{"area_code":"0","is_show_gat":"SHOW_GAT","is_bind":false}'
         self.assertEqual(calculate_sign(params, body, "yourappsecret"), "25F7915F9DD6666FAD8D412349A00ED6")
+
+    def test_vipshop_authorization_url_encodes_callback_and_state(self):
+        url = build_authorization_url(
+            "app-key-1",
+            "https://sienna.tiger8.com.cn/oauth/vipshop/callback",
+            "state-value",
+        )
+        parsed = urlsplit(url)
+        self.assertEqual(
+            (parsed.scheme, parsed.netloc, parsed.path),
+            ("https", "auth.vip.com", "/oauth2/authorize"),
+        )
+        query = parse_qs(parsed.query)
+        self.assertEqual(query["client_id"], ["app-key-1"])
+        self.assertEqual(query["response_type"], ["code"])
+        self.assertEqual(
+            query["redirect_uri"],
+            ["https://sienna.tiger8.com.cn/oauth/vipshop/callback"],
+        )
+        self.assertEqual(query["state"], ["state-value"])
+
+    def test_vipshop_token_exchange_posts_secret_and_validates_token(self):
+        with patch(
+            "replenishment_center.vipshop._oauth_post",
+            side_effect=[
+                {
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "expires_in": 7776000,
+                    "refresh_expires_time": 1790000000000,
+                    "open_id": "OPEN-1",
+                },
+                {"access_token": "access-token", "open_id": "OPEN-1", "expires_in": 7776000},
+            ],
+        ) as oauth_post:
+            result = exchange_authorization_code(
+                app_key="app-key",
+                app_secret="app-secret",
+                code="single-use-code",
+                redirect_uri="https://sienna.tiger8.com.cn/oauth/vipshop/callback",
+                request_client_ip="203.0.113.5",
+            )
+        token_call = oauth_post.call_args_list[0]
+        self.assertEqual(token_call.args[0], "https://auth.vip.com/oauth2/token")
+        self.assertEqual(token_call.args[1]["client_secret"], "app-secret")
+        self.assertEqual(token_call.args[1]["grant_type"], "authorization_code")
+        self.assertEqual(result["open_id"], "OPEN-1")
+        self.assertEqual(oauth_post.call_args_list[1].args[1], {"access_token": "access-token"})
+
+    def test_vipshop_oauth_start_and_public_callback_complete_once(self):
+        user = db.authenticate(self.db_path, "merch", "demo123")
+        bnx = db.get_store(self.db_path, "VIP-BNX")
+        db.save_api_config(
+            self.db_path,
+            {
+                "environment": "production",
+                "app_key": "bnx-app-key",
+                "app_secret": "bnx-app-secret",
+                "expected_store_name": "BNX",
+            },
+            user["id"],
+            bnx["id"],
+        )
+        cookie = self.login("merch")
+        with patch.dict(
+            "os.environ",
+            {"REPLENISH_PUBLIC_BASE_URL": "https://sienna.tiger8.com.cn"},
+            clear=False,
+        ):
+            start = self.request(
+                "/oauth/vipshop/start?store=VIP-BNX", method="POST", cookie=cookie
+            )
+        self.assertEqual(start["status"], "302 Found")
+        authorize_url = dict(start["headers"])["Location"]
+        authorize_query = parse_qs(urlsplit(authorize_url).query)
+        state = authorize_query["state"][0]
+        self.assertEqual(
+            authorize_query["redirect_uri"],
+            ["https://sienna.tiger8.com.cn/oauth/vipshop/callback"],
+        )
+        with db.get_connection(self.db_path) as connection:
+            raw_state = connection.execute(
+                "SELECT * FROM vipshop_oauth_states WHERE store_id = ?", (bnx["id"],)
+            ).fetchone()
+        self.assertNotEqual(raw_state["state_hash"], state)
+        token_payload = {
+            "access_token": "oauth-access-token",
+            "refresh_token": "oauth-refresh-token",
+            "expires_in": 7776000,
+            "refresh_expires_time": 1790000000000,
+            "open_id": "BNX-OPEN-ID",
+            "token_info": {
+                "access_token": "oauth-access-token",
+                "open_id": "BNX-OPEN-ID",
+            },
+        }
+        verification = {
+            "ok": True,
+            "credentials_complete": True,
+            "gateway": {},
+            "message": "鉴权成功",
+            "store": {"store_name": "BNX唯品会官方店"},
+        }
+        with patch(
+            "replenishment_center.web.exchange_authorization_code",
+            return_value=token_payload,
+        ) as exchange, patch(
+            "replenishment_center.web.test_configured_connection",
+            return_value=verification,
+        ):
+            callback = self.request(
+                f"/oauth/vipshop/callback?{urlencode({'code': 'auth-code', 'state': state})}"
+            )
+        self.assertEqual(callback["status"], "303 See Other")
+        self.assertEqual(dict(callback["headers"])["Cache-Control"], "no-store")
+        self.assertEqual(dict(callback["headers"])["Referrer-Policy"], "no-referrer")
+        self.assertEqual(
+            dict(callback["headers"])["Location"],
+            "/oauth/vipshop/result?store=VIP-BNX&result=success",
+        )
+        self.assertEqual(exchange.call_args.kwargs["request_client_ip"], "127.0.0.1")
+        config = db.get_api_config(self.db_path, bnx["id"], include_secrets=True)
+        self.assertEqual(config["access_token"], "oauth-access-token")
+        self.assertEqual(config["refresh_token"], "oauth-refresh-token")
+        self.assertEqual(config["open_id"], "BNX-OPEN-ID")
+        self.assertTrue(config["access_token_expires_at"])
+        self.assertTrue(config["refresh_token_expires_at"])
+        with db.get_connection(self.db_path) as connection:
+            raw = connection.execute(
+                "SELECT access_token_enc, refresh_token_enc FROM vipshop_store_api_config WHERE store_id = ?",
+                (bnx["id"],),
+            ).fetchone()
+        self.assertNotIn("oauth-access-token", raw["access_token_enc"])
+        self.assertNotIn("oauth-refresh-token", raw["refresh_token_enc"])
+        replay = self.request(
+            f"/oauth/vipshop/callback?{urlencode({'code': 'auth-code', 'state': state})}"
+        )
+        self.assertEqual(replay["status"], "303 See Other")
+        self.assertEqual(
+            dict(replay["headers"])["Location"],
+            "/oauth/vipshop/result?result=invalid",
+        )
+        result_page = self.request(
+            "/oauth/vipshop/result?store=VIP-BNX&result=success"
+        )
+        self.assertEqual(result_page["status"], "200 OK")
+        self.assertEqual(dict(result_page["headers"])["Cache-Control"], "no-store")
+        self.assertIn("授权与店铺校验成功", result_page["body"].decode())
+
+    def test_vipshop_oauth_callback_never_falls_through_to_login(self):
+        missing_state = self.request("/oauth/vipshop/callback?code=TEST")
+        self.assertEqual(missing_state["status"], "303 See Other")
+        self.assertEqual(
+            dict(missing_state["headers"])["Location"],
+            "/oauth/vipshop/result?result=invalid",
+        )
 
     def test_vipshop_credentials_are_encrypted_and_masked(self):
         user = db.authenticate(self.db_path, "merch", "demo123")

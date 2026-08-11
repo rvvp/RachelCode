@@ -122,19 +122,33 @@ replenishment_data/replenishment.db
 数据中心 → API 配置与试连
 ```
 
-需要填写：
+需要先填写：
 
 - `AppKey`
 - `AppSecret`
-- 店铺主账号授权得到的 `AccessToken`
 - 预期店铺名称，第一期保持为“马天奴”
 
-`AppSecret` 和 `AccessToken` 会用本机独立密钥加密后写入数据库；本机密钥保存在 `replenishment_data/replenishment.key`，权限为 `0600`，不会进入源码提交。也可以完全不在页面保存凭证，改用环境变量：
+保存后由页面上的“授权唯品店铺”按钮生成 OAuth 2.0 授权地址。系统使用一次性、15 分钟有效的 `state` 关联目标店铺；唯品回调 `GET /oauth/vipshop/callback` 无需登录货品监控中心，但必须通过 state 校验且只能处理一次。回调取得的 `code` 会立即在服务端换取并校验 `AccessToken`，随后保存 `RefreshToken`、`OpenID` 和到期时间，再自动执行店铺信息接口试连。
+
+正式服务器必须设置：
+
+```text
+REPLENISH_PUBLIC_BASE_URL=https://sienna.tiger8.com.cn
+```
+
+唯品开放平台登记的回调地址为：
+
+```text
+https://sienna.tiger8.com.cn/oauth/vipshop/callback
+```
+
+`AppSecret`、`AccessToken` 和 `RefreshToken` 会用服务端独立密钥加密后写入数据库；密钥文件与数据库同目录、权限为 `0600`，不会进入源码提交。也可以完全不在页面保存凭证，改用环境变量：
 
 - `VIPSHOP_ENVIRONMENT=production`
 - `VIPSHOP_APP_KEY`
 - `VIPSHOP_APP_SECRET`
 - `VIPSHOP_ACCESS_TOKEN`
+- `VIPSHOP_REFRESH_TOKEN`
 
 配置后先执行“测试网关与店铺鉴权”。系统会调用只读店铺接口，并检查授权店铺名称包含“马天奴”；通过后才能执行真实同步。
 
@@ -158,6 +172,7 @@ BNX 凭证可在页面加密保存，也可使用独立环境变量提供：
 - `VIPSHOP_BNX_APP_KEY`
 - `VIPSHOP_BNX_APP_SECRET`
 - `VIPSHOP_BNX_ACCESS_TOKEN`
+- `VIPSHOP_BNX_REFRESH_TOKEN`
 
 页面保存的 `AppSecret` 和 `AccessToken` 使用本机密钥加密，界面只显示是否已配置，不回显明文。BNX 单店闭环确认前不会启用自动同步频率。
 

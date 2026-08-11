@@ -21,5 +21,6 @@ tmp/
 replenishment_data/
 
 # Generated visual QA and presentation video assets are not application code.
+outputs/
 screenshots/
 videos/

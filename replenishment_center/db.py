@@ -6,7 +6,7 @@ import os
 import secrets
 import sqlite3
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -120,6 +120,11 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True) -> None:
                 app_key TEXT NOT NULL DEFAULT '',
                 app_secret_enc TEXT NOT NULL DEFAULT '',
                 access_token_enc TEXT NOT NULL DEFAULT '',
+                refresh_token_enc TEXT NOT NULL DEFAULT '',
+                open_id TEXT NOT NULL DEFAULT '',
+                access_token_expires_at TEXT NOT NULL DEFAULT '',
+                refresh_token_expires_at TEXT NOT NULL DEFAULT '',
+                oauth_authorized_at TEXT NOT NULL DEFAULT '',
                 expected_store_name TEXT NOT NULL DEFAULT '',
                 external_store_id TEXT NOT NULL DEFAULT '',
                 external_seller_id TEXT NOT NULL DEFAULT '',
@@ -130,6 +135,21 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True) -> None:
                 last_sync_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(store_id) REFERENCES stores(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS vipshop_oauth_states (
+                state_hash TEXT PRIMARY KEY,
+                store_id INTEGER NOT NULL,
+                initiated_by INTEGER NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error_code TEXT NOT NULL DEFAULT '',
+                error_description TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(store_id) REFERENCES stores(id),
+                FOREIGN KEY(initiated_by) REFERENCES users(id)
             );
 
             CREATE TABLE IF NOT EXISTS tmall_api_config (
@@ -166,6 +186,8 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True) -> None:
                 core_size INTEGER NOT NULL DEFAULT 0,
                 demand_factor REAL NOT NULL DEFAULT 1,
                 lifecycle TEXT NOT NULL DEFAULT 'active',
+                current_price REAL NOT NULL DEFAULT 0,
+                tag_price REAL NOT NULL DEFAULT 0,
                 UNIQUE(store_id, style_code, color_name, size_name),
                 FOREIGN KEY(store_id) REFERENCES stores(id)
             );
@@ -177,6 +199,9 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True) -> None:
                 gross_units INTEGER NOT NULL DEFAULT 0,
                 return_units INTEGER NOT NULL DEFAULT 0,
                 net_units INTEGER NOT NULL DEFAULT 0,
+                gross_sales_amount REAL NOT NULL DEFAULT 0,
+                refund_amount REAL NOT NULL DEFAULT 0,
+                net_sales_amount REAL NOT NULL DEFAULT 0,
                 UNIQUE(sku_id, sale_date),
                 FOREIGN KEY(sku_id) REFERENCES skus(id)
             );
@@ -269,6 +294,14 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True) -> None:
                 expected_arrival_date TEXT NOT NULL DEFAULT '',
                 followup_status TEXT NOT NULL DEFAULT 'pending',
                 followup_note TEXT NOT NULL DEFAULT '',
+                price_snapshot REAL NOT NULL DEFAULT 0,
+                unit_cost_snapshot REAL,
+                gross_margin_snapshot REAL,
+                margin_gate_status TEXT NOT NULL DEFAULT 'unchecked',
+                actual_arrival_date TEXT NOT NULL DEFAULT '',
+                actual_arrived_qty INTEGER NOT NULL DEFAULT 0,
+                arrival_variance_level TEXT NOT NULL DEFAULT 'none',
+                arrival_variance_note TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY(plan_id) REFERENCES plans(id),
                 FOREIGN KEY(sku_id) REFERENCES skus(id)
             );
@@ -296,6 +329,68 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True) -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
+
+            CREATE TABLE IF NOT EXISTS sku_cost_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sku_id INTEGER NOT NULL,
+                unit_cost REAL NOT NULL,
+                effective_from TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'excel',
+                version_label TEXT NOT NULL DEFAULT '',
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(sku_id) REFERENCES skus(id),
+                FOREIGN KEY(created_by) REFERENCES users(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sku_cost_versions_lookup
+                ON sku_cost_versions(sku_id, effective_from DESC, id DESC);
+
+            CREATE TABLE IF NOT EXISTS price_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_id INTEGER NOT NULL,
+                batch_no TEXT NOT NULL UNIQUE,
+                mode TEXT NOT NULL DEFAULT 'system',
+                status TEXT NOT NULL DEFAULT 'draft',
+                rule_label TEXT NOT NULL DEFAULT '',
+                rule_payload TEXT NOT NULL DEFAULT '{}',
+                created_by INTEGER,
+                confirmed_by INTEGER,
+                created_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                exported_at TEXT,
+                FOREIGN KEY(store_id) REFERENCES stores(id),
+                FOREIGN KEY(created_by) REFERENCES users(id),
+                FOREIGN KEY(confirmed_by) REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS price_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                price_plan_id INTEGER NOT NULL,
+                sku_id INTEGER NOT NULL,
+                style_code TEXT NOT NULL,
+                outer_sku_id TEXT NOT NULL DEFAULT '',
+                style_name TEXT NOT NULL,
+                color_name TEXT NOT NULL,
+                size_name TEXT NOT NULL,
+                current_price REAL NOT NULL DEFAULT 0,
+                proposed_price REAL NOT NULL DEFAULT 0,
+                confirmed_price REAL NOT NULL DEFAULT 0,
+                floor_price REAL NOT NULL DEFAULT 0,
+                unit_cost REAL,
+                current_margin REAL,
+                proposed_margin REAL,
+                sales_14 INTEGER NOT NULL DEFAULT 0,
+                sellable INTEGER NOT NULL DEFAULT 0,
+                coverage_days REAL,
+                decision TEXT NOT NULL DEFAULT 'hold',
+                reason TEXT NOT NULL DEFAULT '',
+                include_flag INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY(price_plan_id) REFERENCES price_plans(id),
+                FOREIGN KEY(sku_id) REFERENCES skus(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_price_items_plan ON price_items(price_plan_id);
 
             CREATE TABLE IF NOT EXISTS api_unmatched_skus (
                 external_sku_id TEXT PRIMARY KEY,
@@ -367,12 +462,21 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True) -> None:
             "external_spu_id": "TEXT NOT NULL DEFAULT ''",
             "outer_sku_id": "TEXT NOT NULL DEFAULT ''",
             "is_demo": "INTEGER NOT NULL DEFAULT 0",
+            "current_price": "REAL NOT NULL DEFAULT 0",
+            "tag_price": "REAL NOT NULL DEFAULT 0",
         }.items():
             if column not in sku_columns:
                 connection.execute(f"ALTER TABLE skus ADD COLUMN {column} {definition}")
         sales_columns = {row["name"] for row in connection.execute("PRAGMA table_info(sales_daily)")}
         if "source" not in sales_columns:
             connection.execute("ALTER TABLE sales_daily ADD COLUMN source TEXT NOT NULL DEFAULT 'test'")
+        for column, definition in {
+            "gross_sales_amount": "REAL NOT NULL DEFAULT 0",
+            "refund_amount": "REAL NOT NULL DEFAULT 0",
+            "net_sales_amount": "REAL NOT NULL DEFAULT 0",
+        }.items():
+            if column not in sales_columns:
+                connection.execute(f"ALTER TABLE sales_daily ADD COLUMN {column} {definition}")
         inventory_columns = {row["name"] for row in connection.execute("PRAGMA table_info(inventory_current)")}
         if "source" not in inventory_columns:
             connection.execute("ALTER TABLE inventory_current ADD COLUMN source TEXT NOT NULL DEFAULT 'test'")
@@ -401,6 +505,18 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True) -> None:
             connection.execute("ALTER TABLE plan_items ADD COLUMN consecutive_sales_days INTEGER NOT NULL DEFAULT 0")
         if "selection_reason" not in plan_item_columns:
             connection.execute("ALTER TABLE plan_items ADD COLUMN selection_reason TEXT NOT NULL DEFAULT ''")
+        for column, definition in {
+            "price_snapshot": "REAL NOT NULL DEFAULT 0",
+            "unit_cost_snapshot": "REAL",
+            "gross_margin_snapshot": "REAL",
+            "margin_gate_status": "TEXT NOT NULL DEFAULT 'unchecked'",
+            "actual_arrival_date": "TEXT NOT NULL DEFAULT ''",
+            "actual_arrived_qty": "INTEGER NOT NULL DEFAULT 0",
+            "arrival_variance_level": "TEXT NOT NULL DEFAULT 'none'",
+            "arrival_variance_note": "TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if column not in plan_item_columns:
+                connection.execute(f"ALTER TABLE plan_items ADD COLUMN {column} {definition}")
         connection.execute(
             """
             UPDATE plan_items SET outer_sku_id = COALESCE(
@@ -417,6 +533,23 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True) -> None:
         notification_columns = {row["name"] for row in connection.execute("PRAGMA table_info(notifications)")}
         if "store_id" not in notification_columns:
             connection.execute("ALTER TABLE notifications ADD COLUMN store_id INTEGER")
+        vipshop_config_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(vipshop_store_api_config)")
+        }
+        for column, definition in {
+            "refresh_token_enc": "TEXT NOT NULL DEFAULT ''",
+            "open_id": "TEXT NOT NULL DEFAULT ''",
+            "access_token_expires_at": "TEXT NOT NULL DEFAULT ''",
+            "refresh_token_expires_at": "TEXT NOT NULL DEFAULT ''",
+            "oauth_authorized_at": "TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if column not in vipshop_config_columns:
+                connection.execute(
+                    f"ALTER TABLE vipshop_store_api_config ADD COLUMN {column} {definition}"
+                )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vipshop_oauth_states_store ON vipshop_oauth_states(store_id, created_at)"
+        )
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_skus_external ON skus(store_id, external_sku_id) WHERE external_sku_id <> ''"
         )
@@ -439,6 +572,7 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True) -> None:
         _ensure_stores(connection)
         if seed_demo:
             _seed_demo(connection)
+            _ensure_demo_enrichment(connection)
     if seed_demo:
         with get_connection(path) as connection:
             count = connection.execute("SELECT COUNT(*) AS count FROM plans").fetchone()["count"]
@@ -611,6 +745,40 @@ def _seed_demo(connection: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_demo_enrichment(connection: sqlite3.Connection) -> None:
+    """Seed safe, clearly-labelled demo pricing and cost values for the prototype."""
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO users(username, display_name, role, password_hash, created_at)
+        VALUES ('ops', '运营部 · 只读执行', 'operations', ?, ?)
+        """,
+        (hash_password(DEMO_PASSWORD), utc_now()),
+    )
+    price_map = {
+        "MTN260701": (599, 189), "MTN260715": (899, 268), "MTN260628": (499, 158),
+        "MTN260722": (1299, 438), "MTN260610": (699, 218), "MTN260530": (399, 128),
+    }
+    today = local_today().isoformat()
+    for style_code, (price, cost) in price_map.items():
+        connection.execute(
+            "UPDATE skus SET current_price = CASE WHEN current_price = 0 THEN ? ELSE current_price END, tag_price = CASE WHEN tag_price = 0 THEN ? ELSE tag_price END WHERE style_code = ? AND is_demo = 1",
+            (price, round(price * 1.7, 2), style_code),
+        )
+        for row in connection.execute("SELECT id FROM skus WHERE style_code = ? AND is_demo = 1", (style_code,)).fetchall():
+            connection.execute(
+                "INSERT INTO sku_cost_versions(sku_id, unit_cost, effective_from, source, version_label, created_at) SELECT ?, ?, ?, 'demo', '首期演示成本', ? WHERE NOT EXISTS (SELECT 1 FROM sku_cost_versions WHERE sku_id = ? AND source = 'demo' AND version_label = '首期演示成本')",
+                (row["id"], cost, today, utc_now(), row["id"]),
+            )
+    connection.execute(
+        """
+        UPDATE sales_daily SET gross_sales_amount = gross_units * COALESCE((SELECT current_price FROM skus WHERE skus.id = sales_daily.sku_id), 0),
+            refund_amount = return_units * COALESCE((SELECT current_price FROM skus WHERE skus.id = sales_daily.sku_id), 0),
+            net_sales_amount = net_units * COALESCE((SELECT current_price FROM skus WHERE skus.id = sales_daily.sku_id), 0)
+        WHERE net_sales_amount = 0 AND source = 'test'
+        """
+    )
+
+
 def _mask(value: str, visible: int = 4) -> str:
     text = str(value or "")
     if not text:
@@ -618,6 +786,51 @@ def _mask(value: str, visible: int = 4) -> str:
     if len(text) <= visible:
         return "*" * len(text)
     return "*" * max(4, len(text) - visible) + text[-visible:]
+
+
+def _state_hash(state: str) -> str:
+    return hashlib.sha256(str(state or "").encode("utf-8")).hexdigest()
+
+
+def _utc_iso(value: datetime) -> str:
+    return value.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _duration_expiry(seconds) -> str:
+    try:
+        duration = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        return ""
+    return _utc_iso(datetime.now(UTC) + timedelta(seconds=duration))
+
+
+def _absolute_expiry(value) -> str:
+    if value in {None, ""}:
+        return ""
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        parsed = _parse_utc(str(value))
+        return _utc_iso(parsed) if parsed else ""
+    if timestamp > 100_000_000_000:
+        timestamp /= 1000
+    try:
+        return _utc_iso(datetime.fromtimestamp(timestamp, UTC))
+    except (OverflowError, OSError, ValueError):
+        return ""
 
 
 def list_stores(db_path: str | Path) -> list[dict]:
@@ -792,21 +1005,30 @@ def get_api_config(
     app_key = os.environ.get(f"{env_prefix}_APP_KEY", "").strip()
     app_secret = os.environ.get(f"{env_prefix}_APP_SECRET", "").strip()
     access_token = os.environ.get(f"{env_prefix}_ACCESS_TOKEN", "").strip()
+    refresh_token = os.environ.get(f"{env_prefix}_REFRESH_TOKEN", "").strip()
     if environment in {"production", "sandbox"}:
         result["environment"] = environment
     stored_secret = secret_store.unseal(db_path, result["app_secret_enc"]) if result["app_secret_enc"] else ""
     stored_token = secret_store.unseal(db_path, result["access_token_enc"]) if result["access_token_enc"] else ""
+    stored_refresh = secret_store.unseal(db_path, result["refresh_token_enc"]) if result["refresh_token_enc"] else ""
     effective_key = app_key or result["app_key"]
     effective_secret = app_secret or stored_secret
     effective_token = access_token or stored_token
+    effective_refresh = refresh_token or stored_refresh
+    access_expiry = _parse_utc(result["access_token_expires_at"])
+    refresh_expiry = _parse_utc(result["refresh_token_expires_at"])
+    now = datetime.now(UTC)
     result.update(
         {
             "app_key": effective_key,
             "app_key_masked": _mask(effective_key),
             "has_app_secret": bool(effective_secret),
             "has_access_token": bool(effective_token),
+            "has_refresh_token": bool(effective_refresh),
             "credentials_complete": bool(effective_key and effective_secret and effective_token),
-            "credential_source": "environment" if app_key or app_secret or access_token else "encrypted_database",
+            "credential_source": "environment" if app_key or app_secret or access_token or refresh_token else "encrypted_database",
+            "access_token_expired": bool(access_expiry and access_expiry <= now),
+            "refresh_token_expired": bool(refresh_expiry and refresh_expiry <= now),
             "store_code": store["store_code"],
             "store_name": store["store_name"],
             "brand_name": store["brand_name"],
@@ -816,8 +1038,10 @@ def get_api_config(
     if include_secrets:
         result["app_secret"] = effective_secret
         result["access_token"] = effective_token
+        result["refresh_token"] = effective_refresh
     result.pop("app_secret_enc", None)
     result.pop("access_token_enc", None)
+    result.pop("refresh_token_enc", None)
     return result
 
 
@@ -870,6 +1094,171 @@ def save_api_config(
             "vipshop_store_api_config", store["id"], f"environment={environment}",
         )
     return get_api_config(db_path, store["id"])
+
+
+def create_vipshop_oauth_state(
+    db_path: str | Path,
+    store_id: int,
+    user_id: int,
+    redirect_uri: str,
+    *,
+    ttl_minutes: int = 15,
+) -> str:
+    redirect_uri = str(redirect_uri or "").strip()
+    if not redirect_uri:
+        raise ValueError("唯品 OAuth 回调地址不能为空。")
+    state = secrets.token_urlsafe(32)
+    now = datetime.now(UTC).replace(microsecond=0)
+    expires_at = now + timedelta(minutes=max(5, min(int(ttl_minutes), 30)))
+    with get_connection(db_path) as connection:
+        store = _vipshop_store(connection, store_id)
+        connection.execute(
+            "UPDATE vipshop_oauth_states SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?",
+            (_utc_iso(now),),
+        )
+        connection.execute(
+            """
+            INSERT INTO vipshop_oauth_states(
+                state_hash, store_id, initiated_by, redirect_uri, status,
+                created_at, expires_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                _state_hash(state), store["id"], int(user_id), redirect_uri,
+                _utc_iso(now), _utc_iso(expires_at),
+            ),
+        )
+        _audit(
+            connection, int(user_id), "vipshop_oauth_started", "stores",
+            int(store["id"]), f"redirect_uri={redirect_uri}",
+        )
+    return state
+
+
+def consume_vipshop_oauth_state(db_path: str | Path, state: str) -> dict:
+    state = str(state or "").strip()
+    if not state:
+        raise ValueError("唯品授权回调缺少 state。")
+    now = datetime.now(UTC).replace(microsecond=0)
+    with get_connection(db_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            """
+            SELECT oauth.*, stores.store_code, stores.store_name
+            FROM vipshop_oauth_states AS oauth
+            JOIN stores ON stores.id = oauth.store_id
+            WHERE oauth.state_hash = ?
+            """,
+            (_state_hash(state),),
+        ).fetchone()
+        if not row:
+            raise ValueError("唯品授权 state 无效，请从货品监控中心重新发起授权。")
+        if row["status"] != "pending" or row["consumed_at"]:
+            raise ValueError("本次唯品授权已处理，不能重复使用。")
+        expires_at = _parse_utc(row["expires_at"])
+        if not expires_at or expires_at <= now:
+            connection.execute(
+                "UPDATE vipshop_oauth_states SET status = 'expired', consumed_at = ? WHERE state_hash = ?",
+                (_utc_iso(now), row["state_hash"]),
+            )
+            raise ValueError("唯品授权请求已过期，请重新发起授权。")
+        connection.execute(
+            "UPDATE vipshop_oauth_states SET status = 'processing', consumed_at = ? WHERE state_hash = ?",
+            (_utc_iso(now), row["state_hash"]),
+        )
+    return dict(row)
+
+
+def record_vipshop_oauth_failure(
+    db_path: str | Path,
+    state_hash: str,
+    error_code: str,
+    error_description: str,
+) -> None:
+    with get_connection(db_path) as connection:
+        state_row = connection.execute(
+            "SELECT store_id FROM vipshop_oauth_states WHERE state_hash = ?",
+            (str(state_hash or ""),),
+        ).fetchone()
+        connection.execute(
+            """
+            UPDATE vipshop_oauth_states
+            SET status = 'failed', error_code = ?, error_description = ?
+            WHERE state_hash = ?
+            """,
+            (
+                str(error_code or "oauth-failed")[:120],
+                str(error_description or "唯品授权失败")[:500],
+                str(state_hash or ""),
+            ),
+        )
+        if state_row:
+            connection.execute(
+                """
+                UPDATE vipshop_store_api_config
+                SET last_test_status = 'oauth_failed', last_test_message = ?,
+                    last_test_at = ?, updated_at = ?
+                WHERE store_id = ?
+                """,
+                (
+                    str(error_description or "唯品授权失败")[:500],
+                    utc_now(), utc_now(), int(state_row["store_id"]),
+                ),
+            )
+
+
+def save_vipshop_oauth_tokens(
+    db_path: str | Path,
+    oauth_state: dict,
+    token_payload: dict,
+) -> dict:
+    access_token = str(token_payload.get("access_token") or "").strip()
+    refresh_token = str(token_payload.get("refresh_token") or "").strip()
+    if not access_token:
+        raise ValueError("唯品 OAuth 响应缺少 AccessToken。")
+    token_info = token_payload.get("token_info") or {}
+    open_id = str(token_payload.get("open_id") or token_info.get("open_id") or "").strip()
+    access_expires_at = _duration_expiry(
+        token_payload.get("expires_in") or token_info.get("expires_in")
+    )
+    refresh_expires_at = _absolute_expiry(token_payload.get("refresh_expires_time"))
+    store_id = int(oauth_state["store_id"])
+    user_id = int(oauth_state["initiated_by"])
+    now = utc_now()
+    with get_connection(db_path) as connection:
+        _vipshop_store(connection, store_id)
+        connection.execute(
+            """
+            UPDATE vipshop_store_api_config
+            SET access_token_enc = ?, refresh_token_enc = ?, open_id = ?,
+                access_token_expires_at = ?, refresh_token_expires_at = ?,
+                oauth_authorized_at = ?, last_test_status = 'oauth_authorized',
+                last_test_message = 'OAuth 授权成功，正在校验店铺及接口权限。',
+                last_test_at = ?, updated_at = ?
+            WHERE store_id = ?
+            """,
+            (
+                secret_store.seal(db_path, access_token),
+                secret_store.seal(db_path, refresh_token) if refresh_token else "",
+                open_id, access_expires_at, refresh_expires_at,
+                now, now, now, store_id,
+            ),
+        )
+        connection.execute(
+            "UPDATE vipshop_oauth_states SET status = 'succeeded' WHERE state_hash = ?",
+            (oauth_state["state_hash"],),
+        )
+        default_store = connection.execute("SELECT store_id FROM settings WHERE id = 1").fetchone()
+        if default_store and int(default_store["store_id"]) == store_id:
+            connection.execute(
+                "UPDATE settings SET api_status = 'configured', updated_at = ? WHERE id = 1",
+                (now,),
+            )
+        _audit(
+            connection, user_id, "vipshop_oauth_succeeded", "stores",
+            store_id, f"open_id={_mask(open_id)}",
+        )
+    return get_api_config(db_path, store_id)
 
 
 def vipshop_client_config(db_path: str | Path, store_id: int | None = None):
@@ -1365,6 +1754,245 @@ def get_settings(db_path: str | Path) -> dict:
     return result
 
 
+def _latest_cost(connection: sqlite3.Connection, sku_id: int, as_of: str | None = None) -> float | None:
+    as_of = as_of or local_today().isoformat()
+    row = connection.execute(
+        "SELECT unit_cost FROM sku_cost_versions WHERE sku_id = ? AND effective_from <= ? ORDER BY effective_from DESC, id DESC LIMIT 1",
+        (sku_id, as_of),
+    ).fetchone()
+    return float(row["unit_cost"]) if row else None
+
+
+def cost_summary(db_path: str | Path, *, store_id: int | None = None) -> dict:
+    with get_connection(db_path) as connection:
+        selected_store_id = int(store_id or get_settings(db_path)["store_id"])
+        rows = connection.execute("SELECT id, style_code, outer_sku_id, color_name FROM skus WHERE store_id = ? AND lifecycle = 'active'", (selected_store_id,)).fetchall()
+        groups = defaultdict(list)
+        for row in rows:
+            groups[(row["style_code"], row["outer_sku_id"] or row["color_name"])].append(row)
+        covered = sum(all(_latest_cost(connection, int(row["id"])) is not None for row in group) for group in groups.values())
+    return {"sku_count": len(groups), "covered_count": covered, "missing_count": len(groups) - covered}
+
+
+def product_monitor_data(db_path: str | Path, *, store_id: int | None = None) -> dict:
+    settings = get_settings(db_path)
+    selected_store_id = int(store_id or settings["store_id"])
+    with get_connection(db_path) as connection:
+        latest_sale = connection.execute("SELECT MAX(sale_date) AS value FROM sales_daily WHERE sku_id IN (SELECT id FROM skus WHERE store_id = ?)", (selected_store_id,)).fetchone()["value"]
+        today = date.fromisoformat(str(latest_sale)[:10]) if latest_sale else local_today()
+        month_start = today.replace(day=1).isoformat()
+        start_14 = (today - timedelta(days=13)).isoformat()
+        start_60 = (today - timedelta(days=59)).isoformat()
+        skus = [dict(row) for row in connection.execute("SELECT * FROM skus WHERE store_id = ? AND lifecycle = 'active' ORDER BY style_code, color_name, size_name", (selected_store_id,)).fetchall()]
+        sales = connection.execute(
+            "SELECT sku_id, sale_date, gross_units, return_units, net_units, gross_sales_amount, refund_amount, net_sales_amount FROM sales_daily WHERE sku_id IN (SELECT id FROM skus WHERE store_id = ?) AND sale_date >= ?",
+            (selected_store_id, start_60),
+        ).fetchall()
+        sales_by = defaultdict(list)
+        for row in sales:
+            sales_by[int(row["sku_id"])].append(dict(row))
+        inventory = {int(row["sku_id"]): dict(row) for row in connection.execute("SELECT * FROM inventory_current WHERE sku_id IN (SELECT id FROM skus WHERE store_id = ?)", (selected_store_id,)).fetchall()}
+        rows = []
+        for sku in skus:
+            sku_sales = sales_by.get(int(sku["id"]), [])
+            sales_14 = sum(int(row["net_units"] or 0) for row in sku_sales if row["sale_date"] >= start_14)
+            sales_30 = sum(int(row["net_units"] or 0) for row in sku_sales if row["sale_date"] >= max(start_60, (today - timedelta(days=29)).isoformat()))
+            month_units = sum(int(row["net_units"] or 0) for row in sku_sales if row["sale_date"] >= month_start)
+            amount = sum(float(row["net_sales_amount"] or 0) for row in sku_sales if row["sale_date"] >= month_start)
+            if amount == 0 and sku["current_price"]:
+                amount = month_units * float(sku["current_price"])
+            inv = inventory.get(int(sku["id"]), {})
+            sellable = max(0, int(inv.get("on_hand", 0)) - int(inv.get("locked", 0)) - int(inv.get("defective", 0)))
+            daily_demand = sales_14 / 14 if sales_14 else 0
+            coverage = sellable / daily_demand if daily_demand else None
+            cost = _latest_cost(connection, int(sku["id"]))
+            price = float(sku["current_price"] or 0)
+            margin = (price - cost) / price if price and cost is not None else None
+            sell_through = sales_14 / (sales_14 + sellable) if sales_14 + sellable else 0
+            if coverage is not None and coverage <= 14 and sales_14 >= 5:
+                health = "risk"
+            elif sales_14 <= 2 and (coverage is None or coverage > 60):
+                health = "slow"
+            elif sales_14 >= 10 and (coverage is None or coverage <= 30):
+                health = "potential"
+            else:
+                health = "normal"
+            rows.append({
+                **sku, "sales_14": sales_14, "sales_30": sales_30, "month_units": month_units,
+                "month_amount": amount, "sellable": sellable, "coverage_days": coverage,
+                "unit_cost": cost, "margin": margin, "sell_through": sell_through, "health": health,
+                "inventory_snapshot_at": inv.get("snapshot_at", ""),
+            })
+        total_amount = sum(row["month_amount"] for row in rows)
+        cost_complete = all(row["unit_cost"] is not None for row in rows if row["month_units"] > 0)
+        total_cost = sum(row["month_units"] * row["unit_cost"] for row in rows if row["unit_cost"] is not None)
+        total_sales_14 = sum(row["sales_14"] for row in rows)
+        total_sellable = sum(row["sellable"] for row in rows)
+        exact_amount_rows = connection.execute("SELECT COUNT(*) AS c FROM sales_daily WHERE sku_id IN (SELECT id FROM skus WHERE store_id = ?) AND sale_date >= ? AND net_sales_amount != 0", (selected_store_id, month_start)).fetchone()["c"]
+    grouped = defaultdict(list)
+    for row in rows:
+        if row["sales_14"] <= 0 and row["sellable"] <= 0:
+            continue
+        grouped[(row["style_code"], row.get("outer_sku_id") or row["color_name"])].append(row)
+    goods_rows = []
+    for (_, goods_code), group in grouped.items():
+        sales_14 = sum(row["sales_14"] for row in group)
+        sales_30 = sum(row["sales_30"] for row in group)
+        month_units = sum(row["month_units"] for row in group)
+        month_amount = sum(row["month_amount"] for row in group)
+        sellable = sum(row["sellable"] for row in group)
+        coverage = sellable / (sales_14 / 14) if sales_14 else None
+        sell_through = sales_14 / (sales_14 + sellable) if sales_14 + sellable else 0
+        costs = [row["unit_cost"] for row in group if row["unit_cost"] is not None]
+        prices = [row["current_price"] for row in group if row["current_price"]]
+        cost = sum(costs) / len(costs) if len(costs) == len(group) and costs else None
+        price = sum(prices) / len(prices) if prices else 0
+        margin = (price - cost) / price if price and cost is not None else None
+        if coverage is not None and coverage <= 14 and sales_14 >= 5:
+            health = "risk"
+        elif sales_14 <= 2 and (coverage is None or coverage > 60):
+            health = "slow"
+        elif sales_14 >= 10 and (coverage is None or coverage <= 30):
+            health = "potential"
+        else:
+            health = "normal"
+        goods_rows.append({
+            **group[0], "outer_sku_id": goods_code, "sales_14": sales_14, "sales_30": sales_30,
+            "month_units": month_units, "month_amount": month_amount, "sellable": sellable,
+            "coverage_days": coverage, "sell_through": sell_through, "unit_cost": cost,
+            "current_price": price, "margin": margin, "health": health,
+            "inventory_snapshot_at": max((row["inventory_snapshot_at"] for row in group), default=""),
+        })
+    goods_rows.sort(key=lambda row: ({"risk": 0, "potential": 1, "slow": 2, "normal": 3}.get(row["health"], 9), row["sales_14"] * -1))
+    lifecycle_counts = Counter(row["lifecycle"] for row in goods_rows)
+    return {
+        "rows": goods_rows,
+        "sku_count": len(goods_rows),
+        "sales_amount": total_amount,
+        "cost_amount": total_cost,
+        "gross_margin": (total_amount - total_cost) / total_amount if total_amount and cost_complete else None,
+        "gross_margin_basis": "actual_amount" if exact_amount_rows else "current_price_estimate",
+        "sell_through": total_sales_14 / (total_sales_14 + total_sellable) if total_sales_14 + total_sellable else 0,
+        "sales_14": total_sales_14,
+        "sellable": total_sellable,
+        "risk_count": sum(row["health"] == "risk" for row in goods_rows),
+        "slow_count": sum(row["health"] == "slow" for row in goods_rows),
+        "potential_count": sum(row["health"] == "potential" for row in goods_rows),
+        "missing_cost_count": sum(row["unit_cost"] is None for row in goods_rows),
+        "lifecycle_counts": dict(lifecycle_counts),
+        "snapshot_at": max((row["inventory_snapshot_at"] for row in goods_rows), default=""),
+    }
+
+
+def list_price_plans(db_path: str | Path, *, store_id: int | None = None, limit: int = 12) -> list[dict]:
+    with get_connection(db_path) as connection:
+        if store_id is None:
+            rows = connection.execute("SELECT price_plans.*, stores.store_name FROM price_plans JOIN stores ON stores.id = price_plans.store_id ORDER BY price_plans.id DESC LIMIT ?", (limit,)).fetchall()
+        else:
+            rows = connection.execute("SELECT price_plans.*, stores.store_name FROM price_plans JOIN stores ON stores.id = price_plans.store_id WHERE store_id = ? ORDER BY price_plans.id DESC LIMIT ?", (int(store_id), limit)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_price_plan(db_path: str | Path, plan_id: int) -> dict | None:
+    with get_connection(db_path) as connection:
+        row = connection.execute("SELECT price_plans.*, stores.platform_name, stores.store_name, stores.brand_name FROM price_plans JOIN stores ON stores.id = price_plans.store_id WHERE price_plans.id = ?", (plan_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_price_items(db_path: str | Path, plan_id: int, *, include_internal: bool = True) -> list[dict]:
+    with get_connection(db_path) as connection:
+        rows = connection.execute("SELECT * FROM price_items WHERE price_plan_id = ? ORDER BY style_code, outer_sku_id, color_name, size_name", (plan_id,)).fetchall()
+    result = [dict(row) for row in rows]
+    if not include_internal:
+        for row in result:
+            for key in ("unit_cost", "current_margin", "proposed_margin", "floor_price"):
+                row.pop(key, None)
+    return result
+
+
+def generate_price_plan(db_path: str | Path, *, store_id: int, user_id: int, mode: str = "system", rule_payload: dict | None = None) -> int:
+    payload = dict(rule_payload or {})
+    target_margin = float(payload.get("target_margin") or 0.55)
+    if target_margin > 1:
+        target_margin /= 100
+    discount_rate = float(payload.get("discount_rate") or 0) / 100
+    if not 0 <= target_margin < 0.95:
+        raise ValueError("目标毛利率需在 0%–95% 之间。")
+    if not 0 <= discount_rate <= 0.9:
+        raise ValueError("手工调价幅度需在 0%–90% 之间。")
+    today = local_today()
+    with get_connection(db_path) as connection:
+        store = connection.execute("SELECT * FROM stores WHERE id = ?", (store_id,)).fetchone()
+        if not store:
+            raise ValueError("店铺不存在。")
+        batch_no = f"{store['store_code']}-PRICE-{today.strftime('%Y%m%d')}-{connection.execute('SELECT COUNT(*) AS c FROM price_plans WHERE store_id = ? AND date(created_at) = ?', (store_id, today.isoformat())).fetchone()['c'] + 1:02d}"
+        cursor = connection.execute("INSERT INTO price_plans(store_id, batch_no, mode, status, rule_label, rule_payload, created_by, created_at) VALUES (?, ?, ?, 'draft', ?, ?, ?, ?)", (store_id, batch_no, mode, "系统建议" if mode == "system" else "手工规则", json.dumps(payload, ensure_ascii=False), user_id, utc_now()))
+        plan_id = int(cursor.lastrowid)
+        start_14 = (today - timedelta(days=13)).isoformat()
+        sku_groups = defaultdict(list)
+        for sku_row in connection.execute("SELECT * FROM skus WHERE store_id = ? AND lifecycle = 'active' ORDER BY style_code, color_name, size_name", (store_id,)).fetchall():
+            sku_groups[(sku_row["style_code"], sku_row["outer_sku_id"] or sku_row["color_name"])].append(dict(sku_row))
+        for _, group in sku_groups.items():
+            sku = group[0]
+            sales_14 = 0
+            sellable = 0
+            coverage_rows = []
+            for size_sku in group:
+                sales_14 += int(connection.execute("SELECT COALESCE(SUM(net_units), 0) AS c FROM sales_daily WHERE sku_id = ? AND sale_date >= ?", (size_sku["id"], start_14)).fetchone()["c"])
+                inv = connection.execute("SELECT * FROM inventory_current WHERE sku_id = ?", (size_sku["id"],)).fetchone()
+                available = max(0, int(inv["on_hand"] if inv else 0) - int(inv["locked"] if inv else 0) - int(inv["defective"] if inv else 0))
+                sellable += available
+                coverage_rows.append((size_sku, available))
+            if sales_14 <= 0 and sellable <= 0:
+                continue
+            coverage = sellable / (sales_14 / 14) if sales_14 else None
+            costs = [_latest_cost(connection, size_sku["id"], today.isoformat()) for size_sku in group]
+            cost = sum(costs) / len(costs) if costs and all(value is not None for value in costs) else None
+            current_price = float(sku["current_price"] or 0)
+            floor_price = cost / (1 - target_margin) if cost is not None else 0
+            decision, reason = "hold", "销量与库存均处于日常区间，暂不调整"
+            proposed = current_price
+            if not current_price or cost is None:
+                decision, reason = "excluded", "价格或成本缺失，不进入自动建议"
+            elif mode == "manual":
+                proposed = max(floor_price, current_price * (1 - discount_rate))
+                decision, reason = "manual", f"手工规则：当前价下调 {discount_rate * 100:g}%；不低于目标毛利率保护价"
+            elif sales_14 <= 2 and (coverage is None or coverage > 60):
+                proposed = max(floor_price, current_price * 0.9)
+                decision, reason = "markdown", "近14天低动销且库存支撑较高，建议清理库存"
+            elif current_price and cost is not None and (current_price - cost) / current_price < target_margin:
+                proposed = max(floor_price, current_price * 1.08)
+                decision, reason = "margin_protect", "当前毛利率低于目标，建议先保护毛利"
+            elif sales_14 >= 10 and coverage is not None and coverage <= 14:
+                decision, reason = "hold", "高动销且库存偏紧，暂不降价，优先补货"
+            proposed = round(proposed / 10) * 10 if proposed else 0
+            proposed = max(proposed, round(floor_price / 10) * 10) if floor_price else proposed
+            current_margin = (current_price - cost) / current_price if current_price and cost is not None else None
+            proposed_margin = (proposed - cost) / proposed if proposed and cost is not None else None
+            connection.execute("INSERT INTO price_items(price_plan_id, sku_id, style_code, outer_sku_id, style_name, color_name, size_name, current_price, proposed_price, confirmed_price, floor_price, unit_cost, current_margin, proposed_margin, sales_14, sellable, coverage_days, decision, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (plan_id, sku["id"], sku["style_code"], sku.get("outer_sku_id", ""), sku["style_name"], sku["color_name"], "整货号", current_price, proposed, proposed, floor_price, cost, current_margin, proposed_margin, sales_14, sellable, coverage, decision, reason))
+        _audit(connection, user_id, "price_plan_generated", "price_plan", plan_id, mode)
+    return plan_id
+
+
+def save_price_plan(db_path: str | Path, plan_id: int, prices: dict[int, float], include_flags: dict[int, int], user_id: int, *, confirm: bool = False) -> None:
+    with get_connection(db_path) as connection:
+        plan = connection.execute("SELECT * FROM price_plans WHERE id = ?", (plan_id,)).fetchone()
+        if not plan or plan["status"] not in {"draft", "confirmed"}:
+            raise ValueError("当前调价批次不能继续修改。")
+        for row in connection.execute("SELECT id, proposed_price FROM price_items WHERE price_plan_id = ?", (plan_id,)).fetchall():
+            value = max(0, float(prices.get(int(row["id"]), row["proposed_price"])))
+            connection.execute("UPDATE price_items SET confirmed_price = ?, include_flag = ? WHERE id = ?", (value, int(include_flags.get(int(row["id"]), 1)), row["id"]))
+        if confirm:
+            connection.execute("UPDATE price_plans SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? WHERE id = ?", (user_id, utc_now(), plan_id))
+        _audit(connection, user_id, "price_plan_saved" if not confirm else "price_plan_confirmed", "price_plan", plan_id, "商品部调价确认")
+
+
+def mark_price_plan_exported(db_path: str | Path, plan_id: int, user_id: int) -> None:
+    with get_connection(db_path) as connection:
+        connection.execute("UPDATE price_plans SET status = 'exported', exported_at = ? WHERE id = ?", (utc_now(), plan_id))
+        _audit(connection, user_id, "price_plan_exported", "price_plan", plan_id, "导出运营执行明细")
+
+
 def update_settings(db_path: str | Path, payload: dict, user_id: int) -> None:
     weekdays = sorted({int(day) for day in payload.get("schedule_weekdays", []) if int(day) in range(1, 8)})
     if not weekdays:
@@ -1580,9 +2208,24 @@ def generate_plan(
             "size_share", "daily_demand", "sellable", "inbound",
             "inbound_date", "projected_14", "coverage_days", "stockout_day", "risk_level", "broken_core", "pack_size",
             "moq", "suggested_qty", "confirmed_qty",
+            "price_snapshot", "unit_cost_snapshot", "gross_margin_snapshot", "margin_gate_status",
         ]
         placeholders = ",".join("?" for _ in columns)
         for item in items:
+            sku_row = next((sku for sku in skus if int(sku["id"]) == int(item["sku_id"])), None)
+            price = float((sku_row or {}).get("current_price") or 0)
+            unit_cost = _latest_cost(connection, int(item["sku_id"]), as_of.isoformat())
+            margin = (price - unit_cost) / price if price and unit_cost is not None else None
+            gate = "ok"
+            if generation_type == "main" and unit_cost is None:
+                gate = "cost_missing"
+                item["suggested_qty"] = 0
+                item["confirmed_qty"] = 0
+            elif generation_type == "main" and margin < 0.45:
+                gate = "below_target"
+                item["suggested_qty"] = 0
+                item["confirmed_qty"] = 0
+            item.update({"price_snapshot": price, "unit_cost_snapshot": unit_cost, "gross_margin_snapshot": margin, "margin_gate_status": gate})
             connection.execute(
                 f"INSERT INTO plan_items(plan_id, {','.join(columns)}) VALUES (?, {placeholders})",
                 [plan_id, *[item.get(column) for column in columns]],
@@ -1779,6 +2422,22 @@ def submit_to_followup(db_path: str | Path, plan_id: int, user_id: int) -> None:
         )
 
 
+def _business_days_late(expected: str, actual: str) -> int:
+    if not expected or not actual:
+        return 0
+    try:
+        current = date.fromisoformat(expected) + timedelta(days=1)
+        actual_date = date.fromisoformat(actual)
+    except ValueError:
+        return 0
+    days = 0
+    while current <= actual_date:
+        if current.weekday() < 5:
+            days += 1
+        current += timedelta(days=1)
+    return days
+
+
 def save_followup_response(db_path: str | Path, plan_id: int, payloads: dict[int, dict], user_id: int, *, complete: bool = False) -> None:
     with get_connection(db_path) as connection:
         plan = connection.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
@@ -1794,7 +2453,8 @@ def save_followup_response(db_path: str | Path, plan_id: int, payloads: dict[int
             connection.execute(
                 """
                 UPDATE plan_items SET followup_qty = ?, expected_order_date = ?, expected_arrival_date = ?,
-                    followup_status = ?, followup_note = ? WHERE id = ?
+                    followup_status = ?, followup_note = ?, actual_arrival_date = ?,
+                    actual_arrived_qty = ?, arrival_variance_note = ? WHERE id = ?
                 """,
                 (
                     quantity,
@@ -1802,9 +2462,38 @@ def save_followup_response(db_path: str | Path, plan_id: int, payloads: dict[int
                     str(item.get("expected_arrival_date") or "").strip(),
                     status,
                     str(item.get("followup_note") or "").strip(),
+                    str(item.get("actual_arrival_date") or "").strip(),
+                    max(0, int(item.get("actual_arrived_qty") or 0)),
+                    str(item.get("arrival_variance_note") or "").strip(),
                     row["id"],
                 ),
             )
+        receipt_rows = [dict(row) for row in connection.execute("SELECT * FROM plan_items WHERE plan_id = ?", (plan_id,)).fetchall()]
+        grouped = defaultdict(list)
+        for row in receipt_rows:
+            grouped[(row["style_code"], row["outer_sku_id"] or row["color_name"])].append(row)
+        major_count = 0
+        for goods_rows in grouped.values():
+            receipt_active = any(row["actual_arrival_date"] or row["actual_arrived_qty"] > 0 or row["followup_status"] == "arrived" for row in goods_rows)
+            if not receipt_active:
+                continue
+            planned_total = sum(max(0, int(row["confirmed_qty"] or 0)) for row in goods_rows)
+            actual_total = sum(max(0, int(row["actual_arrived_qty"] or 0)) for row in goods_rows)
+            group_major = planned_total > 0 and actual_total / planned_total < 0.9
+            for row in goods_rows:
+                planned = max(0, int(row["confirmed_qty"] or 0))
+                actual = max(0, int(row["actual_arrived_qty"] or 0))
+                shortage = max(0, planned - actual)
+                size_major = planned > 0 and (actual == 0 or (actual / planned < 0.7 and shortage >= 5))
+                late_major = _business_days_late(row["expected_arrival_date"], row["actual_arrival_date"]) > 2
+                if group_major or size_major or late_major:
+                    level = "major"
+                    major_count += 1
+                elif planned != actual or (row["expected_arrival_date"] and row["actual_arrival_date"] != row["expected_arrival_date"]):
+                    level = "general"
+                else:
+                    level = "none"
+                connection.execute("UPDATE plan_items SET arrival_variance_level = ? WHERE id = ?", (level, row["id"]))
         next_status = "completed" if complete else "followup_processing"
         connection.execute(
             """
@@ -1814,11 +2503,13 @@ def save_followup_response(db_path: str | Path, plan_id: int, payloads: dict[int
         )
         _audit(connection, user_id, "followup_completed" if complete else "followup_saved", "plan", plan_id, "跟单部回填")
         if complete:
+            title = "补货到货存在重大差异" if major_count else "补货任务已完成"
+            body = f"{plan['plan_no']} 有 {major_count} 个尺码命中重大差异，请商品部重点查看。" if major_count else f"{plan['plan_no']} 已完成跟单确认，可查看最终数量和交期。"
             _notify_roles(
                 connection,
                 ("merchandise", "manager", "admin"),
-                "补货任务已完成",
-                f"{plan['plan_no']} 已完成跟单确认，可查看最终数量和交期。",
+                title,
+                body,
                 f"/plans/{plan_id}",
                 store_id=plan["store_id"],
             )

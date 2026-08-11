@@ -15,6 +15,9 @@ from urllib.request import Request, urlopen
 
 PRODUCTION_GATEWAY = "https://vop.vipapis.com"
 SANDBOX_GATEWAY = "http://sandbox.vipapis.com"
+OAUTH_AUTHORIZE_URL = "https://auth.vip.com/oauth2/authorize"
+OAUTH_TOKEN_URL = "https://auth.vip.com/oauth2/token"
+OAUTH_TOKEN_INFO_URL = "https://auth.vip.com/oauth2/token_info"
 STORE_SERVICE = "vipapis.marketplace.store.StoreInfoService"
 PRODUCT_SERVICE = "vipapis.marketplace.product.ProductService"
 ORDER_SERVICE = "vipapis.marketplace.delivery.SovDeliveryService"
@@ -45,6 +48,106 @@ class VipshopConfig:
     @property
     def complete(self) -> bool:
         return bool(self.app_key and self.app_secret and self.access_token)
+
+
+def build_authorization_url(app_key: str, redirect_uri: str, state: str) -> str:
+    app_key = str(app_key or "").strip()
+    redirect_uri = str(redirect_uri or "").strip()
+    state = str(state or "").strip()
+    if not app_key or not redirect_uri or not state:
+        raise ValueError("生成唯品授权地址需要 AppKey、回调地址和 state。")
+    params = {
+        'client_id': app_key,
+        'response_type': 'code',
+        'redirect_uri': redirect_uri,
+        'state': state,
+    }
+    return f"{OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
+
+
+def _oauth_post(url: str, payload: dict[str, str], *, timeout: int = 25) -> dict:
+    request = Request(
+        url,
+        data=urlencode(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            "Accept": "application/json",
+            "User-Agent": "MerchandiseMonitor/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            status = response.status
+    except HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        status = exc.code
+    except URLError as exc:
+        raise VipshopAPIError("oauth-network-error", f"无法连接唯品授权服务器：{exc.reason}") from exc
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise VipshopAPIError(
+            "oauth-invalid-response", "唯品授权服务器没有返回有效 JSON。", http_status=status
+        ) from exc
+    error = result.get("error") or result.get("code")
+    if error and str(error).lower() not in {"0", "200", "success"}:
+        message = result.get("error_description") or result.get("msg") or result.get("message") or "OAuth 请求失败"
+        raise VipshopAPIError(str(error), str(message), http_status=status, payload=result)
+    if status >= 400:
+        raise VipshopAPIError(
+            "oauth-http-error", f"唯品授权服务器返回 HTTP {status}", http_status=status, payload=result
+        )
+    return result
+
+
+def inspect_access_token(access_token: str, *, timeout: int = 20) -> dict:
+    token = str(access_token or "").strip()
+    if not token:
+        raise ValueError("缺少待校验的 AccessToken。")
+    result = _oauth_post(OAUTH_TOKEN_INFO_URL, {"access_token": token}, timeout=timeout)
+    returned_token = str(result.get("access_token") or "").strip()
+    if not returned_token:
+        message = str(result.get("msg") or result.get("message") or "TokenInfo 未返回 AccessToken。")
+        raise VipshopAPIError("oauth-token-invalid", message, payload=result)
+    if not secrets_compare(token, returned_token):
+        raise VipshopAPIError("oauth-token-mismatch", "唯品返回的 Token 校验结果不一致。", payload=result)
+    return result
+
+
+def secrets_compare(left: str, right: str) -> bool:
+    return hmac.compare_digest(str(left).encode("utf-8"), str(right).encode("utf-8"))
+
+
+def exchange_authorization_code(
+    *,
+    app_key: str,
+    app_secret: str,
+    code: str,
+    redirect_uri: str,
+    request_client_ip: str,
+    timeout: int = 25,
+) -> dict:
+    values = {
+        "client_id": str(app_key or "").strip(),
+        "client_secret": str(app_secret or "").strip(),
+        "grant_type": "authorization_code",
+        "redirect_uri": str(redirect_uri or "").strip(),
+        "request_client_ip": str(request_client_ip or "").strip(),
+        "code": str(code or "").strip(),
+    }
+    if not all(values.values()):
+        raise ValueError("兑换唯品 AccessToken 的参数不完整。")
+    result = _oauth_post(OAUTH_TOKEN_URL, values, timeout=timeout)
+    access_token = str(result.get("access_token") or "").strip()
+    if not access_token:
+        raise VipshopAPIError("oauth-token-missing", "唯品授权成功响应中缺少 AccessToken。", payload=result)
+    token_info = inspect_access_token(access_token, timeout=timeout)
+    normalized = dict(result)
+    normalized["token_info"] = token_info
+    normalized["open_id"] = str(result.get("open_id") or token_info.get("open_id") or "").strip()
+    return normalized
 
 
 def canonical_json(payload: dict | None) -> str:

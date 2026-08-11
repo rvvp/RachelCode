@@ -27,6 +27,10 @@ async function setDateInput(input, value) {
   }, value);
 }
 
+async function inputDisplayValue(input) {
+  return String((await input.inputValue().catch(() => "")) || (await input.getAttribute("placeholder")) || "").trim();
+}
+
 function newestFinishedReport(directories, range, startedAt) {
   const candidates = [];
   for (const directory of directories) {
@@ -78,17 +82,54 @@ async function exportProductDetail(context, page, command) {
   await page.bringToFront();
   await page.locator("button:visible").filter({ hasText: exactText("查询") }).first().waitFor({ timeout: 60000 });
 
-  const brandInput = page.locator('input[placeholder="请选择品牌"]:visible').first();
-  const selectedBrand = await brandInput.inputValue().catch(() => "");
-  if (!selectedBrand || (brand && !selectedBrand.includes(brand))) {
-    throw new Error(`唯品报表页未锁定目标品牌，当前为“${selectedBrand || "未选择"}”。`);
+  const reminderDialog = page.locator(".el-dialog__wrapper:visible").filter({ hasText: "重要提醒" }).first();
+  if (await reminderDialog.count()) {
+    const acknowledge = reminderDialog.locator("button").filter({ hasText: exactText("已知悉") }).first();
+    if (await acknowledge.count()) await acknowledge.click({ force: true });
   }
 
-  const dateInputs = page.locator("input.el-range-input:visible");
+  const dateType = page.locator(".pd-date-picker__wrap .date-type .el-dropdown-link:visible").first();
+  if (await dateType.count()) {
+    const currentDateType = (await dateType.innerText()).trim();
+    if (currentDateType !== "自定义") {
+      const customDateType = page.locator(".pd-date-picker__wrap .date-type .el-dropdown-menu__item")
+        .filter({ hasText: exactText("自定义") }).first();
+      await customDateType.evaluate((element) => element.click());
+      await page.waitForFunction(
+        () => document.querySelector(".pd-date-picker__wrap .date-type .el-dropdown-link")?.textContent.trim() === "自定义",
+        null,
+        { timeout: 10000 },
+      );
+    }
+  }
+
+  const dateInputs = page.locator(".pd-date-picker__wrap input.el-range-input:visible");
   if ((await dateInputs.count()) < 2) throw new Error("唯品报表页缺少统计日期输入框。");
   await setDateInput(dateInputs.nth(0), startDate);
   await setDateInput(dateInputs.nth(1), endDate);
   await page.keyboard.press("Escape").catch(() => {});
+
+  const brandBlock = page.locator(".app-view-block:visible").filter({
+    has: page.locator(".app-view-label").filter({ hasText: exactText("品牌") }),
+  }).first();
+  let brandInput = brandBlock.locator("input.el-input__inner").first();
+  if (!(await brandInput.count())) brandInput = page.locator('input[placeholder*="品牌"]:visible').first();
+  if (!(await brandInput.count())) throw new Error("唯品报表页缺少品牌选择控件。");
+  let selectedBrand = await inputDisplayValue(brandInput);
+  if (!selectedBrand.includes(brand)) {
+    const brandOptions = brandBlock.locator(".el-select-dropdown__item").filter({ hasText: brand });
+    const optionTexts = (await brandOptions.allTextContents()).map((value) => value.trim()).filter((value) => value.includes(brand));
+    if (optionTexts.length !== 1) {
+      throw new Error(`唯品品牌选项无法唯一匹配“${brand}”，当前匹配 ${optionTexts.length} 项。`);
+    }
+    await brandOptions.filter({ hasText: exactText(optionTexts[0]) }).first().evaluate((element) => element.click());
+    await page.waitForTimeout(500);
+    selectedBrand = await inputDisplayValue(brandInput);
+  }
+  if (!selectedBrand.includes(brand)) {
+    throw new Error(`唯品报表页未锁定目标品牌，当前为“${selectedBrand || "未选择"}”。`);
+  }
+
   await checkedLabel(page, "分天查看");
   await checkedLabel(page, "跨天不去重");
   await checkedLabel(page, "货号");
@@ -107,7 +148,10 @@ async function exportProductDetail(context, page, command) {
   const dialog = page.locator(".el-dialog__wrapper:visible").filter({ hasText: "下载维度" }).first();
   await dialog.waitFor({ timeout: 15000 });
   await dialog.locator("label").filter({ hasText: exactText("条码粒度") }).first().click();
-  const modalBrand = (await dialog.locator(".el-select__tags-text").allTextContents()).join(" ");
+  const modalBrand = [
+    ...(await dialog.locator(".el-select__tags-text").allTextContents()),
+    await dialog.innerText(),
+  ].join(" ");
   if (brand && !modalBrand.includes(brand)) {
     throw new Error(`唯品下载窗口品牌不匹配，当前为“${modalBrand || "未选择"}”。`);
   }
