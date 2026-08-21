@@ -56,6 +56,12 @@ class PlanningApplication:
                 return self.html_response(start_response, self.render_rules(user, query))
             if path == "/rules/category" and method == "POST":
                 return self.handle_category_rule(environ, start_response, user)
+            if path.startswith("/rules/category/") and path.endswith("/delete") and method == "POST":
+                return self.handle_category_rule_delete(
+                    start_response,
+                    user,
+                    self.path_id(path, "/rules/category/", "/delete"),
+                )
             if path == "/rules/category-cost" and method == "POST":
                 return self.handle_category_cost_rule(environ, start_response, user)
             if path.startswith("/rules/category-cost/") and path.endswith("/delete") and method == "POST":
@@ -66,6 +72,12 @@ class PlanningApplication:
                 )
             if path == "/rules/supplier" and method == "POST":
                 return self.handle_supplier_rule(environ, start_response, user)
+            if path.startswith("/rules/supplier/") and path.endswith("/delete") and method == "POST":
+                return self.handle_supplier_rule_delete(
+                    start_response,
+                    user,
+                    self.path_id(path, "/rules/supplier/", "/delete"),
+                )
             if path == "/stats" and method == "GET":
                 return self.html_response(start_response, self.render_stats(user, query))
             if path == "/settings" and method == "GET":
@@ -202,16 +214,29 @@ class PlanningApplication:
         return self.redirect(start_response, "/workbench?error=" + self.q(updated.get("error_message") or "回传失败，请重新同步后处理。"))
 
     def handle_category_rule(self, environ, start_response, user):
-        if user.get("role") != "admin":
-            raise PermissionError("只有企划管理员可以修改规则。")
+        self.require_rule_manager(user)
         form = self.parse_form(environ)
-        db.save_category_rule(self.db_path, form.get("season_year", ""), "连衣裙", float(form.get("multiplier") or 0), form.get("note", ""))
-        return self.redirect(start_response, "/rules?notice=" + self.q("连衣裙固定倍率已保存。"))
+        rule_id = self.optional_id(form.get("rule_id"))
+        db.save_category_rule(
+            self.db_path,
+            form.get("season_year", ""),
+            "连衣裙",
+            float(form.get("multiplier") or 0),
+            form.get("note", ""),
+            rule_id,
+        )
+        message = "连衣裙固定倍率已修改。" if rule_id else "连衣裙固定倍率已新增。"
+        return self.redirect(start_response, "/rules?notice=" + self.q(message) + "#dress-rules")
+
+    def handle_category_rule_delete(self, start_response, user, rule_id: int):
+        self.require_rule_manager(user)
+        db.delete_category_rule(self.db_path, rule_id)
+        return self.redirect(start_response, "/rules?notice=" + self.q("连衣裙固定倍率已删除。") + "#dress-rules")
 
     def handle_category_cost_rule(self, environ, start_response, user):
-        if user.get("role") != "admin":
-            raise PermissionError("只有企划管理员可以修改规则。")
+        self.require_rule_manager(user)
         form = self.parse_form(environ)
+        rule_id = self.optional_id(form.get("rule_id"))
         db.save_category_cost_rule(
             self.db_path,
             form.get("season_year", ""),
@@ -219,21 +244,47 @@ class PlanningApplication:
             form.get("upper_cost", ""),
             float(form.get("multiplier") or 0),
             form.get("note", ""),
+            rule_id,
         )
-        return self.redirect(start_response, "/rules?notice=" + self.q("其他品类成本区间倍率已保存。"))
+        message = "其他品类成本区间倍率已修改。" if rule_id else "其他品类成本区间倍率已新增。"
+        return self.redirect(start_response, "/rules?notice=" + self.q(message) + "#cost-rules")
 
     def handle_category_cost_rule_delete(self, start_response, user, rule_id: int):
-        if user.get("role") != "admin":
-            raise PermissionError("只有企划管理员可以删除规则。")
+        self.require_rule_manager(user)
         db.delete_category_cost_rule(self.db_path, rule_id)
-        return self.redirect(start_response, "/rules?notice=" + self.q("成本区间规则已删除。"))
+        return self.redirect(start_response, "/rules?notice=" + self.q("成本区间规则已删除。") + "#cost-rules")
 
     def handle_supplier_rule(self, environ, start_response, user):
-        if user.get("role") != "admin":
-            raise PermissionError("只有企划管理员可以修改规则。")
+        self.require_rule_manager(user)
         form = self.parse_form(environ)
-        db.save_supplier_coefficient(self.db_path, form.get("season_year", ""), form.get("supplier", ""), float(form.get("coefficient") or 0), form.get("note", ""))
-        return self.redirect(start_response, "/rules?notice=" + self.q("供应商浮动系数已保存。"))
+        rule_id = self.optional_id(form.get("rule_id"))
+        db.save_supplier_coefficient(
+            self.db_path,
+            form.get("season_year", ""),
+            form.get("supplier", ""),
+            float(form.get("coefficient") or 0),
+            form.get("note", ""),
+            rule_id,
+        )
+        message = "供应商浮动系数已修改。" if rule_id else "供应商浮动系数已新增。"
+        return self.redirect(start_response, "/rules?notice=" + self.q(message) + "#supplier-rules")
+
+    def handle_supplier_rule_delete(self, start_response, user, rule_id: int):
+        self.require_rule_manager(user)
+        db.delete_supplier_coefficient(self.db_path, rule_id)
+        return self.redirect(start_response, "/rules?notice=" + self.q("供应商浮动系数已删除。") + "#supplier-rules")
+
+    def require_rule_manager(self, user: dict) -> None:
+        if user.get("role") != "admin":
+            raise PermissionError("只有企划管理员可以维护定价规则。")
+
+    def optional_id(self, value) -> int | None:
+        if value in (None, ""):
+            return None
+        text = str(value).strip()
+        if not text.isdigit():
+            raise ValueError("规则编号不正确。")
+        return int(text)
 
     def render_login(self, error: str = "") -> str:
         content = f"""
@@ -324,20 +375,104 @@ class PlanningApplication:
         dress_rules = db.list_category_rules(self.db_path)
         cost_rules = db.list_category_cost_rules(self.db_path)
         suppliers = db.list_supplier_coefficients(self.db_path)
-        disabled = "disabled" if user.get("role") != "admin" else ""
-        dress_rows = ''.join(f"<tr><td>{html.escape(item['season_year'] or '默认')}</td><td>{item['multiplier']:g}</td><td>{html.escape(item['note'])}</td></tr>" for item in dress_rules)
+        can_manage = user.get("role") == "admin"
+
+        def selected(items: list[dict], query_key: str) -> dict | None:
+            try:
+                selected_id = int(query.get(query_key) or 0)
+            except (TypeError, ValueError):
+                return None
+            return next((item for item in items if int(item["id"]) == selected_id), None)
+
+        def field(item: dict | None, key: str) -> str:
+            value = item.get(key) if item else ""
+            if value is None:
+                return ""
+            if isinstance(value, float):
+                value = f"{value:g}"
+            return html.escape(str(value), quote=True)
+
+        dress_edit = selected(dress_rules, "edit_dress") if can_manage else None
+        cost_edit = selected(cost_rules, "edit_cost") if can_manage else None
+        supplier_edit = selected(suppliers, "edit_supplier") if can_manage else None
+
+        dress_rows = "".join(
+            f"<tr><td>{html.escape(item['season_year'] or '默认')}</td><td>{item['multiplier']:g}</td><td>{html.escape(item['note'])}</td>"
+            + (
+                f"<td><div class='rule-actions'><a class='button compact-button' href='/rules?edit_dress={item['id']}#dress-rules'>编辑</a><form method='post' action='/rules/category/{item['id']}/delete' onsubmit=\"return confirm('确定删除这条连衣裙倍率规则吗？');\"><button class='danger-button' type='submit'>删除</button></form></div></td>"
+                if can_manage
+                else ""
+            )
+            + "</tr>"
+            for item in dress_rules
+        )
         cost_rows = ''.join(
-            f"<tr><td>{html.escape(item['season_year'] or '默认')}</td><td>{html.escape(self.cost_range_label(item.get('lower_cost'), item.get('upper_cost')))}</td><td>{item['multiplier']:g}</td><td>{html.escape(item['note'])}</td><td><form method='post' action='/rules/category-cost/{item['id']}/delete'><button class='danger-button' {disabled}>删除</button></form></td></tr>"
+            f"<tr><td>{html.escape(item['season_year'] or '默认')}</td><td>{html.escape(self.cost_range_label(item.get('lower_cost'), item.get('upper_cost')))}</td><td>{item['multiplier']:g}</td><td>{html.escape(item['note'])}</td>"
+            + (
+                f"<td><div class='rule-actions'><a class='button compact-button' href='/rules?edit_cost={item['id']}#cost-rules'>编辑</a><form method='post' action='/rules/category-cost/{item['id']}/delete' onsubmit=\"return confirm('确定删除这条成本区间规则吗？');\"><button class='danger-button' type='submit'>删除</button></form></div></td>"
+                if can_manage
+                else ""
+            )
+            + "</tr>"
             for item in cost_rules
         )
-        supplier_rows = ''.join(f"<tr><td>{html.escape(item['season_year'] or '默认')}</td><td>{html.escape(item['supplier'])}</td><td>{item['coefficient']:g}</td><td>{html.escape(item['note'])}</td></tr>" for item in suppliers)
+        supplier_rows = "".join(
+            f"<tr><td>{html.escape(item['season_year'] or '默认')}</td><td>{html.escape(item['supplier'])}</td><td>{item['coefficient']:g}</td><td>{html.escape(item['note'])}</td>"
+            + (
+                f"<td><div class='rule-actions'><a class='button compact-button' href='/rules?edit_supplier={item['id']}#supplier-rules'>编辑</a><form method='post' action='/rules/supplier/{item['id']}/delete' onsubmit=\"return confirm('确定删除这条供应商系数规则吗？');\"><button class='danger-button' type='submit'>删除</button></form></div></td>"
+                if can_manage
+                else ""
+            )
+            + "</tr>"
+            for item in suppliers
+        )
+
+        dress_form = ""
+        cost_form = ""
+        supplier_form = ""
+        if can_manage:
+            dress_form = f"""
+            <form class='rule-form dress-rule-form' method='post' action='/rules/category'>
+              <input type='hidden' name='rule_id' value='{field(dress_edit, 'id')}'>
+              <label><span>适用季节</span><input name='season_year' value='{field(dress_edit, 'season_year')}' placeholder='留空为默认'></label>
+              <label><span>固定倍率</span><input name='multiplier' value='{field(dress_edit, 'multiplier')}' type='number' min='0.01' step='0.01' placeholder='例如 4.20' required></label>
+              <label><span>备注</span><input name='note' value='{field(dress_edit, 'note')}' placeholder='选填'></label>
+              <div class='form-actions'><button class='primary' type='submit'>{'保存修改' if dress_edit else '新增规则'}</button>{"<a class='button' href='/rules#dress-rules'>取消</a>" if dress_edit else ''}</div>
+            </form>"""
+            cost_form = f"""
+            <form class='rule-form cost-rule-form' method='post' action='/rules/category-cost'>
+              <input type='hidden' name='rule_id' value='{field(cost_edit, 'id')}'>
+              <label><span>适用季节</span><input name='season_year' value='{field(cost_edit, 'season_year')}' placeholder='留空为默认'></label>
+              <label><span>成本下限（包含）</span><input name='lower_cost' value='{field(cost_edit, 'lower_cost')}' type='number' min='0' step='0.01' placeholder='不填表示无下限'></label>
+              <label><span>成本上限（不包含）</span><input name='upper_cost' value='{field(cost_edit, 'upper_cost')}' type='number' min='0' step='0.01' placeholder='不填表示无上限'></label>
+              <label><span>倍率</span><input name='multiplier' value='{field(cost_edit, 'multiplier')}' type='number' min='0.01' step='0.01' placeholder='例如 3.90' required></label>
+              <label><span>备注</span><input name='note' value='{field(cost_edit, 'note')}' placeholder='选填'></label>
+              <div class='form-actions'><button class='primary' type='submit'>{'保存修改' if cost_edit else '新增区间'}</button>{"<a class='button' href='/rules#cost-rules'>取消</a>" if cost_edit else ''}</div>
+            </form>"""
+            supplier_form = f"""
+            <form class='rule-form supplier-rule-form' method='post' action='/rules/supplier'>
+              <input type='hidden' name='rule_id' value='{field(supplier_edit, 'id')}'>
+              <label><span>适用季节</span><input name='season_year' value='{field(supplier_edit, 'season_year')}' placeholder='留空为默认'></label>
+              <label><span>供应商</span><input name='supplier' value='{field(supplier_edit, 'supplier')}' placeholder='供应商名称' required></label>
+              <label><span>浮动系数</span><input name='coefficient' value='{field(supplier_edit, 'coefficient')}' type='number' min='0.01' step='0.01' placeholder='例如 1.00' required></label>
+              <label><span>备注</span><input name='note' value='{field(supplier_edit, 'note')}' placeholder='选填'></label>
+              <div class='form-actions'><button class='primary' type='submit'>{'保存修改' if supplier_edit else '新增规则'}</button>{"<a class='button' href='/rules#supplier-rules'>取消</a>" if supplier_edit else ''}</div>
+            </form>"""
+
+        access_text = (
+            "当前账号具有规则维护权限，可以新增、编辑和删除全部定价规则。"
+            if can_manage
+            else "当前账号为只读权限，可以查看规则但不能新增、编辑或删除。"
+        )
+        access_class = "access-write" if can_manage else "access-readonly"
         content = f"""
         <section class='page-heading'><div><div class='eyebrow'>RULES & ASSUMPTIONS</div><h1>定价规则</h1><p>规则保存后只影响新生成的建议价，已确认记录保留当时的倍率和系数快照。</p></div></section>
         {self.alert(query.get('notice', ''), 'success') if query.get('notice') else ''}
+        <section class='rule-access {access_class}'><div><strong>{'规则维护账号' if can_manage else '规则只读账号'}</strong><span>{access_text}</span></div><small>维护权限：企划管理员</small></section>
         <section class='rule-logic'><div><span>01</span><strong>连衣裙</strong><p>不区分成本金额，直接匹配固定倍率。</p></div><div><span>02</span><strong>其他品类</strong><p>按照含税采购成本落入的金额区间匹配倍率。</p></div><div><span>03</span><strong>供应商系数</strong><p>最后再乘供应商浮动系数，未配置时为 1.00。</p></div></section>
-        <section class='panel'><div class='panel-head'><div><div class='eyebrow'>DRESS</div><h2>连衣裙固定倍率</h2></div><span class='hint'>不区分成本金额</span></div><form class='rule-form dress-rule-form' method='post' action='/rules/category'><label><span>适用季节</span><input name='season_year' placeholder='留空为默认'></label><label><span>固定倍率</span><input name='multiplier' type='number' min='0.01' step='0.01' placeholder='例如 4.20' required></label><label><span>备注</span><input name='note' placeholder='选填'></label><button class='primary' {disabled}>保存连衣裙倍率</button></form><div class='table-wrap'><table><thead><tr><th>适用季节</th><th>固定倍率</th><th>备注</th></tr></thead><tbody>{dress_rows or '<tr><td colspan="3" class="empty">尚未配置连衣裙固定倍率。</td></tr>'}</tbody></table></div></section>
-        <section class='panel'><div class='panel-head'><div><div class='eyebrow'>OTHER CATEGORIES</div><h2>其他品类成本区间倍率</h2></div><span class='hint'>下限包含，上限不包含</span></div><form class='rule-form cost-rule-form' method='post' action='/rules/category-cost'><label><span>适用季节</span><input name='season_year' placeholder='留空为默认'></label><label><span>成本下限（包含）</span><input name='lower_cost' type='number' min='0' step='0.01' placeholder='例如 600'></label><label><span>成本上限（不包含）</span><input name='upper_cost' type='number' min='0' step='0.01' placeholder='例如 791'></label><label><span>倍率</span><input name='multiplier' type='number' min='0.01' step='0.01' placeholder='例如 3.90' required></label><label><span>备注</span><input name='note' placeholder='选填'></label><button class='primary' {disabled}>保存成本区间</button></form><p class='range-help'>示例：上限填 600 表示成本小于 600；下限 600、上限 791 表示 600 ≤ 成本 &lt; 791；最后一档可不填上限。同一季节的区间不能重叠。</p><div class='table-wrap'><table><thead><tr><th>适用季节</th><th>含税成本区间</th><th>倍率</th><th>备注</th><th>操作</th></tr></thead><tbody>{cost_rows or '<tr><td colspan="5" class="empty">尚未配置其他品类成本区间；未命中区间时不能生成建议价。</td></tr>'}</tbody></table></div></section>
-        <section class='panel'><div class='panel-head'><div><div class='eyebrow'>SUPPLIER ADJUSTMENT</div><h2>供应商浮动系数</h2></div><span class='hint'>未配置时为 1.00</span></div><form class='rule-form' method='post' action='/rules/supplier'><label><span>适用季节</span><input name='season_year' placeholder='留空为默认'></label><label><span>供应商</span><input name='supplier' placeholder='供应商名称' required></label><label><span>浮动系数</span><input name='coefficient' type='number' min='0.01' step='0.01' placeholder='例如 1.00' required></label><label><span>备注</span><input name='note' placeholder='选填'></label><button class='primary' {disabled}>保存系数</button></form><div class='table-wrap'><table><thead><tr><th>适用季节</th><th>供应商</th><th>系数</th><th>备注</th></tr></thead><tbody>{supplier_rows or '<tr><td colspan="4" class="empty">尚未配置，系统默认使用 1.00。</td></tr>'}</tbody></table></div></section>
+        <section class='panel' id='dress-rules'><div class='panel-head'><div><div class='eyebrow'>DRESS</div><h2>连衣裙固定倍率</h2></div><span class='hint'>不区分成本金额</span></div>{dress_form}<div class='table-wrap'><table><thead><tr><th>适用季节</th><th>固定倍率</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{dress_rows or f'<tr><td colspan="{4 if can_manage else 3}" class="empty">尚未配置连衣裙固定倍率。</td></tr>'}</tbody></table></div></section>
+        <section class='panel' id='cost-rules'><div class='panel-head'><div><div class='eyebrow'>OTHER CATEGORIES</div><h2>其他品类成本区间倍率</h2></div><span class='hint'>下限包含，上限不包含</span></div>{cost_form}<p class='range-help'>可按实际业务新增任意数量的成本区间，也可随时编辑区间边界和倍率。上限填 600 表示成本小于 600；最后一档可不填上限。同一季节的区间不能重叠。</p><div class='table-wrap'><table><thead><tr><th>适用季节</th><th>含税成本区间</th><th>倍率</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{cost_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置其他品类成本区间；未命中区间时不能生成建议价。</td></tr>'}</tbody></table></div></section>
+        <section class='panel' id='supplier-rules'><div class='panel-head'><div><div class='eyebrow'>SUPPLIER ADJUSTMENT</div><h2>供应商浮动系数</h2></div><span class='hint'>未配置时为 1.00</span></div>{supplier_form}<div class='table-wrap'><table><thead><tr><th>适用季节</th><th>供应商</th><th>系数</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{supplier_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置，系统默认使用 1.00。</td></tr>'}</tbody></table></div></section>
         """
         return self.shell("定价规则", content, user, "rules")
 
@@ -405,7 +540,7 @@ class PlanningApplication:
 
     def css(self) -> str:
         return """
-        .rule-logic{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));background:#fff;border:1px solid var(--line);margin-bottom:24px}.rule-logic>div{padding:20px 22px;border-right:1px solid var(--line)}.rule-logic>div:last-child{border-right:0}.rule-logic span{color:var(--accent);font:21px Georgia,serif}.rule-logic strong{display:block;font-size:17px;margin:4px 0}.rule-logic p,.range-help{margin:0;color:var(--muted);font-size:12px}.rule-form{align-items:end}.rule-form.dress-rule-form{grid-template-columns:1fr .7fr 1.5fr auto}.rule-form.cost-rule-form{grid-template-columns:1fr 1fr 1fr .7fr 1.2fr auto}.range-help{margin:-5px 0 18px}.danger-button{color:#9b3e32;border-color:#efc9c2;padding:5px 9px;font-size:12px}@media(max-width:900px){.rule-logic{grid-template-columns:1fr}.rule-logic>div{border-right:0;border-bottom:1px solid var(--line)}.rule-logic>div:last-child{border-bottom:0}.rule-form.dress-rule-form,.rule-form.cost-rule-form{grid-template-columns:1fr 1fr}.rule-form.dress-rule-form button,.rule-form.cost-rule-form button{grid-column:span 2}}@media(max-width:620px){.rule-form.dress-rule-form,.rule-form.cost-rule-form{grid-template-columns:1fr}.rule-form.dress-rule-form button,.rule-form.cost-rule-form button{grid-column:auto}}
+        .rule-access{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 17px;border:1px solid;margin-bottom:16px}.rule-access div{display:flex;align-items:baseline;gap:12px}.rule-access span,.rule-access small{font-size:12px}.rule-access.access-write{background:#eaf3ed;border-color:#c7d9cc;color:#315447}.rule-access.access-readonly{background:#f3f1ee;border-color:#ded8d1;color:#6f6259}.rule-logic{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));background:#fff;border:1px solid var(--line);margin-bottom:24px}.rule-logic>div{padding:20px 22px;border-right:1px solid var(--line)}.rule-logic>div:last-child{border-right:0}.rule-logic span{color:var(--accent);font:21px Georgia,serif}.rule-logic strong{display:block;font-size:17px;margin:4px 0}.rule-logic p,.range-help{margin:0;color:var(--muted);font-size:12px}.rule-form{align-items:end}.rule-form.dress-rule-form{grid-template-columns:1fr .7fr 1.5fr auto}.rule-form.cost-rule-form{grid-template-columns:1fr 1fr 1fr .7fr 1.2fr auto}.range-help{margin:-5px 0 18px}.form-actions,.rule-actions{display:flex;align-items:center;gap:6px;white-space:nowrap}.form-actions button,.form-actions .button{height:42px}.compact-button,.danger-button{padding:5px 9px;font-size:12px}.danger-button{color:#9b3e32;border-color:#efc9c2}.rule-actions form{margin:0}@media(max-width:900px){.rule-logic{grid-template-columns:1fr}.rule-logic>div{border-right:0;border-bottom:1px solid var(--line)}.rule-logic>div:last-child{border-bottom:0}.rule-form.dress-rule-form,.rule-form.cost-rule-form{grid-template-columns:1fr 1fr}.rule-form.dress-rule-form .form-actions,.rule-form.cost-rule-form .form-actions{grid-column:span 2}}@media(max-width:620px){.rule-access,.rule-access div{align-items:flex-start;flex-direction:column;gap:3px}.rule-form.dress-rule-form,.rule-form.cost-rule-form{grid-template-columns:1fr}.rule-form.dress-rule-form .form-actions,.rule-form.cost-rule-form .form-actions{grid-column:auto}}
         .module-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px;margin-bottom:34px}.module-entry{min-width:0;min-height:252px;background:#fff;border:1px solid var(--line);border-top:3px solid var(--deep);padding:25px;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:24px}.module-entry-planned{border-top-color:#9a8172;background:#fbfaf8}.module-entry-top{width:100%;display:flex;justify-content:space-between;align-items:center}.module-index{font:29px Georgia,serif;color:#9aa19c}.phase-tag,.phase-badge{display:inline-block;background:#eeeae6;color:#745e51;padding:4px 9px;border-radius:3px;font-size:12px}.phase-tag-live{background:#e5f2e9;color:#2d6b42}.module-entry h2{font:28px Georgia,serif;font-weight:500;margin:5px 0 7px}.module-entry p{color:var(--muted);margin:0}.section-label{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:12px}.section-label h2{font-size:20px;margin:2px 0 0}.section-label>a{color:var(--deep);font-size:13px}.planning-scope{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));background:#fff;border:1px solid var(--line);margin-bottom:24px}.planning-scope>div{min-width:0;padding:28px;border-right:1px solid var(--line);display:flex;gap:18px}.planning-scope>div:last-child{border-right:0}.scope-primary{background:#f0f5f1}.scope-number{font:25px Georgia,serif;color:var(--accent)}.planning-scope div div>span{display:block;color:var(--muted);font-size:12px}.planning-scope strong{display:block;font:24px Georgia,serif;margin:3px 0 7px}.planning-scope p{margin:0;color:var(--muted)}.phase-panel{display:flex;align-items:center;justify-content:space-between;gap:28px;background:#fbfaf8;border-left:3px solid #9a8172}.phase-panel>div{max-width:760px}.phase-panel p{margin:5px 0 0;color:var(--muted)}.phase-badge{font-size:13px;padding:7px 12px}@media(max-width:900px){.planning-scope{grid-template-columns:1fr}.planning-scope>div{border-right:0;border-bottom:1px solid var(--line)}.planning-scope>div:last-child{border-bottom:0}}@media(max-width:620px){.module-grid{grid-template-columns:1fr;gap:14px}.module-entry{min-height:220px;padding:20px}.section-label,.phase-panel{align-items:flex-start;flex-direction:column}.planning-scope>div{padding:21px}}
         :root{--ink:#202421;--muted:#6c756e;--line:#dde3dc;--paper:#f6f8f5;--card:#fff;--accent:#b5572a;--deep:#315447;--soft:#eaf0eb}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif}a{color:inherit;text-decoration:none}button,.button{border:1px solid #cbd5ce;background:#fff;color:var(--ink);border-radius:4px;padding:9px 14px;font:inherit;cursor:pointer}button:hover,.button:hover{border-color:var(--accent);color:var(--accent)}button.primary,.button.primary{background:var(--deep);border-color:var(--deep);color:#fff}button:disabled{cursor:not-allowed;opacity:.45}.app-shell{width:100%;min-width:0;min-height:100vh}header{width:100%;height:72px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 34px;gap:30px;position:sticky;top:0;z-index:3}.brand{display:flex;align-items:center;gap:10px;min-width:230px}.brand>span{display:grid;place-items:center;width:34px;height:34px;background:var(--deep);color:#fff;font-weight:700;letter-spacing:.08em;border-radius:3px}.brand strong{display:block;font-size:15px}.brand small{display:block;color:var(--muted);font-size:10px;letter-spacing:.08em;text-transform:uppercase}nav{display:flex;gap:4px;flex:1;min-width:0}nav a{padding:9px 12px;color:var(--muted);border-bottom:2px solid transparent}nav a.active,nav a:hover{color:var(--deep);border-bottom-color:var(--accent)}.user{display:flex;align-items:center;gap:13px;color:var(--muted);white-space:nowrap}.user button{padding:5px 9px}.main{width:100%;min-width:0;max-width:1320px;margin:0 auto;padding:38px 34px 60px}.hero,.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;margin-bottom:25px}.hero h1,.page-heading h1{font-family:Georgia,'Times New Roman',serif;font-weight:500;font-size:42px;line-height:1.15;margin:5px 0 10px;letter-spacing:0}.hero p,.page-heading p{margin:0;color:var(--muted);max-width:680px}.eyebrow{color:var(--accent);font-size:11px;letter-spacing:.14em;font-weight:700}.hero-note{background:var(--deep);color:#fff;padding:18px 22px;min-width:190px}.hero-note span,.hero-note small{display:block;opacity:.7;font-size:12px}.hero-note strong{display:block;font-size:21px;margin:4px 0}.metrics{display:grid;grid-template-columns:repeat(3,1fr);background:#fff;border:1px solid var(--line);margin-bottom:24px}.metrics>a,.metrics>div{padding:20px 24px;border-right:1px solid var(--line)}.metrics>*:last-child{border-right:0}.metrics span,.metrics small{display:block;color:var(--muted)}.metrics strong{display:block;font:34px Georgia,serif;margin:4px 0}.split{display:grid;grid-template-columns:1.45fr 1fr;gap:24px}.panel{min-width:0;background:var(--card);border:1px solid var(--line);padding:24px;margin-bottom:24px}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:18px}.panel h2{font-size:20px;font-weight:600;margin:2px 0}.hint,.count,.muted,.meta{color:var(--muted)}.count{font-size:13px}.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.quick-grid a{border:1px solid var(--line);padding:17px;min-height:126px;display:flex;flex-direction:column;gap:3px}.quick-grid a:hover{border-color:var(--accent);background:#fffaf7}.quick-grid b{color:var(--accent);font:23px Georgia,serif}.quick-grid small{color:var(--muted);font-size:12px}.notice-panel{background:#f0f5f1}.notice-panel p{color:#53645a}.page-heading form{margin-bottom:4px}.filter-bar{background:#fff;border:1px solid var(--line);padding:14px 18px;margin-bottom:24px}.filter-bar form{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}.filter-bar label,.rule-form label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.filter-bar input,.filter-bar select{min-width:190px}input,select{border:1px solid #cfd8d1;background:#fff;padding:9px 10px;border-radius:3px;color:var(--ink);font:inherit;min-width:0}table{width:100%;border-collapse:collapse}th{text-align:left;color:var(--muted);font-size:12px;font-weight:500;background:#f7f9f7}th,td{padding:12px 11px;border-bottom:1px solid var(--line);vertical-align:middle}tbody tr:last-child td{border-bottom:0}td strong{display:block}td small{display:block;color:var(--muted);font-size:11px}.table-wrap{width:100%;max-width:100%;overflow:auto}.inline-form{display:flex;gap:6px;min-width:205px}.inline-form input{width:120px}.inline-form button{padding:7px 10px;white-space:nowrap}.status{display:inline-block;border-radius:3px;padding:3px 7px;background:var(--soft);color:var(--deep);font-size:12px}.status-confirmed{background:#fff1e7;color:#98431d}.status-published{background:#e5f2e9;color:#2d6b42}.status-conflict,.error-text{background:#fff0ef;color:#a23f35}.price{font:20px Georgia,serif;color:var(--deep)}.actions{display:flex;gap:5px;white-space:nowrap}.actions button{padding:6px 9px;font-size:12px}.empty{text-align:center;color:var(--muted);padding:30px!important}.alert{padding:11px 14px;border:1px solid;margin:0 0 20px}.alert.success{background:#edf7ef;border-color:#c8e2cd;color:#2f6741}.alert.error{background:#fff1ef;border-color:#efc9c2;color:#9b3e32}.rule-form{display:grid;grid-template-columns:1fr 1fr .7fr 1.2fr auto;gap:7px;margin-bottom:20px}.band-row{margin:19px 0}.band-label{display:flex;justify-content:space-between;gap:15px;margin-bottom:6px}.band-label span{font-weight:600}.band-label strong{color:var(--muted);font-size:13px;font-weight:500}.bar{height:11px;background:#edf1ed}.bar i{display:block;height:100%;background:var(--accent)}.settings dl{display:grid;grid-template-columns:180px 1fr;border-top:1px solid var(--line)}.settings dt,.settings dd{padding:13px 0;margin:0;border-bottom:1px solid var(--line)}.settings dt{color:var(--muted)}footer{max-width:1320px;margin:0 auto;padding:0 34px 25px;color:#909890;font-size:12px}.login-body{min-height:100vh;display:grid;place-items:center;background:#eef2ee}.login{width:min(430px,calc(100% - 36px));background:#fff;border:1px solid var(--line);padding:38px}.login-mark{color:var(--accent);font-size:12px;letter-spacing:.12em;font-weight:700}.login h1{font:36px Georgia,serif;margin:15px 0 8px}.login form{margin-top:25px}.login label{display:block;color:var(--muted);font-size:12px;margin:14px 0}.login input{width:100%;margin-top:5px}.login button{width:100%;margin-top:12px}.button{display:inline-block}.login .button{margin-top:18px} @media(max-width:900px){header{padding:0 18px;gap:16px}.brand{min-width:auto}.brand small,nav a{font-size:12px}nav{overflow:auto}.user>span{display:none}.main{padding:28px 18px 45px}.hero,.page-heading{align-items:flex-start;flex-direction:column}.hero h1,.page-heading h1{font-size:35px}.split{grid-template-columns:1fr}.rule-form{grid-template-columns:1fr 1fr}.rule-form button{grid-column:span 2}.quick-grid{grid-template-columns:1fr 1fr}}@media(max-width:620px){header{height:auto;min-height:66px;flex-wrap:wrap;padding:12px 15px}nav{order:3;flex:0 0 100%;width:100%;max-width:100%;overflow-x:auto}.metrics{grid-template-columns:1fr}.metrics>*{border-right:0;border-bottom:1px solid var(--line)}.metrics>*:last-child{border-bottom:0}.quick-grid{grid-template-columns:1fr}.rule-form{grid-template-columns:1fr}.rule-form button{grid-column:auto}.filter-bar form{align-items:stretch;flex-direction:column}.filter-bar label,.filter-bar input,.filter-bar select,.filter-bar button{width:100%}.filter-bar input,.filter-bar select{min-width:0}.panel{padding:18px}.main{padding-left:13px;padding-right:13px}.hero h1,.page-heading h1{font-size:30px}.actions{flex-direction:column}.settings dl{grid-template-columns:1fr}.settings dt{border-bottom:0;padding-bottom:3px}.settings dd{padding-top:0}.login{padding:28px 22px}}
         """

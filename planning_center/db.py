@@ -239,16 +239,59 @@ def list_supplier_coefficients(db_path: str | Path) -> list[dict]:
         return [dict(row) for row in connection.execute("SELECT * FROM supplier_coefficients ORDER BY season_year, supplier").fetchall()]
 
 
-def save_category_rule(db_path: str | Path, season_year: str, category: str, multiplier: float, note: str = "") -> None:
+def save_category_rule(
+    db_path: str | Path,
+    season_year: str,
+    category: str,
+    multiplier: float,
+    note: str = "",
+    rule_id: int | None = None,
+) -> None:
     if category.strip() != "连衣裙":
         raise ValueError("固定倍率只适用于“连衣裙”，其他品类请按成本区间配置。")
     if not math.isfinite(float(multiplier)) or multiplier <= 0:
         raise ValueError("连衣裙固定倍率必须大于 0。")
     with get_connection(db_path) as connection:
+        clean_season = season_year.strip()
+        now = utc_now()
+        if rule_id is not None:
+            target = connection.execute(
+                "SELECT id FROM category_rules WHERE id = ? AND category = '连衣裙'",
+                (int(rule_id),),
+            ).fetchone()
+            if not target:
+                raise LookupError("连衣裙固定倍率规则不存在。")
+            duplicate = connection.execute(
+                "SELECT id FROM category_rules WHERE season_year = ? AND category = '连衣裙' AND id != ?",
+                (clean_season, int(rule_id)),
+            ).fetchone()
+            if duplicate:
+                raise ValueError("该季节已存在连衣裙固定倍率，请编辑已有规则。")
+            connection.execute(
+                "UPDATE category_rules SET season_year = ?, category = ?, multiplier = ?, note = ?, updated_at = ?, enabled = 1 WHERE id = ? AND category = '连衣裙'",
+                (clean_season, category.strip(), float(multiplier), note.strip(), now, int(rule_id)),
+            )
+            return
+        existing = connection.execute(
+            "SELECT id FROM category_rules WHERE season_year = ? AND category = '连衣裙'",
+            (clean_season,),
+        ).fetchone()
+        if existing:
+            raise ValueError("该季节已存在连衣裙固定倍率，请点击编辑已有规则。")
         connection.execute(
-            "INSERT INTO category_rules (season_year, category, multiplier, note, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(season_year, category) DO UPDATE SET multiplier=excluded.multiplier, note=excluded.note, updated_at=excluded.updated_at",
-            (season_year.strip(), category.strip(), float(multiplier), note.strip(), utc_now()),
+            "INSERT INTO category_rules (season_year, category, multiplier, note, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (clean_season, category.strip(), float(multiplier), note.strip(), now),
         )
+
+
+def delete_category_rule(db_path: str | Path, rule_id: int) -> None:
+    with get_connection(db_path) as connection:
+        cursor = connection.execute(
+            "DELETE FROM category_rules WHERE id = ? AND category = '连衣裙'",
+            (int(rule_id),),
+        )
+        if cursor.rowcount != 1:
+            raise LookupError("连衣裙固定倍率规则不存在。")
 
 
 def _cost_bound(value, label: str) -> float | None:
@@ -280,6 +323,7 @@ def save_category_cost_rule(
     upper_cost,
     multiplier: float,
     note: str = "",
+    rule_id: int | None = None,
 ) -> None:
     lower = _cost_bound(lower_cost, "成本下限")
     upper = _cost_bound(upper_cost, "成本上限")
@@ -295,8 +339,8 @@ def save_category_cost_rule(
         existing_rows = [
             dict(row)
             for row in connection.execute(
-                "SELECT * FROM category_cost_rules WHERE season_year = ? AND category = '其他品类' AND enabled = 1",
-                (clean_season,),
+                "SELECT * FROM category_cost_rules WHERE season_year = ? AND category = '其他品类' AND enabled = 1 AND (? IS NULL OR id != ?)",
+                (clean_season, rule_id, rule_id),
             ).fetchall()
         ]
         for row in existing_rows:
@@ -312,16 +356,26 @@ def save_category_cost_rule(
             ),
             None,
         )
+        if rule_id is not None:
+            if matching:
+                raise ValueError("该成本区间已存在，请编辑已有规则。")
+            target = connection.execute(
+                "SELECT id FROM category_cost_rules WHERE id = ? AND category = '其他品类'",
+                (int(rule_id),),
+            ).fetchone()
+            if not target:
+                raise LookupError("成本区间规则不存在。")
+            connection.execute(
+                "UPDATE category_cost_rules SET season_year = ?, lower_cost = ?, upper_cost = ?, multiplier = ?, note = ?, updated_at = ?, enabled = 1 WHERE id = ? AND category = '其他品类'",
+                (clean_season, lower, upper, float(multiplier), note.strip(), now, int(rule_id)),
+            )
+            return
         if matching:
-            connection.execute(
-                "UPDATE category_cost_rules SET multiplier = ?, note = ?, updated_at = ?, enabled = 1 WHERE id = ?",
-                (float(multiplier), note.strip(), now, matching["id"]),
-            )
-        else:
-            connection.execute(
-                "INSERT INTO category_cost_rules (season_year, category, lower_cost, upper_cost, multiplier, note, updated_at) VALUES (?, '其他品类', ?, ?, ?, ?, ?)",
-                (clean_season, lower, upper, float(multiplier), note.strip(), now),
-            )
+            raise ValueError("该成本区间已存在，请点击编辑已有规则。")
+        connection.execute(
+            "INSERT INTO category_cost_rules (season_year, category, lower_cost, upper_cost, multiplier, note, updated_at) VALUES (?, '其他品类', ?, ?, ?, ?, ?)",
+            (clean_season, lower, upper, float(multiplier), note.strip(), now),
+        )
 
 
 def delete_category_cost_rule(db_path: str | Path, rule_id: int) -> None:
@@ -334,16 +388,57 @@ def delete_category_cost_rule(db_path: str | Path, rule_id: int) -> None:
             raise LookupError("成本区间规则不存在。")
 
 
-def save_supplier_coefficient(db_path: str | Path, season_year: str, supplier: str, coefficient: float, note: str = "") -> None:
+def save_supplier_coefficient(
+    db_path: str | Path,
+    season_year: str,
+    supplier: str,
+    coefficient: float,
+    note: str = "",
+    rule_id: int | None = None,
+) -> None:
     if not supplier.strip():
         raise ValueError("供应商不能为空。")
-    if coefficient <= 0:
+    if not math.isfinite(float(coefficient)) or coefficient <= 0:
         raise ValueError("供应商浮动系数必须大于 0。")
     with get_connection(db_path) as connection:
+        clean_season = season_year.strip()
+        clean_supplier = supplier.strip()
+        now = utc_now()
+        if rule_id is not None:
+            target = connection.execute(
+                "SELECT id FROM supplier_coefficients WHERE id = ?",
+                (int(rule_id),),
+            ).fetchone()
+            if not target:
+                raise LookupError("供应商浮动系数规则不存在。")
+            duplicate = connection.execute(
+                "SELECT id FROM supplier_coefficients WHERE season_year = ? AND supplier = ? AND id != ?",
+                (clean_season, clean_supplier, int(rule_id)),
+            ).fetchone()
+            if duplicate:
+                raise ValueError("该季节已存在此供应商的浮动系数，请编辑已有规则。")
+            connection.execute(
+                "UPDATE supplier_coefficients SET season_year = ?, supplier = ?, coefficient = ?, note = ?, updated_at = ? WHERE id = ?",
+                (clean_season, clean_supplier, float(coefficient), note.strip(), now, int(rule_id)),
+            )
+            return
+        existing = connection.execute(
+            "SELECT id FROM supplier_coefficients WHERE season_year = ? AND supplier = ?",
+            (clean_season, clean_supplier),
+        ).fetchone()
+        if existing:
+            raise ValueError("该季节已存在此供应商的浮动系数，请点击编辑已有规则。")
         connection.execute(
-            "INSERT INTO supplier_coefficients (season_year, supplier, coefficient, note, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(season_year, supplier) DO UPDATE SET coefficient=excluded.coefficient, note=excluded.note, updated_at=excluded.updated_at",
-            (season_year.strip(), supplier.strip(), float(coefficient), note.strip(), utc_now()),
+            "INSERT INTO supplier_coefficients (season_year, supplier, coefficient, note, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (clean_season, clean_supplier, float(coefficient), note.strip(), now),
         )
+
+
+def delete_supplier_coefficient(db_path: str | Path, rule_id: int) -> None:
+    with get_connection(db_path) as connection:
+        cursor = connection.execute("DELETE FROM supplier_coefficients WHERE id = ?", (int(rule_id),))
+        if cursor.rowcount != 1:
+            raise LookupError("供应商浮动系数规则不存在。")
 
 
 def resolve_rules(db_path: str | Path, season_year: str, category: str, supplier: str, cost: float | None = None) -> tuple[float | None, float]:

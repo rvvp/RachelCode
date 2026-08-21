@@ -177,6 +177,55 @@ class PlanningCenterTests(unittest.TestCase):
         )
         self.assertEqual(fixed, 4.1)
 
+    def test_all_pricing_rule_types_can_be_edited_and_deleted(self):
+        planning_db.save_category_rule(self.planning_db_path, "", "连衣裙", 4.2, "默认")
+        dress = planning_db.list_category_rules(self.planning_db_path)[0]
+        planning_db.save_category_rule(
+            self.planning_db_path,
+            "2026秋冬",
+            "连衣裙",
+            4.3,
+            "秋冬调整",
+            dress["id"],
+        )
+        edited_dress = planning_db.list_category_rules(self.planning_db_path)[0]
+        self.assertEqual(edited_dress["season_year"], "2026秋冬")
+        self.assertEqual(edited_dress["multiplier"], 4.3)
+
+        planning_db.save_category_cost_rule(self.planning_db_path, "", None, 600, 4, "首档")
+        cost_rule = planning_db.list_category_cost_rules(self.planning_db_path)[0]
+        planning_db.save_category_cost_rule(
+            self.planning_db_path,
+            "",
+            None,
+            650,
+            4.1,
+            "调整首档",
+            cost_rule["id"],
+        )
+        fixed, _ = planning_db.resolve_rules(self.planning_db_path, "2026秋冬", "毛衣", "供应商 A", 620)
+        self.assertEqual(fixed, 4.1)
+
+        planning_db.save_supplier_coefficient(self.planning_db_path, "", "供应商 A", 1.0, "默认")
+        supplier_rule = planning_db.list_supplier_coefficients(self.planning_db_path)[0]
+        planning_db.save_supplier_coefficient(
+            self.planning_db_path,
+            "2026秋冬",
+            "供应商 A",
+            1.05,
+            "秋冬调整",
+            supplier_rule["id"],
+        )
+        _, coefficient = planning_db.resolve_rules(self.planning_db_path, "2026秋冬", "连衣裙", "供应商 A", 300)
+        self.assertEqual(coefficient, 1.05)
+
+        planning_db.delete_category_rule(self.planning_db_path, dress["id"])
+        planning_db.delete_category_cost_rule(self.planning_db_path, cost_rule["id"])
+        planning_db.delete_supplier_coefficient(self.planning_db_path, supplier_rule["id"])
+        self.assertEqual(planning_db.list_category_rules(self.planning_db_path), [])
+        self.assertEqual(planning_db.list_category_cost_rules(self.planning_db_path), [])
+        self.assertEqual(planning_db.list_supplier_coefficients(self.planning_db_path), [])
+
     def test_rule_page_explains_category_and_cost_logic(self):
         app = PlanningApplication(self.planning_db_path, "http://catalog.test")
         login = self.wsgi_request(
@@ -191,6 +240,62 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("连衣裙固定倍率", page)
         self.assertIn("其他品类成本区间倍率", page)
         self.assertIn("下限包含，上限不包含", page)
+        self.assertIn("可按实际业务新增任意数量的成本区间", page)
+        self.assertIn("规则维护账号", page)
+
+    def test_only_admin_can_maintain_pricing_rules(self):
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_login = self.wsgi_request(
+            app,
+            "/login",
+            method="POST",
+            body=urlencode({"username": "planner", "password": "demo123"}).encode(),
+        )
+        planner_cookie = dict(planner_login["headers"])["Set-Cookie"].split(";", 1)[0]
+        readonly_page = self.wsgi_request(app, "/rules", cookie=planner_cookie)["body"].decode("utf-8")
+        self.assertIn("规则只读账号", readonly_page)
+        self.assertNotIn("action='/rules/category-cost'", readonly_page)
+        denied = self.wsgi_request(
+            app,
+            "/rules/category-cost",
+            method="POST",
+            body=urlencode({"upper_cost": "500", "multiplier": "4"}).encode(),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(denied["status"].startswith("403"))
+
+        admin_login = self.wsgi_request(
+            app,
+            "/login",
+            method="POST",
+            body=urlencode({"username": "planning_admin", "password": "demo123"}).encode(),
+        )
+        admin_cookie = dict(admin_login["headers"])["Set-Cookie"].split(";", 1)[0]
+        created = self.wsgi_request(
+            app,
+            "/rules/category-cost",
+            method="POST",
+            body=urlencode({"upper_cost": "600", "multiplier": "4", "note": "首档"}).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(created["status"].startswith("302"))
+        cost_rule = planning_db.list_category_cost_rules(self.planning_db_path)[0]
+        edit_page = self.wsgi_request(app, f"/rules?edit_cost={cost_rule['id']}", cookie=admin_cookie)["body"].decode("utf-8")
+        self.assertIn("保存修改", edit_page)
+        self.assertIn("编辑", edit_page)
+        self.assertIn("删除", edit_page)
+
+        updated = self.wsgi_request(
+            app,
+            "/rules/category-cost",
+            method="POST",
+            body=urlencode({"rule_id": str(cost_rule["id"]), "upper_cost": "650", "multiplier": "4.1", "note": "调整后"}).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(updated["status"].startswith("302"))
+        edited = planning_db.list_category_cost_rules(self.planning_db_path)[0]
+        self.assertEqual(edited["upper_cost"], 650)
+        self.assertEqual(edited["multiplier"], 4.1)
 
     def test_formal_database_can_bootstrap_first_admin(self):
         formal_path = Path(self.temp.name) / "formal-planning.db"
