@@ -19,6 +19,7 @@ tmp/
 
 # Runtime business data, downloaded platform reports, and browser profiles.
 replenishment_data/
+planning_data/
 
 # Generated visual QA and presentation video assets are not application code.
 outputs/

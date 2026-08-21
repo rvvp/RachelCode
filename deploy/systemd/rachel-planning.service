@@ -1,0 +1,26 @@
+[Unit]
+Description=Rachel Merchandise Planning Center
+After=network-online.target rachel-catalog.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rachelcode
+Group=rachelcode
+WorkingDirectory=/opt/rachelcode/app
+Environment=PYTHONUNBUFFERED=1
+Environment=PLANNING_CATALOG_API_URL=http://127.0.0.1:8765
+EnvironmentFile=-/opt/rachelcode/app/.env
+ExecStart=/opt/rachelcode/venv/bin/python /opt/rachelcode/app/planning_app.py --host 0.0.0.0 --port 8785 --db /data/rachelcode/planning/planning.db --no-seed-demo
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/data/rachelcode
+
+[Install]
+WantedBy=multi-user.target

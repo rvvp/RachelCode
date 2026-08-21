@@ -80,6 +80,8 @@ def c_user_can_see_launch_channel(user: dict | None, launch_channel) -> bool:
     operating_channel = str(user.get("operating_channel") or "").strip()
     normalized_channel = normalize_launch_channel(launch_channel)
     if operating_channel not in C_OPERATING_CHANNELS or not normalized_channel:
+        if operating_channel == "all":
+            return True
         return False
     if normalized_channel == "同款":
         return True

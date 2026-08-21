@@ -75,6 +75,7 @@ def parse_args():
     parser.add_argument("--brand-accent", default=env_text("CATALOG_BRAND_ACCENT", "#bc6c25"), help="主色")
     parser.add_argument("--brand-accent-strong", default=env_text("CATALOG_BRAND_ACCENT_STRONG", "#7f3b08"), help="深主色")
     parser.add_argument("--brand-accent-deep", default=env_text("CATALOG_BRAND_ACCENT_DEEP", "#355f52"), help="辅色")
+    parser.add_argument("--planning-api-token", default=os.environ.get("CATALOG_PLANNING_API_TOKEN", ""), help="商品企划中心内部接口 Token")
     return parser.parse_args()
 
 
@@ -109,6 +110,7 @@ def main():
             "accent_strong": args.brand_accent_strong,
             "accent_deep": args.brand_accent_deep,
         },
+        planning_api_token=args.planning_api_token,
     )
     print("思安娜的藏寶閣已启动")
     print(f"访问地址: http://{args.host}:{args.port}")

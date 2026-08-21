@@ -114,10 +114,11 @@ BRAND_TITLE_ASSET_PATH = Path(__file__).resolve().parent / "assets" / "cangbaoge
 
 
 class CatalogApplication:
-    def __init__(self, db_path: str | Path, upload_dir: str | Path, brand_config: dict | None = None):
+    def __init__(self, db_path: str | Path, upload_dir: str | Path, brand_config: dict | None = None, planning_api_token: str = ""):
         self.db_path = str(db_path)
         self.upload_dir = str(upload_dir)
         self.brand_config = self.build_brand_config(brand_config or {})
+        self.planning_api_token = str(planning_api_token or "").strip()
 
     def build_brand_config(self, overrides: dict) -> dict:
         config = {
@@ -172,6 +173,13 @@ class CatalogApplication:
                 return self.handle_logout(environ, start_response)
             if path == "/api/products" and method == "GET":
                 return self.handle_api(environ, start_response, user, query)
+            if path == "/api/internal/planning/products" and method == "GET":
+                return self.handle_planning_products_api(environ, start_response, query)
+            if path.startswith("/api/internal/planning/products/") and path.endswith("/price-publication") and method == "POST":
+                product_id_text = path[len("/api/internal/planning/products/") : -len("/price-publication")].strip("/")
+                if product_id_text.isdigit():
+                    return self.handle_planning_publication_api(environ, start_response, int(product_id_text))
+                return self.json_error_response(start_response, "not_found", "商品编号格式不正确。", "404 Not Found")
             if not user:
                 return self.redirect(start_response, "/login")
             if path == "/profile/password":
@@ -1042,6 +1050,88 @@ class CatalogApplication:
             [("Content-Type", "application/json; charset=utf-8"), ("Content-Length", str(len(payload)))],
         )
         return [payload]
+
+    def json_response(self, start_response, payload: dict, status: str = "200 OK"):
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        start_response(
+            status,
+            [
+                ("Content-Type", "application/json; charset=utf-8"),
+                ("Cache-Control", "no-store"),
+                ("Content-Length", str(len(body))),
+            ],
+        )
+        return [body]
+
+    def json_error_response(self, start_response, error: str, message: str, status: str = "400 Bad Request"):
+        return self.json_response(start_response, {"error": error, "message": message}, status)
+
+    def planning_api_authorized(self, environ) -> bool:
+        if not self.planning_api_token:
+            return False
+        authorization = str(environ.get("HTTP_AUTHORIZATION") or "").strip()
+        supplied = ""
+        if authorization.lower().startswith("bearer "):
+            supplied = authorization[7:].strip()
+        if not supplied:
+            supplied = str(environ.get("HTTP_X_PLANNING_TOKEN") or "").strip()
+        return bool(supplied and secrets.compare_digest(supplied, self.planning_api_token))
+
+    def handle_planning_products_api(self, environ, start_response, query):
+        if not self.planning_api_token:
+            return self.json_error_response(start_response, "not_configured", "商品企划内部接口尚未配置 Token。", "503 Service Unavailable")
+        if not self.planning_api_authorized(environ):
+            return self.json_error_response(start_response, "unauthorized", "需要有效的商品企划内部 Token。", "401 Unauthorized")
+        product_id = int(query["id"]) if str(query.get("id") or "").isdigit() else None
+        products = db.planning_source_payloads(self.db_path, product_id)
+        season_year = str(query.get("season_year") or "").strip()
+        status = str(query.get("status") or "").strip()
+        if season_year:
+            products = [item for item in products if item.get("season_year") == season_year]
+        if status:
+            products = [item for item in products if item.get("status") == status]
+        return self.json_response(
+            start_response,
+            {
+                "source": "cangbaoge",
+                "count": len(products),
+                "items": products,
+                "synced_at": db.utc_now(),
+            },
+        )
+
+    def parse_json_body(self, environ) -> dict:
+        content_length = int(environ.get("CONTENT_LENGTH") or "0")
+        if content_length <= 0 or content_length > 1_000_000:
+            raise ValueError("请求体为空或超过 1MB。")
+        raw = environ["wsgi.input"].read(content_length)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("请求体必须是 UTF-8 JSON。")
+        if not isinstance(payload, dict):
+            raise ValueError("请求体必须是 JSON 对象。")
+        return payload
+
+    def handle_planning_publication_api(self, environ, start_response, product_id: int):
+        if not self.planning_api_token:
+            return self.json_error_response(start_response, "not_configured", "商品企划内部接口尚未配置 Token。", "503 Service Unavailable")
+        if not self.planning_api_authorized(environ):
+            return self.json_error_response(start_response, "unauthorized", "需要有效的商品企划内部 Token。", "401 Unauthorized")
+        try:
+            payload = self.parse_json_body(environ)
+            with db.get_connection(self.db_path) as connection:
+                actor_id = db.get_or_create_planning_service_user(connection)
+                result = db.publish_planning_price(connection, product_id, payload, actor_id)
+            if result.get("status") == "already_published":
+                return self.json_response(start_response, result, "200 OK")
+            return self.json_response(start_response, result, "200 OK")
+        except LookupError as error:
+            return self.json_error_response(start_response, "not_found", str(error), "404 Not Found")
+        except ValueError as error:
+            code = getattr(error, "code", "invalid_request")
+            status = "409 Conflict" if code == "version_conflict" else "400 Bad Request"
+            return self.json_error_response(start_response, code, str(error), status)
 
     def handle_healthz(self, start_response):
         db_exists = Path(self.db_path).exists()
@@ -2624,6 +2714,7 @@ class CatalogApplication:
             "username": "c_api_token",
             "display_name": "C 部门接口令牌",
             "department": "C",
+            "operating_channel": "all",
         }
 
     def api_token_from_request(self, environ, query: dict) -> str:

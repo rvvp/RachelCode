@@ -412,6 +412,28 @@ def init_db(
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS planning_publications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                publication_id TEXT NOT NULL,
+                source_version_no INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                launch_price REAL NOT NULL,
+                fixed_multiplier REAL,
+                supplier_coefficient REAL,
+                raw_price REAL,
+                operator_name TEXT NOT NULL DEFAULT '',
+                published_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'published',
+                FOREIGN KEY(product_id) REFERENCES products(id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_planning_publications_product ON planning_publications(product_id, published_at DESC)"
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS billing_months (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 month_key TEXT NOT NULL UNIQUE,
@@ -1381,6 +1403,24 @@ def get_user_by_id(db_path: str | Path, user_id: int) -> dict | None:
         return row_to_dict(row)
 
 
+def get_or_create_planning_service_user(connection: sqlite3.Connection) -> int:
+    row = connection.execute(
+        "SELECT id FROM users WHERE username = 'planning_service'",
+    ).fetchone()
+    if row:
+        return int(row["id"])
+    connection.execute(
+        """
+        INSERT INTO users (
+            username, display_name, department, operating_channel, billing_platforms_json,
+            password_hash, is_active, must_change_password, created_at
+        ) VALUES ('planning_service', '商品企划中心', 'ADMIN', '', '[]', ?, 0, 0, ?)
+        """,
+        (hash_password(secrets.token_urlsafe(32)), utc_now()),
+    )
+    return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
 def list_users(db_path: str | Path) -> list[dict]:
     with get_connection(db_path) as connection:
         rows = connection.execute(
@@ -2218,6 +2258,178 @@ def get_product(db_path: str | Path, product_id: int) -> dict | None:
             (product_id,),
         ).fetchone()
         return row_to_dict(row)
+
+
+def _planning_source_query() -> str:
+    return """
+        SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
+               reviewer.display_name AS reviewer_name
+        FROM products p
+        JOIN users u ON u.id = p.created_by
+        LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
+        WHERE p.lifecycle_status = 'active'
+          AND p.status IN ('pending', 'published', 'received')
+          AND EXISTS (
+              SELECT 1 FROM product_logs pl
+              WHERE pl.product_id = p.id AND pl.action = 'status:pending'
+          )
+    """
+
+
+def list_planning_source_products(db_path: str | Path, product_id: int | None = None) -> list[dict]:
+    query = _planning_source_query()
+    params: list[object] = []
+    if product_id is not None:
+        query += " AND p.id = ?"
+        params.append(int(product_id))
+    query += " ORDER BY p.updated_at DESC, p.id DESC"
+    with get_connection(db_path) as connection:
+        rows = connection.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _planning_product_payload(product: dict) -> dict:
+    return {
+        "id": int(product["id"]),
+        "style_code": product.get("style_code") or "",
+        "style_color": product.get("style_color") or "",
+        "color_name": product.get("color_name") or "",
+        "product_name": product.get("product_name") or "",
+        "brand_name": product.get("brand_name") or "",
+        "season_year": product.get("season_year") or "",
+        "supplier": product.get("supplier") or "",
+        "supplier_code": product.get("supplier_code") or "",
+        "supplier_style_code": product.get("supplier_style_code") or "",
+        "category": product.get("category") or "",
+        "actual_cost": product.get("tax_included_price"),
+        "tax_included_price": product.get("tax_included_price"),
+        "status": product.get("status") or "",
+        "lifecycle_status": product.get("lifecycle_status") or "",
+        "source_version_no": int(product.get("current_version_no") or 1),
+        "updated_at": product.get("updated_at") or "",
+        "created_at": product.get("created_at") or "",
+        "creator_name": product.get("creator_name") or "",
+    }
+
+
+def planning_source_payloads(db_path: str | Path, product_id: int | None = None) -> list[dict]:
+    return [_planning_product_payload(product) for product in list_planning_source_products(db_path, product_id)]
+
+
+def publish_planning_price(
+    connection: sqlite3.Connection,
+    product_id: int,
+    payload: dict,
+    actor_user_id: int,
+) -> dict:
+    product_row = connection.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+    product = row_to_dict(product_row)
+    if not product:
+        raise LookupError("商品资料不存在。")
+    if product.get("lifecycle_status") != "active" or product.get("status") not in {"pending", "published", "received"}:
+        raise ValueError("当前商品尚未提交到商品部，不能接收商品企划回传。")
+    eligible = connection.execute(
+        "SELECT 1 FROM product_logs WHERE product_id = ? AND action = 'status:pending' LIMIT 1",
+        (product_id,),
+    ).fetchone()
+    if not eligible:
+        raise ValueError("当前商品没有有效的提交商品部记录。")
+    publication_id = str(payload.get("publication_id") or "").strip()
+    if not publication_id:
+        raise ValueError("回传必须包含企划定价记录号。")
+    duplicate = connection.execute(
+        "SELECT product_id FROM planning_publications WHERE publication_id = ? LIMIT 1",
+        (publication_id,),
+    ).fetchone()
+    if duplicate:
+        if int(duplicate["product_id"]) != int(product_id):
+            raise ValueError("企划定价记录号已被其他商品使用。")
+        return {"status": "already_published", "product_id": product_id, "publication_id": publication_id}
+    expected_version = int(payload.get("source_version_no") or 0)
+    current_version = int(product.get("current_version_no") or 1)
+    if expected_version != current_version:
+        error = ValueError(f"商品资料已发生变化，请重新同步后定价。当前版本为 V{current_version}。")
+        error.code = "version_conflict"
+        raise error
+    category = str(payload.get("category") or "").strip()
+    if not category:
+        raise ValueError("回传必须包含品类。")
+    try:
+        launch_price = float(payload.get("launch_price"))
+    except (TypeError, ValueError):
+        raise ValueError("回传上新价格必须是数字。")
+    if launch_price <= 0:
+        raise ValueError("回传上新价格必须大于 0。")
+    next_version = current_version + 1
+    after = dict(product)
+    after["category"] = category
+    after["launch_price"] = launch_price
+    diff_items = build_product_diff(product, after)
+    timestamp = utc_now()
+    connection.execute(
+        """
+        UPDATE products
+        SET category = ?, launch_price = ?, current_version_no = ?, revision_flag = 0,
+            last_reviewed_by = ?, last_reviewed_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (category, launch_price, next_version, actor_user_id, timestamp, timestamp, product_id),
+    )
+    record_product_version(
+        connection,
+        product_id,
+        version_no=next_version,
+        snapshot=product_snapshot_from_payload(
+            {**product, "category": category, "launch_price": launch_price},
+            {**product, "current_version_no": next_version},
+        ),
+        summary_json=summarize_diff_items(diff_items),
+        change_count=len(diff_items),
+        created_by=actor_user_id,
+        source_version_no=expected_version,
+        note=f"商品企划中心回传定价 {publication_id}",
+    )
+    operator_name = str(payload.get("operator_name") or "商品企划中心").strip() or "商品企划中心"
+    connection.execute(
+        """
+        INSERT INTO planning_publications (
+            product_id, publication_id, source_version_no, category, launch_price,
+            fixed_multiplier, supplier_coefficient, raw_price, operator_name, published_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            product_id,
+            publication_id,
+            expected_version,
+            category,
+            launch_price,
+            payload.get("fixed_multiplier"),
+            payload.get("supplier_coefficient"),
+            payload.get("raw_price"),
+            operator_name,
+            str(payload.get("published_at") or timestamp),
+        ),
+    )
+    log_product_action(
+        connection,
+        product_id,
+        actor_user_id,
+        "planning_publish",
+        "接收商品企划定价",
+        f"商品企划中心回传定价记录 {publication_id}，品类：{category}，上新价格：{launch_price:g}，来源资料 V{expected_version}。",
+        diff_json=summarize_diff_items(diff_items),
+        diff_count=len(diff_items),
+    )
+    return {
+        "status": "published",
+        "product_id": product_id,
+        "publication_id": publication_id,
+        "source_version_no": expected_version,
+        "current_version_no": next_version,
+        "category": category,
+        "launch_price": launch_price,
+        "published_at": str(payload.get("published_at") or timestamp),
+    }
 
 
 def get_product_version(db_path: str | Path, product_id: int, version_no: int) -> dict | None:

@@ -2,6 +2,27 @@
 
 这是一个围绕 `A / B / C` 三个部门协作场景搭建的本地轻量后台，用来替代共享 Excel 在多人协作、权限管理和资料调用上的不足。
 
+## 商品企划中心
+
+仓库现在同时包含独立的“商品企划中心”，用于商品部在上新前完成定价决策：
+
+- 从藏宝阁读取已经由跟单部提交到商品部的新款资料
+- 采购成本只读，统一采用藏宝阁的含税价
+- 按“品类固定倍率 × 供应商浮动系数”计算建议价
+- 默认向下取最近的 `9` 结尾整数，例如 `150 × 4 × 1 = 600 → 599`
+- 确认定价后发布品类和上新价格回藏宝阁
+- 回传时核对藏宝阁资料版本，版本不一致时阻止覆盖
+- 实时统计已确认和已发布款式的价格带分布
+
+开发环境可使用同一个随机 Token 启动两个服务：
+
+```bash
+CATALOG_PLANNING_API_TOKEN='replace-with-random-token' ./scripts/start.sh --port 8765
+PLANNING_CATALOG_API_TOKEN='replace-with-random-token' ./scripts/start_planning.sh --port 8785
+```
+
+然后访问 `http://127.0.0.1:8785`。商品企划中心使用独立数据库 `planning_data/planning.db`，该目录已排除在 Git 之外。演示模式提供 `planner / demo123` 和 `planning_admin / demo123`；正式环境应设置 `PLANNING_SEED_DEMO=0`，并通过 `PLANNING_BOOTSTRAP_ADMIN_USERNAME`、`PLANNING_BOOTSTRAP_ADMIN_PASSWORD` 和 `PLANNING_BOOTSTRAP_ADMIN_NAME` 初始化首个管理员。
+
 ## 为什么推荐做软件，不建议继续只用共享文件
 
 共享 Excel 适合单人维护或低权限复杂度场景，但不适合你这次的需求，原因很直接：
