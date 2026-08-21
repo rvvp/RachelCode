@@ -2293,6 +2293,7 @@ def _planning_product_payload(product: dict) -> dict:
         "id": int(product["id"]),
         "style_code": product.get("style_code") or "",
         "style_color": product.get("style_color") or "",
+        "image_url": product.get("image_url") or "",
         "color_name": product.get("color_name") or "",
         "product_name": product.get("product_name") or "",
         "brand_name": product.get("brand_name") or "",

@@ -68,6 +68,7 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
                 category TEXT NOT NULL DEFAULT '',
                 actual_cost REAL,
                 tax_included_price REAL,
+                image_url TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '',
                 lifecycle_status TEXT NOT NULL DEFAULT '',
                 source_version_no INTEGER NOT NULL DEFAULT 1,
@@ -140,6 +141,9 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
             CREATE INDEX IF NOT EXISTS idx_category_cost_rules_lookup ON category_cost_rules(season_year, category, enabled, lower_cost, upper_cost);
             """
         )
+        source_columns = {row["name"] for row in connection.execute("PRAGMA table_info(source_products)").fetchall()}
+        if "image_url" not in source_columns:
+            connection.execute("ALTER TABLE source_products ADD COLUMN image_url TEXT NOT NULL DEFAULT ''")
         if seed_demo and connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             now = utc_now()
             connection.executemany(
@@ -198,13 +202,13 @@ def upsert_source_products(db_path: str | Path, items: list[dict]) -> int:
                 INSERT INTO source_products (
                     id, style_code, style_color, color_name, product_name, brand_name, season_year,
                     supplier, supplier_code, supplier_style_code, category, actual_cost, tax_included_price,
-                    status, lifecycle_status, source_version_no, source_updated_at, creator_name, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    image_url, status, lifecycle_status, source_version_no, source_updated_at, creator_name, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     style_code=excluded.style_code, style_color=excluded.style_color, color_name=excluded.color_name,
                     product_name=excluded.product_name, brand_name=excluded.brand_name, season_year=excluded.season_year,
                     supplier=excluded.supplier, supplier_code=excluded.supplier_code, supplier_style_code=excluded.supplier_style_code,
-                    category=excluded.category, actual_cost=excluded.actual_cost, tax_included_price=excluded.tax_included_price,
+                    category=excluded.category, actual_cost=excluded.actual_cost, tax_included_price=excluded.tax_included_price, image_url=excluded.image_url,
                     status=excluded.status, lifecycle_status=excluded.lifecycle_status, source_version_no=excluded.source_version_no,
                     source_updated_at=excluded.source_updated_at, creator_name=excluded.creator_name, synced_at=excluded.synced_at
                 """,
@@ -212,7 +216,7 @@ def upsert_source_products(db_path: str | Path, items: list[dict]) -> int:
                     int(item["id"]), item.get("style_code", ""), item.get("style_color", ""), item.get("color_name", ""),
                     item.get("product_name", ""), item.get("brand_name", ""), item.get("season_year", ""), item.get("supplier", ""),
                     item.get("supplier_code", ""), item.get("supplier_style_code", ""), item.get("category", ""), item.get("actual_cost"),
-                    item.get("tax_included_price"), item.get("status", ""), item.get("lifecycle_status", ""), int(item.get("source_version_no") or 1),
+                    item.get("tax_included_price"), item.get("image_url", ""), item.get("status", ""), item.get("lifecycle_status", ""), int(item.get("source_version_no") or 1),
                     item.get("updated_at", ""), item.get("creator_name", ""), now,
                 ),
             )
@@ -495,12 +499,20 @@ def create_pricing_record(db_path: str | Path, product: dict, operator_name: str
         raise ValueError(f"其他品类成本 {float(cost):g} 尚未落入成本区间倍率规则，请先到定价规则中配置。")
     raw = float(cost) * fixed * coefficient
     launch = round_price_to_9(raw)
-    publication_id = f"PC-{product['id']}-V{int(product.get('source_version_no') or 1)}-{secrets.token_hex(4).upper()}"
+    source_version_no = int(product.get("source_version_no") or 1)
+    with get_connection(db_path) as connection:
+        existing = connection.execute(
+            "SELECT * FROM pricing_records WHERE source_product_id = ? AND source_version_no = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            (int(product["id"]), source_version_no),
+        ).fetchone()
+        if existing and existing["status"] in {"suggested", "review_pending", "confirmed", "published"}:
+            return dict(existing)
+    publication_id = f"PC-{product['id']}-V{source_version_no}-{secrets.token_hex(4).upper()}"
     now = utc_now()
     with get_connection(db_path) as connection:
         connection.execute(
             "INSERT INTO pricing_records (publication_id, source_product_id, source_version_no, season_year, style_code, product_name, supplier, category, cost, fixed_multiplier, supplier_coefficient, raw_price, launch_price, status, operator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)",
-            (publication_id, product["id"], int(product.get("source_version_no") or 1), product.get("season_year", ""), product.get("style_code", ""), product.get("product_name", ""), product.get("supplier", ""), category, float(cost), fixed, coefficient, raw, launch, operator_name, now),
+            (publication_id, product["id"], source_version_no, product.get("season_year", ""), product.get("style_code", ""), product.get("product_name", ""), product.get("supplier", ""), category, float(cost), fixed, coefficient, raw, launch, operator_name, now),
         )
         row = connection.execute("SELECT * FROM pricing_records WHERE publication_id = ?", (publication_id,)).fetchone()
     return dict(row)
@@ -529,6 +541,64 @@ def confirm_pricing_record(db_path: str | Path, record_id: int, operator_name: s
         if row["status"] not in {"suggested", "conflict"}:
             return dict(row)
         connection.execute("UPDATE pricing_records SET status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = '' WHERE id = ?", (operator_name, utc_now(), record_id))
+        updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+    return dict(updated)
+
+
+def _validated_launch_price(value) -> float:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("上新价必须是有效数字。")
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("上新价必须大于 0。")
+    return price
+
+
+def submit_pricing_for_review(db_path: str | Path, record_id: int, launch_price, operator_name: str) -> dict:
+    price = _validated_launch_price(launch_price)
+    with get_connection(db_path) as connection:
+        row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+        if not row:
+            raise LookupError("定价记录不存在。")
+        if row["status"] not in {"suggested", "conflict"}:
+            raise ValueError("当前定价记录不在商品部确认阶段。")
+        connection.execute(
+            "UPDATE pricing_records SET launch_price = ?, status = 'review_pending', operator_name = ?, confirmed_at = NULL, error_message = '' WHERE id = ?",
+            (price, operator_name, record_id),
+        )
+        updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+    return dict(updated)
+
+
+def save_review_price(db_path: str | Path, record_id: int, launch_price, operator_name: str) -> dict:
+    price = _validated_launch_price(launch_price)
+    with get_connection(db_path) as connection:
+        row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+        if not row:
+            raise LookupError("定价记录不存在。")
+        if row["status"] != "review_pending":
+            raise ValueError("当前定价记录不在管理员审核阶段。")
+        connection.execute(
+            "UPDATE pricing_records SET launch_price = ?, operator_name = ?, error_message = '' WHERE id = ?",
+            (price, operator_name, record_id),
+        )
+        updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+    return dict(updated)
+
+
+def approve_pricing_record(db_path: str | Path, record_id: int, launch_price, operator_name: str) -> dict:
+    price = _validated_launch_price(launch_price)
+    with get_connection(db_path) as connection:
+        row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+        if not row:
+            raise LookupError("定价记录不存在。")
+        if row["status"] != "review_pending":
+            raise ValueError("当前定价记录不在管理员审核阶段。")
+        connection.execute(
+            "UPDATE pricing_records SET launch_price = ?, status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = '' WHERE id = ?",
+            (price, operator_name, utc_now(), record_id),
+        )
         updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
     return dict(updated)
 

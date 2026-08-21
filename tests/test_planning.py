@@ -318,6 +318,94 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("302"))
         self.assertEqual(planning_db.get_source_product(self.planning_db_path, 9)["style_code"], "M009")
 
+    def test_pricing_workbench_uses_one_card_and_requires_admin_review(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        planning_db.save_category_rule(self.planning_db_path, "2026秋冬", "连衣裙", 4.2)
+        source = {
+            "id": 31,
+            "style_code": "M031",
+            "style_color": "M031-黑",
+            "image_url": "https://example.com/m031.jpg",
+            "product_name": "审核测试款",
+            "season_year": "2026秋冬",
+            "supplier": "供应商审核",
+            "category": "毛衣",
+            "actual_cost": 150,
+            "tax_included_price": 150,
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 1,
+            "updated_at": "",
+            "creator_name": "跟单员",
+        }
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_login = self.wsgi_request(
+            app,
+            "/login",
+            method="POST",
+            body=urlencode({"username": "planner", "password": "demo123"}).encode(),
+        )
+        planner_cookie = dict(planner_login["headers"])["Set-Cookie"].split(";", 1)[0]
+        with patch.object(app, "fetch_catalog_products", return_value=[source]):
+            self.wsgi_request(app, "/sync", method="POST", cookie=planner_cookie)
+        suggest = self.wsgi_request(
+            app,
+            "/pricing/suggest",
+            method="POST",
+            body=urlencode({"product_id": "31", "category": "毛衣"}).encode(),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(suggest["status"].startswith("302"))
+        record = planning_db.list_pricing_records(self.planning_db_path)[0]
+        self.assertEqual(record["status"], "suggested")
+        workbench = self.wsgi_request(app, "/workbench", cookie=planner_cookie)["body"].decode("utf-8")
+        self.assertEqual(workbench.count("<article class='product-card'>"), 1)
+        self.assertIn("年份季节", workbench)
+        self.assertIn("款色", workbench)
+        self.assertIn("图片", workbench)
+        self.assertIn("确认并提交审核", workbench)
+        self.assertNotIn("PRICING RECORDS", workbench)
+
+        submitted = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/submit-review",
+            method="POST",
+            body=urlencode({"launch_price": "589"}).encode(),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(submitted["status"].startswith("302"))
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "review_pending")
+        denied = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/approve",
+            method="POST",
+            body=urlencode({"launch_price": "579"}).encode(),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(denied["status"].startswith("403"))
+
+        admin_login = self.wsgi_request(
+            app,
+            "/login",
+            method="POST",
+            body=urlencode({"username": "planning_admin", "password": "demo123"}).encode(),
+        )
+        admin_cookie = dict(admin_login["headers"])["Set-Cookie"].split(";", 1)[0]
+        review_page = self.wsgi_request(app, "/workbench?status=review_pending", cookie=admin_cookie)["body"].decode("utf-8")
+        self.assertIn("审核上新价", review_page)
+        self.assertIn("审核通过", review_page)
+        approved = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/approve",
+            method="POST",
+            body=urlencode({"launch_price": "579"}).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(approved["status"].startswith("302"))
+        approved_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+        self.assertEqual(approved_record["status"], "confirmed")
+        self.assertEqual(approved_record["launch_price"], 579)
+
     def test_category_planning_phase_two_entry_is_visible(self):
         app = PlanningApplication(self.planning_db_path, "http://catalog.test")
         login = self.wsgi_request(
