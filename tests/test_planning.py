@@ -359,10 +359,16 @@ class PlanningCenterTests(unittest.TestCase):
         record = planning_db.list_pricing_records(self.planning_db_path)[0]
         self.assertEqual(record["status"], "suggested")
         workbench = self.wsgi_request(app, "/workbench", cookie=planner_cookie)["body"].decode("utf-8")
-        self.assertEqual(workbench.count("<article class='product-card'>"), 1)
-        self.assertIn("年份季节", workbench)
-        self.assertIn("款色", workbench)
-        self.assertIn("图片", workbench)
+        self.assertEqual(workbench.count("<section class='panel pricing-board'>"), 1)
+        self.assertEqual(workbench.count("<table class='pricing-table'>"), 1)
+        self.assertNotIn("<article class='product-card'>", workbench)
+        headers = ["年份季节", "款号", "款色", "图片", "商品名称", "供应商", "含税成本", "来源状态"]
+        header_positions = [workbench.index(f"<th>{header}</th>") for header in headers]
+        self.assertEqual(header_positions, sorted(header_positions))
+        self.assertIn("品类与规则计算", workbench)
+        self.assertIn("当前上新价", workbench)
+        self.assertIn("定价状态", workbench)
+        self.assertIn("审核 / 回传", workbench)
         self.assertIn("确认并提交审核", workbench)
         self.assertNotIn("PRICING RECORDS", workbench)
 
@@ -405,6 +411,40 @@ class PlanningCenterTests(unittest.TestCase):
         approved_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
         self.assertEqual(approved_record["status"], "confirmed")
         self.assertEqual(approved_record["launch_price"], 579)
+
+    def test_pricing_workbench_keeps_multiple_styles_in_one_board(self):
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        products = [
+            {
+                "id": 41,
+                "style_code": "M041",
+                "style_color": "M041-黑",
+                "product_name": "多款测试一",
+                "season_year": "2026秋冬",
+                "supplier": "供应商一",
+                "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 1,
+            },
+            {
+                "id": 42,
+                "style_code": "M042",
+                "style_color": "M042-白",
+                "product_name": "多款测试二",
+                "season_year": "2026秋冬",
+                "supplier": "供应商二",
+                "actual_cost": 620,
+                "status": "pending",
+                "source_version_no": 1,
+            },
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        user = planning_db.authenticate_user(self.planning_db_path, "planner", "demo123")
+        workbench = app.render_workbench(user, {})
+        self.assertEqual(workbench.count("<section class='panel pricing-board'>"), 1)
+        self.assertEqual(workbench.count("<tr>"), 3)
+        self.assertIn("M041", workbench)
+        self.assertIn("M042", workbench)
 
     def test_category_planning_phase_two_entry_is_visible(self):
         app = PlanningApplication(self.planning_db_path, "http://catalog.test")
