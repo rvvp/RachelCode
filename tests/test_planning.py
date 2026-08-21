@@ -95,7 +95,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("409"))
 
     def test_pricing_formula_rounds_down_to_9_and_snapshots_rules(self):
-        planning_db.save_category_rule(self.planning_db_path, "2026秋", "毛衣", 4)
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋", None, 600, 4)
         product = {
             "id": 7, "style_code": "M001", "product_name": "测试毛衣", "season_year": "2026秋",
             "supplier": "供应商 A", "category": "毛衣", "actual_cost": 150, "source_version_no": 3,
@@ -110,11 +110,11 @@ class PlanningCenterTests(unittest.TestCase):
             "id": 8, "style_code": "M008", "product_name": "未配置品类", "season_year": "2026秋",
             "supplier": "供应商 A", "category": "外套", "actual_cost": 150, "source_version_no": 1,
         }
-        with self.assertRaisesRegex(ValueError, "尚未配置固定倍率"):
+        with self.assertRaisesRegex(ValueError, "尚未落入成本区间倍率规则"):
             planning_db.create_pricing_record(self.planning_db_path, product, "测试企划员")
 
     def test_idempotent_publication_is_marked_published(self):
-        planning_db.save_category_rule(self.planning_db_path, "2026秋", "毛衣", 4)
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋", None, 600, 4)
         product = {
             "id": 10, "style_code": "M010", "product_name": "幂等测试", "season_year": "2026秋",
             "supplier": "供应商 A", "category": "毛衣", "actual_cost": 150, "source_version_no": 1,
@@ -126,6 +126,71 @@ class PlanningCenterTests(unittest.TestCase):
             {"status": "already_published"},
         )
         self.assertEqual(updated["status"], "published")
+
+    def test_dress_uses_fixed_multiplier_regardless_of_cost(self):
+        planning_db.save_category_rule(self.planning_db_path, "", "连衣裙", 4.2)
+        for product_id, cost in ((20, 150), (21, 900)):
+            product = {
+                "id": product_id,
+                "style_code": f"D{product_id}",
+                "product_name": "测试连衣裙",
+                "season_year": "2026秋",
+                "supplier": "供应商 A",
+                "category": "连衣裙",
+                "actual_cost": cost,
+                "source_version_no": 1,
+            }
+            record = planning_db.create_pricing_record(self.planning_db_path, product, "测试企划员")
+            self.assertEqual(record["fixed_multiplier"], 4.2)
+            self.assertEqual(record["raw_price"], cost * 4.2)
+
+    def test_other_category_cost_ranges_use_inclusive_lower_exclusive_upper(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "", None, 600, 4)
+        planning_db.save_category_cost_rule(self.planning_db_path, "", 600, 791, 3.9)
+        planning_db.save_category_cost_rule(self.planning_db_path, "", 791, 1001, 3.8)
+        planning_db.save_category_cost_rule(self.planning_db_path, "", 1001, None, 3.7)
+
+        cases = ((599.99, 4), (600, 3.9), (790, 3.9), (791, 3.8), (1000, 3.8), (1001, 3.7))
+        for cost, expected in cases:
+            fixed, coefficient = planning_db.resolve_rules(
+                self.planning_db_path,
+                "2026秋",
+                "毛衣",
+                "供应商 A",
+                cost,
+            )
+            self.assertEqual(fixed, expected)
+            self.assertEqual(coefficient, 1)
+
+    def test_other_category_cost_ranges_reject_overlap_and_allow_season_override(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "", None, 600, 4)
+        with self.assertRaisesRegex(ValueError, "区间.*重叠"):
+            planning_db.save_category_cost_rule(self.planning_db_path, "", 500, 700, 3.9)
+
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋", None, 600, 4.1)
+        fixed, _ = planning_db.resolve_rules(
+            self.planning_db_path,
+            "2026秋",
+            "外套",
+            "供应商 A",
+            500,
+        )
+        self.assertEqual(fixed, 4.1)
+
+    def test_rule_page_explains_category_and_cost_logic(self):
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        login = self.wsgi_request(
+            app,
+            "/login",
+            method="POST",
+            body=urlencode({"username": "planning_admin", "password": "demo123"}).encode(),
+        )
+        cookie = dict(login["headers"])["Set-Cookie"].split(";", 1)[0]
+        response = self.wsgi_request(app, "/rules", cookie=cookie)
+        page = response["body"].decode("utf-8")
+        self.assertIn("连衣裙固定倍率", page)
+        self.assertIn("其他品类成本区间倍率", page)
+        self.assertIn("下限包含，上限不包含", page)
 
     def test_formal_database_can_bootstrap_first_admin(self):
         formal_path = Path(self.temp.name) / "formal-planning.db"
