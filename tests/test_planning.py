@@ -148,6 +148,29 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("302"))
         self.assertEqual(planning_db.get_source_product(self.planning_db_path, 9)["style_code"], "M009")
 
+    def test_category_planning_phase_two_entry_is_visible(self):
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        login = self.wsgi_request(
+            app,
+            "/login",
+            method="POST",
+            body=urlencode({"username": "planner", "password": "demo123"}).encode(),
+        )
+        cookie = dict(login["headers"])["Set-Cookie"].split(";", 1)[0]
+
+        dashboard = self.wsgi_request(app, "/dashboard", cookie=cookie)
+        dashboard_html = dashboard["body"].decode("utf-8")
+        self.assertIn("品类企划", dashboard_html)
+        self.assertIn("/category-planning", dashboard_html)
+
+        category_planning = self.wsgi_request(app, "/category-planning", cookie=cookie)
+        category_html = category_planning["body"].decode("utf-8")
+        self.assertTrue(category_planning["status"].startswith("200"))
+        self.assertIn("年份季节", category_html)
+        self.assertIn("品类组合", category_html)
+        self.assertIn("SKU 数", category_html)
+        self.assertIn("第二阶段", category_html)
+
 
 if __name__ == "__main__":
     unittest.main()
