@@ -168,7 +168,7 @@ class PlanningApplication:
             connection.execute("UPDATE source_products SET category = ? WHERE id = ?", (category, product_id))
         product["category"] = category
         record = db.create_pricing_record(self.db_path, product, user.get("display_name", "商品企划中心"))
-        return self.redirect(start_response, "/workbench?notice=" + self.q(f"已生成 {record['style_code'] or record['product_name']} 的建议价 {record['launch_price']:g}。"))
+        return self.redirect(start_response, "/workbench?notice=" + self.q(f"已生成 {record['style_code'] or record['product_name']} 的测算上新价 {record['calculated_price']:g}。"))
 
     def handle_confirm(self, start_response, user, record_id: int):
         record = db.get_pricing_record(self.db_path, record_id)
@@ -176,23 +176,26 @@ class PlanningApplication:
             raise LookupError("定价记录不存在。")
         if user.get("role") == "admin":
             record = db.approve_pricing_record(self.db_path, record_id, record["launch_price"], user.get("display_name", "企划管理员"))
-            message = f"定价记录 {record['publication_id']} 已审核通过。"
+            message = f"定价记录 {record['publication_id']} 已复核通过。"
         else:
             record = db.submit_pricing_for_review(self.db_path, record_id, record["launch_price"], user.get("display_name", "商品部企划员"))
-            message = f"定价记录 {record['publication_id']} 已提交管理员审核。"
+            message = f"定价记录 {record['publication_id']} 已提交复核。"
         return self.redirect(start_response, "/workbench?notice=" + self.q(message))
 
     def handle_submit_review(self, environ, start_response, user, record_id: int):
         if user.get("role") == "admin":
             raise PermissionError("企划管理员请在审核区处理定价。")
         form = self.parse_form(environ)
+        existing = db.get_pricing_record(self.db_path, record_id)
+        if not existing:
+            raise LookupError("定价记录不存在。")
         record = db.submit_pricing_for_review(
             self.db_path,
             record_id,
-            form.get("launch_price", ""),
+            form.get("launch_price") or existing.get("calculated_price") or existing.get("launch_price"),
             user.get("display_name", "商品部企划员"),
         )
-        return self.redirect(start_response, "/workbench?notice=" + self.q(f"{record['style_code'] or record['product_name']} 已提交企划管理员审核。"))
+        return self.redirect(start_response, "/workbench?notice=" + self.q(f"{record['style_code'] or record['product_name']} 已提交企划管理员复核。"))
 
     def handle_review_save(self, environ, start_response, user, record_id: int):
         self.require_rule_manager(user)
@@ -203,7 +206,7 @@ class PlanningApplication:
             form.get("launch_price", ""),
             user.get("display_name", "企划管理员"),
         )
-        return self.redirect(start_response, "/workbench?notice=" + self.q(f"{record['style_code'] or record['product_name']} 的审核上新价已保存。"))
+        return self.redirect(start_response, "/workbench?notice=" + self.q(f"{record['style_code'] or record['product_name']} 的复核上新价已保存。"))
 
     def handle_approve(self, environ, start_response, user, record_id: int):
         self.require_rule_manager(user)
@@ -214,7 +217,7 @@ class PlanningApplication:
             form.get("launch_price", ""),
             user.get("display_name", "企划管理员"),
         )
-        return self.redirect(start_response, "/workbench?notice=" + self.q(f"{record['style_code'] or record['product_name']} 已审核通过，可回传藏宝阁。"))
+        return self.redirect(start_response, "/workbench?notice=" + self.q(f"{record['style_code'] or record['product_name']} 已复核通过，可回传藏宝阁。"))
 
     def handle_publish(self, start_response, user, record_id: int):
         self.require_rule_manager(user)
@@ -222,7 +225,7 @@ class PlanningApplication:
         if not record:
             raise LookupError("定价记录不存在。")
         if record["status"] not in {"confirmed", "conflict"}:
-            raise ValueError("请先确认定价后再发布。")
+            raise ValueError("请先完成复核后再回传。")
         if not self.catalog_api_token:
             raise ValueError("尚未配置藏宝阁内部 Token。")
         payload = {
@@ -356,8 +359,8 @@ class PlanningApplication:
           <article class='module-entry'><div class='module-entry-top'><span class='module-index'>02</span><span class='phase-tag phase-tag-live'>当前可用</span></div><div><div class='eyebrow'>NEW ARRIVAL PRICING</div><h2>上新定价</h2><p>同步藏宝阁新款，完成价格计算、确认、统计与回传。</p></div><a class='button primary' href='/workbench'>进入工作台</a></article>
         </section>
         <div class='section-label'><div><div class='eyebrow'>PRICING OVERVIEW</div><h2>上新定价概况</h2></div><a href='/stats'>查看价格带统计</a></div>
-        <section class='metrics'><a href='/workbench'><span>待定价商品</span><strong>{pending}</strong><small>来源：藏宝阁已提交资料</small></a><a href='/workbench?status=confirmed'><span>待发布定价</span><strong>{confirmed}</strong><small>已确认，等待回传</small></a><a href='/workbench?status=published'><span>已发布</span><strong>{published}</strong><small>已写回藏宝阁</small></a></section>
-        <section class='split'><div class='panel'><div class='panel-head'><div><div class='eyebrow'>QUICK START</div><h2>今天从这里开始</h2></div></div><div class='quick-grid'><a href='/workbench'><b>01</b><span>打开上新定价工作台</span><small>同步新款、输入品类、生成建议价</small></a><a href='/rules'><b>02</b><span>检查定价规则</span><small>品类倍率与供应商浮动系数</small></a><a href='/stats'><b>03</b><span>查看价格带分布</span><small>用当前定价结果校验结构</small></a></div></div><div class='panel notice-panel'><div class='eyebrow'>DATA BOUNDARY</div><h2>成本以藏宝阁为准</h2><p>商品企划中心不录入或估算采购成本。所有成本来自藏宝阁跟单部提交的含税价，回传时会核对资料版本，避免旧成本覆盖新资料。</p><form method='post' action='/sync'><button class='primary' type='submit'>立即同步藏宝阁</button></form></div></section>
+        <section class='metrics'><a href='/workbench'><span>待定价商品</span><strong>{pending}</strong><small>来源：藏宝阁已提交资料</small></a><a href='/workbench?status=confirmed'><span>待回传定价</span><strong>{confirmed}</strong><small>复核通过，等待回传</small></a><a href='/workbench?status=published'><span>已发布</span><strong>{published}</strong><small>已写回藏宝阁</small></a></section>
+        <section class='split'><div class='panel'><div class='panel-head'><div><div class='eyebrow'>QUICK START</div><h2>今天从这里开始</h2></div></div><div class='quick-grid'><a href='/workbench'><b>01</b><span>打开上新定价工作台</span><small>同步新款、输入品类、生成测算上新价</small></a><a href='/rules'><b>02</b><span>检查定价规则</span><small>品类倍率与供应商浮动系数</small></a><a href='/stats'><b>03</b><span>查看价格带分布</span><small>用当前定价结果校验结构</small></a></div></div><div class='panel notice-panel'><div class='eyebrow'>DATA BOUNDARY</div><h2>成本以藏宝阁为准</h2><p>商品企划中心不录入或估算采购成本。所有成本来自藏宝阁跟单部提交的含税价，回传时会核对资料版本，避免旧成本覆盖新资料。</p><form method='post' action='/sync'><button class='primary' type='submit'>立即同步藏宝阁</button></form></div></section>
         """
         return self.shell("企划总览", content, user, "dashboard")
 
@@ -392,9 +395,9 @@ class PlanningApplication:
             latest_records.setdefault(int(record["source_product_id"]), record)
         workflow_labels = {
             "waiting": "待计算",
-            "suggested": "待商品部确认",
-            "review_pending": "待管理员审核",
-            "confirmed": "审核通过，待回传",
+            "suggested": "待初审",
+            "review_pending": "待复核",
+            "confirmed": "复核通过，待回传",
             "published": "已回传",
             "conflict": "版本冲突",
         }
@@ -425,14 +428,14 @@ class PlanningApplication:
             pricing_cell = ""
             price_cell = "<span class='muted'>—</span>"
             status_cell = "<span class='status status-waiting'>待计算</span>"
-            action_cell = "<span class='review-note'>先匹配品类并计算建议价</span>"
+            action_cell = "<span class='review-note'>先匹配品类并生成测算上新价</span>"
             if not record:
                 category_value = html.escape(item.get("category", ""), quote=True)
                 pricing_cell = f"""
                   <form class='table-action-form pricing-calc-form' method='post' action='/pricing/suggest'>
                     <input type='hidden' name='product_id' value='{item['id']}'>
                     <label>实际品类<input name='category' value='{category_value}' placeholder='例如 毛衣' required></label>
-                    <button class='primary' type='submit' {' ' if can_price else 'disabled'}>计算建议价</button>
+                    <button class='primary' type='submit' {' ' if can_price else 'disabled'}>生成测算上新价</button>
                   </form>
                   <small>连衣裙匹配固定倍率，其余品类按含税成本区间匹配。</small>
                 """
@@ -441,24 +444,26 @@ class PlanningApplication:
                 status_label = workflow_labels.get(record_status, record_status)
                 status_class = workflow_classes.get(record_status, "waiting")
                 record_error = f"<small class='error-text'>{html.escape(record['error_message'])}</small>" if record.get("error_message") else ""
+                calculated_price = float(record.get("calculated_price") or record["launch_price"])
+                calculated_price_value = html.escape(f"{calculated_price:g}", quote=True)
                 price_value = html.escape(f"{float(record['launch_price']):g}", quote=True)
                 rule_summary = f"{record['fixed_multiplier']:g} × {record['supplier_coefficient']:g} = 原始 {record['raw_price']:.1f}"
                 pricing_cell = f"<strong>{html.escape(record['category'])}</strong><small>{html.escape(rule_summary)}</small>{record_error}"
-                price_cell = f"<span class='price'>{price_value}</span><small>{html.escape(record['publication_id'])}</small>"
+                price_cell = f"<span class='price'>{calculated_price_value}</span><small>当前执行价：{price_value}</small><small>{html.escape(record['publication_id'])}</small>"
                 status_cell = f"<span class='status status-{status_class}'>{html.escape(status_label)}</span>"
                 controls = ""
                 if record_status in {"suggested", "conflict"} and user.get("role") != "admin":
                     controls = f"""
                     <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/submit-review'>
-                      <label>上新价<input name='launch_price' type='number' min='0.01' step='1' value='{price_value}' required></label>
-                      <button class='primary' type='submit'>确认并提交审核</button>
+                      <label>初审上新价<input name='launch_price' type='number' min='0.01' step='1' value='{price_value}' required></label>
+                      <button class='primary' type='submit'>确认并提交复核</button>
                     </form>
-                    <small>可先修改上新价，再提交给企划管理员审核。</small>"""
+                    <small>默认使用测算上新价；如需调整，可直接修改初审上新价。</small>"""
                 elif record_status == "review_pending" and user.get("role") == "admin":
                     controls = f"""
-                    <div class='review-controls'><span class='review-note'>商品部已提交，请审核上新价</span>
-                      <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/review-save'><label>审核上新价<input name='launch_price' type='number' min='0.01' step='1' value='{price_value}' required></label><button type='submit'>保存审核价</button></form>
-                      <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/approve'><label>最终上新价<input name='launch_price' type='number' min='0.01' step='1' value='{price_value}' required></label><button class='primary' type='submit'>审核通过</button></form>
+                    <div class='review-controls'><span class='review-note'>商品部初审已提交，请进行复核</span>
+                      <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/review-save'><label>复核上新价<input name='launch_price' type='number' min='0.01' step='1' value='{price_value}' required></label><button type='submit'>保存复核价</button></form>
+                      <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/approve'><label>复核上新价<input name='launch_price' type='number' min='0.01' step='1' value='{price_value}' required></label><button class='primary' type='submit'>复核通过</button></form>
                     </div>"""
                 elif record_status == "confirmed" and user.get("role") == "admin":
                     controls = f"<form class='table-action-form' method='post' action='/pricing/{record['id']}/publish'><button class='primary' type='submit'>回传藏宝阁</button></form>"
@@ -483,11 +488,11 @@ class PlanningApplication:
                 <td class='pricing-action-cell'>{action_cell}</td>
               </tr>""")
         content = f"""
-        <section class='page-heading'><div><div class='eyebrow'>NEW ARRIVAL PRICING</div><h1>上新定价工作台</h1><p>所有款色集中在一张定价资料与审核卡片中，按条目完成规则匹配、确认、审核和回传。</p></div><form method='post' action='/sync'><button class='primary' type='submit'>同步藏宝阁</button></form></section>
+        <section class='page-heading'><div><div class='eyebrow'>NEW ARRIVAL PRICING</div><h1>上新定价工作台</h1><p>所有款色集中在一张定价资料与审核卡片中，按条目完成规则匹配、初审、复核和回传。</p></div><form method='post' action='/sync'><button class='primary' type='submit'>同步藏宝阁</button></form></section>
         {self.alert(notice, 'success') if notice else ''}{self.alert(error, 'error') if error else ''}
-        <section class='filter-bar'><form method='get' action='/workbench'><label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待商品部确认</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待管理员审核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>审核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button type='submit'>筛选</button></form></section>
+        <section class='filter-bar'><form method='get' action='/workbench'><label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待初审</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待复核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>复核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button type='submit'>筛选</button></form></section>
         <section class='workbench-summary'><span>当前显示</span><strong>{len(filtered_products)} 款</strong><small>资料字段顺序：年份季节、款号、款色、图片、商品名称、供应商、含税成本、来源状态</small></section>
-        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>定价资料与审核</h2><p class='hint'>来源资料与定价结果在同一行展示，便于逐条处理。</p></div><span class='count'>{len(filtered_products)} 款</span></div><div class='table-wrap pricing-table-wrap'><table class='pricing-table'><thead><tr><th>年份季节</th><th>款号</th><th>款色</th><th>图片</th><th>商品名称</th><th>供应商</th><th>含税成本</th><th>来源状态</th><th>品类与规则计算</th><th>当前上新价</th><th>定价状态</th><th>审核 / 回传</th></tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="12" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div></section>
+        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>定价资料与初审 / 复核</h2><p class='hint'>来源资料与定价结果在同一行展示，按初审、复核流程逐条处理。</p></div><span class='count'>{len(filtered_products)} 款</span></div><div class='table-wrap pricing-table-wrap'><table class='pricing-table'><thead><tr><th>年份季节</th><th>款号</th><th>款色</th><th>图片</th><th>商品名称</th><th>供应商</th><th>含税成本</th><th>来源状态</th><th>品类与规则计算</th><th>测算上新价</th><th>定价状态</th><th>初审 / 复核 / 回传</th></tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="12" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div></section>
         """
         return self.shell("上新定价工作台", content, user, "workbench")
 
@@ -587,12 +592,12 @@ class PlanningApplication:
         )
         access_class = "access-write" if can_manage else "access-readonly"
         content = f"""
-        <section class='page-heading'><div><div class='eyebrow'>RULES & ASSUMPTIONS</div><h1>定价规则</h1><p>规则保存后只影响新生成的建议价，已确认记录保留当时的倍率和系数快照。</p></div></section>
+        <section class='page-heading'><div><div class='eyebrow'>RULES & ASSUMPTIONS</div><h1>定价规则</h1><p>规则保存后只影响新生成的测算上新价，已确认记录保留当时的倍率和系数快照。</p></div></section>
         {self.alert(query.get('notice', ''), 'success') if query.get('notice') else ''}
         <section class='rule-access {access_class}'><div><strong>{'规则维护账号' if can_manage else '规则只读账号'}</strong><span>{access_text}</span></div><small>维护权限：企划管理员</small></section>
         <section class='rule-logic'><div><span>01</span><strong>连衣裙</strong><p>不区分成本金额，直接匹配固定倍率。</p></div><div><span>02</span><strong>其他品类</strong><p>按照含税采购成本落入的金额区间匹配倍率。</p></div><div><span>03</span><strong>供应商系数</strong><p>最后再乘供应商浮动系数，未配置时为 1.00。</p></div></section>
         <section class='panel' id='dress-rules'><div class='panel-head'><div><div class='eyebrow'>DRESS</div><h2>连衣裙固定倍率</h2></div><span class='hint'>不区分成本金额</span></div>{dress_form}<div class='table-wrap'><table><thead><tr><th>适用季节</th><th>固定倍率</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{dress_rows or f'<tr><td colspan="{4 if can_manage else 3}" class="empty">尚未配置连衣裙固定倍率。</td></tr>'}</tbody></table></div></section>
-        <section class='panel' id='cost-rules'><div class='panel-head'><div><div class='eyebrow'>OTHER CATEGORIES</div><h2>其他品类成本区间倍率</h2></div><span class='hint'>下限包含，上限不包含</span></div>{cost_form}<p class='range-help'>可按实际业务新增任意数量的成本区间，也可随时编辑区间边界和倍率。上限填 600 表示成本小于 600；最后一档可不填上限。同一季节的区间不能重叠。</p><div class='table-wrap'><table><thead><tr><th>适用季节</th><th>含税成本区间</th><th>倍率</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{cost_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置其他品类成本区间；未命中区间时不能生成建议价。</td></tr>'}</tbody></table></div></section>
+        <section class='panel' id='cost-rules'><div class='panel-head'><div><div class='eyebrow'>OTHER CATEGORIES</div><h2>其他品类成本区间倍率</h2></div><span class='hint'>下限包含，上限不包含</span></div>{cost_form}<p class='range-help'>可按实际业务新增任意数量的成本区间，也可随时编辑区间边界和倍率。上限填 600 表示成本小于 600；最后一档可不填上限。同一季节的区间不能重叠。</p><div class='table-wrap'><table><thead><tr><th>适用季节</th><th>含税成本区间</th><th>倍率</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{cost_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置其他品类成本区间；未命中区间时不能生成测算上新价。</td></tr>'}</tbody></table></div></section>
         <section class='panel' id='supplier-rules'><div class='panel-head'><div><div class='eyebrow'>SUPPLIER ADJUSTMENT</div><h2>供应商浮动系数</h2></div><span class='hint'>未配置时为 1.00</span></div>{supplier_form}<div class='table-wrap'><table><thead><tr><th>适用季节</th><th>供应商</th><th>系数</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{supplier_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置，系统默认使用 1.00。</td></tr>'}</tbody></table></div></section>
         """
         return self.shell("定价规则", content, user, "rules")
@@ -625,7 +630,7 @@ class PlanningApplication:
         return self.shell("连接设置", content, user, "settings")
 
     def record_status_label(self, status: str) -> str:
-        return {"suggested": "待商品部确认", "review_pending": "待管理员审核", "confirmed": "审核通过，待回传", "published": "已回传", "conflict": "版本冲突", "failed": "回传失败"}.get(status, status)
+        return {"suggested": "待初审", "review_pending": "待复核", "confirmed": "复核通过，待回传", "published": "已回传", "conflict": "版本冲突", "failed": "回传失败"}.get(status, status)
 
     def page(self, title: str, content: str, user: dict | None) -> str:
         body_class = "app-body" if user else "login-body"

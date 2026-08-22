@@ -46,6 +46,10 @@ class PlanningCenterTests(unittest.TestCase):
         captured["body"] = b"".join(app(environ, start_response))
         return captured
 
+    def login_cookie(self, app, username):
+        response = self.wsgi_request(app, "/login", method="POST", body=urlencode({"username": username, "password": "demo123"}).encode())
+        return dict(response["headers"])["Set-Cookie"].split(";", 1)[0]
+
     def test_internal_api_requires_token_and_publishes_with_version_check(self):
         app = CatalogApplication(self.catalog_db_path, Path(self.temp.name) / "uploads", planning_api_token="planning-secret")
         response = self.wsgi_request(app, "/api/internal/planning/products")
@@ -366,10 +370,12 @@ class PlanningCenterTests(unittest.TestCase):
         header_positions = [workbench.index(f"<th>{header}</th>") for header in headers]
         self.assertEqual(header_positions, sorted(header_positions))
         self.assertIn("品类与规则计算", workbench)
-        self.assertIn("当前上新价", workbench)
+        self.assertIn("测算上新价", workbench)
+        self.assertIn("初审上新价", workbench)
+        self.assertIn("待初审", workbench)
         self.assertIn("定价状态", workbench)
-        self.assertIn("审核 / 回传", workbench)
-        self.assertIn("确认并提交审核", workbench)
+        self.assertIn("初审 / 复核 / 回传", workbench)
+        self.assertIn("确认并提交复核", workbench)
         self.assertNotIn("PRICING RECORDS", workbench)
 
         submitted = self.wsgi_request(
@@ -380,7 +386,10 @@ class PlanningCenterTests(unittest.TestCase):
             cookie=planner_cookie,
         )
         self.assertTrue(submitted["status"].startswith("302"))
-        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "review_pending")
+        submitted_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+        self.assertEqual(submitted_record["status"], "review_pending")
+        self.assertEqual(submitted_record["calculated_price"], 599)
+        self.assertEqual(submitted_record["launch_price"], 589)
         denied = self.wsgi_request(
             app,
             f"/pricing/{record['id']}/approve",
@@ -398,8 +407,9 @@ class PlanningCenterTests(unittest.TestCase):
         )
         admin_cookie = dict(admin_login["headers"])["Set-Cookie"].split(";", 1)[0]
         review_page = self.wsgi_request(app, "/workbench?status=review_pending", cookie=admin_cookie)["body"].decode("utf-8")
-        self.assertIn("审核上新价", review_page)
-        self.assertIn("审核通过", review_page)
+        self.assertIn("复核上新价", review_page)
+        self.assertIn("保存复核价", review_page)
+        self.assertIn("复核通过", review_page)
         approved = self.wsgi_request(
             app,
             f"/pricing/{record['id']}/approve",
@@ -411,6 +421,34 @@ class PlanningCenterTests(unittest.TestCase):
         approved_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
         self.assertEqual(approved_record["status"], "confirmed")
         self.assertEqual(approved_record["launch_price"], 579)
+
+    def test_initial_review_defaults_to_calculated_price_when_price_is_omitted(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        product = {
+            "id": 35,
+            "style_code": "M035",
+            "product_name": "默认测算价",
+            "season_year": "2026秋冬",
+            "supplier": "供应商",
+            "category": "毛衣",
+            "actual_cost": 150,
+            "source_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [product])
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        user = planning_db.authenticate_user(self.planning_db_path, "planner", "demo123")
+        record = planning_db.create_pricing_record(self.planning_db_path, product, user["display_name"])
+        response = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/submit-review",
+            method="POST",
+            body=b"",
+            cookie=self.login_cookie(app, "planner"),
+        )
+        self.assertTrue(response["status"].startswith("302"))
+        submitted = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+        self.assertEqual(submitted["calculated_price"], 599)
+        self.assertEqual(submitted["launch_price"], 599)
 
     def test_pricing_workbench_keeps_multiple_styles_in_one_board(self):
         app = PlanningApplication(self.planning_db_path, "http://catalog.test")

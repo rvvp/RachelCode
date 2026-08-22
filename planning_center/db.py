@@ -128,6 +128,7 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
                 fixed_multiplier REAL NOT NULL,
                 supplier_coefficient REAL NOT NULL,
                 raw_price REAL NOT NULL,
+                calculated_price REAL,
                 launch_price REAL NOT NULL,
                 status TEXT NOT NULL DEFAULT 'suggested',
                 operator_name TEXT NOT NULL DEFAULT '',
@@ -144,6 +145,10 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
         source_columns = {row["name"] for row in connection.execute("PRAGMA table_info(source_products)").fetchall()}
         if "image_url" not in source_columns:
             connection.execute("ALTER TABLE source_products ADD COLUMN image_url TEXT NOT NULL DEFAULT ''")
+        pricing_columns = {row["name"] for row in connection.execute("PRAGMA table_info(pricing_records)").fetchall()}
+        if "calculated_price" not in pricing_columns:
+            connection.execute("ALTER TABLE pricing_records ADD COLUMN calculated_price REAL")
+            connection.execute("UPDATE pricing_records SET calculated_price = launch_price WHERE calculated_price IS NULL")
         if seed_demo and connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             now = utc_now()
             connection.executemany(
@@ -491,7 +496,7 @@ def create_pricing_record(db_path: str | Path, product: dict, operator_name: str
         raise ValueError("藏宝阁尚未提供有效的含税采购成本。")
     category = str(product.get("category") or "").strip()
     if not category:
-        raise ValueError("请先在定价工作台选择品类，再计算建议价。")
+        raise ValueError("请先在定价工作台选择品类，再生成测算上新价。")
     fixed, coefficient = resolve_rules(db_path, product.get("season_year", ""), category, product.get("supplier", ""), float(cost))
     if fixed is None:
         if category == "连衣裙":
@@ -511,8 +516,8 @@ def create_pricing_record(db_path: str | Path, product: dict, operator_name: str
     now = utc_now()
     with get_connection(db_path) as connection:
         connection.execute(
-            "INSERT INTO pricing_records (publication_id, source_product_id, source_version_no, season_year, style_code, product_name, supplier, category, cost, fixed_multiplier, supplier_coefficient, raw_price, launch_price, status, operator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)",
-            (publication_id, product["id"], source_version_no, product.get("season_year", ""), product.get("style_code", ""), product.get("product_name", ""), product.get("supplier", ""), category, float(cost), fixed, coefficient, raw, launch, operator_name, now),
+            "INSERT INTO pricing_records (publication_id, source_product_id, source_version_no, season_year, style_code, product_name, supplier, category, cost, fixed_multiplier, supplier_coefficient, raw_price, calculated_price, launch_price, status, operator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)",
+            (publication_id, product["id"], source_version_no, product.get("season_year", ""), product.get("style_code", ""), product.get("product_name", ""), product.get("supplier", ""), category, float(cost), fixed, coefficient, raw, launch, launch, operator_name, now),
         )
         row = connection.execute("SELECT * FROM pricing_records WHERE publication_id = ?", (publication_id,)).fetchone()
     return dict(row)
@@ -562,7 +567,7 @@ def submit_pricing_for_review(db_path: str | Path, record_id: int, launch_price,
         if not row:
             raise LookupError("定价记录不存在。")
         if row["status"] not in {"suggested", "conflict"}:
-            raise ValueError("当前定价记录不在商品部确认阶段。")
+            raise ValueError("当前定价记录不在商品部初审阶段。")
         connection.execute(
             "UPDATE pricing_records SET launch_price = ?, status = 'review_pending', operator_name = ?, confirmed_at = NULL, error_message = '' WHERE id = ?",
             (price, operator_name, record_id),
@@ -578,7 +583,7 @@ def save_review_price(db_path: str | Path, record_id: int, launch_price, operato
         if not row:
             raise LookupError("定价记录不存在。")
         if row["status"] != "review_pending":
-            raise ValueError("当前定价记录不在管理员审核阶段。")
+            raise ValueError("当前定价记录不在企划管理员复核阶段。")
         connection.execute(
             "UPDATE pricing_records SET launch_price = ?, operator_name = ?, error_message = '' WHERE id = ?",
             (price, operator_name, record_id),
@@ -594,7 +599,7 @@ def approve_pricing_record(db_path: str | Path, record_id: int, launch_price, op
         if not row:
             raise LookupError("定价记录不存在。")
         if row["status"] != "review_pending":
-            raise ValueError("当前定价记录不在管理员审核阶段。")
+            raise ValueError("当前定价记录不在企划管理员复核阶段。")
         connection.execute(
             "UPDATE pricing_records SET launch_price = ?, status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = '' WHERE id = ?",
             (price, operator_name, utc_now(), record_id),
