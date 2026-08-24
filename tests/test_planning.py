@@ -453,9 +453,11 @@ class PlanningCenterTests(unittest.TestCase):
         )
         admin_cookie = dict(admin_login["headers"])["Set-Cookie"].split(";", 1)[0]
         review_page = self.wsgi_request(app, "/workbench?status=review_pending", cookie=admin_cookie)["body"].decode("utf-8")
-        self.assertIn("复核上新价", review_page)
+        self.assertEqual(review_page.count("复核上新价"), 1)
+        self.assertEqual(review_page.count("<input name='launch_price'"), 1)
         self.assertIn("min='1' step='1' inputmode='numeric'", review_page)
-        self.assertIn("保存复核价", review_page)
+        self.assertIn("data-saved-value='2539'", review_page)
+        self.assertIn("修改保存", review_page)
         self.assertIn("复核通过", review_page)
         rejected_review_fractional = self.wsgi_request(
             app,
@@ -466,6 +468,27 @@ class PlanningCenterTests(unittest.TestCase):
         )
         self.assertTrue(rejected_review_fractional["status"].startswith("400"))
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "review_pending")
+        rejected_unsaved_review = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/approve",
+            method="POST",
+            body=urlencode({"launch_price": "579"}).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(rejected_unsaved_review["status"].startswith("400"))
+        self.assertIn("请先点击“修改保存”", rejected_unsaved_review["body"].decode("utf-8"))
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "review_pending")
+        saved_review = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/review-save",
+            method="POST",
+            body=urlencode({"launch_price": "579"}).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(saved_review["status"].startswith("302"))
+        saved_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+        self.assertEqual(saved_record["status"], "review_pending")
+        self.assertEqual(saved_record["launch_price"], 579)
         approved = self.wsgi_request(
             app,
             f"/pricing/{record['id']}/approve",

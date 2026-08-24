@@ -600,9 +600,11 @@ def approve_pricing_record(db_path: str | Path, record_id: int, launch_price, op
             raise LookupError("定价记录不存在。")
         if row["status"] != "review_pending":
             raise ValueError("当前定价记录不在企划管理员复核阶段。")
+        if price != _validated_launch_price(row["launch_price"]):
+            raise ValueError("复核上新价已修改，请先点击“修改保存”，再进行复核通过。")
         connection.execute(
-            "UPDATE pricing_records SET launch_price = ?, status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = '' WHERE id = ?",
-            (price, operator_name, utc_now(), record_id),
+            "UPDATE pricing_records SET status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = '' WHERE id = ?",
+            (operator_name, utc_now(), record_id),
         )
         updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
     return dict(updated)

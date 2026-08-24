@@ -490,8 +490,11 @@ class PlanningApplication:
                 elif record_status == "review_pending" and user.get("role") == "admin":
                     controls = f"""
                     <div class='review-controls'><span class='review-note'>商品部初审已提交，请进行复核</span>
-                      <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/review-save'><label>复核上新价<input name='launch_price' type='number' min='1' step='1' inputmode='numeric' value='{price_value}' required></label><button type='submit'>保存复核价</button></form>
-                      <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/approve'><label>复核上新价<input name='launch_price' type='number' min='1' step='1' inputmode='numeric' value='{price_value}' required></label><button class='primary' type='submit'>复核通过</button></form>
+                      <form class='table-action-form price-review-form review-approval-form' method='post' action='/pricing/{record['id']}/review-save'>
+                        <label>复核上新价<input name='launch_price' type='number' min='1' step='1' inputmode='numeric' value='{price_value}' data-saved-value='{price_value}' required></label>
+                        <button type='submit'>修改保存</button>
+                        <button class='primary review-approve-button' type='submit' formaction='/pricing/{record['id']}/approve'>复核通过</button>
+                      </form>
                     </div>"""
                 elif record_status == "confirmed" and user.get("role") == "planner":
                     controls = f"<form class='table-action-form' method='post' action='/pricing/{record['id']}/publish'><button class='primary' type='submit'>回传藏宝阁</button></form>"
@@ -527,6 +530,19 @@ class PlanningApplication:
         (() => {{
           const storageKey = 'planning-workbench-scroll';
           const tableWrap = document.querySelector('.pricing-table-wrap');
+          document.querySelectorAll('.review-approval-form').forEach((form) => {{
+            const input = form.querySelector("input[name='launch_price']");
+            const approveButton = form.querySelector('.review-approve-button');
+            if (!input || !approveButton) return;
+            const syncApprovalState = () => {{
+              const savedValue = Number(input.dataset.savedValue);
+              const currentValue = Number(input.value);
+              approveButton.disabled = !input.validity.valid || !input.value.trim() || currentValue !== savedValue;
+            }};
+            input.addEventListener('input', syncApprovalState);
+            input.addEventListener('change', syncApprovalState);
+            syncApprovalState();
+          }});
           document.querySelectorAll('.pricing-table form').forEach((form) => {{
             form.addEventListener('submit', () => {{
               sessionStorage.setItem(storageKey, JSON.stringify({{
