@@ -386,6 +386,7 @@ class PlanningCenterTests(unittest.TestCase):
             cookie=planner_cookie,
         )
         self.assertTrue(suggest["status"].startswith("302"))
+        self.assertTrue(dict(suggest["headers"])["Location"].endswith("#pricing-row-31"))
         record = planning_db.list_pricing_records(self.planning_db_path)[0]
         self.assertEqual(record["status"], "suggested")
         workbench = self.wsgi_request(app, "/workbench", cookie=planner_cookie)["body"].decode("utf-8")
@@ -404,6 +405,11 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("定价状态", workbench)
         self.assertIn("初审 / 复核 / 回传", workbench)
         self.assertIn("确认并提交复核", workbench)
+        self.assertIn("id='pricing-row-31'", workbench)
+        self.assertIn("planning-workbench-scroll", workbench)
+        self.assertIn("tableWrap.scrollLeft", workbench)
+        self.assertIn("history.replaceState", workbench)
+        self.assertIn("setTimeout(restoreScroll, 150)", workbench)
         self.assertNotIn("PRICING RECORDS", workbench)
 
         rejected_fractional = self.wsgi_request(
@@ -425,6 +431,7 @@ class PlanningCenterTests(unittest.TestCase):
             cookie=planner_cookie,
         )
         self.assertTrue(submitted["status"].startswith("302"))
+        self.assertTrue(dict(submitted["headers"])["Location"].endswith("#pricing-row-31"))
         submitted_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
         self.assertEqual(submitted_record["status"], "review_pending")
         self.assertEqual(submitted_record["calculated_price"], 599)
@@ -570,7 +577,7 @@ class PlanningCenterTests(unittest.TestCase):
         user = planning_db.authenticate_user(self.planning_db_path, "planner", "demo123")
         workbench = app.render_workbench(user, {})
         self.assertEqual(workbench.count("<section class='panel pricing-board'>"), 1)
-        self.assertEqual(workbench.count("<tr>"), 3)
+        self.assertEqual(workbench.count("<tr"), 3)
         self.assertIn("M041", workbench)
         self.assertIn("M042", workbench)
 
