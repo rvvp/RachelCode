@@ -370,6 +370,7 @@ class PlanningCenterTests(unittest.TestCase):
         header_positions = [workbench.index(f"<th>{header}</th>") for header in headers]
         self.assertEqual(header_positions, sorted(header_positions))
         self.assertIn("品类与规则计算", workbench)
+        self.assertIn("定价初审与复核", workbench)
         self.assertIn("测算上新价", workbench)
         self.assertIn("初审上新价", workbench)
         self.assertIn("待初审", workbench)
