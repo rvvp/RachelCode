@@ -572,6 +572,8 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("pricing-select-all", initial_page)
         self.assertIn("批量初审提交", initial_page)
         self.assertIn("批量回传藏宝阁", initial_page)
+        self.assertIn(".pricing-select-cell{position:sticky;left:0", initial_page)
+        self.assertIn(".pricing-table thead .pricing-select-cell{z-index:2", initial_page)
         self.assertEqual(initial_page.count("name='submit_review_ids'"), 2)
         no_selection = self.wsgi_request(
             app,
