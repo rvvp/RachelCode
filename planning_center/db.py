@@ -550,7 +550,7 @@ def confirm_pricing_record(db_path: str | Path, record_id: int, operator_name: s
     return dict(updated)
 
 
-def _validated_launch_price(value) -> int:
+def validated_launch_price(value) -> int:
     try:
         price = Decimal(str(value).strip())
     except (InvalidOperation, AttributeError, TypeError, ValueError):
@@ -561,7 +561,7 @@ def _validated_launch_price(value) -> int:
 
 
 def submit_pricing_for_review(db_path: str | Path, record_id: int, launch_price, operator_name: str) -> dict:
-    price = _validated_launch_price(launch_price)
+    price = validated_launch_price(launch_price)
     with get_connection(db_path) as connection:
         row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
         if not row:
@@ -577,7 +577,7 @@ def submit_pricing_for_review(db_path: str | Path, record_id: int, launch_price,
 
 
 def save_review_price(db_path: str | Path, record_id: int, launch_price, operator_name: str) -> dict:
-    price = _validated_launch_price(launch_price)
+    price = validated_launch_price(launch_price)
     with get_connection(db_path) as connection:
         row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
         if not row:
@@ -593,14 +593,14 @@ def save_review_price(db_path: str | Path, record_id: int, launch_price, operato
 
 
 def approve_pricing_record(db_path: str | Path, record_id: int, launch_price, operator_name: str) -> dict:
-    price = _validated_launch_price(launch_price)
+    price = validated_launch_price(launch_price)
     with get_connection(db_path) as connection:
         row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
         if not row:
             raise LookupError("定价记录不存在。")
         if row["status"] != "review_pending":
             raise ValueError("当前定价记录不在企划管理员复核阶段。")
-        if price != _validated_launch_price(row["launch_price"]):
+        if price != validated_launch_price(row["launch_price"]):
             raise ValueError("复核上新价已修改，请先点击“修改保存”，再进行复核通过。")
         connection.execute(
             "UPDATE pricing_records SET status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = '' WHERE id = ?",

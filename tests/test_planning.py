@@ -544,6 +544,145 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(publication_payload["operator_name"], "商品部企划员")
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "published")
 
+    def test_batch_initial_review_approval_and_publication(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        products = [
+            {
+                "id": product_id,
+                "style_code": f"B{product_id}",
+                "style_color": f"B{product_id}-黑",
+                "product_name": f"批量测试款 {product_id}",
+                "season_year": "2026秋冬",
+                "supplier": "批量供应商",
+                "category": "毛衣",
+                "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 1,
+            }
+            for product_id in (71, 72)
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        records = [planning_db.create_pricing_record(self.planning_db_path, product, "商品部企划员") for product in products]
+        first, second = records
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+
+        initial_page = self.wsgi_request(app, "/workbench?status=suggested", cookie=planner_cookie)["body"].decode("utf-8")
+        self.assertIn("pricing-select-all", initial_page)
+        self.assertIn("批量初审提交", initial_page)
+        self.assertIn("批量回传藏宝阁", initial_page)
+        self.assertEqual(initial_page.count("name='submit_review_ids'"), 2)
+        no_selection = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode({"batch_action": "submit-review"}).encode(),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(no_selection["status"].startswith("400"))
+        batch_initial = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode(
+                [
+                    ("batch_action", "submit-review"),
+                    ("submit_review_ids", str(first["id"])),
+                    ("submit_review_ids", str(second["id"])),
+                    (f"launch_price_{first['id']}", "609"),
+                    (f"launch_price_{second['id']}", "619"),
+                ]
+            ).encode(),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(batch_initial["status"].startswith("302"))
+        self.assertIn("status=review_pending", dict(batch_initial["headers"])["Location"])
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, first["id"])["launch_price"], 609)
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, second["id"])["launch_price"], 619)
+
+        denied_approval = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode([("batch_action", "approve"), ("approve_ids", str(first["id"])), (f"review_price_{first['id']}", "609")]).encode(),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(denied_approval["status"].startswith("403"))
+        review_page = self.wsgi_request(app, "/workbench?status=review_pending", cookie=admin_cookie)["body"].decode("utf-8")
+        self.assertIn("批量复核通过", review_page)
+        self.assertEqual(review_page.count("name='approve_ids'"), 2)
+        missing_price = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode([("batch_action", "approve"), ("approve_ids", str(first["id"]))]).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(missing_price["status"].startswith("400"))
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, first["id"])["status"], "review_pending")
+        unsaved_price = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode(
+                [
+                    ("batch_action", "approve"),
+                    ("approve_ids", str(first["id"])),
+                    (f"review_price_{first['id']}", "629"),
+                ]
+            ).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(unsaved_price["status"].startswith("400"))
+        self.assertIn("请先点击“修改保存”", unsaved_price["body"].decode("utf-8"))
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, first["id"])["status"], "review_pending")
+        batch_approval = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode(
+                [
+                    ("batch_action", "approve"),
+                    ("approve_ids", str(first["id"])),
+                    ("approve_ids", str(second["id"])),
+                    (f"review_price_{first['id']}", "609"),
+                    (f"review_price_{second['id']}", "619"),
+                ]
+            ).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(batch_approval["status"].startswith("302"))
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, first["id"])["status"], "confirmed")
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, second["id"])["status"], "confirmed")
+
+        app.catalog_api_token = "token"
+        with patch.object(app, "fetch_catalog_products", return_value=[]):
+            publish_page = self.wsgi_request(app, "/workbench?status=confirmed", cookie=planner_cookie)["body"].decode("utf-8")
+        self.assertEqual(publish_page.count("name='publish_ids'"), 2)
+        publication_responses = [
+            io.BytesIO(json.dumps({"status": "published"}).encode("utf-8")),
+            io.BytesIO(json.dumps({"status": "published"}).encode("utf-8")),
+        ]
+        with patch("planning_center.web.urlopen", side_effect=publication_responses) as mocked_urlopen:
+            batch_publish = self.wsgi_request(
+                app,
+                "/pricing/batch",
+                method="POST",
+                body=urlencode(
+                    [
+                        ("batch_action", "publish"),
+                        ("publish_ids", str(first["id"])),
+                        ("publish_ids", str(second["id"])),
+                    ]
+                ).encode(),
+                cookie=planner_cookie,
+            )
+        self.assertTrue(batch_publish["status"].startswith("302"))
+        self.assertEqual(mocked_urlopen.call_count, 2)
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, first["id"])["status"], "published")
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, second["id"])["status"], "published")
+
     def test_initial_review_defaults_to_calculated_price_when_price_is_omitted(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
         product = {
