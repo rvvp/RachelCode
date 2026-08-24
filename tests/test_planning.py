@@ -423,6 +423,47 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(approved_record["status"], "confirmed")
         self.assertEqual(approved_record["launch_price"], 579)
 
+        app.catalog_api_token = "token"
+        admin_confirmed_page = self.wsgi_request(
+            app,
+            "/workbench?status=confirmed",
+            cookie=admin_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn("复核已通过，待商品部回传", admin_confirmed_page)
+        self.assertNotIn(f"action='/pricing/{record['id']}/publish'", admin_confirmed_page)
+        self.assertNotIn("action='/sync'", admin_confirmed_page)
+        denied_publish = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/publish",
+            method="POST",
+            cookie=admin_cookie,
+        )
+        self.assertTrue(denied_publish["status"].startswith("403"))
+        denied_sync = self.wsgi_request(app, "/sync", method="POST", cookie=admin_cookie)
+        self.assertTrue(denied_sync["status"].startswith("403"))
+
+        with patch.object(app, "fetch_catalog_products", return_value=[]):
+            planner_confirmed_page = self.wsgi_request(
+                app,
+                "/workbench?status=confirmed",
+                cookie=planner_cookie,
+            )["body"].decode("utf-8")
+        self.assertIn(f"action='/pricing/{record['id']}/publish'", planner_confirmed_page)
+        self.assertIn("回传藏宝阁", planner_confirmed_page)
+        self.assertIn("action='/sync'", planner_confirmed_page)
+        publication_result = io.BytesIO(json.dumps({"status": "published"}).encode("utf-8"))
+        with patch("planning_center.web.urlopen", return_value=publication_result) as mocked_urlopen:
+            published = self.wsgi_request(
+                app,
+                f"/pricing/{record['id']}/publish",
+                method="POST",
+                cookie=planner_cookie,
+            )
+        self.assertTrue(published["status"].startswith("302"))
+        publication_payload = json.loads(mocked_urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(publication_payload["operator_name"], "商品部企划员")
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "published")
+
     def test_initial_review_defaults_to_calculated_price_when_price_is_omitted(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
         product = {
