@@ -459,8 +459,8 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("data-saved-value='2539'", review_page)
         self.assertIn("修改保存", review_page)
         self.assertIn("复核通过", review_page)
-        self.assertIn("review-approval-actions", review_page)
-        self.assertIn("justify-content:flex-end", review_page)
+        self.assertIn("grid-template-columns:max-content max-content", review_page)
+        self.assertIn(".review-approve-button{grid-column:2;justify-self:end}", review_page)
         rejected_review_fractional = self.wsgi_request(
             app,
             f"/pricing/{record['id']}/approve",
