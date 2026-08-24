@@ -68,6 +68,16 @@ class PlanningCenterTests(unittest.TestCase):
             "raw_price": 600,
             "operator_name": "测试企划员",
         }
+        fractional = self.wsgi_request(
+            app,
+            f"/api/internal/planning/products/{source['id']}/price-publication",
+            method="POST",
+            body=json.dumps(dict(publication, publication_id="PC-TEST-FRACTION", launch_price=599.5)).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(fractional["status"].startswith("400"))
+        self.assertIn("必须是大于 0 的整数", fractional["body"].decode("utf-8"))
         response = self.wsgi_request(
             app,
             f"/api/internal/planning/products/{source['id']}/price-publication",
@@ -130,6 +140,22 @@ class PlanningCenterTests(unittest.TestCase):
             {"status": "already_published"},
         )
         self.assertEqual(updated["status"], "published")
+
+    def test_catalog_launch_price_input_and_validation_require_integer(self):
+        app = CatalogApplication(self.catalog_db_path, Path(self.temp.name) / "uploads")
+        markup = app.render_input(catalog_db.PRODUCT_FIELD_MAP["launch_price"], {"launch_price": 2539.0})
+        self.assertIn('min="1" step="1" inputmode="numeric"', markup)
+        self.assertIn('value="2539"', markup)
+        self.assertNotIn('value="2539.0"', markup)
+
+        valid_errors = app.validate_product_form(
+            {"product_name": "整数价格测试", "style_code": "INTEGER-PRICE", "launch_price": "2539"}
+        )
+        self.assertEqual(valid_errors, [])
+        fractional_errors = app.validate_product_form(
+            {"product_name": "小数价格测试", "style_code": "FRACTION-PRICE", "launch_price": "2539.5"}
+        )
+        self.assertIn("上新价格必须是大于 0 的整数，不保留小数位。", fractional_errors)
 
     def test_dress_uses_fixed_multiplier_regardless_of_cost(self):
         planning_db.save_category_rule(self.planning_db_path, "", "连衣裙", 4.2)
@@ -373,24 +399,36 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("定价初审与复核", workbench)
         self.assertIn("测算上新价", workbench)
         self.assertIn("初审上新价", workbench)
+        self.assertIn("min='1' step='1' inputmode='numeric'", workbench)
         self.assertIn("待初审", workbench)
         self.assertIn("定价状态", workbench)
         self.assertIn("初审 / 复核 / 回传", workbench)
         self.assertIn("确认并提交复核", workbench)
         self.assertNotIn("PRICING RECORDS", workbench)
 
+        rejected_fractional = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/submit-review",
+            method="POST",
+            body=urlencode({"launch_price": "589.5"}).encode(),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(rejected_fractional["status"].startswith("400"))
+        self.assertIn("必须是大于 0 的整数", rejected_fractional["body"].decode("utf-8"))
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "suggested")
+
         submitted = self.wsgi_request(
             app,
             f"/pricing/{record['id']}/submit-review",
             method="POST",
-            body=urlencode({"launch_price": "589"}).encode(),
+            body=urlencode({"launch_price": "2539"}).encode(),
             cookie=planner_cookie,
         )
         self.assertTrue(submitted["status"].startswith("302"))
         submitted_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
         self.assertEqual(submitted_record["status"], "review_pending")
         self.assertEqual(submitted_record["calculated_price"], 599)
-        self.assertEqual(submitted_record["launch_price"], 589)
+        self.assertEqual(submitted_record["launch_price"], 2539)
         denied = self.wsgi_request(
             app,
             f"/pricing/{record['id']}/approve",
@@ -409,8 +447,18 @@ class PlanningCenterTests(unittest.TestCase):
         admin_cookie = dict(admin_login["headers"])["Set-Cookie"].split(";", 1)[0]
         review_page = self.wsgi_request(app, "/workbench?status=review_pending", cookie=admin_cookie)["body"].decode("utf-8")
         self.assertIn("复核上新价", review_page)
+        self.assertIn("min='1' step='1' inputmode='numeric'", review_page)
         self.assertIn("保存复核价", review_page)
         self.assertIn("复核通过", review_page)
+        rejected_review_fractional = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/approve",
+            method="POST",
+            body=urlencode({"launch_price": "2539.5"}).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(rejected_review_fractional["status"].startswith("400"))
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "review_pending")
         approved = self.wsgi_request(
             app,
             f"/pricing/{record['id']}/approve",

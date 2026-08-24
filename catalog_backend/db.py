@@ -6,6 +6,7 @@ import hashlib
 import secrets
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from catalog_backend.fields import CATALOG_EXPORT_FIELD_ORDER, PRODUCT_FIELDS, PRODUCT_FIELD_MAP
@@ -2356,11 +2357,16 @@ def publish_planning_price(
     if not category:
         raise ValueError("回传必须包含品类。")
     try:
-        launch_price = float(payload.get("launch_price"))
-    except (TypeError, ValueError):
+        launch_price_value = Decimal(str(payload.get("launch_price")).strip())
+    except (InvalidOperation, AttributeError, TypeError, ValueError):
         raise ValueError("回传上新价格必须是数字。")
-    if launch_price <= 0:
-        raise ValueError("回传上新价格必须大于 0。")
+    if (
+        not launch_price_value.is_finite()
+        or launch_price_value <= 0
+        or launch_price_value != launch_price_value.to_integral_value()
+    ):
+        raise ValueError("回传上新价格必须是大于 0 的整数。")
+    launch_price = int(launch_price_value)
     next_version = current_version + 1
     after = dict(product)
     after["category"] = category

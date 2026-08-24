@@ -550,14 +550,14 @@ def confirm_pricing_record(db_path: str | Path, record_id: int, operator_name: s
     return dict(updated)
 
 
-def _validated_launch_price(value) -> float:
+def _validated_launch_price(value) -> int:
     try:
-        price = float(value)
-    except (TypeError, ValueError):
+        price = Decimal(str(value).strip())
+    except (InvalidOperation, AttributeError, TypeError, ValueError):
         raise ValueError("上新价必须是有效数字。")
-    if not math.isfinite(price) or price <= 0:
-        raise ValueError("上新价必须大于 0。")
-    return price
+    if not price.is_finite() or price <= 0 or price != price.to_integral_value():
+        raise ValueError("上新价必须是大于 0 的整数，不保留小数位。")
+    return int(price)
 
 
 def submit_pricing_for_review(db_path: str | Path, record_id: int, launch_price, operator_name: str) -> dict:

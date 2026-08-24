@@ -2120,11 +2120,18 @@ class CatalogApplication:
                 continue
             try:
                 if PRODUCT_FIELD_MAP[numeric_field].storage_type == "INTEGER":
-                    int(float(value))
+                    numeric_value = int(float(value))
                 else:
-                    float(value)
+                    numeric_value = float(value)
             except ValueError:
                 errors.append(f"{PRODUCT_FIELD_MAP[numeric_field].label} 必须是数字。")
+                continue
+            if numeric_field == "launch_price" and (
+                not math.isfinite(numeric_value)
+                or numeric_value <= 0
+                or not numeric_value.is_integer()
+            ):
+                errors.append("上新价格必须是大于 0 的整数，不保留小数位。")
         return errors
 
     def apply_image_upload(self, form: dict, files: dict, existing_image_url: str | None):
@@ -10649,6 +10656,13 @@ class CatalogApplication:
     def render_input(self, field, values):
         raw_value = values.get(field.key, "")
         value = "" if raw_value is None else str(raw_value)
+        if field.key == "launch_price" and raw_value not in (None, ""):
+            try:
+                parsed_price = float(raw_value)
+                if math.isfinite(parsed_price) and parsed_price.is_integer():
+                    value = str(int(parsed_price))
+            except (TypeError, ValueError):
+                pass
         field_class = "field field-wide" if field.input_type == "textarea" else "field"
         label = html.escape(field.label)
         placeholder = html.escape(field.placeholder or "")
@@ -10708,7 +10722,10 @@ class CatalogApplication:
             </label>
             """
         input_type = "number" if field.input_type == "number" else "text"
-        step = ' step="0.01"' if field.storage_type == "REAL" else ""
+        if field.key == "launch_price":
+            step = ' min="1" step="1" inputmode="numeric"'
+        else:
+            step = ' step="0.01"' if field.storage_type == "REAL" else ""
         return f"""
         <label class="{field_class}">
           <span>{label}</span>

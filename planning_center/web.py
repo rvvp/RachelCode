@@ -473,15 +473,15 @@ class PlanningApplication:
                 if record_status in {"suggested", "conflict"} and user.get("role") == "planner":
                     controls = f"""
                     <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/submit-review'>
-                      <label>初审上新价<input name='launch_price' type='number' min='0.01' step='1' value='{price_value}' required></label>
+                      <label>初审上新价<input name='launch_price' type='number' min='1' step='1' inputmode='numeric' value='{price_value}' required></label>
                       <button class='primary' type='submit'>确认并提交复核</button>
                     </form>
                     <small>默认使用测算上新价；如需调整，可直接修改初审上新价。</small>"""
                 elif record_status == "review_pending" and user.get("role") == "admin":
                     controls = f"""
                     <div class='review-controls'><span class='review-note'>商品部初审已提交，请进行复核</span>
-                      <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/review-save'><label>复核上新价<input name='launch_price' type='number' min='0.01' step='1' value='{price_value}' required></label><button type='submit'>保存复核价</button></form>
-                      <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/approve'><label>复核上新价<input name='launch_price' type='number' min='0.01' step='1' value='{price_value}' required></label><button class='primary' type='submit'>复核通过</button></form>
+                      <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/review-save'><label>复核上新价<input name='launch_price' type='number' min='1' step='1' inputmode='numeric' value='{price_value}' required></label><button type='submit'>保存复核价</button></form>
+                      <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/approve'><label>复核上新价<input name='launch_price' type='number' min='1' step='1' inputmode='numeric' value='{price_value}' required></label><button class='primary' type='submit'>复核通过</button></form>
                     </div>"""
                 elif record_status == "confirmed" and user.get("role") == "planner":
                     controls = f"<form class='table-action-form' method='post' action='/pricing/{record['id']}/publish'><button class='primary' type='submit'>回传藏宝阁</button></form>"
