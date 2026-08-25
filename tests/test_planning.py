@@ -530,6 +530,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(header_positions, sorted(header_positions))
         self.assertIn("data-column-key='category'>品类", workbench)
         self.assertIn("data-column-key='rule'>规则计算", workbench)
+        self.assertIn("<span class='rule-expression'>4 × 1</span><span class='rule-raw-price'>= 600.0 原始</span>", workbench)
         self.assertIn("data-column-key='price'>测算上新价", workbench)
         self.assertIn("data-column-key='channel'>渠道划分", workbench)
         self.assertIn("data-column-key='workflow'>流程状态与操作", workbench)
