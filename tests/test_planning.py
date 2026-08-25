@@ -722,14 +722,56 @@ class PlanningCenterTests(unittest.TestCase):
             for product_id in (71, 72)
         ]
         planning_db.upsert_source_products(self.planning_db_path, products)
-        records = [planning_db.create_pricing_record(self.planning_db_path, product, "商品部企划员") for product in products]
-        first, second = records
         app = PlanningApplication(self.planning_db_path, "http://catalog.test")
         planner_cookie = self.login_cookie(app, "planner")
         admin_cookie = self.login_cookie(app, "planning_admin")
 
+        waiting_page = self.wsgi_request(app, "/workbench?status=waiting", cookie=planner_cookie)["body"].decode("utf-8")
+        self.assertIn("批量生成测算上新价", waiting_page)
+        self.assertEqual(waiting_page.count("name='suggest_ids'"), 2)
+        self.assertEqual(waiting_page.count(">生成测算上新价</button>"), 2)
+        no_suggest_selection = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode({"batch_action": "suggest"}).encode(),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(no_suggest_selection["status"].startswith("400"))
+        denied_suggest = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode([("batch_action", "suggest"), ("suggest_ids", "71")]).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(denied_suggest["status"].startswith("403"))
+        batch_suggest = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode(
+                [
+                    ("batch_action", "suggest"),
+                    ("suggest_ids", "71"),
+                    ("suggest_ids", "72"),
+                ]
+            ).encode(),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(batch_suggest["status"].startswith("302"))
+        self.assertIn("status=suggested", dict(batch_suggest["headers"])["Location"])
+        records_by_source = {
+            int(record["source_product_id"]): record
+            for record in planning_db.list_pricing_records(self.planning_db_path)
+        }
+        first, second = records_by_source[71], records_by_source[72]
+        self.assertEqual(first["calculated_price"], 599)
+        self.assertEqual(second["calculated_price"], 599)
+
         initial_page = self.wsgi_request(app, "/workbench?status=suggested", cookie=planner_cookie)["body"].decode("utf-8")
         self.assertIn("pricing-select-all", initial_page)
+        self.assertIn("批量生成测算上新价", initial_page)
         self.assertIn("批量初审提交", initial_page)
         self.assertIn("批量回传藏宝阁", initial_page)
         self.assertIn(".pricing-select-cell{position:sticky;left:0", initial_page)

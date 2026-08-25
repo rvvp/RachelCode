@@ -282,6 +282,7 @@ class PlanningApplication:
         form = self.parse_form_values(environ)
         action = (form.get("batch_action") or [""])[0]
         field_names = {
+            "suggest": "suggest_ids",
             "submit-review": "submit_review_ids",
             "approve": "approve_ids",
             "publish": "publish_ids",
@@ -293,11 +294,36 @@ class PlanningApplication:
             self.require_rule_manager(user)
         else:
             self.require_catalog_operator(user)
-        record_ids = self.batch_record_ids(form.get(field_name, []))
-        if not record_ids:
+        item_ids = self.batch_record_ids(form.get(field_name, []))
+        if not item_ids:
             raise ValueError("请先勾选要处理的款式。")
+
+        if action == "suggest":
+            latest_records = {}
+            for record in db.list_pricing_records(self.db_path):
+                latest_records.setdefault(int(record["source_product_id"]), record)
+            products = []
+            for product_id in item_ids:
+                product = db.get_source_product(self.db_path, product_id)
+                if not product:
+                    raise LookupError(f"同步商品 {product_id} 不存在。")
+                if product_id in latest_records:
+                    raise ValueError(f"{product['style_code'] or product['product_name']} 已有测算记录，无需重复生成。")
+                category = str(product.get("category_suggestion") or product.get("category") or "").strip()
+                product["category"] = db.validate_category_option(self.db_path, category)
+                products.append(product)
+            created = db.create_pricing_records(
+                self.db_path,
+                products,
+                user.get("display_name", "商品部企划员"),
+            )
+            return self.redirect(
+                start_response,
+                "/workbench?status=suggested&notice=" + self.q(f"已批量生成 {len(created)} 款测算上新价。"),
+            )
+
         records = []
-        for record_id in record_ids:
+        for record_id in item_ids:
             record = db.get_pricing_record(self.db_path, record_id)
             if not record:
                 raise LookupError(f"定价记录 {record_id} 不存在。")
@@ -652,6 +678,7 @@ class PlanningApplication:
             else "<span class='review-note'>同步与回传由商品部初审人员执行</span>"
         )
         batch_buttons = (
+            "<button type='submit' name='batch_action' value='suggest' data-label='批量生成测算上新价' disabled>批量生成测算上新价</button>"
             "<button type='submit' name='batch_action' value='submit-review' data-label='批量初审提交' disabled>批量初审提交</button>"
             "<button class='primary' type='submit' name='batch_action' value='publish' data-label='批量回传藏宝阁' disabled>批量回传藏宝阁</button>"
             if user.get("role") == "planner"
@@ -720,6 +747,9 @@ class PlanningApplication:
             if not record:
                 category_value = str(item.get("category_suggestion") or item.get("category") or "")
                 if user.get("role") == "planner":
+                    selection_cell = (
+                        f"<input class='pricing-batch-checkbox' type='checkbox' name='suggest_ids' value='{item['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(item.get('style_code') or item.get('product_name') or str(item['id']), quote=True)} 批量生成测算上新价' {' ' if can_price else 'disabled'}>"
+                    )
                     category_cell = f"""
                       <form id='pricing-calc-{item['id']}' class='table-action-form pricing-calc-form' method='post' action='/pricing/suggest'>
                         <input type='hidden' name='product_id' value='{item['id']}'>
@@ -917,7 +947,7 @@ class PlanningApplication:
           const selectedCount = document.querySelector('#pricing-selected-count');
           const batchChecks = Array.from(document.querySelectorAll('.pricing-batch-checkbox'));
           const batchButtons = Array.from(document.querySelectorAll("#pricing-batch-form button[name='batch_action']"));
-          const batchFieldByAction = {{'submit-review': 'submit_review_ids', 'approve': 'approve_ids', 'publish': 'publish_ids'}};
+          const batchFieldByAction = {{'suggest': 'suggest_ids', 'submit-review': 'submit_review_ids', 'approve': 'approve_ids', 'publish': 'publish_ids'}};
           const updateBatchControls = () => {{
             const enabled = batchChecks.filter((checkbox) => !checkbox.disabled);
             const selected = enabled.filter((checkbox) => checkbox.checked);

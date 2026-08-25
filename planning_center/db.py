@@ -734,37 +734,70 @@ def calculate_pricing(
     }
 
 
-def create_pricing_record(db_path: str | Path, product: dict, operator_name: str) -> dict:
-    cost = product.get("actual_cost")
-    category = str(product.get("category") or product.get("category_suggestion") or "").strip()
-    calculation = calculate_pricing(
-        db_path,
-        product.get("season_year", ""),
-        category,
-        product.get("supplier", ""),
-        cost,
-    )
-    fixed = calculation["fixed_multiplier"]
-    coefficient = calculation["supplier_coefficient"]
-    raw = calculation["raw_price"]
-    launch = calculation["calculated_price"]
-    source_version_no = int(product.get("source_version_no") or 1)
-    with get_connection(db_path) as connection:
-        existing = connection.execute(
-            "SELECT * FROM pricing_records WHERE source_product_id = ? AND source_version_no = ? ORDER BY created_at DESC, id DESC LIMIT 1",
-            (int(product["id"]), source_version_no),
-        ).fetchone()
-        if existing and existing["status"] in {"suggested", "review_pending", "confirmed", "published"}:
-            return dict(existing)
-    publication_id = f"PC-{product['id']}-V{source_version_no}-{secrets.token_hex(4).upper()}"
-    now = utc_now()
-    with get_connection(db_path) as connection:
-        connection.execute(
-            "INSERT INTO pricing_records (publication_id, source_product_id, source_version_no, season_year, style_code, product_name, supplier, category, channel, cost, fixed_multiplier, supplier_coefficient, raw_price, calculated_price, launch_price, status, operator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)",
-            (publication_id, product["id"], source_version_no, product.get("season_year", ""), product.get("style_code", ""), product.get("product_name", ""), product.get("supplier", ""), category, float(cost), fixed, coefficient, raw, launch, launch, operator_name, now),
+def create_pricing_records(db_path: str | Path, products: list[dict], operator_name: str) -> list[dict]:
+    prepared = []
+    for product in products:
+        cost = product.get("actual_cost")
+        category = str(product.get("category") or product.get("category_suggestion") or "").strip()
+        calculation = calculate_pricing(
+            db_path,
+            product.get("season_year", ""),
+            category,
+            product.get("supplier", ""),
+            cost,
         )
-        row = connection.execute("SELECT * FROM pricing_records WHERE publication_id = ?", (publication_id,)).fetchone()
-    return dict(row)
+        prepared.append(
+            (
+                product,
+                category,
+                float(cost),
+                calculation,
+                int(product.get("source_version_no") or 1),
+            )
+        )
+
+    now = utc_now()
+    created = []
+    with get_connection(db_path) as connection:
+        for product, category, cost, calculation, source_version_no in prepared:
+            existing = connection.execute(
+                "SELECT * FROM pricing_records WHERE source_product_id = ? AND source_version_no = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (int(product["id"]), source_version_no),
+            ).fetchone()
+            connection.execute("UPDATE source_products SET category = ? WHERE id = ?", (category, int(product["id"])))
+            if existing and existing["status"] in {"suggested", "review_pending", "confirmed", "published"}:
+                created.append(dict(existing))
+                continue
+            publication_id = f"PC-{product['id']}-V{source_version_no}-{secrets.token_hex(4).upper()}"
+            launch = calculation["calculated_price"]
+            connection.execute(
+                "INSERT INTO pricing_records (publication_id, source_product_id, source_version_no, season_year, style_code, product_name, supplier, category, channel, cost, fixed_multiplier, supplier_coefficient, raw_price, calculated_price, launch_price, status, operator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)",
+                (
+                    publication_id,
+                    product["id"],
+                    source_version_no,
+                    product.get("season_year", ""),
+                    product.get("style_code", ""),
+                    product.get("product_name", ""),
+                    product.get("supplier", ""),
+                    category,
+                    cost,
+                    calculation["fixed_multiplier"],
+                    calculation["supplier_coefficient"],
+                    calculation["raw_price"],
+                    launch,
+                    launch,
+                    operator_name,
+                    now,
+                ),
+            )
+            row = connection.execute("SELECT * FROM pricing_records WHERE publication_id = ?", (publication_id,)).fetchone()
+            created.append(dict(row))
+    return created
+
+
+def create_pricing_record(db_path: str | Path, product: dict, operator_name: str) -> dict:
+    return create_pricing_records(db_path, [product], operator_name)[0]
 
 
 def list_pricing_records(db_path: str | Path, *, season_year: str = "", status: str = "") -> list[dict]:
