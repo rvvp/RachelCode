@@ -734,30 +734,30 @@ class PlanningApplication:
                 else:
                     controls = "<span class='review-note'>等待下一处理环节</span>"
                 action_cell = controls
+            workflow_cell = f"<div class='workflow-status'>{status_cell}</div><div class='workflow-actions'>{action_cell}</div>"
             rows.append(f"""
               <tr id='pricing-row-{int(item['id'])}'>
                 <td class='pricing-select-cell'>{selection_cell}</td>
+                <td class='pricing-image-cell image-cell'>{image}</td>
                 <td><strong>{html.escape(item.get('season_year') or '未提供')}</strong>{source_version}</td>
                 <td><strong>{html.escape(item.get('style_code') or '未提供')}</strong></td>
                 <td>{html.escape(item.get('style_color') or item.get('color_name') or '未提供')}</td>
-                <td class='image-cell'>{image}</td>
                 <td>{html.escape(item.get('product_name') or '未提供')}</td>
                 <td>{html.escape(item.get('supplier') or '未提供')}</td>
                 <td><strong class='cost-value'>{html.escape(f"{float(cost):g}" if cost is not None else '未提供')}</strong></td>
                 <td><span class='status status-source'>{html.escape(source_status_label)}</span></td>
                 <td class='pricing-category-cell'>{category_cell}</td>
                 <td class='pricing-rule-cell'>{rule_cell}</td>
-                <td class='pricing-channel-cell'>{channel_cell}</td>
                 <td class='price-cell'>{price_cell}</td>
-                <td>{status_cell}</td>
-                <td class='pricing-action-cell'>{action_cell}</td>
+                <td class='pricing-channel-cell'>{channel_cell}</td>
+                <td class='pricing-workflow-cell'>{workflow_cell}</td>
               </tr>""")
         content = f"""
         <section class='page-heading'><div><div class='eyebrow'>NEW ARRIVAL PRICING</div><h1>上新定价工作台</h1><p>所有款色集中在一张定价资料与审核卡片中，按条目完成规则匹配、初审、复核和回传。</p></div>{catalog_sync_action}</section>
         {self.alert(notice, 'success') if notice else ''}{self.alert(error, 'error') if error else ''}
         <section class='filter-bar'><form method='get' action='/workbench'><label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待初审</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待复核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>复核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button type='submit'>筛选</button></form></section>
-        <section class='workbench-summary'><span>当前显示</span><strong>{len(filtered_products)} 款</strong><small>资料字段顺序：年份季节、款号、款色、图片、商品名称、供应商、含税成本、来源状态</small></section>
-        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>定价初审与复核</h2><p class='hint'>来源资料与定价结果在同一行展示，按初审、复核流程逐条处理。</p></div><span class='count'>{len(filtered_products)} 款</span></div>{batch_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table'><thead><tr><th class='pricing-select-cell'><span class='visually-hidden'>选择</span></th><th>年份季节</th><th>款号</th><th>款色</th><th>图片</th><th>商品名称</th><th>供应商</th><th>含税成本</th><th>来源状态</th><th>品类</th><th>规则计算</th><th>渠道划分</th><th>测算上新价</th><th>定价状态</th><th>初审 / 复核 / 回传</th></tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="15" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div></section>
+        <section class='workbench-summary'><span>当前显示</span><strong>{len(filtered_products)} 款</strong><small>左侧固定：勾选、图片；资料字段：年份季节、款号、款色、商品名称、供应商、含税成本、来源状态</small></section>
+        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>定价初审与复核</h2><p class='hint'>来源资料、测算结果和流程操作在同一行展示，状态与操作合并在最后一列。</p></div><span class='count'>{len(filtered_products)} 款</span></div>{batch_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table'><thead><tr><th class='pricing-select-cell'><span class='visually-hidden'>选择</span></th><th>图片</th><th>年份季节</th><th>款号</th><th>款色</th><th>商品名称</th><th>供应商</th><th>含税成本</th><th>来源状态</th><th>品类</th><th>规则计算</th><th>测算上新价</th><th>渠道划分</th><th>流程状态与操作</th></tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="14" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div></section>
         <script>
         (() => {{
           const storageKey = 'planning-workbench-scroll';
@@ -1103,4 +1103,6 @@ class PlanningApplication:
         .rule-form.option-rule-form{grid-template-columns:1fr 1.4fr .55fr 1.2fr auto}.pricing-table{min-width:1690px}.pricing-table td:nth-child(10){min-width:170px}.pricing-table td:nth-child(11){min-width:180px}.pricing-table td:nth-child(12){min-width:135px}.pricing-table td:nth-child(13){min-width:112px}.pricing-table td:nth-child(14){min-width:130px}.pricing-table td:nth-child(15){min-width:270px}.pricing-table .pricing-category-cell select,.pricing-table .pricing-channel-cell select,.pricing-table .pricing-calc-form select{width:145px;padding:7px 8px}.pricing-table .cell-field{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:12px}.pricing-table .pricing-rule-cell .rule-summary{display:block;white-space:nowrap}.pricing-table .pricing-rule-cell .recalculate-button{display:block;margin-top:8px;white-space:nowrap}.pricing-table .pricing-category-cell small,.pricing-table .pricing-rule-cell small{margin-top:4px}
         @media(max-width:900px){.rule-form.option-rule-form{grid-template-columns:1fr 1fr}.rule-form.option-rule-form .form-actions{grid-column:span 2}}
         @media(max-width:620px){.rule-form.option-rule-form{grid-template-columns:1fr}.rule-form.option-rule-form .form-actions{grid-column:auto}.pricing-board>.panel-head{padding:18px 18px 0;align-items:flex-start}.pricing-batch-toolbar{align-items:flex-start;flex-wrap:wrap;padding:10px 18px}.pricing-batch-actions{width:100%;justify-content:flex-start;margin-left:0;overflow-x:auto}.pricing-table{min-width:1690px}.pricing-table th,.pricing-table td{padding:10px 9px}.pricing-table .pricing-action-cell input{width:102px}.pricing-table .pricing-action-cell button{font-size:11px;padding:6px 8px}}
+        .pricing-table .pricing-image-cell{position:sticky;left:44px;z-index:1;min-width:78px;width:78px;padding-left:10px;padding-right:10px;background:#fff;box-shadow:1px 0 0 var(--line)}.pricing-table thead th:nth-child(2){position:sticky;left:44px;z-index:3;min-width:78px;width:78px;background:#f7f9f7;box-shadow:1px 0 0 var(--line)}.pricing-table tbody tr:hover .pricing-image-cell{background:#fbfcfb}.pricing-table td:nth-child(2){min-width:78px;width:78px}.pricing-table td:nth-child(3){min-width:105px}.pricing-table td:nth-child(4){min-width:88px}.pricing-table td:nth-child(5){min-width:92px}.pricing-table td:nth-child(6){min-width:130px}.pricing-table td:nth-child(7){min-width:110px}.pricing-table td:nth-child(8){min-width:88px}.pricing-table td:nth-child(9){min-width:112px}.pricing-table td:nth-child(10){min-width:170px}.pricing-table td:nth-child(11){min-width:180px}.pricing-table td:nth-child(12){min-width:112px}.pricing-table td:nth-child(13){min-width:135px}.pricing-table td:nth-child(14){min-width:270px}.pricing-table .pricing-workflow-cell{vertical-align:middle}.pricing-table .workflow-status{margin-bottom:8px}.pricing-table .workflow-actions form{margin:0 0 7px}.pricing-table .workflow-actions>form:only-child{margin-bottom:0}.pricing-table .workflow-actions label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap}.pricing-table .workflow-actions input{width:110px;padding:7px 8px}.pricing-table .workflow-actions button{padding:7px 9px;font-size:12px;white-space:nowrap}.pricing-table .workflow-actions small{max-width:245px}
+        @media(max-width:620px){.pricing-table .workflow-actions input{width:102px}.pricing-table .workflow-actions button{font-size:11px;padding:6px 8px}}
         """

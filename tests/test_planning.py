@@ -510,19 +510,20 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertNotIn("<article class='product-card'>", workbench)
         self.assertIn("系统按商品名称自动判定", workbench)
         self.assertNotIn("name='category' value", workbench)
-        headers = ["年份季节", "款号", "款色", "图片", "商品名称", "供应商", "含税成本", "来源状态"]
+        headers = ["图片", "年份季节", "款号", "款色", "商品名称", "供应商", "含税成本", "来源状态"]
         header_positions = [workbench.index(f"<th>{header}</th>") for header in headers]
         self.assertEqual(header_positions, sorted(header_positions))
         self.assertIn("<th>品类</th>", workbench)
         self.assertIn("<th>规则计算</th>", workbench)
-        self.assertIn("<th>渠道划分</th>", workbench)
+        self.assertIn("<th>测算上新价</th><th>渠道划分</th>", workbench)
+        self.assertIn("<th>流程状态与操作</th>", workbench)
+        self.assertNotIn("<th>定价状态</th>", workbench)
+        self.assertNotIn("<th>初审 / 复核 / 回传</th>", workbench)
         self.assertIn("定价初审与复核", workbench)
         self.assertIn("测算上新价", workbench)
         self.assertIn("初审上新价", workbench)
         self.assertIn("min='1' step='1' inputmode='numeric'", workbench)
         self.assertIn("待初审", workbench)
-        self.assertIn("定价状态", workbench)
-        self.assertIn("初审 / 复核 / 回传", workbench)
         self.assertIn("确认并提交复核", workbench)
         self.assertIn("id='pricing-row-31'", workbench)
         self.assertIn("planning-workbench-scroll", workbench)
@@ -695,8 +696,10 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("批量回传藏宝阁", initial_page)
         self.assertIn(".pricing-select-cell{position:sticky;left:0", initial_page)
         self.assertIn(".pricing-table thead .pricing-select-cell{z-index:2", initial_page)
-        self.assertIn(".pricing-table .pricing-action-cell{vertical-align:middle}", initial_page)
-        self.assertIn(".pricing-table .pricing-action-cell>form:only-child{margin-bottom:0}", initial_page)
+        self.assertIn(".pricing-table .pricing-image-cell{position:sticky;left:44px", initial_page)
+        self.assertIn(".pricing-table thead th:nth-child(2){position:sticky;left:44px;z-index:3", initial_page)
+        self.assertIn(".pricing-table .pricing-workflow-cell{vertical-align:middle}", initial_page)
+        self.assertIn(".pricing-table .workflow-actions>form:only-child{margin-bottom:0}", initial_page)
         self.assertEqual(initial_page.count("name='submit_review_ids'"), 2)
         no_selection = self.wsgi_request(
             app,
