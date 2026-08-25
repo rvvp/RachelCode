@@ -598,9 +598,12 @@ class PlanningCenterTests(unittest.TestCase):
         admin_cookie = dict(admin_login["headers"])["Set-Cookie"].split(";", 1)[0]
         review_page = self.wsgi_request(app, "/workbench?status=review_pending", cookie=admin_cookie)["body"].decode("utf-8")
         self.assertEqual(review_page.count("复核上新价"), 1)
+        self.assertEqual(review_page.count("复核渠道"), 1)
         self.assertEqual(review_page.count("<input name='launch_price'"), 1)
+        self.assertEqual(review_page.count("<select name='channel'"), 1)
         self.assertIn("min='1' step='1' inputmode='numeric'", review_page)
         self.assertIn("data-saved-value='2539'", review_page)
+        self.assertIn("data-saved-value='天猫'", review_page)
         self.assertIn("修改保存", review_page)
         self.assertIn("复核通过", review_page)
         self.assertIn("grid-template-columns:max-content max-content", review_page)
@@ -618,34 +621,46 @@ class PlanningCenterTests(unittest.TestCase):
             app,
             f"/pricing/{record['id']}/approve",
             method="POST",
-            body=urlencode({"launch_price": "579"}).encode(),
+            body=urlencode({"launch_price": "579", "channel": "天猫"}).encode(),
             cookie=admin_cookie,
         )
         self.assertTrue(rejected_unsaved_review["status"].startswith("400"))
         self.assertIn("请先点击“修改保存”", rejected_unsaved_review["body"].decode("utf-8"))
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "review_pending")
+        rejected_unsaved_channel = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/approve",
+            method="POST",
+            body=urlencode({"launch_price": "2539", "channel": "唯品"}).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(rejected_unsaved_channel["status"].startswith("400"))
+        self.assertIn("上新价或渠道已修改", rejected_unsaved_channel["body"].decode("utf-8"))
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["channel"], "天猫")
         saved_review = self.wsgi_request(
             app,
             f"/pricing/{record['id']}/review-save",
             method="POST",
-            body=urlencode({"launch_price": "579"}).encode(),
+            body=urlencode({"launch_price": "579", "channel": "唯品"}).encode(),
             cookie=admin_cookie,
         )
         self.assertTrue(saved_review["status"].startswith("302"))
         saved_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
         self.assertEqual(saved_record["status"], "review_pending")
         self.assertEqual(saved_record["launch_price"], 579)
+        self.assertEqual(saved_record["channel"], "唯品")
         approved = self.wsgi_request(
             app,
             f"/pricing/{record['id']}/approve",
             method="POST",
-            body=urlencode({"launch_price": "579"}).encode(),
+            body=urlencode({"launch_price": "579", "channel": "唯品"}).encode(),
             cookie=admin_cookie,
         )
         self.assertTrue(approved["status"].startswith("302"))
         approved_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
         self.assertEqual(approved_record["status"], "confirmed")
         self.assertEqual(approved_record["launch_price"], 579)
+        self.assertEqual(approved_record["channel"], "唯品")
 
         app.catalog_api_token = "token"
         admin_confirmed_page = self.wsgi_request(
@@ -686,7 +701,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(published["status"].startswith("302"))
         publication_payload = json.loads(mocked_urlopen.call_args.args[0].data.decode("utf-8"))
         self.assertEqual(publication_payload["operator_name"], "商品部企划员")
-        self.assertEqual(publication_payload["launch_channel"], "天猫")
+        self.assertEqual(publication_payload["launch_channel"], "唯品")
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "published")
 
     def test_batch_initial_review_approval_and_publication(self):
@@ -787,6 +802,7 @@ class PlanningCenterTests(unittest.TestCase):
                     ("batch_action", "approve"),
                     ("approve_ids", str(first["id"])),
                     (f"review_price_{first['id']}", "629"),
+                    (f"review_channel_{first['id']}", "天猫"),
                 ]
             ).encode(),
             cookie=admin_cookie,
@@ -794,6 +810,22 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(unsaved_price["status"].startswith("400"))
         self.assertIn("请先点击“修改保存”", unsaved_price["body"].decode("utf-8"))
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, first["id"])["status"], "review_pending")
+        unsaved_channel = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode(
+                [
+                    ("batch_action", "approve"),
+                    ("approve_ids", str(first["id"])),
+                    (f"review_price_{first['id']}", "609"),
+                    (f"review_channel_{first['id']}", "唯品"),
+                ]
+            ).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(unsaved_channel["status"].startswith("400"))
+        self.assertIn("上新价或渠道已修改", unsaved_channel["body"].decode("utf-8"))
         batch_approval = self.wsgi_request(
             app,
             "/pricing/batch",
@@ -805,6 +837,8 @@ class PlanningCenterTests(unittest.TestCase):
                     ("approve_ids", str(second["id"])),
                     (f"review_price_{first['id']}", "609"),
                     (f"review_price_{second['id']}", "619"),
+                    (f"review_channel_{first['id']}", "天猫"),
+                    (f"review_channel_{second['id']}", "唯品"),
                 ]
             ).encode(),
             cookie=admin_cookie,

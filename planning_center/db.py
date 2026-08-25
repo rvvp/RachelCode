@@ -889,7 +889,13 @@ def submit_pricing_for_review(
     return dict(updated)
 
 
-def save_review_price(db_path: str | Path, record_id: int, launch_price, operator_name: str) -> dict:
+def save_review_price(
+    db_path: str | Path,
+    record_id: int,
+    launch_price,
+    channel: str,
+    operator_name: str,
+) -> dict:
     price = validated_launch_price(launch_price)
     with get_connection(db_path) as connection:
         row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
@@ -897,15 +903,22 @@ def save_review_price(db_path: str | Path, record_id: int, launch_price, operato
             raise LookupError("定价记录不存在。")
         if row["status"] != "review_pending":
             raise ValueError("当前定价记录不在企划管理员复核阶段。")
+        clean_channel = validate_channel_option(db_path, channel)
         connection.execute(
-            "UPDATE pricing_records SET launch_price = ?, operator_name = ?, error_message = '' WHERE id = ?",
-            (price, operator_name, record_id),
+            "UPDATE pricing_records SET launch_price = ?, channel = ?, operator_name = ?, error_message = '' WHERE id = ?",
+            (price, clean_channel, operator_name, record_id),
         )
         updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
     return dict(updated)
 
 
-def approve_pricing_record(db_path: str | Path, record_id: int, launch_price, operator_name: str) -> dict:
+def approve_pricing_record(
+    db_path: str | Path,
+    record_id: int,
+    launch_price,
+    channel: str,
+    operator_name: str,
+) -> dict:
     price = validated_launch_price(launch_price)
     with get_connection(db_path) as connection:
         row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
@@ -913,8 +926,9 @@ def approve_pricing_record(db_path: str | Path, record_id: int, launch_price, op
             raise LookupError("定价记录不存在。")
         if row["status"] != "review_pending":
             raise ValueError("当前定价记录不在企划管理员复核阶段。")
-        if price != validated_launch_price(row["launch_price"]):
-            raise ValueError("复核上新价已修改，请先点击“修改保存”，再进行复核通过。")
+        clean_channel = validate_channel_option(db_path, channel)
+        if price != validated_launch_price(row["launch_price"]) or clean_channel != row["channel"]:
+            raise ValueError("复核上新价或渠道已修改，请先点击“修改保存”，再进行复核通过。")
         connection.execute(
             "UPDATE pricing_records SET status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = '' WHERE id = ?",
             (operator_name, utc_now(), record_id),
