@@ -633,6 +633,10 @@ class PlanningApplication:
         notice, error = query.get("notice", ""), query.get("error", "")
         season = query.get("season_year", "")
         status = query.get("status", "")
+        try:
+            requested_page = max(1, int(query.get("page") or 1))
+        except ValueError:
+            requested_page = 1
         if self.catalog_api_token and user.get("role") == "planner":
             try:
                 count = db.upsert_source_products(self.db_path, self.fetch_catalog_products())
@@ -671,6 +675,12 @@ class PlanningApplication:
             if status and workflow_status != status:
                 continue
             filtered_products.append((item, record, workflow_status))
+        page_size = 50
+        total_products = len(filtered_products)
+        total_pages = max(1, (total_products + page_size - 1) // page_size)
+        current_page = min(requested_page, total_pages)
+        page_start = (current_page - 1) * page_size
+        page_products = filtered_products[page_start : page_start + page_size]
         seasons = sorted({item.get("season_year", "") for item in db.list_source_products(self.db_path) if item.get("season_year")}, reverse=True)
         catalog_sync_action = (
             "<form method='post' action='/sync'><button class='primary' type='submit'>同步藏宝阁</button></form>"
@@ -678,7 +688,7 @@ class PlanningApplication:
             else "<span class='review-note'>同步与回传由商品部初审人员执行</span>"
         )
         batch_buttons = (
-            "<button type='submit' name='batch_action' value='suggest' data-label='批量生成测算上新价' disabled>批量生成测算上新价</button>"
+            "<button type='submit' name='batch_action' value='suggest' data-label='批量测算上新价' disabled>批量测算上新价</button>"
             "<button type='submit' name='batch_action' value='submit-review' data-label='批量初审提交' disabled>批量初审提交</button>"
             "<button class='primary' type='submit' name='batch_action' value='publish' data-label='批量回传藏宝阁' disabled>批量回传藏宝阁</button>"
             if user.get("role") == "planner"
@@ -730,7 +740,7 @@ class PlanningApplication:
         pricing_header = "".join(pricing_header_cells)
 
         rows = []
-        for item, record, workflow_status in filtered_products:
+        for item, record, workflow_status in page_products:
             cost = item.get("actual_cost")
             can_price = user.get("role") == "planner" and cost is not None and float(cost or 0) > 0
             source_status_label = {"pending": "已提交商品部", "published": "已完成", "received": "已接收"}.get(item.get("status"), item.get("status") or "未知")
@@ -748,7 +758,7 @@ class PlanningApplication:
                 category_value = str(item.get("category_suggestion") or item.get("category") or "")
                 if user.get("role") == "planner":
                     selection_cell = (
-                        f"<input class='pricing-batch-checkbox' type='checkbox' name='suggest_ids' value='{item['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(item.get('style_code') or item.get('product_name') or str(item['id']), quote=True)} 批量生成测算上新价' {' ' if can_price else 'disabled'}>"
+                        f"<input class='pricing-batch-checkbox' type='checkbox' name='suggest_ids' value='{item['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(item.get('style_code') or item.get('product_name') or str(item['id']), quote=True)} 批量测算上新价' {' ' if can_price else 'disabled'}>"
                     )
                     category_cell = f"""
                       <form id='pricing-calc-{item['id']}' class='table-action-form pricing-calc-form' method='post' action='/pricing/suggest'>
@@ -834,12 +844,41 @@ class PlanningApplication:
                 <td class='pricing-channel-cell'>{channel_cell}</td>
                 <td class='pricing-workflow-cell'>{workflow_cell}</td>
               </tr>""")
+
+        def page_url(target_page: int) -> str:
+            params = {}
+            if season:
+                params["season_year"] = season
+            if status:
+                params["status"] = status
+            if target_page > 1:
+                params["page"] = target_page
+            return "/workbench" + ("?" + urlencode(params) if params else "")
+
+        previous_page = (
+            f"<a class='button pagination-link' href='{html.escape(page_url(current_page - 1), quote=True)}'>上一页</a>"
+            if current_page > 1
+            else "<span class='button pagination-link disabled' aria-disabled='true'>上一页</span>"
+        )
+        next_page = (
+            f"<a class='button pagination-link' href='{html.escape(page_url(current_page + 1), quote=True)}'>下一页</a>"
+            if current_page < total_pages
+            else "<span class='button pagination-link disabled' aria-disabled='true'>下一页</span>"
+        )
+        pagination = f"""
+        <nav class='pricing-pagination' aria-label='列表分页'>
+          {previous_page}
+          <span>每页 50 款 · 第 {current_page} / {total_pages} 页 · 共 {total_products} 款</span>
+          {next_page}
+        </nav>"""
         content = f"""
         <section class='page-heading'><div><div class='eyebrow'>NEW ARRIVAL PRICING</div><h1>上新审核工作台</h1><p>所有款色集中在一张定价资料与审核卡片中，按条目完成规则匹配、初审、复核和回传。</p></div>{catalog_sync_action}</section>
         {self.alert(notice, 'success') if notice else ''}{self.alert(error, 'error') if error else ''}
-        <section class='filter-bar'><form method='get' action='/workbench'><label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待初审</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待复核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>复核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button type='submit'>筛选</button></form></section>
-        <section class='workbench-summary'><span>当前显示</span><strong>{len(filtered_products)} 款</strong><small>左侧固定：勾选、图片；资料字段：年份季节、款号、款色、商品名称、供应商、含税成本、来源状态</small></section>
-        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>初审与复核</h2><p class='hint'>来源资料、测算结果和流程操作在同一行展示，状态与操作合并在最后一列。</p></div><div class='pricing-board-tools'><button id='pricing-reset-columns' class='compact-button' type='button' title='恢复默认列宽'>恢复默认列宽</button><span class='count'>{len(filtered_products)} 款</span></div></div>{batch_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table' data-resizable-columns='pricing-v1'>{pricing_colgroup}<thead><tr>{pricing_header}</tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="14" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div></section>
+        <section class='workbench-toolbar'>
+          <div class='workbench-toolbar-summary'><span>当前结果</span><strong>{total_products} 款</strong><small>第 {current_page} / {total_pages} 页，本页 {len(page_products)} 款</small></div>
+          <form class='workbench-filter' method='get' action='/workbench'><label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待初审</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待复核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>复核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button type='submit'>筛选</button></form>
+        </section>
+        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>初审与复核</h2><p class='hint'>来源资料、测算结果和流程操作在同一行展示，每页最多 50 款。</p></div><div class='pricing-board-tools'><button id='pricing-reset-columns' class='compact-button' type='button' title='恢复默认列宽'>恢复默认列宽</button><span class='count'>本页 {len(page_products)} 款</span></div></div>{batch_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table' data-resizable-columns='pricing-v1'>{pricing_colgroup}<thead><tr>{pricing_header}</tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="14" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div>{pagination}</section>
         <script>
         (() => {{
           const storageKey = 'planning-workbench-scroll';
@@ -1317,5 +1356,8 @@ class PlanningApplication:
         .pricing-table .pricing-image-cell{position:sticky;left:44px;z-index:1;min-width:78px;width:78px;padding-left:10px;padding-right:10px;background:#fff;box-shadow:1px 0 0 var(--line)}.pricing-table thead th:nth-child(2){position:sticky;left:44px;z-index:3;min-width:78px;width:78px;background:#f7f9f7;box-shadow:1px 0 0 var(--line)}.pricing-table tbody tr:hover .pricing-image-cell{background:#fbfcfb}.pricing-table td:nth-child(2){min-width:78px;width:78px}.pricing-table td:nth-child(3){min-width:105px}.pricing-table td:nth-child(4){min-width:88px}.pricing-table td:nth-child(5){min-width:92px}.pricing-table td:nth-child(6){min-width:130px}.pricing-table td:nth-child(7){min-width:110px}.pricing-table td:nth-child(8){min-width:88px}.pricing-table td:nth-child(9){min-width:112px}.pricing-table td:nth-child(10){min-width:170px}.pricing-table td:nth-child(11){min-width:180px}.pricing-table td:nth-child(12){min-width:112px}.pricing-table td:nth-child(13){min-width:135px}.pricing-table td:nth-child(14){min-width:270px}.pricing-table .pricing-workflow-cell{vertical-align:middle}.pricing-table .workflow-status{margin-bottom:8px}.pricing-table .workflow-actions form{margin:0 0 7px}.pricing-table .workflow-actions>form:only-child{margin-bottom:0}.pricing-table .workflow-actions label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap}.pricing-table .workflow-actions input{width:110px;padding:7px 8px}.pricing-table .workflow-actions button{padding:7px 9px;font-size:12px;white-space:nowrap}.pricing-table .workflow-actions small{max-width:245px}
         @media(max-width:620px){.pricing-table .workflow-actions input{width:102px}.pricing-table .workflow-actions button{font-size:11px;padding:6px 8px}}
         .pricing-board-tools{display:flex;align-items:center;gap:12px}.pricing-board-tools .compact-button{background:#fff}.pricing-table[data-resizable-columns]{table-layout:fixed;width:max-content;min-width:0;--select-column-width:44px;--image-column-width:78px}.pricing-table[data-resizable-columns] col{width:auto}.pricing-table[data-resizable-columns] th,.pricing-table[data-resizable-columns] td{width:auto;min-width:0!important;overflow-wrap:anywhere}.pricing-table[data-resizable-columns] .pricing-select-cell{width:var(--select-column-width)}.pricing-table[data-resizable-columns] .pricing-image-cell{left:var(--select-column-width);width:var(--image-column-width)}.pricing-table[data-resizable-columns] thead th:nth-child(2){left:var(--select-column-width);width:var(--image-column-width)}.pricing-table[data-resizable-columns] thead th:not(:first-child):not(:nth-child(2)){position:relative}.pricing-table .rule-summary{display:flex;flex-direction:column;gap:2px;white-space:normal}.pricing-table .rule-expression,.pricing-table .rule-raw-price{display:block;white-space:nowrap}.column-resize-handle{position:absolute;top:0;right:-4px;width:8px;height:100%;cursor:col-resize;touch-action:none;z-index:4}.column-resize-handle:hover,.column-resize-handle:focus-visible,.column-resizing .column-resize-handle{background:var(--accent);opacity:.6;outline:0}.column-resizing{cursor:col-resize!important;user-select:none}.column-resizing *{cursor:col-resize!important;user-select:none}
+        .workbench-toolbar{display:flex;align-items:center;justify-content:space-between;gap:24px;background:#fff;border:1px solid var(--line);padding:12px 18px;margin-bottom:16px}.workbench-toolbar-summary{display:flex;align-items:baseline;gap:10px;min-width:max-content}.workbench-toolbar-summary span,.workbench-toolbar-summary small{color:var(--muted);font-size:12px}.workbench-toolbar-summary strong{font:24px Georgia,serif;color:var(--deep)}.workbench-filter{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;margin-left:auto}.workbench-filter label{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:11px}.workbench-filter select{min-width:145px;padding:7px 9px}.workbench-filter button{padding:7px 12px}.pricing-pagination{display:flex;align-items:center;justify-content:flex-end;gap:12px;min-height:58px;padding:10px 24px;border-top:1px solid var(--line);background:#f7f9f7}.pricing-pagination>span:not(.button){color:var(--muted);font-size:12px}.pagination-link{padding:6px 11px;font-size:12px}.pagination-link.disabled{cursor:not-allowed;opacity:.45;pointer-events:none}
         @media(max-width:620px){.pricing-board-tools{align-items:flex-start;flex-direction:column;gap:6px}.pricing-table[data-resizable-columns]{min-width:0}}
+        @media(max-width:900px){.workbench-toolbar{align-items:flex-start;flex-wrap:wrap}.workbench-filter{width:100%;margin-left:0}.workbench-filter label{flex:1}.workbench-filter select{width:100%}}
+        @media(max-width:620px){.workbench-toolbar-summary{min-width:0;flex-wrap:wrap}.workbench-filter{align-items:stretch;flex-direction:column}.workbench-filter label,.workbench-filter select,.workbench-filter button{width:100%}.pricing-pagination{justify-content:space-between;padding:10px 18px}.pricing-pagination>span:not(.button){text-align:center}.pagination-link{white-space:nowrap}}
         """

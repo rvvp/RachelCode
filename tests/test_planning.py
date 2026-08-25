@@ -463,6 +463,57 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("302"))
         self.assertEqual(planning_db.get_source_product(self.planning_db_path, 9)["style_code"], "M009")
 
+    def test_workbench_paginates_50_items_and_merges_filter_toolbar(self):
+        products = [
+            {
+                "id": product_id,
+                "style_code": f"PAGE-{product_id}",
+                "style_color": f"PAGE-{product_id}-黑",
+                "product_name": f"分页测试毛衣 {product_id}",
+                "season_year": "2026秋冬",
+                "supplier": "分页测试供应商",
+                "actual_cost": 100,
+                "status": "pending",
+                "source_version_no": 1,
+            }
+            for product_id in range(1001, 1052)
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+
+        page_one = self.wsgi_request(
+            app,
+            "/workbench?season_year=2026%E7%A7%8B%E5%86%AC&status=waiting&page=1",
+            cookie=planner_cookie,
+        )["body"].decode("utf-8")
+        self.assertEqual(page_one.count("id='pricing-row-"), 50)
+        self.assertEqual(page_one.count("name='suggest_ids'"), 50)
+        self.assertIn("当前结果", page_one)
+        self.assertIn("<strong>51 款</strong>", page_one)
+        self.assertIn("第 1 / 2 页，本页 50 款", page_one)
+        self.assertIn("每页 50 款 · 第 1 / 2 页 · 共 51 款", page_one)
+        self.assertIn("href='/workbench?season_year=2026%E7%A7%8B%E5%86%AC&amp;status=waiting&amp;page=2'", page_one)
+        self.assertLess(page_one.index("workbench-toolbar-summary"), page_one.index("workbench-filter"))
+        self.assertNotIn("<section class='filter-bar'>", page_one)
+
+        page_two = self.wsgi_request(
+            app,
+            "/workbench?season_year=2026%E7%A7%8B%E5%86%AC&status=waiting&page=2",
+            cookie=planner_cookie,
+        )["body"].decode("utf-8")
+        self.assertEqual(page_two.count("id='pricing-row-"), 1)
+        self.assertEqual(page_two.count("name='suggest_ids'"), 1)
+        self.assertIn("第 2 / 2 页，本页 1 款", page_two)
+        self.assertIn("id='pricing-row-1001'", page_two)
+
+        clamped_page = self.wsgi_request(
+            app,
+            "/workbench?season_year=2026%E7%A7%8B%E5%86%AC&status=waiting&page=999",
+            cookie=planner_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn("第 2 / 2 页，本页 1 款", clamped_page)
+
     def test_pricing_workbench_uses_one_card_and_requires_admin_review(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
         planning_db.save_category_rule(self.planning_db_path, "2026秋冬", "连衣裙", 4.2)
@@ -727,7 +778,8 @@ class PlanningCenterTests(unittest.TestCase):
         admin_cookie = self.login_cookie(app, "planning_admin")
 
         waiting_page = self.wsgi_request(app, "/workbench?status=waiting", cookie=planner_cookie)["body"].decode("utf-8")
-        self.assertIn("批量生成测算上新价", waiting_page)
+        self.assertIn("批量测算上新价", waiting_page)
+        self.assertNotIn("批量生成测算上新价", waiting_page)
         self.assertEqual(waiting_page.count("name='suggest_ids'"), 2)
         self.assertEqual(waiting_page.count(">生成测算上新价</button>"), 2)
         no_suggest_selection = self.wsgi_request(
@@ -771,7 +823,7 @@ class PlanningCenterTests(unittest.TestCase):
 
         initial_page = self.wsgi_request(app, "/workbench?status=suggested", cookie=planner_cookie)["body"].decode("utf-8")
         self.assertIn("pricing-select-all", initial_page)
-        self.assertIn("批量生成测算上新价", initial_page)
+        self.assertIn("批量测算上新价", initial_page)
         self.assertIn("批量初审提交", initial_page)
         self.assertIn("批量回传藏宝阁", initial_page)
         self.assertIn(".pricing-select-cell{position:sticky;left:0", initial_page)
