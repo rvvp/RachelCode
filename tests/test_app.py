@@ -253,8 +253,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn(">筛选</button>", b_body)
         self.assertNotIn(">筛选资料</button>", b_body)
         self.assertIn("padding: 10px 18px 10px 10px;\n      text-align: center;", b_body)
-        self.assertIn("grid-template-rows: minmax(0, 6fr) minmax(0, 14fr);", b_body)
-        self.assertIn("grid-template-rows: minmax(250px, 17fr) minmax(150px, 13fr);", b_body)
+        self.assertIn("grid-template-rows: auto minmax(420px, 1fr);", b_body)
+        self.assertIn("grid-template-rows: auto auto;", b_body)
+        self.assertNotIn("min-height: 1620px;", b_body)
         self.assertNotIn("当前资料协作节奏", b_body)
 
         for body in (a_body, b_body):
@@ -2598,7 +2599,8 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn("总资料数", summary_block)
         self.assertLess(summary_block.index("<span>总接收</span>"), summary_block.index("<span>近7天新增</span>"))
         self.assertLess(summary_block.index("<span>近7天新增</span>"), summary_block.index("<span>待接收</span>"))
-        self.assertIn("grid-template-rows: minmax(288px, 7fr) minmax(150px, 3fr);", list_body)
+        self.assertIn("grid-template-rows: auto minmax(420px, 1fr);", list_body)
+        self.assertNotIn("min-height: 1520px;", list_body)
 
         receive_response = self.request(
             "/products/bulk",

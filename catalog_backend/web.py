@@ -4945,13 +4945,13 @@ class CatalogApplication:
     }}
     .products-c-dashboard {{
       display: grid;
-      grid-template-rows: minmax(0, 2fr) minmax(0, 8fr);
+      grid-template-rows: auto minmax(420px, 1fr);
       gap: 18px;
-      min-height: 1520px;
+      min-height: calc(100vh - 300px);
     }}
     .products-c-overview-stack {{
       display: grid;
-      grid-template-rows: minmax(160px, 6fr) minmax(104px, 4fr);
+      grid-template-rows: auto auto;
       gap: 16px;
       min-height: 0;
     }}
@@ -5026,13 +5026,13 @@ class CatalogApplication:
     }}
     .products-editor-dashboard {{
       display: grid;
-      grid-template-rows: minmax(0, 6fr) minmax(0, 14fr);
+      grid-template-rows: auto minmax(420px, 1fr);
       gap: 18px;
-      min-height: 1620px;
+      min-height: calc(100vh - 300px);
     }}
     .products-editor-overview-stack {{
       display: grid;
-      grid-template-rows: minmax(250px, 17fr) minmax(150px, 13fr);
+      grid-template-rows: auto auto;
       gap: 16px;
       min-height: 0;
     }}
