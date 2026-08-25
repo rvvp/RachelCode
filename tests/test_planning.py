@@ -463,6 +463,12 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("302"))
         self.assertEqual(planning_db.get_source_product(self.planning_db_path, 9)["style_code"], "M009")
 
+        with patch.object(app, "fetch_catalog_products", return_value=[source]):
+            workbench = self.wsgi_request(app, "/workbench", cookie=cookie)["body"].decode("utf-8")
+        self.assertEqual(workbench.count("已自动同步 1 条藏宝阁资料。"), 1)
+        self.assertNotIn("当前结果", workbench)
+        self.assertLess(workbench.index("已自动同步 1 条藏宝阁资料。"), workbench.index("<form class='workbench-filter'"))
+
     def test_workbench_paginates_50_items_and_merges_filter_toolbar(self):
         products = [
             {
@@ -489,9 +495,8 @@ class PlanningCenterTests(unittest.TestCase):
         )["body"].decode("utf-8")
         self.assertEqual(page_one.count("id='pricing-row-"), 50)
         self.assertEqual(page_one.count("name='suggest_ids'"), 50)
-        self.assertIn("当前结果", page_one)
-        self.assertIn("<strong>51 款</strong>", page_one)
-        self.assertIn("第 1 / 2 页，本页 50 款", page_one)
+        self.assertNotIn("当前结果", page_one)
+        self.assertIn("商品资料已加载，可按条件筛选。", page_one)
         self.assertIn("每页 50 款 · 第 1 / 2 页 · 共 51 款", page_one)
         self.assertIn("href='/workbench?season_year=2026%E7%A7%8B%E5%86%AC&amp;status=waiting&amp;page=2'", page_one)
         self.assertLess(page_one.index("workbench-toolbar-summary"), page_one.index("workbench-filter"))
@@ -504,7 +509,7 @@ class PlanningCenterTests(unittest.TestCase):
         )["body"].decode("utf-8")
         self.assertEqual(page_two.count("id='pricing-row-"), 1)
         self.assertEqual(page_two.count("name='suggest_ids'"), 1)
-        self.assertIn("第 2 / 2 页，本页 1 款", page_two)
+        self.assertIn("每页 50 款 · 第 2 / 2 页 · 共 51 款", page_two)
         self.assertIn("id='pricing-row-1001'", page_two)
 
         clamped_page = self.wsgi_request(
@@ -512,7 +517,7 @@ class PlanningCenterTests(unittest.TestCase):
             "/workbench?season_year=2026%E7%A7%8B%E5%86%AC&status=waiting&page=999",
             cookie=planner_cookie,
         )["body"].decode("utf-8")
-        self.assertIn("第 2 / 2 页，本页 1 款", clamped_page)
+        self.assertIn("每页 50 款 · 第 2 / 2 页 · 共 51 款", clamped_page)
 
     def test_pricing_workbench_uses_one_card_and_requires_admin_review(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
