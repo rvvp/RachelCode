@@ -573,7 +573,7 @@ class PlanningApplication:
         </section>
         <div class='section-label'><div><div class='eyebrow'>PRICING OVERVIEW</div><h2>上新定价概况</h2></div><a href='/stats'>查看价格带统计</a></div>
         <section class='metrics'><a href='/workbench'><span>待定价商品</span><strong>{pending}</strong><small>来源：藏宝阁已提交资料</small></a><a href='/workbench?status=confirmed'><span>待回传定价</span><strong>{confirmed}</strong><small>复核通过，等待回传</small></a><a href='/workbench?status=published'><span>已发布</span><strong>{published}</strong><small>已写回藏宝阁</small></a></section>
-        <section class='split'><div class='panel'><div class='panel-head'><div><div class='eyebrow'>QUICK START</div><h2>今天从这里开始</h2></div></div><div class='quick-grid'><a href='/workbench'><b>01</b><span>打开上新定价工作台</span><small>同步新款、确认品类、生成测算上新价</small></a><a href='/rules'><b>02</b><span>检查规则</span><small>品类、渠道、倍率与供应商系数</small></a><a href='/stats'><b>03</b><span>查看价格带分布</span><small>用当前定价结果校验结构</small></a></div></div><div class='panel notice-panel'><div class='eyebrow'>DATA BOUNDARY</div><h2>成本以藏宝阁为准</h2><p>商品企划中心不录入或估算采购成本。所有成本来自藏宝阁跟单部提交的含税价，回传时会核对资料版本，避免旧成本覆盖新资料。</p>{catalog_sync_action}</div></section>
+        <section class='split'><div class='panel'><div class='panel-head'><div><div class='eyebrow'>QUICK START</div><h2>今天从这里开始</h2></div></div><div class='quick-grid'><a href='/workbench'><b>01</b><span>打开上新审核工作台</span><small>同步新款、确认品类、生成测算上新价</small></a><a href='/rules'><b>02</b><span>检查规则</span><small>品类、渠道、倍率与供应商系数</small></a><a href='/stats'><b>03</b><span>查看价格带分布</span><small>用当前定价结果校验结构</small></a></div></div><div class='panel notice-panel'><div class='eyebrow'>DATA BOUNDARY</div><h2>成本以藏宝阁为准</h2><p>商品企划中心不录入或估算采购成本。所有成本来自藏宝阁跟单部提交的含税价，回传时会核对资料版本，避免旧成本覆盖新资料。</p>{catalog_sync_action}</div></section>
         """
         return self.shell("企划总览", content, user, "dashboard")
 
@@ -784,11 +784,11 @@ class PlanningApplication:
                 <td class='pricing-workflow-cell'>{workflow_cell}</td>
               </tr>""")
         content = f"""
-        <section class='page-heading'><div><div class='eyebrow'>NEW ARRIVAL PRICING</div><h1>上新定价工作台</h1><p>所有款色集中在一张定价资料与审核卡片中，按条目完成规则匹配、初审、复核和回传。</p></div>{catalog_sync_action}</section>
+        <section class='page-heading'><div><div class='eyebrow'>NEW ARRIVAL PRICING</div><h1>上新审核工作台</h1><p>所有款色集中在一张定价资料与审核卡片中，按条目完成规则匹配、初审、复核和回传。</p></div>{catalog_sync_action}</section>
         {self.alert(notice, 'success') if notice else ''}{self.alert(error, 'error') if error else ''}
         <section class='filter-bar'><form method='get' action='/workbench'><label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待初审</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待复核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>复核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button type='submit'>筛选</button></form></section>
         <section class='workbench-summary'><span>当前显示</span><strong>{len(filtered_products)} 款</strong><small>左侧固定：勾选、图片；资料字段：年份季节、款号、款色、商品名称、供应商、含税成本、来源状态</small></section>
-        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>定价初审与复核</h2><p class='hint'>来源资料、测算结果和流程操作在同一行展示，状态与操作合并在最后一列。</p></div><div class='pricing-board-tools'><button id='pricing-reset-columns' class='compact-button' type='button' title='恢复默认列宽'>恢复默认列宽</button><span class='count'>{len(filtered_products)} 款</span></div></div>{batch_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table' data-resizable-columns='pricing-v1'>{pricing_colgroup}<thead><tr>{pricing_header}</tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="14" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div></section>
+        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>初审与复核</h2><p class='hint'>来源资料、测算结果和流程操作在同一行展示，状态与操作合并在最后一列。</p></div><div class='pricing-board-tools'><button id='pricing-reset-columns' class='compact-button' type='button' title='恢复默认列宽'>恢复默认列宽</button><span class='count'>{len(filtered_products)} 款</span></div></div>{batch_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table' data-resizable-columns='pricing-v1'>{pricing_colgroup}<thead><tr>{pricing_header}</tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="14" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div></section>
         <script>
         (() => {{
           const storageKey = 'planning-workbench-scroll';
@@ -1008,7 +1008,7 @@ class PlanningApplication:
         }})();
         </script>
         """
-        return self.shell("上新定价工作台", content, user, "workbench")
+        return self.shell("上新审核工作台", content, user, "workbench")
 
     def render_rules(self, user: dict, query: dict | None = None) -> str:
         query = query or {}
