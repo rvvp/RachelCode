@@ -419,6 +419,7 @@ def init_db(
                 publication_id TEXT NOT NULL,
                 source_version_no INTEGER NOT NULL,
                 category TEXT NOT NULL,
+                launch_channel TEXT NOT NULL DEFAULT '',
                 launch_price REAL NOT NULL,
                 fixed_multiplier REAL,
                 supplier_coefficient REAL,
@@ -430,6 +431,12 @@ def init_db(
             )
             """
         )
+        planning_publication_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(planning_publications)").fetchall()
+        }
+        if "launch_channel" not in planning_publication_columns:
+            connection.execute("ALTER TABLE planning_publications ADD COLUMN launch_channel TEXT NOT NULL DEFAULT ''")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_planning_publications_product ON planning_publications(product_id, published_at DESC)"
         )
@@ -2356,6 +2363,7 @@ def publish_planning_price(
     category = str(payload.get("category") or "").strip()
     if not category:
         raise ValueError("回传必须包含品类。")
+    launch_channel = str(payload.get("launch_channel") or "").strip()
     try:
         launch_price_value = Decimal(str(payload.get("launch_price")).strip())
     except (InvalidOperation, AttributeError, TypeError, ValueError):
@@ -2371,23 +2379,26 @@ def publish_planning_price(
     after = dict(product)
     after["category"] = category
     after["launch_price"] = launch_price
+    if launch_channel:
+        after["launch_channel"] = launch_channel
     diff_items = build_product_diff(product, after)
     timestamp = utc_now()
     connection.execute(
         """
         UPDATE products
-        SET category = ?, launch_price = ?, current_version_no = ?, revision_flag = 0,
+        SET category = ?, launch_channel = CASE WHEN ? = '' THEN launch_channel ELSE ? END,
+            launch_price = ?, current_version_no = ?, revision_flag = 0,
             last_reviewed_by = ?, last_reviewed_at = ?, updated_at = ?
         WHERE id = ?
         """,
-        (category, launch_price, next_version, actor_user_id, timestamp, timestamp, product_id),
+        (category, launch_channel, launch_channel, launch_price, next_version, actor_user_id, timestamp, timestamp, product_id),
     )
     record_product_version(
         connection,
         product_id,
         version_no=next_version,
         snapshot=product_snapshot_from_payload(
-            {**product, "category": category, "launch_price": launch_price},
+            {**product, "category": category, "launch_channel": launch_channel or product.get("launch_channel", ""), "launch_price": launch_price},
             {**product, "current_version_no": next_version},
         ),
         summary_json=summarize_diff_items(diff_items),
@@ -2400,15 +2411,16 @@ def publish_planning_price(
     connection.execute(
         """
         INSERT INTO planning_publications (
-            product_id, publication_id, source_version_no, category, launch_price,
+            product_id, publication_id, source_version_no, category, launch_channel, launch_price,
             fixed_multiplier, supplier_coefficient, raw_price, operator_name, published_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             product_id,
             publication_id,
             expected_version,
             category,
+            launch_channel,
             launch_price,
             payload.get("fixed_multiplier"),
             payload.get("supplier_coefficient"),
@@ -2423,7 +2435,7 @@ def publish_planning_price(
         actor_user_id,
         "planning_publish",
         "接收商品企划定价",
-        f"商品企划中心回传定价记录 {publication_id}，品类：{category}，上新价格：{launch_price:g}，来源资料 V{expected_version}。",
+        f"商品企划中心回传定价记录 {publication_id}，品类：{category}，渠道：{launch_channel or '未调整'}，上新价格：{launch_price:g}，来源资料 V{expected_version}。",
         diff_json=summarize_diff_items(diff_items),
         diff_count=len(diff_items),
     )
@@ -2434,6 +2446,7 @@ def publish_planning_price(
         "source_version_no": expected_version,
         "current_version_no": next_version,
         "category": category,
+        "launch_channel": launch_channel or product.get("launch_channel", ""),
         "launch_price": launch_price,
         "published_at": str(payload.get("published_at") or timestamp),
     }

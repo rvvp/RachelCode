@@ -62,6 +62,7 @@ class PlanningCenterTests(unittest.TestCase):
             "publication_id": "PC-TEST-001",
             "source_version_no": source["source_version_no"],
             "category": "连衣裙",
+            "launch_channel": "唯品",
             "launch_price": 599,
             "fixed_multiplier": 4,
             "supplier_coefficient": 1,
@@ -87,7 +88,9 @@ class PlanningCenterTests(unittest.TestCase):
             authorization="Bearer planning-secret",
         )
         self.assertTrue(response["status"].startswith("200"))
-        self.assertEqual(catalog_db.get_product(self.catalog_db_path, source["id"])["launch_price"], 599)
+        published_product = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(published_product["launch_price"], 599)
+        self.assertEqual(published_product["launch_channel"], "唯品")
         retry = self.wsgi_request(
             app,
             f"/api/internal/planning/products/{source['id']}/price-publication",
@@ -272,6 +275,10 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("下限包含，上限不包含", page)
         self.assertIn("可按实际业务新增任意数量的成本区间", page)
         self.assertIn("规则维护账号", page)
+        self.assertIn("<h1>规则</h1>", page)
+        self.assertIn("品类选项", page)
+        self.assertIn("渠道选项", page)
+        self.assertNotIn("<h1>定价规则</h1>", page)
 
     def test_only_admin_can_maintain_pricing_rules(self):
         app = PlanningApplication(self.planning_db_path, "http://catalog.test")
@@ -326,6 +333,114 @@ class PlanningCenterTests(unittest.TestCase):
         edited = planning_db.list_category_cost_rules(self.planning_db_path)[0]
         self.assertEqual(edited["upper_cost"], 650)
         self.assertEqual(edited["multiplier"], 4.1)
+
+    def test_category_and_channel_options_are_configurable_by_admin_only(self):
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+
+        denied = self.wsgi_request(
+            app,
+            "/rules/category-option",
+            method="POST",
+            body=urlencode({"name": "西装", "keywords": "西服,西装外套", "sort_order": "35"}).encode(),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(denied["status"].startswith("403"))
+
+        created_category = self.wsgi_request(
+            app,
+            "/rules/category-option",
+            method="POST",
+            body=urlencode({"name": "西装", "keywords": "西服,西装外套", "sort_order": "35", "note": "测试"}).encode(),
+            cookie=admin_cookie,
+        )
+        created_channel = self.wsgi_request(
+            app,
+            "/rules/channel-option",
+            method="POST",
+            body=urlencode({"name": "抖音", "sort_order": "40"}).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(created_category["status"].startswith("302"))
+        self.assertTrue(created_channel["status"].startswith("302"))
+        category = next(item for item in planning_db.list_category_options(self.planning_db_path) if item["name"] == "西装")
+        channel = next(item for item in planning_db.list_channel_options(self.planning_db_path) if item["name"] == "抖音")
+
+        updated = self.wsgi_request(
+            app,
+            "/rules/category-option",
+            method="POST",
+            body=urlencode({"option_id": str(category["id"]), "name": "西装", "keywords": "西服,西装外套,套装", "sort_order": "34"}).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(updated["status"].startswith("302"))
+        self.assertIn("套装", next(item for item in planning_db.list_category_options(self.planning_db_path) if item["id"] == category["id"])["keywords"])
+
+        deleted = self.wsgi_request(
+            app,
+            f"/rules/channel-option/{channel['id']}/delete",
+            method="POST",
+            cookie=admin_cookie,
+        )
+        self.assertTrue(deleted["status"].startswith("302"))
+        self.assertNotIn("抖音", [item["name"] for item in planning_db.list_channel_options(self.planning_db_path)])
+
+    def test_sync_infers_category_from_product_name_with_longest_keyword(self):
+        planning_db.save_category_option(self.planning_db_path, "西装", "西服,西装外套", 35)
+        products = [
+            {"id": 61, "product_name": "通勤西装外套", "actual_cost": 300, "source_version_no": 1},
+            {"id": 62, "product_name": "法式连衣裙", "actual_cost": 300, "source_version_no": 1},
+            {"id": 63, "product_name": "基础测试款", "actual_cost": 300, "source_version_no": 1},
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        self.assertEqual(planning_db.get_source_product(self.planning_db_path, 61)["category_suggestion"], "西装")
+        self.assertEqual(planning_db.get_source_product(self.planning_db_path, 62)["category"], "连衣裙")
+        self.assertEqual(planning_db.get_source_product(self.planning_db_path, 63)["category"], "其他品类")
+
+    def test_initial_review_can_change_category_recalculate_and_select_channel(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        planning_db.save_category_rule(self.planning_db_path, "2026秋冬", "连衣裙", 4.2)
+        product = {
+            "id": 64,
+            "style_code": "R064",
+            "product_name": "基础毛衣",
+            "season_year": "2026秋冬",
+            "supplier": "测试供应商",
+            "category": "毛衣",
+            "actual_cost": 150,
+            "source_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [product])
+        record = planning_db.create_pricing_record(self.planning_db_path, product, "商品部企划员")
+        self.assertEqual(record["calculated_price"], 599)
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planner")
+
+        missing_channel = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/submit-review",
+            method="POST",
+            body=urlencode({"launch_price": "599", "category": "连衣裙"}).encode(),
+            cookie=cookie,
+        )
+        self.assertTrue(missing_channel["status"].startswith("400"))
+
+        submitted = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/submit-review",
+            method="POST",
+            body=urlencode({"launch_price": "599", "category": "连衣裙", "channel": "唯品"}).encode(),
+            cookie=cookie,
+        )
+        self.assertTrue(submitted["status"].startswith("302"))
+        updated = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+        self.assertEqual(updated["category"], "连衣裙")
+        self.assertEqual(updated["channel"], "唯品")
+        self.assertEqual(updated["fixed_multiplier"], 4.2)
+        self.assertEqual(updated["calculated_price"], 629)
+        self.assertEqual(updated["launch_price"], 629)
+        self.assertEqual(planning_db.get_source_product(self.planning_db_path, 64)["category"], "连衣裙")
 
     def test_formal_database_can_bootstrap_first_admin(self):
         formal_path = Path(self.temp.name) / "formal-planning.db"
@@ -393,10 +508,14 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(workbench.count("<section class='panel pricing-board'>"), 1)
         self.assertEqual(workbench.count("<table class='pricing-table'>"), 1)
         self.assertNotIn("<article class='product-card'>", workbench)
+        self.assertIn("系统按商品名称自动判定", workbench)
+        self.assertNotIn("name='category' value", workbench)
         headers = ["年份季节", "款号", "款色", "图片", "商品名称", "供应商", "含税成本", "来源状态"]
         header_positions = [workbench.index(f"<th>{header}</th>") for header in headers]
         self.assertEqual(header_positions, sorted(header_positions))
-        self.assertIn("品类与规则计算", workbench)
+        self.assertIn("<th>品类</th>", workbench)
+        self.assertIn("<th>规则计算</th>", workbench)
+        self.assertIn("<th>渠道划分</th>", workbench)
         self.assertIn("定价初审与复核", workbench)
         self.assertIn("测算上新价", workbench)
         self.assertIn("初审上新价", workbench)
@@ -416,7 +535,7 @@ class PlanningCenterTests(unittest.TestCase):
             app,
             f"/pricing/{record['id']}/submit-review",
             method="POST",
-            body=urlencode({"launch_price": "589.5"}).encode(),
+            body=urlencode({"launch_price": "589.5", "category": "毛衣", "channel": "天猫"}).encode(),
             cookie=planner_cookie,
         )
         self.assertTrue(rejected_fractional["status"].startswith("400"))
@@ -427,7 +546,7 @@ class PlanningCenterTests(unittest.TestCase):
             app,
             f"/pricing/{record['id']}/submit-review",
             method="POST",
-            body=urlencode({"launch_price": "2539"}).encode(),
+            body=urlencode({"launch_price": "2539", "category": "毛衣", "channel": "天猫"}).encode(),
             cookie=planner_cookie,
         )
         self.assertTrue(submitted["status"].startswith("302"))
@@ -436,6 +555,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(submitted_record["status"], "review_pending")
         self.assertEqual(submitted_record["calculated_price"], 599)
         self.assertEqual(submitted_record["launch_price"], 2539)
+        self.assertEqual(submitted_record["channel"], "天猫")
         denied = self.wsgi_request(
             app,
             f"/pricing/{record['id']}/approve",
@@ -542,6 +662,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(published["status"].startswith("302"))
         publication_payload = json.loads(mocked_urlopen.call_args.args[0].data.decode("utf-8"))
         self.assertEqual(publication_payload["operator_name"], "商品部企划员")
+        self.assertEqual(publication_payload["launch_channel"], "天猫")
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "published")
 
     def test_batch_initial_review_approval_and_publication(self):
@@ -596,6 +717,10 @@ class PlanningCenterTests(unittest.TestCase):
                     ("submit_review_ids", str(second["id"])),
                     (f"launch_price_{first['id']}", "609"),
                     (f"launch_price_{second['id']}", "619"),
+                    (f"category_{first['id']}", "毛衣"),
+                    (f"category_{second['id']}", "毛衣"),
+                    (f"channel_{first['id']}", "天猫"),
+                    (f"channel_{second['id']}", "唯品"),
                 ]
             ).encode(),
             cookie=planner_cookie,
@@ -604,6 +729,8 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("status=review_pending", dict(batch_initial["headers"])["Location"])
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, first["id"])["launch_price"], 609)
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, second["id"])["launch_price"], 619)
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, first["id"])["channel"], "天猫")
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, second["id"])["channel"], "唯品")
 
         denied_approval = self.wsgi_request(
             app,
@@ -707,7 +834,7 @@ class PlanningCenterTests(unittest.TestCase):
             app,
             f"/pricing/{record['id']}/submit-review",
             method="POST",
-            body=b"",
+            body=urlencode({"category": "毛衣", "channel": "同款"}).encode(),
             cookie=self.login_cookie(app, "planner"),
         )
         self.assertTrue(response["status"].startswith("302"))

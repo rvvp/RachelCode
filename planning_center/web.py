@@ -52,6 +52,8 @@ class PlanningApplication:
                 return self.handle_pricing_batch(environ, start_response, user)
             if path.startswith("/pricing/") and path.endswith("/confirm") and method == "POST":
                 return self.handle_confirm(start_response, user, self.path_id(path, "/pricing/", "/confirm"))
+            if path.startswith("/pricing/") and path.endswith("/recalculate") and method == "POST":
+                return self.handle_recalculate(environ, start_response, user, self.path_id(path, "/pricing/", "/recalculate"))
             if path.startswith("/pricing/") and path.endswith("/submit-review") and method == "POST":
                 return self.handle_submit_review(environ, start_response, user, self.path_id(path, "/pricing/", "/submit-review"))
             if path.startswith("/pricing/") and path.endswith("/review-save") and method == "POST":
@@ -62,6 +64,22 @@ class PlanningApplication:
                 return self.handle_publish(start_response, user, self.path_id(path, "/pricing/", "/publish"))
             if path == "/rules" and method == "GET":
                 return self.html_response(start_response, self.render_rules(user, query))
+            if path == "/rules/category-option" and method == "POST":
+                return self.handle_category_option(environ, start_response, user)
+            if path.startswith("/rules/category-option/") and path.endswith("/delete") and method == "POST":
+                return self.handle_category_option_delete(
+                    start_response,
+                    user,
+                    self.path_id(path, "/rules/category-option/", "/delete"),
+                )
+            if path == "/rules/channel-option" and method == "POST":
+                return self.handle_channel_option(environ, start_response, user)
+            if path.startswith("/rules/channel-option/") and path.endswith("/delete") and method == "POST":
+                return self.handle_channel_option_delete(
+                    start_response,
+                    user,
+                    self.path_id(path, "/rules/channel-option/", "/delete"),
+                )
             if path == "/rules/category" and method == "POST":
                 return self.handle_category_rule(environ, start_response, user)
             if path.startswith("/rules/category/") and path.endswith("/delete") and method == "POST":
@@ -168,9 +186,8 @@ class PlanningApplication:
         product = db.get_source_product(self.db_path, product_id)
         if not product:
             raise LookupError("同步商品不存在，请先同步藏宝阁。")
-        category = str(form.get("category") or "").strip()
-        if not category:
-            raise ValueError("请填写品类。")
+        category = str(form.get("category") or product.get("category_suggestion") or product.get("category") or "").strip()
+        category = db.validate_category_option(self.db_path, category)
         with db.get_connection(self.db_path) as connection:
             connection.execute("UPDATE source_products SET category = ? WHERE id = ?", (category, product_id))
         product["category"] = category
@@ -205,11 +222,29 @@ class PlanningApplication:
             record_id,
             form.get("launch_price") or existing.get("calculated_price") or existing.get("launch_price"),
             user.get("display_name", "商品部企划员"),
+            form.get("category"),
+            form.get("channel"),
         )
         return self.redirect(
             start_response,
             "/workbench?notice="
             + self.q(f"{record['style_code'] or record['product_name']} 已提交企划管理员复核。")
+            + f"#pricing-row-{int(record['source_product_id'])}",
+        )
+
+    def handle_recalculate(self, environ, start_response, user, record_id: int):
+        self.require_catalog_operator(user)
+        form = self.parse_form(environ)
+        record = db.recalculate_pricing_record(
+            self.db_path,
+            record_id,
+            form.get("category", ""),
+            user.get("display_name", "商品部企划员"),
+        )
+        return self.redirect(
+            start_response,
+            "/workbench?notice="
+            + self.q(f"{record['style_code'] or record['product_name']} 已按所选品类重新测算，上新价为 {record['calculated_price']:g}。")
             + f"#pricing-row-{int(record['source_product_id'])}",
         )
 
@@ -266,13 +301,33 @@ class PlanningApplication:
                 if record["status"] not in {"suggested", "conflict"}:
                     raise ValueError(f"{record['style_code'] or record['product_name']} 不在初审阶段。")
                 price = (form.get(f"launch_price_{record['id']}") or [record.get("launch_price")])[0]
-                pending.append((record, db.validated_launch_price(price)))
-            for record, price in pending:
+                category = (form.get(f"category_{record['id']}") or [record.get("category")])[0]
+                channel = (form.get(f"channel_{record['id']}") or [record.get("channel")])[0]
+                validated_category = db.validate_category_option(self.db_path, category)
+                validated_channel = db.validate_channel_option(self.db_path, channel)
+                db.calculate_pricing(
+                    self.db_path,
+                    record["season_year"],
+                    validated_category,
+                    record["supplier"],
+                    record["cost"],
+                )
+                pending.append(
+                    (
+                        record,
+                        db.validated_launch_price(price),
+                        validated_category,
+                        validated_channel,
+                    )
+                )
+            for record, price, category, channel in pending:
                 db.submit_pricing_for_review(
                     self.db_path,
                     record["id"],
                     price,
                     user.get("display_name", "商品部企划员"),
+                    category,
+                    channel,
                 )
             return self.redirect(start_response, "/workbench?status=review_pending&notice=" + self.q(f"已批量提交 {len(pending)} 款上新定价进入复核。"))
 
@@ -327,6 +382,7 @@ class PlanningApplication:
             "publication_id": record["publication_id"],
             "source_version_no": record["source_version_no"],
             "category": record["category"],
+            "launch_channel": record.get("channel", ""),
             "launch_price": record["launch_price"],
             "fixed_multiplier": record["fixed_multiplier"],
             "supplier_coefficient": record["supplier_coefficient"],
@@ -360,6 +416,45 @@ class PlanningApplication:
             record["id"],
             result if isinstance(result, dict) else {"status": "failed", "message": "返回内容异常"},
         )
+
+    def handle_category_option(self, environ, start_response, user):
+        self.require_rule_manager(user)
+        form = self.parse_form(environ)
+        option_id = self.optional_id(form.get("option_id"))
+        db.save_category_option(
+            self.db_path,
+            form.get("name", ""),
+            form.get("keywords", ""),
+            form.get("sort_order", "0"),
+            form.get("note", ""),
+            option_id,
+        )
+        message = "品类选项已修改。" if option_id else "品类选项已新增。"
+        return self.redirect(start_response, "/rules?notice=" + self.q(message) + "#category-options")
+
+    def handle_category_option_delete(self, start_response, user, option_id: int):
+        self.require_rule_manager(user)
+        db.delete_category_option(self.db_path, option_id)
+        return self.redirect(start_response, "/rules?notice=" + self.q("品类选项已删除。") + "#category-options")
+
+    def handle_channel_option(self, environ, start_response, user):
+        self.require_rule_manager(user)
+        form = self.parse_form(environ)
+        option_id = self.optional_id(form.get("option_id"))
+        db.save_channel_option(
+            self.db_path,
+            form.get("name", ""),
+            form.get("sort_order", "0"),
+            form.get("note", ""),
+            option_id,
+        )
+        message = "渠道选项已修改。" if option_id else "渠道选项已新增。"
+        return self.redirect(start_response, "/rules?notice=" + self.q(message) + "#channel-options")
+
+    def handle_channel_option_delete(self, start_response, user, option_id: int):
+        self.require_rule_manager(user)
+        db.delete_channel_option(self.db_path, option_id)
+        return self.redirect(start_response, "/rules?notice=" + self.q("渠道选项已删除。") + "#channel-options")
 
     def handle_category_rule(self, environ, start_response, user):
         self.require_rule_manager(user)
@@ -424,7 +519,7 @@ class PlanningApplication:
 
     def require_rule_manager(self, user: dict) -> None:
         if user.get("role") != "admin":
-            raise PermissionError("只有企划管理员可以维护定价规则。")
+            raise PermissionError("只有企划管理员可以维护规则。")
 
     def require_catalog_operator(self, user: dict) -> None:
         if user.get("role") != "planner":
@@ -478,7 +573,7 @@ class PlanningApplication:
         </section>
         <div class='section-label'><div><div class='eyebrow'>PRICING OVERVIEW</div><h2>上新定价概况</h2></div><a href='/stats'>查看价格带统计</a></div>
         <section class='metrics'><a href='/workbench'><span>待定价商品</span><strong>{pending}</strong><small>来源：藏宝阁已提交资料</small></a><a href='/workbench?status=confirmed'><span>待回传定价</span><strong>{confirmed}</strong><small>复核通过，等待回传</small></a><a href='/workbench?status=published'><span>已发布</span><strong>{published}</strong><small>已写回藏宝阁</small></a></section>
-        <section class='split'><div class='panel'><div class='panel-head'><div><div class='eyebrow'>QUICK START</div><h2>今天从这里开始</h2></div></div><div class='quick-grid'><a href='/workbench'><b>01</b><span>打开上新定价工作台</span><small>同步新款、输入品类、生成测算上新价</small></a><a href='/rules'><b>02</b><span>检查定价规则</span><small>品类倍率与供应商浮动系数</small></a><a href='/stats'><b>03</b><span>查看价格带分布</span><small>用当前定价结果校验结构</small></a></div></div><div class='panel notice-panel'><div class='eyebrow'>DATA BOUNDARY</div><h2>成本以藏宝阁为准</h2><p>商品企划中心不录入或估算采购成本。所有成本来自藏宝阁跟单部提交的含税价，回传时会核对资料版本，避免旧成本覆盖新资料。</p>{catalog_sync_action}</div></section>
+        <section class='split'><div class='panel'><div class='panel-head'><div><div class='eyebrow'>QUICK START</div><h2>今天从这里开始</h2></div></div><div class='quick-grid'><a href='/workbench'><b>01</b><span>打开上新定价工作台</span><small>同步新款、确认品类、生成测算上新价</small></a><a href='/rules'><b>02</b><span>检查规则</span><small>品类、渠道、倍率与供应商系数</small></a><a href='/stats'><b>03</b><span>查看价格带分布</span><small>用当前定价结果校验结构</small></a></div></div><div class='panel notice-panel'><div class='eyebrow'>DATA BOUNDARY</div><h2>成本以藏宝阁为准</h2><p>商品企划中心不录入或估算采购成本。所有成本来自藏宝阁跟单部提交的含税价，回传时会核对资料版本，避免旧成本覆盖新资料。</p>{catalog_sync_action}</div></section>
         """
         return self.shell("企划总览", content, user, "dashboard")
 
@@ -508,6 +603,8 @@ class PlanningApplication:
                     error = str(sync_error)
         products = db.list_source_products(self.db_path, season_year=season)
         records = db.list_pricing_records(self.db_path, season_year=season)
+        category_options = db.list_category_options(self.db_path, enabled_only=True)
+        channel_options = db.list_channel_options(self.db_path, enabled_only=True)
         latest_records = {}
         for record in records:
             latest_records.setdefault(int(record["source_product_id"]), record)
@@ -552,6 +649,15 @@ class PlanningApplication:
           <span id='pricing-selected-count'>已选 0 款</span>
           <div class='pricing-batch-actions'>{batch_buttons}</div>
         </form>"""
+        def select_options(options: list[dict], selected_value: str, placeholder: str) -> str:
+            return (
+                f"<option value='' {'selected' if not selected_value else ''} disabled>{html.escape(placeholder)}</option>"
+                + "".join(
+                    f"<option value='{html.escape(option['name'], quote=True)}' {'selected' if option['name'] == selected_value else ''}>{html.escape(option['name'])}</option>"
+                    for option in options
+                )
+            )
+
         rows = []
         for item, record, workflow_status in filtered_products:
             cost = item.get("actual_cost")
@@ -560,24 +666,27 @@ class PlanningApplication:
             image_url = str(item.get("image_url") or "").strip()
             image = f"<img src='{html.escape(image_url, quote=True)}' alt='{html.escape(item.get('style_color') or item.get('style_code') or '商品图片', quote=True)}'>" if image_url else "<div class='product-image-empty'>暂无图片</div>"
             source_version = f"<small>来源 V{int(item.get('source_version_no') or 1)}</small>"
-            pricing_cell = ""
+            category_cell = ""
+            rule_cell = ""
+            channel_cell = "<span class='muted'>初审时选择</span>"
             price_cell = "<span class='muted'>—</span>"
             status_cell = "<span class='status status-waiting'>待计算</span>"
             action_cell = "<span class='review-note'>先匹配品类并生成测算上新价</span>"
             selection_cell = "<span class='muted'>—</span>"
             if not record:
-                category_value = html.escape(item.get("category", ""), quote=True)
+                category_value = str(item.get("category_suggestion") or item.get("category") or "")
                 if user.get("role") == "planner":
-                    pricing_cell = f"""
-                      <form class='table-action-form pricing-calc-form' method='post' action='/pricing/suggest'>
+                    category_cell = f"""
+                      <form id='pricing-calc-{item['id']}' class='table-action-form pricing-calc-form' method='post' action='/pricing/suggest'>
                         <input type='hidden' name='product_id' value='{item['id']}'>
-                        <label>实际品类<input name='category' value='{category_value}' placeholder='例如 毛衣' required></label>
-                        <button class='primary' type='submit' {' ' if can_price else 'disabled'}>生成测算上新价</button>
+                        <strong>{html.escape(category_value or '品类待匹配')}</strong>
                       </form>
-                      <small>连衣裙匹配固定倍率，其余品类按含税成本区间匹配。</small>
+                      <small>根据商品名称自动判定，初审阶段可确认或修正。</small>
                     """
+                    rule_cell = f"<button class='primary' type='submit' form='pricing-calc-{item['id']}' {' ' if can_price else 'disabled'}>生成测算上新价</button><small>连衣裙用固定倍率，其余品类按成本区间。</small>"
                 else:
-                    pricing_cell = f"<strong>{category_value or '品类待匹配'}</strong><small>由商品部初审人员生成测算上新价。</small>"
+                    category_cell = f"<strong>{html.escape(category_value or '品类待匹配')}</strong><small>系统按商品名称自动判定</small>"
+                    rule_cell = "<span class='review-note'>由商品部初审人员生成测算上新价</span>"
             else:
                 record_status = str(record.get("status") or "")
                 status_label = workflow_labels.get(record_status, record_status)
@@ -587,15 +696,21 @@ class PlanningApplication:
                 calculated_price_value = html.escape(f"{calculated_price:g}", quote=True)
                 price_value = html.escape(f"{float(record['launch_price']):g}", quote=True)
                 rule_summary = f"{record['fixed_multiplier']:g} × {record['supplier_coefficient']:g} = 原始 {record['raw_price']:.1f}"
-                pricing_cell = f"<strong>{html.escape(record['category'])}</strong><small>{html.escape(rule_summary)}</small>{record_error}"
-                price_cell = f"<span class='price'>{calculated_price_value}</span><small>当前执行价：{price_value}</small><small>{html.escape(record['publication_id'])}</small>"
+                category_cell = f"<strong>{html.escape(record['category'])}</strong>"
+                rule_cell = f"<span class='rule-summary'>{html.escape(rule_summary)}</span>{record_error}"
+                channel_label = record.get("channel") or ("待初审选择" if record_status in {"suggested", "conflict"} else "历史记录未划分")
+                channel_cell = f"<strong>{html.escape(channel_label)}</strong>"
+                price_cell = f"<span class='price calculated-price'>{calculated_price_value}</span><small>当前执行价：{price_value}</small><small>{html.escape(record['publication_id'])}</small>"
                 status_cell = f"<span class='status status-{status_class}'>{html.escape(status_label)}</span>"
                 controls = ""
                 if record_status in {"suggested", "conflict"} and user.get("role") == "planner":
                     selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='submit_review_ids' value='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 进行批量初审'>"
+                    category_cell = f"<label class='cell-field'>品类<select id='initial-category-{record['id']}' class='initial-review-category' name='category' form='initial-review-form-{record['id']}' required>{select_options(category_options, record['category'], '请选择品类')}</select></label><small>系统按商品名称自动判定，初审时可确认或修改</small>"
+                    rule_cell += f"<button class='compact-button recalculate-button' type='submit' form='initial-review-form-{record['id']}' formaction='/pricing/{record['id']}/recalculate' formnovalidate>按所选品类重新测算</button>"
+                    channel_cell = f"<label class='cell-field'>渠道<select id='initial-channel-{record['id']}' class='initial-review-channel' name='channel' form='initial-review-form-{record['id']}' required>{select_options(channel_options, record.get('channel') or '', '请选择渠道')}</select></label>"
                     controls = f"""
-                    <form class='table-action-form price-review-form' method='post' action='/pricing/{record['id']}/submit-review'>
-                      <label>初审上新价<input id='initial-price-{record['id']}' class='initial-review-price' name='launch_price' type='number' min='1' step='1' inputmode='numeric' value='{price_value}' required></label>
+                    <form id='initial-review-form-{record['id']}' class='table-action-form price-review-form initial-review-form' method='post' action='/pricing/{record['id']}/submit-review'>
+                      <label>初审上新价<input id='initial-price-{record['id']}' class='initial-review-price' name='launch_price' type='number' min='1' step='1' inputmode='numeric' value='{price_value}' data-calculated-value='{calculated_price_value}' required></label>
                       <button class='primary' type='submit'>确认并提交复核</button>
                     </form>
                     <small>默认使用测算上新价；如需调整，可直接修改初审上新价。</small>"""
@@ -630,7 +745,9 @@ class PlanningApplication:
                 <td>{html.escape(item.get('supplier') or '未提供')}</td>
                 <td><strong class='cost-value'>{html.escape(f"{float(cost):g}" if cost is not None else '未提供')}</strong></td>
                 <td><span class='status status-source'>{html.escape(source_status_label)}</span></td>
-                <td class='pricing-match-cell'>{pricing_cell}</td>
+                <td class='pricing-category-cell'>{category_cell}</td>
+                <td class='pricing-rule-cell'>{rule_cell}</td>
+                <td class='pricing-channel-cell'>{channel_cell}</td>
                 <td class='price-cell'>{price_cell}</td>
                 <td>{status_cell}</td>
                 <td class='pricing-action-cell'>{action_cell}</td>
@@ -640,7 +757,7 @@ class PlanningApplication:
         {self.alert(notice, 'success') if notice else ''}{self.alert(error, 'error') if error else ''}
         <section class='filter-bar'><form method='get' action='/workbench'><label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待初审</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待复核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>复核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button type='submit'>筛选</button></form></section>
         <section class='workbench-summary'><span>当前显示</span><strong>{len(filtered_products)} 款</strong><small>资料字段顺序：年份季节、款号、款色、图片、商品名称、供应商、含税成本、来源状态</small></section>
-        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>定价初审与复核</h2><p class='hint'>来源资料与定价结果在同一行展示，按初审、复核流程逐条处理。</p></div><span class='count'>{len(filtered_products)} 款</span></div>{batch_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table'><thead><tr><th class='pricing-select-cell'><span class='visually-hidden'>选择</span></th><th>年份季节</th><th>款号</th><th>款色</th><th>图片</th><th>商品名称</th><th>供应商</th><th>含税成本</th><th>来源状态</th><th>品类与规则计算</th><th>测算上新价</th><th>定价状态</th><th>初审 / 复核 / 回传</th></tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="13" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div></section>
+        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>定价初审与复核</h2><p class='hint'>来源资料与定价结果在同一行展示，按初审、复核流程逐条处理。</p></div><span class='count'>{len(filtered_products)} 款</span></div>{batch_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table'><thead><tr><th class='pricing-select-cell'><span class='visually-hidden'>选择</span></th><th>年份季节</th><th>款号</th><th>款色</th><th>图片</th><th>商品名称</th><th>供应商</th><th>含税成本</th><th>来源状态</th><th>品类</th><th>规则计算</th><th>渠道划分</th><th>测算上新价</th><th>定价状态</th><th>初审 / 复核 / 回传</th></tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="15" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div></section>
         <script>
         (() => {{
           const storageKey = 'planning-workbench-scroll';
@@ -673,7 +790,7 @@ class PlanningApplication:
           }});
           batchChecks.forEach((checkbox) => checkbox.addEventListener('change', updateBatchControls));
           if (batchForm) batchForm.addEventListener('submit', (event) => {{
-            batchForm.querySelectorAll('.batch-price-value').forEach((input) => input.remove());
+            batchForm.querySelectorAll('.batch-row-value').forEach((input) => input.remove());
             const action = event.submitter?.value;
             if (!['submit-review', 'approve'].includes(action)) return;
             const checkboxName = action === 'submit-review' ? 'submit_review_ids' : 'approve_ids';
@@ -689,10 +806,26 @@ class PlanningApplication:
               }}
               const hidden = document.createElement('input');
               hidden.type = 'hidden';
-              hidden.className = 'batch-price-value';
+              hidden.className = 'batch-row-value';
               hidden.name = `${{action === 'submit-review' ? 'launch_price' : 'review_price'}}_${{checkbox.value}}`;
               hidden.value = priceInput.value;
               batchForm.appendChild(hidden);
+              if (action === 'submit-review') {{
+                const row = checkbox.closest('tr');
+                for (const [field, selector] of [['category', '.initial-review-category'], ['channel', '.initial-review-channel']]) {{
+                  const select = row?.querySelector(selector);
+                  if (!select || !select.reportValidity()) {{
+                    event.preventDefault();
+                    return;
+                  }}
+                  const optionHidden = document.createElement('input');
+                  optionHidden.type = 'hidden';
+                  optionHidden.className = 'batch-row-value';
+                  optionHidden.name = `${{field}}_${{checkbox.value}}`;
+                  optionHidden.value = select.value;
+                  batchForm.appendChild(optionHidden);
+                }}
+              }}
             }}
           }});
           document.querySelectorAll('.review-approval-form').forEach((form) => {{
@@ -750,6 +883,8 @@ class PlanningApplication:
 
     def render_rules(self, user: dict, query: dict | None = None) -> str:
         query = query or {}
+        categories = db.list_category_options(self.db_path)
+        channels = db.list_channel_options(self.db_path)
         dress_rules = db.list_category_rules(self.db_path)
         cost_rules = db.list_category_cost_rules(self.db_path)
         suppliers = db.list_supplier_coefficients(self.db_path)
@@ -770,10 +905,32 @@ class PlanningApplication:
                 value = f"{value:g}"
             return html.escape(str(value), quote=True)
 
+        category_edit = selected(categories, "edit_category_option") if can_manage else None
+        channel_edit = selected(channels, "edit_channel_option") if can_manage else None
         dress_edit = selected(dress_rules, "edit_dress") if can_manage else None
         cost_edit = selected(cost_rules, "edit_cost") if can_manage else None
         supplier_edit = selected(suppliers, "edit_supplier") if can_manage else None
 
+        category_option_rows = "".join(
+            f"<tr><td><strong>{html.escape(item['name'])}</strong><small>{'连衣裙固定倍率' if item['pricing_group'] == 'dress' else '其他品类成本区间倍率'}</small></td><td>{html.escape(item['keywords'] or '未配置，作为人工选项')}</td><td>{int(item['sort_order'])}</td><td>{html.escape(item['note'])}</td>"
+            + (
+                f"<td><div class='rule-actions'><a class='button compact-button' href='/rules?edit_category_option={item['id']}#category-options'>编辑</a><form method='post' action='/rules/category-option/{item['id']}/delete' onsubmit=\"return confirm('确定删除这个品类选项吗？');\"><button class='danger-button' type='submit'>删除</button></form></div></td>"
+                if can_manage
+                else ""
+            )
+            + "</tr>"
+            for item in categories
+        )
+        channel_option_rows = "".join(
+            f"<tr><td><strong>{html.escape(item['name'])}</strong></td><td>{int(item['sort_order'])}</td><td>{html.escape(item['note'])}</td>"
+            + (
+                f"<td><div class='rule-actions'><a class='button compact-button' href='/rules?edit_channel_option={item['id']}#channel-options'>编辑</a><form method='post' action='/rules/channel-option/{item['id']}/delete' onsubmit=\"return confirm('确定删除这个渠道选项吗？');\"><button class='danger-button' type='submit'>删除</button></form></div></td>"
+                if can_manage
+                else ""
+            )
+            + "</tr>"
+            for item in channels
+        )
         dress_rows = "".join(
             f"<tr><td>{html.escape(item['season_year'] or '默认')}</td><td>{item['multiplier']:g}</td><td>{html.escape(item['note'])}</td>"
             + (
@@ -805,10 +962,29 @@ class PlanningApplication:
             for item in suppliers
         )
 
+        category_option_form = ""
+        channel_option_form = ""
         dress_form = ""
         cost_form = ""
         supplier_form = ""
         if can_manage:
+            category_option_form = f"""
+            <form class='rule-form option-rule-form' method='post' action='/rules/category-option'>
+              <input type='hidden' name='option_id' value='{field(category_edit, 'id')}'>
+              <label><span>品类名称</span><input name='name' value='{field(category_edit, 'name')}' placeholder='例如 针织衫' required></label>
+              <label><span>商品名匹配词</span><input name='keywords' value='{field(category_edit, 'keywords')}' placeholder='多个词用逗号分隔'></label>
+              <label><span>排序</span><input name='sort_order' value='{field(category_edit, 'sort_order') or '0'}' type='number' min='0' max='9999' step='1' required></label>
+              <label><span>备注</span><input name='note' value='{field(category_edit, 'note')}' placeholder='选填'></label>
+              <div class='form-actions'><button class='primary' type='submit'>{'保存修改' if category_edit else '新增品类'}</button>{"<a class='button' href='/rules#category-options'>取消</a>" if category_edit else ''}</div>
+            </form>"""
+            channel_option_form = f"""
+            <form class='rule-form option-rule-form' method='post' action='/rules/channel-option'>
+              <input type='hidden' name='option_id' value='{field(channel_edit, 'id')}'>
+              <label><span>渠道名称</span><input name='name' value='{field(channel_edit, 'name')}' placeholder='例如 天猫' required></label>
+              <label><span>排序</span><input name='sort_order' value='{field(channel_edit, 'sort_order') or '0'}' type='number' min='0' max='9999' step='1' required></label>
+              <label><span>备注</span><input name='note' value='{field(channel_edit, 'note')}' placeholder='选填'></label>
+              <div class='form-actions'><button class='primary' type='submit'>{'保存修改' if channel_edit else '新增渠道'}</button>{"<a class='button' href='/rules#channel-options'>取消</a>" if channel_edit else ''}</div>
+            </form>"""
             dress_form = f"""
             <form class='rule-form dress-rule-form' method='post' action='/rules/category'>
               <input type='hidden' name='rule_id' value='{field(dress_edit, 'id')}'>
@@ -838,21 +1014,23 @@ class PlanningApplication:
             </form>"""
 
         access_text = (
-            "当前账号具有规则维护权限，可以新增、编辑和删除全部定价规则。"
+            "当前账号具有规则维护权限，可以新增、编辑和删除全部规则及业务选项。"
             if can_manage
             else "当前账号为只读权限，可以查看规则但不能新增、编辑或删除。"
         )
         access_class = "access-write" if can_manage else "access-readonly"
         content = f"""
-        <section class='page-heading'><div><div class='eyebrow'>RULES & ASSUMPTIONS</div><h1>定价规则</h1><p>规则保存后只影响新生成的测算上新价，已确认记录保留当时的倍率和系数快照。</p></div></section>
+        <section class='page-heading'><div><div class='eyebrow'>RULES & ASSUMPTIONS</div><h1>规则</h1><p>统一维护品类、渠道和定价计算规则。定价规则调整后只影响新生成或初审时重新测算的价格。</p></div></section>
         {self.alert(query.get('notice', ''), 'success') if query.get('notice') else ''}
         <section class='rule-access {access_class}'><div><strong>{'规则维护账号' if can_manage else '规则只读账号'}</strong><span>{access_text}</span></div><small>维护权限：企划管理员</small></section>
-        <section class='rule-logic'><div><span>01</span><strong>连衣裙</strong><p>不区分成本金额，直接匹配固定倍率。</p></div><div><span>02</span><strong>其他品类</strong><p>按照含税采购成本落入的金额区间匹配倍率。</p></div><div><span>03</span><strong>供应商系数</strong><p>最后再乘供应商浮动系数，未配置时为 1.00。</p></div></section>
+        <section class='rule-logic'><div><span>01</span><strong>商品名判定品类</strong><p>同步时按品类匹配词自动判定，初审人员可以确认或修改。</p></div><div><span>02</span><strong>规则计算</strong><p>连衣裙使用固定倍率，其余品类按照含税成本区间匹配倍率。</p></div><div><span>03</span><strong>渠道划分</strong><p>渠道选项提前维护，由商品部初审人员人工选择。</p></div></section>
+        <section class='panel' id='category-options'><div class='panel-head'><div><div class='eyebrow'>CATEGORY OPTIONS</div><h2>品类选项</h2></div><span class='hint'>用于自动判定与初审选择</span></div>{category_option_form}<p class='range-help'>系统按商品名称匹配关键词，多个关键词可用逗号或换行分隔；同时命中时优先采用更长的关键词。“其他品类”可作为未命中时的默认选项。</p><div class='table-wrap'><table><thead><tr><th>品类</th><th>商品名匹配词</th><th>排序</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{category_option_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置品类选项。</td></tr>'}</tbody></table></div></section>
+        <section class='panel' id='channel-options'><div class='panel-head'><div><div class='eyebrow'>CHANNEL OPTIONS</div><h2>渠道选项</h2></div><span class='hint'>由商品部初审人员人工判断</span></div>{channel_option_form}<div class='table-wrap'><table><thead><tr><th>渠道</th><th>排序</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{channel_option_rows or f'<tr><td colspan="{4 if can_manage else 3}" class="empty">尚未配置渠道选项。</td></tr>'}</tbody></table></div></section>
         <section class='panel' id='dress-rules'><div class='panel-head'><div><div class='eyebrow'>DRESS</div><h2>连衣裙固定倍率</h2></div><span class='hint'>不区分成本金额</span></div>{dress_form}<div class='table-wrap'><table><thead><tr><th>适用季节</th><th>固定倍率</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{dress_rows or f'<tr><td colspan="{4 if can_manage else 3}" class="empty">尚未配置连衣裙固定倍率。</td></tr>'}</tbody></table></div></section>
         <section class='panel' id='cost-rules'><div class='panel-head'><div><div class='eyebrow'>OTHER CATEGORIES</div><h2>其他品类成本区间倍率</h2></div><span class='hint'>下限包含，上限不包含</span></div>{cost_form}<p class='range-help'>可按实际业务新增任意数量的成本区间，也可随时编辑区间边界和倍率。上限填 600 表示成本小于 600；最后一档可不填上限。同一季节的区间不能重叠。</p><div class='table-wrap'><table><thead><tr><th>适用季节</th><th>含税成本区间</th><th>倍率</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{cost_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置其他品类成本区间；未命中区间时不能生成测算上新价。</td></tr>'}</tbody></table></div></section>
         <section class='panel' id='supplier-rules'><div class='panel-head'><div><div class='eyebrow'>SUPPLIER ADJUSTMENT</div><h2>供应商浮动系数</h2></div><span class='hint'>未配置时为 1.00</span></div>{supplier_form}<div class='table-wrap'><table><thead><tr><th>适用季节</th><th>供应商</th><th>系数</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{supplier_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置，系统默认使用 1.00。</td></tr>'}</tbody></table></div></section>
         """
-        return self.shell("定价规则", content, user, "rules")
+        return self.shell("规则", content, user, "rules")
 
     def cost_range_label(self, lower, upper) -> str:
         if lower is None:
@@ -889,7 +1067,7 @@ class PlanningApplication:
         return f"<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{html.escape(title)}</title><style>{self.css()}</style></head><body class='{body_class}'>{content}</body></html>"
 
     def shell(self, title: str, content: str, user: dict, current: str) -> str:
-        nav = ''.join(f"<a class='{'active' if current == key else ''}' href='{href}'>{label}</a>" for key, href, label in [("dashboard", "/dashboard", "企划总览"), ("category-planning", "/category-planning", "品类企划"), ("workbench", "/workbench", "上新定价"), ("rules", "/rules", "定价规则"), ("stats", "/stats", "价格带统计"), ("settings", "/settings", "连接设置")])
+        nav = ''.join(f"<a class='{'active' if current == key else ''}' href='{href}'>{label}</a>" for key, href, label in [("dashboard", "/dashboard", "企划总览"), ("category-planning", "/category-planning", "品类企划"), ("workbench", "/workbench", "上新定价"), ("rules", "/rules", "规则"), ("stats", "/stats", "价格带统计"), ("settings", "/settings", "连接设置")])
         content = f"<div class='app-shell'><header><a class='brand' href='/dashboard'><span>PC</span><div><strong>商品企划中心</strong><small>Merchandise Planning</small></div></a><nav>{nav}</nav><div class='user'><span>{html.escape(user.get('display_name',''))}</span><form method='post' action='/logout'><button type='submit' aria-label='退出登录'>退出</button></form></div></header><main class='main'>{content}</main><footer>商品企划中心 · 成本来源：藏宝阁跟单部含税价</footer></div>"
         return self.page(title, content, user)
 
@@ -922,5 +1100,7 @@ class PlanningApplication:
         .module-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px;margin-bottom:34px}.module-entry{min-width:0;min-height:252px;background:#fff;border:1px solid var(--line);border-top:3px solid var(--deep);padding:25px;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:24px}.module-entry-planned{border-top-color:#9a8172;background:#fbfaf8}.module-entry-top{width:100%;display:flex;justify-content:space-between;align-items:center}.module-index{font:29px Georgia,serif;color:#9aa19c}.phase-tag,.phase-badge{display:inline-block;background:#eeeae6;color:#745e51;padding:4px 9px;border-radius:3px;font-size:12px}.phase-tag-live{background:#e5f2e9;color:#2d6b42}.module-entry h2{font:28px Georgia,serif;font-weight:500;margin:5px 0 7px}.module-entry p{color:var(--muted);margin:0}.section-label{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:12px}.section-label h2{font-size:20px;margin:2px 0 0}.section-label>a{color:var(--deep);font-size:13px}.planning-scope{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));background:#fff;border:1px solid var(--line);margin-bottom:24px}.planning-scope>div{min-width:0;padding:28px;border-right:1px solid var(--line);display:flex;gap:18px}.planning-scope>div:last-child{border-right:0}.scope-primary{background:#f0f5f1}.scope-number{font:25px Georgia,serif;color:var(--accent)}.planning-scope div div>span{display:block;color:var(--muted);font-size:12px}.planning-scope strong{display:block;font:24px Georgia,serif;margin:3px 0 7px}.planning-scope p{margin:0;color:var(--muted)}.phase-panel{display:flex;align-items:center;justify-content:space-between;gap:28px;background:#fbfaf8;border-left:3px solid #9a8172}.phase-panel>div{max-width:760px}.phase-panel p{margin:5px 0 0;color:var(--muted)}.phase-badge{font-size:13px;padding:7px 12px}@media(max-width:900px){.planning-scope{grid-template-columns:1fr}.planning-scope>div{border-right:0;border-bottom:1px solid var(--line)}.planning-scope>div:last-child{border-bottom:0}}@media(max-width:620px){.module-grid{grid-template-columns:1fr;gap:14px}.module-entry{min-height:220px;padding:20px}.section-label,.phase-panel{align-items:flex-start;flex-direction:column}.planning-scope>div{padding:21px}}
         :root{--ink:#202421;--muted:#6c756e;--line:#dde3dc;--paper:#f6f8f5;--card:#fff;--accent:#b5572a;--deep:#315447;--soft:#eaf0eb}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif}a{color:inherit;text-decoration:none}button,.button{border:1px solid #cbd5ce;background:#fff;color:var(--ink);border-radius:4px;padding:9px 14px;font:inherit;cursor:pointer}button:hover,.button:hover{border-color:var(--accent);color:var(--accent)}button.primary,.button.primary{background:var(--deep);border-color:var(--deep);color:#fff}button:disabled{cursor:not-allowed;opacity:.45}.app-shell{width:100%;min-width:0;min-height:100vh}header{width:100%;height:72px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 34px;gap:30px;position:sticky;top:0;z-index:3}.brand{display:flex;align-items:center;gap:10px;min-width:230px}.brand>span{display:grid;place-items:center;width:34px;height:34px;background:var(--deep);color:#fff;font-weight:700;letter-spacing:.08em;border-radius:3px}.brand strong{display:block;font-size:15px}.brand small{display:block;color:var(--muted);font-size:10px;letter-spacing:.08em;text-transform:uppercase}nav{display:flex;gap:4px;flex:1;min-width:0}nav a{padding:9px 12px;color:var(--muted);border-bottom:2px solid transparent}nav a.active,nav a:hover{color:var(--deep);border-bottom-color:var(--accent)}.user{display:flex;align-items:center;gap:13px;color:var(--muted);white-space:nowrap}.user button{padding:5px 9px}.main{width:100%;min-width:0;max-width:1320px;margin:0 auto;padding:38px 34px 60px}.hero,.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;margin-bottom:25px}.hero h1,.page-heading h1{font-family:Georgia,'Times New Roman',serif;font-weight:500;font-size:42px;line-height:1.15;margin:5px 0 10px;letter-spacing:0}.hero p,.page-heading p{margin:0;color:var(--muted);max-width:680px}.eyebrow{color:var(--accent);font-size:11px;letter-spacing:.14em;font-weight:700}.hero-note{background:var(--deep);color:#fff;padding:18px 22px;min-width:190px}.hero-note span,.hero-note small{display:block;opacity:.7;font-size:12px}.hero-note strong{display:block;font-size:21px;margin:4px 0}.metrics{display:grid;grid-template-columns:repeat(3,1fr);background:#fff;border:1px solid var(--line);margin-bottom:24px}.metrics>a,.metrics>div{padding:20px 24px;border-right:1px solid var(--line)}.metrics>*:last-child{border-right:0}.metrics span,.metrics small{display:block;color:var(--muted)}.metrics strong{display:block;font:34px Georgia,serif;margin:4px 0}.split{display:grid;grid-template-columns:1.45fr 1fr;gap:24px}.panel{min-width:0;background:var(--card);border:1px solid var(--line);padding:24px;margin-bottom:24px}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:18px}.panel h2{font-size:20px;font-weight:600;margin:2px 0}.hint,.count,.muted,.meta{color:var(--muted)}.count{font-size:13px}.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.quick-grid a{border:1px solid var(--line);padding:17px;min-height:126px;display:flex;flex-direction:column;gap:3px}.quick-grid a:hover{border-color:var(--accent);background:#fffaf7}.quick-grid b{color:var(--accent);font:23px Georgia,serif}.quick-grid small{color:var(--muted);font-size:12px}.notice-panel{background:#f0f5f1}.notice-panel p{color:#53645a}.page-heading form{margin-bottom:4px}.filter-bar{background:#fff;border:1px solid var(--line);padding:14px 18px;margin-bottom:24px}.filter-bar form{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}.filter-bar label,.rule-form label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.filter-bar input,.filter-bar select{min-width:190px}input,select{border:1px solid #cfd8d1;background:#fff;padding:9px 10px;border-radius:3px;color:var(--ink);font:inherit;min-width:0}table{width:100%;border-collapse:collapse}th{text-align:left;color:var(--muted);font-size:12px;font-weight:500;background:#f7f9f7}th,td{padding:12px 11px;border-bottom:1px solid var(--line);vertical-align:middle}tbody tr:last-child td{border-bottom:0}td strong{display:block}td small{display:block;color:var(--muted);font-size:11px}.table-wrap{width:100%;max-width:100%;overflow:auto}.inline-form{display:flex;gap:6px;min-width:205px}.inline-form input{width:120px}.inline-form button{padding:7px 10px;white-space:nowrap}.status{display:inline-block;border-radius:3px;padding:3px 7px;background:var(--soft);color:var(--deep);font-size:12px}.status-confirmed{background:#fff1e7;color:#98431d}.status-published{background:#e5f2e9;color:#2d6b42}.status-conflict,.error-text{background:#fff0ef;color:#a23f35}.price{font:20px Georgia,serif;color:var(--deep)}.actions{display:flex;gap:5px;white-space:nowrap}.actions button{padding:6px 9px;font-size:12px}.empty{text-align:center;color:var(--muted);padding:30px!important}.alert{padding:11px 14px;border:1px solid;margin:0 0 20px}.alert.success{background:#edf7ef;border-color:#c8e2cd;color:#2f6741}.alert.error{background:#fff1ef;border-color:#efc9c2;color:#9b3e32}.rule-form{display:grid;grid-template-columns:1fr 1fr .7fr 1.2fr auto;gap:7px;margin-bottom:20px}.band-row{margin:19px 0}.band-label{display:flex;justify-content:space-between;gap:15px;margin-bottom:6px}.band-label span{font-weight:600}.band-label strong{color:var(--muted);font-size:13px;font-weight:500}.bar{height:11px;background:#edf1ed}.bar i{display:block;height:100%;background:var(--accent)}.settings dl{display:grid;grid-template-columns:180px 1fr;border-top:1px solid var(--line)}.settings dt,.settings dd{padding:13px 0;margin:0;border-bottom:1px solid var(--line)}.settings dt{color:var(--muted)}footer{max-width:1320px;margin:0 auto;padding:0 34px 25px;color:#909890;font-size:12px}.login-body{min-height:100vh;display:grid;place-items:center;background:#eef2ee}.login{width:min(430px,calc(100% - 36px));background:#fff;border:1px solid var(--line);padding:38px}.login-mark{color:var(--accent);font-size:12px;letter-spacing:.12em;font-weight:700}.login h1{font:36px Georgia,serif;margin:15px 0 8px}.login form{margin-top:25px}.login label{display:block;color:var(--muted);font-size:12px;margin:14px 0}.login input{width:100%;margin-top:5px}.login button{width:100%;margin-top:12px}.button{display:inline-block}.login .button{margin-top:18px} @media(max-width:900px){header{padding:0 18px;gap:16px}.brand{min-width:auto}.brand small,nav a{font-size:12px}nav{overflow:auto}.user>span{display:none}.main{padding:28px 18px 45px}.hero,.page-heading{align-items:flex-start;flex-direction:column}.hero h1,.page-heading h1{font-size:35px}.split{grid-template-columns:1fr}.rule-form{grid-template-columns:1fr 1fr}.rule-form button{grid-column:span 2}.quick-grid{grid-template-columns:1fr 1fr}}@media(max-width:620px){header{height:auto;min-height:66px;flex-wrap:wrap;padding:12px 15px}nav{order:3;flex:0 0 100%;width:100%;max-width:100%;overflow-x:auto}.metrics{grid-template-columns:1fr}.metrics>*{border-right:0;border-bottom:1px solid var(--line)}.metrics>*:last-child{border-bottom:0}.quick-grid{grid-template-columns:1fr}.rule-form{grid-template-columns:1fr}.rule-form button{grid-column:auto}.filter-bar form{align-items:stretch;flex-direction:column}.filter-bar label,.filter-bar input,.filter-bar select,.filter-bar button{width:100%}.filter-bar input,.filter-bar select{min-width:0}.panel{padding:18px}.main{padding-left:13px;padding-right:13px}.hero h1,.page-heading h1{font-size:30px}.actions{flex-direction:column}.settings dl{grid-template-columns:1fr}.settings dt{border-bottom:0;padding-bottom:3px}.settings dd{padding-top:0}.login{padding:28px 22px}}
         .pricing-board{padding:0;overflow:hidden}.pricing-board>.panel-head{padding:22px 24px 0}.pricing-board>.panel-head h2{margin-bottom:3px}.pricing-board>.panel-head p{margin:0}.pricing-batch-toolbar{display:flex;align-items:center;gap:14px;min-height:58px;padding:10px 24px;border-top:1px solid var(--line);background:#f7f9f7}.pricing-batch-toolbar>label{display:flex;align-items:center;gap:7px;font-weight:600;white-space:nowrap}.pricing-batch-toolbar input,.pricing-select-cell input{width:16px;height:16px;margin:0;accent-color:var(--deep)}.pricing-batch-toolbar>span{color:var(--muted);font-size:12px;white-space:nowrap}.pricing-batch-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-left:auto}.pricing-batch-actions button{padding:7px 11px;font-size:12px;white-space:nowrap}.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.pricing-table-wrap{position:relative;overflow-x:auto}.pricing-table{min-width:1454px}.pricing-table tr[id]{scroll-margin-top:92px}.pricing-table th{white-space:nowrap}.pricing-table th,.pricing-table td{padding:12px 10px}.pricing-table tbody tr:hover{background:#fbfcfb}.pricing-table tbody tr:hover .pricing-select-cell{background:#fbfcfb}.pricing-table td{min-width:92px}.pricing-table .pricing-select-cell{position:sticky;left:0;z-index:1;min-width:44px;width:44px;text-align:center;padding-left:8px;padding-right:8px;background:#fff;box-shadow:1px 0 0 var(--line)}.pricing-table thead .pricing-select-cell{z-index:2;background:#f7f9f7}.pricing-table td:nth-child(2){min-width:105px}.pricing-table td:nth-child(3){min-width:88px}.pricing-table td:nth-child(4){min-width:92px}.pricing-table td:nth-child(5){min-width:78px}.pricing-table td:nth-child(6){min-width:130px}.pricing-table td:nth-child(7){min-width:110px}.pricing-table td:nth-child(8){min-width:88px}.pricing-table td:nth-child(9){min-width:112px}.pricing-table td:nth-child(10){min-width:235px}.pricing-table td:nth-child(11){min-width:112px}.pricing-table td:nth-child(12){min-width:130px}.pricing-table td:nth-child(13){min-width:270px}.pricing-table .image-cell img,.pricing-table .product-image-empty{width:56px;height:56px}.pricing-table .pricing-match-cell>small{margin-top:3px}.pricing-table .price-cell small{margin-top:3px}.pricing-table .pricing-action-cell{vertical-align:middle}.pricing-table .pricing-action-cell form{margin:0 0 7px}.pricing-table .pricing-action-cell>form:only-child{margin-bottom:0}.pricing-table .pricing-action-cell label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap}.pricing-table .pricing-action-cell input{width:110px;padding:7px 8px}.pricing-table .pricing-action-cell button{padding:7px 9px;font-size:12px;white-space:nowrap}.pricing-table .pricing-action-cell small{max-width:245px}.pricing-table .pricing-calc-form{display:flex;align-items:end;gap:6px;flex-wrap:wrap}.pricing-table .pricing-calc-form label{display:flex;flex-direction:column;align-items:stretch;gap:3px;color:var(--muted);font-size:12px;white-space:normal}.pricing-table .pricing-calc-form input{width:116px}.pricing-table .review-controls{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap}.pricing-table .review-controls>span{width:100%}.pricing-table .review-approval-form{display:grid;grid-template-columns:max-content max-content;align-items:end;gap:7px 9px}.pricing-table .review-approval-form button{width:auto;min-width:0}.pricing-table .review-approve-button{grid-column:2;justify-self:end}
-        @media(max-width:620px){.pricing-board>.panel-head{padding:18px 18px 0;align-items:flex-start}.pricing-batch-toolbar{align-items:flex-start;flex-wrap:wrap;padding:10px 18px}.pricing-batch-actions{width:100%;justify-content:flex-start;margin-left:0;overflow-x:auto}.pricing-table{min-width:1454px}.pricing-table th,.pricing-table td{padding:10px 9px}.pricing-table .pricing-action-cell input{width:102px}.pricing-table .pricing-action-cell button{font-size:11px;padding:6px 8px}}
+        .rule-form.option-rule-form{grid-template-columns:1fr 1.4fr .55fr 1.2fr auto}.pricing-table{min-width:1690px}.pricing-table td:nth-child(10){min-width:170px}.pricing-table td:nth-child(11){min-width:180px}.pricing-table td:nth-child(12){min-width:135px}.pricing-table td:nth-child(13){min-width:112px}.pricing-table td:nth-child(14){min-width:130px}.pricing-table td:nth-child(15){min-width:270px}.pricing-table .pricing-category-cell select,.pricing-table .pricing-channel-cell select,.pricing-table .pricing-calc-form select{width:145px;padding:7px 8px}.pricing-table .cell-field{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:12px}.pricing-table .pricing-rule-cell .rule-summary{display:block;white-space:nowrap}.pricing-table .pricing-rule-cell .recalculate-button{display:block;margin-top:8px;white-space:nowrap}.pricing-table .pricing-category-cell small,.pricing-table .pricing-rule-cell small{margin-top:4px}
+        @media(max-width:900px){.rule-form.option-rule-form{grid-template-columns:1fr 1fr}.rule-form.option-rule-form .form-actions{grid-column:span 2}}
+        @media(max-width:620px){.rule-form.option-rule-form{grid-template-columns:1fr}.rule-form.option-rule-form .form-actions{grid-column:auto}.pricing-board>.panel-head{padding:18px 18px 0;align-items:flex-start}.pricing-batch-toolbar{align-items:flex-start;flex-wrap:wrap;padding:10px 18px}.pricing-batch-actions{width:100%;justify-content:flex-start;margin-left:0;overflow-x:auto}.pricing-table{min-width:1690px}.pricing-table th,.pricing-table td{padding:10px 9px}.pricing-table .pricing-action-cell input{width:102px}.pricing-table .pricing-action-cell button{font-size:11px;padding:6px 8px}}
         """

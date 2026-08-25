@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import secrets
 import sqlite3
 from datetime import datetime, timezone
@@ -66,6 +67,7 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
                 supplier_code TEXT NOT NULL DEFAULT '',
                 supplier_style_code TEXT NOT NULL DEFAULT '',
                 category TEXT NOT NULL DEFAULT '',
+                category_suggestion TEXT NOT NULL DEFAULT '',
                 actual_cost REAL,
                 tax_included_price REAL,
                 image_url TEXT NOT NULL DEFAULT '',
@@ -85,6 +87,24 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
                 note TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL,
                 UNIQUE(season_year, category)
+            );
+            CREATE TABLE IF NOT EXISTS category_options (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                keywords TEXT NOT NULL DEFAULT '',
+                pricing_group TEXT NOT NULL DEFAULT 'other',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                note TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS channel_options (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                note TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS category_cost_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +144,7 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
                 product_name TEXT NOT NULL DEFAULT '',
                 supplier TEXT NOT NULL DEFAULT '',
                 category TEXT NOT NULL,
+                channel TEXT NOT NULL DEFAULT '',
                 cost REAL NOT NULL,
                 fixed_multiplier REAL NOT NULL,
                 supplier_coefficient REAL NOT NULL,
@@ -145,10 +166,14 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
         source_columns = {row["name"] for row in connection.execute("PRAGMA table_info(source_products)").fetchall()}
         if "image_url" not in source_columns:
             connection.execute("ALTER TABLE source_products ADD COLUMN image_url TEXT NOT NULL DEFAULT ''")
+        if "category_suggestion" not in source_columns:
+            connection.execute("ALTER TABLE source_products ADD COLUMN category_suggestion TEXT NOT NULL DEFAULT ''")
         pricing_columns = {row["name"] for row in connection.execute("PRAGMA table_info(pricing_records)").fetchall()}
         if "calculated_price" not in pricing_columns:
             connection.execute("ALTER TABLE pricing_records ADD COLUMN calculated_price REAL")
             connection.execute("UPDATE pricing_records SET calculated_price = launch_price WHERE calculated_price IS NULL")
+        if "channel" not in pricing_columns:
+            connection.execute("ALTER TABLE pricing_records ADD COLUMN channel TEXT NOT NULL DEFAULT ''")
         if seed_demo and connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             now = utc_now()
             connection.executemany(
@@ -172,6 +197,36 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
             connection.executemany(
                 "INSERT INTO price_bands (label, lower_bound, upper_bound, sort_order) VALUES (?, ?, ?, ?)",
                 [("300及以下", None, 300, 10), ("301-500", 300, 500, 20), ("501-800", 500, 800, 30), ("801-1200", 800, 1200, 40), ("1201以上", 1200, None, 50)],
+            )
+        if connection.execute("SELECT COUNT(*) FROM category_options").fetchone()[0] == 0:
+            now = utc_now()
+            connection.executemany(
+                "INSERT INTO category_options (name, keywords, pricing_group, sort_order, note, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    ("连衣裙", "连衣裙,裙装,裙子", "dress", 10, "命中关键词时自动判定；使用连衣裙固定倍率。", now),
+                    ("毛衣", "针织衫,毛衣,针织上衣", "other", 20, "", now),
+                    ("衬衫", "衬衫,衬衣", "other", 30, "", now),
+                    ("外套", "外套,大衣,风衣,夹克", "other", 40, "", now),
+                    ("半身裙", "半身裙", "other", 50, "", now),
+                    ("裤装", "裤装,裤子,长裤,短裤", "other", 60, "", now),
+                    ("其他品类", "", "other", 999, "未命中其他关键词时的默认品类；使用成本区间倍率。", now),
+                ],
+            )
+        for row in connection.execute(
+            "SELECT DISTINCT TRIM(category) AS name FROM source_products WHERE TRIM(category) != '' "
+            "UNION SELECT DISTINCT TRIM(category) AS name FROM pricing_records WHERE TRIM(category) != ''"
+        ).fetchall():
+            name = str(row["name"] or "").strip()
+            if name:
+                connection.execute(
+                    "INSERT OR IGNORE INTO category_options (name, keywords, pricing_group, sort_order, note, updated_at) VALUES (?, ?, ?, 500, '', ?)",
+                    (name, name, "dress" if name == "连衣裙" else "other", utc_now()),
+                )
+        if connection.execute("SELECT COUNT(*) FROM channel_options").fetchone()[0] == 0:
+            now = utc_now()
+            connection.executemany(
+                "INSERT INTO channel_options (name, sort_order, note, updated_at) VALUES (?, ?, ?, ?)",
+                [("天猫", 10, "", now), ("唯品", 20, "", now), ("同款", 30, "", now)],
             )
 
 
@@ -198,29 +253,191 @@ def get_source_product(db_path: str | Path, product_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+def list_category_options(db_path: str | Path, *, enabled_only: bool = False) -> list[dict]:
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM category_options WHERE (? = 0 OR enabled = 1) ORDER BY sort_order, id",
+            (1 if enabled_only else 0,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_channel_options(db_path: str | Path, *, enabled_only: bool = False) -> list[dict]:
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM channel_options WHERE (? = 0 OR enabled = 1) ORDER BY sort_order, id",
+            (1 if enabled_only else 0,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _option_sort_order(value) -> int:
+    try:
+        order = int(str(value or "0").strip())
+    except ValueError:
+        raise ValueError("排序必须是整数。")
+    if order < 0 or order > 9999:
+        raise ValueError("排序必须在 0 到 9999 之间。")
+    return order
+
+
+def save_category_option(
+    db_path: str | Path,
+    name: str,
+    keywords: str = "",
+    sort_order=0,
+    note: str = "",
+    option_id: int | None = None,
+) -> None:
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("品类名称不能为空。")
+    if len(clean_name) > 40:
+        raise ValueError("品类名称不能超过 40 个字符。")
+    clean_keywords = str(keywords or "").strip()
+    pricing_group = "dress" if clean_name == "连衣裙" else "other"
+    order = _option_sort_order(sort_order)
+    with get_connection(db_path) as connection:
+        duplicate = connection.execute(
+            "SELECT id FROM category_options WHERE name = ? AND (? IS NULL OR id != ?)",
+            (clean_name, option_id, option_id),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("该品类选项已存在。")
+        if option_id is not None:
+            target = connection.execute("SELECT id FROM category_options WHERE id = ?", (int(option_id),)).fetchone()
+            if not target:
+                raise LookupError("品类选项不存在。")
+            connection.execute(
+                "UPDATE category_options SET name = ?, keywords = ?, pricing_group = ?, sort_order = ?, note = ?, enabled = 1, updated_at = ? WHERE id = ?",
+                (clean_name, clean_keywords, pricing_group, order, str(note or "").strip(), utc_now(), int(option_id)),
+            )
+            return
+        connection.execute(
+            "INSERT INTO category_options (name, keywords, pricing_group, sort_order, note, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (clean_name, clean_keywords, pricing_group, order, str(note or "").strip(), utc_now()),
+        )
+
+
+def delete_category_option(db_path: str | Path, option_id: int) -> None:
+    with get_connection(db_path) as connection:
+        cursor = connection.execute("DELETE FROM category_options WHERE id = ?", (int(option_id),))
+        if cursor.rowcount != 1:
+            raise LookupError("品类选项不存在。")
+
+
+def save_channel_option(
+    db_path: str | Path,
+    name: str,
+    sort_order=0,
+    note: str = "",
+    option_id: int | None = None,
+) -> None:
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("渠道名称不能为空。")
+    if len(clean_name) > 40:
+        raise ValueError("渠道名称不能超过 40 个字符。")
+    order = _option_sort_order(sort_order)
+    with get_connection(db_path) as connection:
+        duplicate = connection.execute(
+            "SELECT id FROM channel_options WHERE name = ? AND (? IS NULL OR id != ?)",
+            (clean_name, option_id, option_id),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("该渠道选项已存在。")
+        if option_id is not None:
+            target = connection.execute("SELECT id FROM channel_options WHERE id = ?", (int(option_id),)).fetchone()
+            if not target:
+                raise LookupError("渠道选项不存在。")
+            connection.execute(
+                "UPDATE channel_options SET name = ?, sort_order = ?, note = ?, enabled = 1, updated_at = ? WHERE id = ?",
+                (clean_name, order, str(note or "").strip(), utc_now(), int(option_id)),
+            )
+            return
+        connection.execute(
+            "INSERT INTO channel_options (name, sort_order, note, updated_at) VALUES (?, ?, ?, ?)",
+            (clean_name, order, str(note or "").strip(), utc_now()),
+        )
+
+
+def delete_channel_option(db_path: str | Path, option_id: int) -> None:
+    with get_connection(db_path) as connection:
+        cursor = connection.execute("DELETE FROM channel_options WHERE id = ?", (int(option_id),))
+        if cursor.rowcount != 1:
+            raise LookupError("渠道选项不存在。")
+
+
+def _category_keywords(value: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[,，;；\n\r]+", str(value or "")) if part.strip()]
+
+
+def infer_category(product_name: str, options: list[dict]) -> str:
+    clean_name = str(product_name or "").strip().casefold()
+    matches: list[tuple[int, int, str]] = []
+    fallback = ""
+    for option in options:
+        if not option.get("enabled", 1):
+            continue
+        name = str(option.get("name") or "").strip()
+        if name == "其他品类":
+            fallback = name
+        for keyword in _category_keywords(option.get("keywords", "")):
+            if keyword.casefold() in clean_name:
+                matches.append((len(keyword), -int(option.get("sort_order") or 0), name))
+    return max(matches)[2] if matches else fallback
+
+
+def validate_category_option(db_path: str | Path, category: str) -> str:
+    clean_category = str(category or "").strip()
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT name FROM category_options WHERE name = ? AND enabled = 1",
+            (clean_category,),
+        ).fetchone()
+    if not row:
+        raise ValueError("请选择规则中已启用的品类选项。")
+    return str(row["name"])
+
+
+def validate_channel_option(db_path: str | Path, channel: str) -> str:
+    clean_channel = str(channel or "").strip()
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT name FROM channel_options WHERE name = ? AND enabled = 1",
+            (clean_channel,),
+        ).fetchone()
+    if not row:
+        raise ValueError("请选择规则中已启用的渠道选项。")
+    return str(row["name"])
+
+
 def upsert_source_products(db_path: str | Path, items: list[dict]) -> int:
     now = utc_now()
     with get_connection(db_path) as connection:
+        category_options = [dict(row) for row in connection.execute("SELECT * FROM category_options WHERE enabled = 1 ORDER BY sort_order, id").fetchall()]
         for item in items:
+            category_suggestion = infer_category(item.get("product_name", ""), category_options)
             connection.execute(
                 """
                 INSERT INTO source_products (
                     id, style_code, style_color, color_name, product_name, brand_name, season_year,
-                    supplier, supplier_code, supplier_style_code, category, actual_cost, tax_included_price,
+                    supplier, supplier_code, supplier_style_code, category, category_suggestion, actual_cost, tax_included_price,
                     image_url, status, lifecycle_status, source_version_no, source_updated_at, creator_name, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     style_code=excluded.style_code, style_color=excluded.style_color, color_name=excluded.color_name,
                     product_name=excluded.product_name, brand_name=excluded.brand_name, season_year=excluded.season_year,
                     supplier=excluded.supplier, supplier_code=excluded.supplier_code, supplier_style_code=excluded.supplier_style_code,
-                    category=excluded.category, actual_cost=excluded.actual_cost, tax_included_price=excluded.tax_included_price, image_url=excluded.image_url,
+                    category=CASE WHEN NOT EXISTS (SELECT 1 FROM pricing_records WHERE source_product_id = excluded.id) THEN excluded.category ELSE source_products.category END,
+                    category_suggestion=excluded.category_suggestion, actual_cost=excluded.actual_cost, tax_included_price=excluded.tax_included_price, image_url=excluded.image_url,
                     status=excluded.status, lifecycle_status=excluded.lifecycle_status, source_version_no=excluded.source_version_no,
                     source_updated_at=excluded.source_updated_at, creator_name=excluded.creator_name, synced_at=excluded.synced_at
                 """,
                 (
                     int(item["id"]), item.get("style_code", ""), item.get("style_color", ""), item.get("color_name", ""),
                     item.get("product_name", ""), item.get("brand_name", ""), item.get("season_year", ""), item.get("supplier", ""),
-                    item.get("supplier_code", ""), item.get("supplier_style_code", ""), item.get("category", ""), item.get("actual_cost"),
+                    item.get("supplier_code", ""), item.get("supplier_style_code", ""), category_suggestion, category_suggestion, item.get("actual_cost"),
                     item.get("tax_included_price"), item.get("image_url", ""), item.get("status", ""), item.get("lifecycle_status", ""), int(item.get("source_version_no") or 1),
                     item.get("updated_at", ""), item.get("creator_name", ""), now,
                 ),
@@ -490,20 +707,47 @@ def round_price_to_9(raw_price: float) -> int:
     return int(((value - Decimal("9")) / Decimal("10")).to_integral_value(rounding=ROUND_FLOOR) * Decimal("10") + Decimal("9"))
 
 
-def create_pricing_record(db_path: str | Path, product: dict, operator_name: str) -> dict:
-    cost = product.get("actual_cost")
+def calculate_pricing(
+    db_path: str | Path,
+    season_year: str,
+    category: str,
+    supplier: str,
+    cost,
+) -> dict:
     if cost is None or float(cost) <= 0:
         raise ValueError("藏宝阁尚未提供有效的含税采购成本。")
-    category = str(product.get("category") or "").strip()
-    if not category:
-        raise ValueError("请先在定价工作台选择品类，再生成测算上新价。")
-    fixed, coefficient = resolve_rules(db_path, product.get("season_year", ""), category, product.get("supplier", ""), float(cost))
+    clean_category = str(category or "").strip()
+    if not clean_category:
+        raise ValueError("请先选择品类，再生成测算上新价。")
+    fixed, coefficient = resolve_rules(db_path, str(season_year or ""), clean_category, str(supplier or ""), float(cost))
     if fixed is None:
-        if category == "连衣裙":
-            raise ValueError("连衣裙尚未配置固定倍率，请先到定价规则中配置。")
-        raise ValueError(f"其他品类成本 {float(cost):g} 尚未落入成本区间倍率规则，请先到定价规则中配置。")
+        if clean_category == "连衣裙":
+            raise ValueError("连衣裙尚未配置固定倍率，请先到规则中配置。")
+        raise ValueError(f"其他品类成本 {float(cost):g} 尚未落入成本区间倍率规则，请先到规则中配置。")
     raw = float(cost) * fixed * coefficient
-    launch = round_price_to_9(raw)
+    return {
+        "category": clean_category,
+        "fixed_multiplier": fixed,
+        "supplier_coefficient": coefficient,
+        "raw_price": raw,
+        "calculated_price": round_price_to_9(raw),
+    }
+
+
+def create_pricing_record(db_path: str | Path, product: dict, operator_name: str) -> dict:
+    cost = product.get("actual_cost")
+    category = str(product.get("category") or product.get("category_suggestion") or "").strip()
+    calculation = calculate_pricing(
+        db_path,
+        product.get("season_year", ""),
+        category,
+        product.get("supplier", ""),
+        cost,
+    )
+    fixed = calculation["fixed_multiplier"]
+    coefficient = calculation["supplier_coefficient"]
+    raw = calculation["raw_price"]
+    launch = calculation["calculated_price"]
     source_version_no = int(product.get("source_version_no") or 1)
     with get_connection(db_path) as connection:
         existing = connection.execute(
@@ -516,7 +760,7 @@ def create_pricing_record(db_path: str | Path, product: dict, operator_name: str
     now = utc_now()
     with get_connection(db_path) as connection:
         connection.execute(
-            "INSERT INTO pricing_records (publication_id, source_product_id, source_version_no, season_year, style_code, product_name, supplier, category, cost, fixed_multiplier, supplier_coefficient, raw_price, calculated_price, launch_price, status, operator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)",
+            "INSERT INTO pricing_records (publication_id, source_product_id, source_version_no, season_year, style_code, product_name, supplier, category, channel, cost, fixed_multiplier, supplier_coefficient, raw_price, calculated_price, launch_price, status, operator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)",
             (publication_id, product["id"], source_version_no, product.get("season_year", ""), product.get("style_code", ""), product.get("product_name", ""), product.get("supplier", ""), category, float(cost), fixed, coefficient, raw, launch, launch, operator_name, now),
         )
         row = connection.execute("SELECT * FROM pricing_records WHERE publication_id = ?", (publication_id,)).fetchone()
@@ -560,18 +804,87 @@ def validated_launch_price(value) -> int:
     return int(price)
 
 
-def submit_pricing_for_review(db_path: str | Path, record_id: int, launch_price, operator_name: str) -> dict:
-    price = validated_launch_price(launch_price)
+def recalculate_pricing_record(db_path: str | Path, record_id: int, category: str, operator_name: str) -> dict:
+    clean_category = validate_category_option(db_path, category)
     with get_connection(db_path) as connection:
         row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
         if not row:
             raise LookupError("定价记录不存在。")
         if row["status"] not in {"suggested", "conflict"}:
             raise ValueError("当前定价记录不在商品部初审阶段。")
+    calculation = calculate_pricing(
+        db_path,
+        row["season_year"],
+        clean_category,
+        row["supplier"],
+        row["cost"],
+    )
+    old_calculated = validated_launch_price(row["calculated_price"] or row["launch_price"])
+    launch_price = (
+        calculation["calculated_price"]
+        if validated_launch_price(row["launch_price"]) == old_calculated
+        else validated_launch_price(row["launch_price"])
+    )
+    with get_connection(db_path) as connection:
         connection.execute(
-            "UPDATE pricing_records SET launch_price = ?, status = 'review_pending', operator_name = ?, confirmed_at = NULL, error_message = '' WHERE id = ?",
-            (price, operator_name, record_id),
+            "UPDATE pricing_records SET category = ?, fixed_multiplier = ?, supplier_coefficient = ?, raw_price = ?, calculated_price = ?, launch_price = ?, operator_name = ?, error_message = '' WHERE id = ?",
+            (
+                clean_category,
+                calculation["fixed_multiplier"],
+                calculation["supplier_coefficient"],
+                calculation["raw_price"],
+                calculation["calculated_price"],
+                launch_price,
+                operator_name,
+                record_id,
+            ),
         )
+        updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+    return dict(updated)
+
+
+def submit_pricing_for_review(
+    db_path: str | Path,
+    record_id: int,
+    launch_price,
+    operator_name: str,
+    category: str | None = None,
+    channel: str | None = None,
+) -> dict:
+    with get_connection(db_path) as connection:
+        row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+        if not row:
+            raise LookupError("定价记录不存在。")
+        if row["status"] not in {"suggested", "conflict"}:
+            raise ValueError("当前定价记录不在商品部初审阶段。")
+    clean_category = validate_category_option(db_path, category if category is not None else row["category"])
+    clean_channel = validate_channel_option(db_path, channel if channel is not None else row["channel"])
+    calculation = calculate_pricing(
+        db_path,
+        row["season_year"],
+        clean_category,
+        row["supplier"],
+        row["cost"],
+    )
+    old_calculated = validated_launch_price(row["calculated_price"] or row["launch_price"])
+    submitted_price = old_calculated if launch_price in (None, "") else validated_launch_price(launch_price)
+    price = calculation["calculated_price"] if clean_category != row["category"] and submitted_price == old_calculated else submitted_price
+    with get_connection(db_path) as connection:
+        connection.execute(
+            "UPDATE pricing_records SET category = ?, channel = ?, fixed_multiplier = ?, supplier_coefficient = ?, raw_price = ?, calculated_price = ?, launch_price = ?, status = 'review_pending', operator_name = ?, confirmed_at = NULL, error_message = '' WHERE id = ?",
+            (
+                clean_category,
+                clean_channel,
+                calculation["fixed_multiplier"],
+                calculation["supplier_coefficient"],
+                calculation["raw_price"],
+                calculation["calculated_price"],
+                price,
+                operator_name,
+                record_id,
+            ),
+        )
+        connection.execute("UPDATE source_products SET category = ? WHERE id = ?", (clean_category, row["source_product_id"]))
         updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
     return dict(updated)
 
