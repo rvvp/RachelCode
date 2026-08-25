@@ -506,17 +506,33 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(record["status"], "suggested")
         workbench = self.wsgi_request(app, "/workbench", cookie=planner_cookie)["body"].decode("utf-8")
         self.assertEqual(workbench.count("<section class='panel pricing-board'>"), 1)
-        self.assertEqual(workbench.count("<table class='pricing-table'>"), 1)
+        self.assertEqual(workbench.count("data-resizable-columns='pricing-v1'"), 1)
+        self.assertEqual(workbench.count("class='column-resize-handle'"), 14)
+        self.assertEqual(workbench.count("role='separator'"), 14)
+        self.assertIn("['ArrowLeft', 'ArrowRight']", workbench)
+        self.assertIn("id='pricing-reset-columns'", workbench)
+        self.assertIn("planning-workbench-column-widths-v1", workbench)
+        self.assertIn("table-layout:fixed", workbench)
         self.assertNotIn("<article class='product-card'>", workbench)
         self.assertIn("系统按商品名称自动判定", workbench)
         self.assertNotIn("name='category' value", workbench)
-        headers = ["图片", "年份季节", "款号", "款色", "商品名称", "供应商", "含税成本", "来源状态"]
-        header_positions = [workbench.index(f"<th>{header}</th>") for header in headers]
+        headers = [
+            ("image", "图片"),
+            ("season", "年份季节"),
+            ("style", "款号"),
+            ("color", "款色"),
+            ("product", "商品名称"),
+            ("supplier", "供应商"),
+            ("cost", "含税成本"),
+            ("source-status", "来源状态"),
+        ]
+        header_positions = [workbench.index(f"data-column-key='{key}'>{header}") for key, header in headers]
         self.assertEqual(header_positions, sorted(header_positions))
-        self.assertIn("<th>品类</th>", workbench)
-        self.assertIn("<th>规则计算</th>", workbench)
-        self.assertIn("<th>测算上新价</th><th>渠道划分</th>", workbench)
-        self.assertIn("<th>流程状态与操作</th>", workbench)
+        self.assertIn("data-column-key='category'>品类", workbench)
+        self.assertIn("data-column-key='rule'>规则计算", workbench)
+        self.assertIn("data-column-key='price'>测算上新价", workbench)
+        self.assertIn("data-column-key='channel'>渠道划分", workbench)
+        self.assertIn("data-column-key='workflow'>流程状态与操作", workbench)
         self.assertNotIn("<th>定价状态</th>", workbench)
         self.assertNotIn("<th>初审 / 复核 / 回传</th>", workbench)
         self.assertIn("定价初审与复核", workbench)

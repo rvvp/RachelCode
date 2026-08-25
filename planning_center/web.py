@@ -658,6 +658,36 @@ class PlanningApplication:
                 )
             )
 
+        pricing_columns = [
+            ("select", "选择", "pricing-select-cell"),
+            ("image", "图片", ""),
+            ("season", "年份季节", ""),
+            ("style", "款号", ""),
+            ("color", "款色", ""),
+            ("product", "商品名称", ""),
+            ("supplier", "供应商", ""),
+            ("cost", "含税成本", ""),
+            ("source-status", "来源状态", ""),
+            ("category", "品类", ""),
+            ("rule", "规则计算", ""),
+            ("price", "测算上新价", ""),
+            ("channel", "渠道划分", ""),
+            ("workflow", "流程状态与操作", ""),
+        ]
+        pricing_colgroup = "<colgroup>" + "".join(
+            f"<col data-column-key='{key}'>" for key, _, _ in pricing_columns
+        ) + "</colgroup>"
+        pricing_header_cells = []
+        for key, label, classes in pricing_columns:
+            class_attr = f" class='{html.escape(classes, quote=True)}'" if classes else ""
+            label_markup = "<span class='visually-hidden'>选择</span>" if key == "select" else html.escape(label)
+            pricing_header_cells.append(
+                f"<th{class_attr} data-column-key='{key}'>{label_markup}"
+                f"<span class='column-resize-handle' title='拖动调整列宽' role='separator' "
+                f"aria-label='调整{html.escape(label, quote=True)}列宽' aria-orientation='vertical' tabindex='0'></span></th>"
+            )
+        pricing_header = "".join(pricing_header_cells)
+
         rows = []
         for item, record, workflow_status in filtered_products:
             cost = item.get("actual_cost")
@@ -757,11 +787,109 @@ class PlanningApplication:
         {self.alert(notice, 'success') if notice else ''}{self.alert(error, 'error') if error else ''}
         <section class='filter-bar'><form method='get' action='/workbench'><label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待初审</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待复核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>复核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button type='submit'>筛选</button></form></section>
         <section class='workbench-summary'><span>当前显示</span><strong>{len(filtered_products)} 款</strong><small>左侧固定：勾选、图片；资料字段：年份季节、款号、款色、商品名称、供应商、含税成本、来源状态</small></section>
-        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>定价初审与复核</h2><p class='hint'>来源资料、测算结果和流程操作在同一行展示，状态与操作合并在最后一列。</p></div><span class='count'>{len(filtered_products)} 款</span></div>{batch_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table'><thead><tr><th class='pricing-select-cell'><span class='visually-hidden'>选择</span></th><th>图片</th><th>年份季节</th><th>款号</th><th>款色</th><th>商品名称</th><th>供应商</th><th>含税成本</th><th>来源状态</th><th>品类</th><th>规则计算</th><th>测算上新价</th><th>渠道划分</th><th>流程状态与操作</th></tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="14" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div></section>
+        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>定价初审与复核</h2><p class='hint'>来源资料、测算结果和流程操作在同一行展示，状态与操作合并在最后一列。</p></div><div class='pricing-board-tools'><button id='pricing-reset-columns' class='compact-button' type='button' title='恢复默认列宽'>恢复默认列宽</button><span class='count'>{len(filtered_products)} 款</span></div></div>{batch_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table' data-resizable-columns='pricing-v1'>{pricing_colgroup}<thead><tr>{pricing_header}</tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="14" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div></section>
         <script>
         (() => {{
           const storageKey = 'planning-workbench-scroll';
           const tableWrap = document.querySelector('.pricing-table-wrap');
+          const pricingTable = document.querySelector('.pricing-table[data-resizable-columns]');
+          const resizeStorageKey = 'planning-workbench-column-widths-v1';
+          const resizeHeaders = pricingTable ? Array.from(pricingTable.querySelectorAll('thead th[data-column-key]')) : [];
+          const resizeColumns = pricingTable ? Array.from(pricingTable.querySelectorAll('col[data-column-key]')) : [];
+          const defaultColumnWidths = {{
+            select: 44, image: 78, season: 105, style: 88, color: 92, product: 130,
+            supplier: 110, cost: 88, 'source-status': 112, category: 170, rule: 180,
+            price: 112, channel: 135, workflow: 270
+          }};
+          const minimumColumnWidths = {{
+            select: 44, image: 68, season: 84, style: 72, color: 72, product: 100,
+            supplier: 90, cost: 72, 'source-status': 92, category: 130, rule: 150,
+            price: 96, channel: 110, workflow: 220
+          }};
+          const maximumColumnWidth = 640;
+          const readColumnWidths = () => {{
+            const widths = {{...defaultColumnWidths}};
+            try {{
+              const saved = JSON.parse(localStorage.getItem(resizeStorageKey) || 'null');
+              if (saved && typeof saved === 'object') {{
+                for (const key of Object.keys(widths)) {{
+                  const value = Number(saved[key]);
+                  if (Number.isFinite(value)) widths[key] = value;
+                }}
+              }}
+            }} catch (error) {{}}
+            return widths;
+          }};
+          const clampColumnWidth = (key, value) => Math.min(
+            maximumColumnWidth,
+            Math.max(minimumColumnWidths[key] || 72, Math.round(Number(value) || defaultColumnWidths[key] || 72))
+          );
+          const applyColumnWidth = (header, width) => {{
+            const key = header.dataset.columnKey;
+            const safeWidth = clampColumnWidth(key, width);
+            const column = resizeColumns.find((item) => item.dataset.columnKey === key);
+            if (column) column.style.width = `${{safeWidth}}px`;
+            header.style.width = `${{safeWidth}}px`;
+            if (key === 'select') pricingTable.style.setProperty('--select-column-width', `${{safeWidth}}px`);
+            if (key === 'image') pricingTable.style.setProperty('--image-column-width', `${{safeWidth}}px`);
+            return safeWidth;
+          }};
+          const saveColumnWidths = () => {{
+            const widths = {{}};
+            resizeHeaders.forEach((header) => {{
+              widths[header.dataset.columnKey] = Math.round(header.getBoundingClientRect().width);
+            }});
+            try {{ localStorage.setItem(resizeStorageKey, JSON.stringify(widths)); }} catch (error) {{}}
+          }};
+          if (pricingTable) {{
+            const widths = readColumnWidths();
+            resizeHeaders.forEach((header) => applyColumnWidth(header, widths[header.dataset.columnKey]));
+            const resetButton = document.querySelector('#pricing-reset-columns');
+            resetButton?.addEventListener('click', () => {{
+              try {{ localStorage.removeItem(resizeStorageKey); }} catch (error) {{}}
+              resizeHeaders.forEach((header) => applyColumnWidth(header, defaultColumnWidths[header.dataset.columnKey]));
+            }});
+            let resizeState = null;
+            const stopResize = () => {{
+              if (!resizeState) return;
+              resizeState = null;
+              document.body.classList.remove('column-resizing');
+              saveColumnWidths();
+            }};
+            resizeHeaders.forEach((header) => {{
+              const handle = header.querySelector('.column-resize-handle');
+              if (!handle) return;
+              handle.addEventListener('pointerdown', (event) => {{
+                if (event.button !== 0) return;
+                event.preventDefault();
+                resizeState = {{
+                  header,
+                  startX: event.clientX,
+                  startWidth: header.getBoundingClientRect().width
+                }};
+                document.body.classList.add('column-resizing');
+                handle.setPointerCapture?.(event.pointerId);
+              }});
+              handle.addEventListener('pointerup', stopResize);
+              handle.addEventListener('pointercancel', stopResize);
+              handle.addEventListener('keydown', (event) => {{
+                if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+                event.preventDefault();
+                const direction = event.key === 'ArrowRight' ? 1 : -1;
+                applyColumnWidth(header, header.getBoundingClientRect().width + direction * 10);
+                saveColumnWidths();
+              }});
+            }});
+            document.addEventListener('pointermove', (event) => {{
+              if (!resizeState) return;
+              applyColumnWidth(
+                resizeState.header,
+                resizeState.startWidth + event.clientX - resizeState.startX
+              );
+            }});
+            document.addEventListener('pointerup', stopResize);
+            document.addEventListener('pointercancel', stopResize);
+          }}
           const batchForm = document.querySelector('#pricing-batch-form');
           const selectAll = document.querySelector('#pricing-select-all');
           const selectedCount = document.querySelector('#pricing-selected-count');
@@ -1105,4 +1233,6 @@ class PlanningApplication:
         @media(max-width:620px){.rule-form.option-rule-form{grid-template-columns:1fr}.rule-form.option-rule-form .form-actions{grid-column:auto}.pricing-board>.panel-head{padding:18px 18px 0;align-items:flex-start}.pricing-batch-toolbar{align-items:flex-start;flex-wrap:wrap;padding:10px 18px}.pricing-batch-actions{width:100%;justify-content:flex-start;margin-left:0;overflow-x:auto}.pricing-table{min-width:1690px}.pricing-table th,.pricing-table td{padding:10px 9px}.pricing-table .pricing-action-cell input{width:102px}.pricing-table .pricing-action-cell button{font-size:11px;padding:6px 8px}}
         .pricing-table .pricing-image-cell{position:sticky;left:44px;z-index:1;min-width:78px;width:78px;padding-left:10px;padding-right:10px;background:#fff;box-shadow:1px 0 0 var(--line)}.pricing-table thead th:nth-child(2){position:sticky;left:44px;z-index:3;min-width:78px;width:78px;background:#f7f9f7;box-shadow:1px 0 0 var(--line)}.pricing-table tbody tr:hover .pricing-image-cell{background:#fbfcfb}.pricing-table td:nth-child(2){min-width:78px;width:78px}.pricing-table td:nth-child(3){min-width:105px}.pricing-table td:nth-child(4){min-width:88px}.pricing-table td:nth-child(5){min-width:92px}.pricing-table td:nth-child(6){min-width:130px}.pricing-table td:nth-child(7){min-width:110px}.pricing-table td:nth-child(8){min-width:88px}.pricing-table td:nth-child(9){min-width:112px}.pricing-table td:nth-child(10){min-width:170px}.pricing-table td:nth-child(11){min-width:180px}.pricing-table td:nth-child(12){min-width:112px}.pricing-table td:nth-child(13){min-width:135px}.pricing-table td:nth-child(14){min-width:270px}.pricing-table .pricing-workflow-cell{vertical-align:middle}.pricing-table .workflow-status{margin-bottom:8px}.pricing-table .workflow-actions form{margin:0 0 7px}.pricing-table .workflow-actions>form:only-child{margin-bottom:0}.pricing-table .workflow-actions label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap}.pricing-table .workflow-actions input{width:110px;padding:7px 8px}.pricing-table .workflow-actions button{padding:7px 9px;font-size:12px;white-space:nowrap}.pricing-table .workflow-actions small{max-width:245px}
         @media(max-width:620px){.pricing-table .workflow-actions input{width:102px}.pricing-table .workflow-actions button{font-size:11px;padding:6px 8px}}
+        .pricing-board-tools{display:flex;align-items:center;gap:12px}.pricing-board-tools .compact-button{background:#fff}.pricing-table[data-resizable-columns]{table-layout:fixed;width:max-content;min-width:0;--select-column-width:44px;--image-column-width:78px}.pricing-table[data-resizable-columns] col{width:auto}.pricing-table[data-resizable-columns] th,.pricing-table[data-resizable-columns] td{width:auto;min-width:0!important;overflow-wrap:anywhere}.pricing-table[data-resizable-columns] .pricing-select-cell{width:var(--select-column-width)}.pricing-table[data-resizable-columns] .pricing-image-cell{left:var(--select-column-width);width:var(--image-column-width)}.pricing-table[data-resizable-columns] thead th:nth-child(2){left:var(--select-column-width);width:var(--image-column-width)}.pricing-table[data-resizable-columns] thead th:not(:first-child):not(:nth-child(2)){position:relative}.column-resize-handle{position:absolute;top:0;right:-4px;width:8px;height:100%;cursor:col-resize;touch-action:none;z-index:4}.column-resize-handle:hover,.column-resize-handle:focus-visible,.column-resizing .column-resize-handle{background:var(--accent);opacity:.6;outline:0}.column-resizing{cursor:col-resize!important;user-select:none}.column-resizing *{cursor:col-resize!important;user-select:none}
+        @media(max-width:620px){.pricing-board-tools{align-items:flex-start;flex-direction:column;gap:6px}.pricing-table[data-resizable-columns]{min-width:0}}
         """
