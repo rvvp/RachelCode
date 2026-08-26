@@ -256,8 +256,8 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("grid-template-rows: max-content minmax(420px, 1fr);", b_body)
         self.assertIn("grid-template-rows: max-content max-content;", b_body)
         self.assertNotIn("min-height: 1620px;", b_body)
-        self.assertIn("align-items: start;", b_body)
-        self.assertIn("align-self: start;", b_body)
+        self.assertIn("align-items: stretch;", b_body)
+        self.assertIn("align-self: stretch;", b_body)
         self.assertNotIn("当前资料协作节奏", b_body)
 
         for body in (a_body, b_body):

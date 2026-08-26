@@ -4917,12 +4917,12 @@ class CatalogApplication:
       grid-template-columns: minmax(0, 1.16fr) minmax(320px, 0.84fr);
       gap: 16px;
       margin-bottom: 18px;
-      align-items: start;
+      align-items: stretch;
     }}
     .products-top-grid .panel {{
       height: auto;
       min-height: 0;
-      align-self: start;
+      align-self: stretch;
       padding: 22px 22px 20px;
       border-radius: 24px;
     }}
