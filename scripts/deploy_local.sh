@@ -6,6 +6,7 @@ TARGET_DIR="${DEPLOY_TARGET_DIR:-/Users/apple/CatalogBackendDeploy}"
 APP_LABEL="${DEPLOY_APP_LABEL:-com.catalogbackend.app}"
 RESTART_APP="${DEPLOY_RESTART_APP:-1}"
 RUN_HEALTHCHECK="${DEPLOY_HEALTHCHECK:-1}"
+EXPECTED_BUILD_VERSION="$(sed -n 's/^CATALOG_BUILD_VERSION = "\([^"]*\)"/\1/p' "$ROOT_DIR/catalog_backend/web.py" | head -n 1)"
 
 if [ "$ROOT_DIR" = "$TARGET_DIR" ]; then
   echo "源目录和目标目录不能相同。" >&2
@@ -71,7 +72,18 @@ if [ "$RUN_HEALTHCHECK" = "1" ] && [ -f "$TARGET_DIR/.env" ]; then
   HEALTH_URL="http://$HOST:$PORT/healthz"
   echo "检查健康接口: $HEALTH_URL"
   sleep 2
-  curl --fail --silent "$HEALTH_URL" >/dev/null && echo "OK 服务健康检查通过" || echo "WARN 健康检查未通过，请手动确认服务日志。"
+  if HEALTH_PAYLOAD="$(curl --fail --silent "$HEALTH_URL")"; then
+    if [ -n "$EXPECTED_BUILD_VERSION" ] && print -r -- "$HEALTH_PAYLOAD" | grep -Fq "\"build_version\": \"$EXPECTED_BUILD_VERSION\""; then
+      echo "OK 服务健康检查通过，构建版本: $EXPECTED_BUILD_VERSION"
+    else
+      echo "ERROR 健康接口仍未加载当前构建版本: $EXPECTED_BUILD_VERSION" >&2
+      print -r -- "$HEALTH_PAYLOAD" >&2
+      exit 1
+    fi
+  else
+    echo "ERROR 健康检查未通过，请确认服务已重启并检查服务日志。" >&2
+    exit 1
+  fi
 fi
 
 echo "本地安全部署完成。"
