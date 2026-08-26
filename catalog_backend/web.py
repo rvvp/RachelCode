@@ -20,7 +20,7 @@ from catalog_backend.excel import (
     brand_bill_template_bytes,
     dashboard_rows_from_brand_bill_summary,
     parse_brand_bill_workbook,
-    parse_image_mapping_workbook,
+    parse_image_mapping_workbook_with_embedded_images,
     parse_supplier_bill_workbook,
     parse_supplier_master_workbook,
     parse_supplier_settlement_workbook,
@@ -711,7 +711,9 @@ class CatalogApplication:
 
         if mapping_workbook:
             try:
-                mapping_rows = parse_image_mapping_workbook(io.BytesIO(mapping_workbook["content"]))
+                mapping_rows, embedded_image_payloads = parse_image_mapping_workbook_with_embedded_images(
+                    io.BytesIO(mapping_workbook["content"])
+                )
             except ValueError as error:
                 return self.html_response(
                     start_response,
@@ -724,10 +726,11 @@ class CatalogApplication:
                     self.render_image_import_page(user, error="图片映射 Excel 解析失败，请确认文件可正常打开，并优先使用 xlsx 格式。"),
                     status="400 Bad Request",
                 )
+            upload_payloads = [*embedded_image_payloads, *upload_payloads]
             if not upload_payloads:
                 return self.html_response(
                     start_response,
-                    self.render_image_import_page(user, error="使用 Excel 映射导入时，请同时上传对应的 JPG 或 PNG 图片文件。"),
+                    self.render_image_import_page(user, error="使用传统 Excel 映射导入时，请同时上传对应的 JPG 或 PNG 图片文件；如果图片已嵌入 Excel，请确认使用的是包含 DISPIMG 图片的 xlsx 文件。"),
                     status="400 Bad Request",
                 )
             return self.handle_image_import_by_workbook(
@@ -11251,7 +11254,7 @@ class CatalogApplication:
           <div class="panel">
             <div class="eyebrow">{html.escape(console_eyebrow)}</div>
             <h1>导入图片</h1>
-            <p>支持两种导入方式：一是直接上传多张 JPG、JPEG、PNG、WEBP 或 GIF 图片，系统按文件名去掉扩展名后的“款色”自动匹配；二是上传一份包含“款色”和“图片/图片文件名”的 Excel，再连同对应图片一起导入，按 Excel 指定关系更新资料。</p>
+            <p>支持两种导入方式：一是直接上传多张 JPG、JPEG、PNG、WEBP 或 GIF 图片，系统按文件名去掉扩展名后的“款色”自动匹配；二是上传图片映射 Excel，传统映射表另选图片，WPS/Excel“网址转图片”格式可直接读取表格内嵌图片，按 Excel 指定关系更新资料。</p>
           </div>
           <div class="panel">
             <div class="stats">
@@ -11264,7 +11267,7 @@ class CatalogApplication:
         </section>
         <section class="panel">
           <h2>导入图片</h2>
-          <p class="meta">方式一示例：如果资料里的款色是“短袖连衣裙-蓝”，图片文件名就命名为“短袖连衣裙-蓝.jpg”。方式二示例：Excel 至少保留“款色”和“图片文件名”两列，再上传这份 Excel 和对应图片文件，系统会按映射关系一一写回资料。</p>
+          <p class="meta">方式一示例：如果资料里的款色是“短袖连衣裙-蓝”，图片文件名就命名为“短袖连衣裙-蓝.jpg”。方式二支持两种 Excel：包含“款色”和“图片文件名”的传统映射表需要同时选择图片；WPS/Excel“网址转图片”格式如果图片已嵌入表格，可只选择这一份 xlsx，系统会按款色一一写回资料。</p>
           {error_block}
           {report_block}
           <form method="post" action="/import-images" enctype="multipart/form-data">
@@ -11274,7 +11277,7 @@ class CatalogApplication:
                 <input type="file" name="mapping_workbook" accept=".xlsx,.xls">
               </label>
               <label class="field field-wide">
-                <span>选择图片文件</span>
+                <span>选择图片文件（传统映射格式可选）</span>
                 <input type="file" name="image_files" accept=".jpg,.jpeg,.png,.webp,.gif,image/*" multiple>
               </label>
             </div>

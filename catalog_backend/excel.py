@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from io import BytesIO
+import posixpath
 from pathlib import Path
 import re
 from typing import Callable
+from zipfile import BadZipFile, ZipFile
+from xml.etree import ElementTree
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as ExcelImage
@@ -138,6 +141,18 @@ IMAGE_MAPPING_HEADER_KEY_LOOKUP = {
     normalize_header("图片名"): "image_filename",
     normalize_header("文件名"): "image_filename",
 }
+IMAGE_FORMULA_PATTERN = re.compile(
+    r"DISPIMG\s*\(\s*[\"'](?P<image_id>[^\"']+)[\"']",
+    re.IGNORECASE,
+)
+RELATIONSHIP_EMBED_ATTRIBUTE = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+EMBEDDED_IMAGE_CONTENT_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
 
 
 def parse_workbook(file_obj) -> list[dict]:
@@ -180,9 +195,7 @@ def parse_workbook(file_obj) -> list[dict]:
     return products
 
 
-def parse_image_mapping_workbook(file_obj) -> list[dict]:
-    workbook = load_workbook(file_obj, data_only=True)
-    worksheet = workbook[workbook.sheetnames[0]]
+def _parse_image_mapping_rows(worksheet, embedded_images_by_id: dict[str, dict] | None = None) -> tuple[list[dict], list[dict]]:
     raw_headers = [worksheet.cell(1, column).value for column in range(1, worksheet.max_column + 1)]
     normalized_headers = [normalize_header(header) for header in raw_headers]
     required_headers = [
@@ -195,6 +208,7 @@ def parse_image_mapping_workbook(file_obj) -> list[dict]:
         raise ValueError("图片映射 Excel 缺少“图片”或“图片文件名”表头。")
 
     rows = []
+    referenced_embedded_images = []
     for row_index in range(2, worksheet.max_row + 1):
         payload = {}
         has_content = False
@@ -214,7 +228,16 @@ def parse_image_mapping_workbook(file_obj) -> list[dict]:
             raise ValueError(f"图片映射 Excel 第 {row_index} 行缺少款色。")
         if not image_filename:
             raise ValueError(f"图片映射 Excel 第 {row_index} 行缺少图片文件名。")
-        clean_image_filename = Path(image_filename.replace("\\", "/")).name.strip()
+        formula_match = IMAGE_FORMULA_PATTERN.search(image_filename)
+        if formula_match and embedded_images_by_id is not None:
+            image_id = formula_match.group("image_id").strip()
+            embedded_image = embedded_images_by_id.get(image_id)
+            if not embedded_image:
+                raise ValueError(f"图片映射 Excel 第 {row_index} 行的内嵌图片无法读取。")
+            clean_image_filename = embedded_image["original_filename"]
+            referenced_embedded_images.append(embedded_image)
+        else:
+            clean_image_filename = Path(image_filename.replace("\\", "/")).name.strip()
         rows.append(
             {
                 "style_color": style_color,
@@ -223,7 +246,82 @@ def parse_image_mapping_workbook(file_obj) -> list[dict]:
         )
     if not rows:
         raise ValueError("图片映射 Excel 里没有可导入的内容。")
+    return rows, referenced_embedded_images
+
+
+def parse_image_mapping_workbook(file_obj) -> list[dict]:
+    workbook = load_workbook(file_obj, data_only=True)
+    rows, _ = _parse_image_mapping_rows(workbook[workbook.sheetnames[0]])
     return rows
+
+
+def _embedded_image_relationships(zip_file: ZipFile) -> dict[str, dict]:
+    try:
+        cellimages_xml = zip_file.read("xl/cellimages.xml")
+        relationships_xml = zip_file.read("xl/_rels/cellimages.xml.rels")
+    except KeyError:
+        return {}
+
+    relationships = {}
+    relationships_root = ElementTree.fromstring(relationships_xml)
+    for relationship in relationships_root:
+        relationship_id = str(relationship.attrib.get("Id") or "").strip()
+        target = str(relationship.attrib.get("Target") or "").strip()
+        if not relationship_id or not target:
+            continue
+        package_path = posixpath.normpath(posixpath.join("xl", target.lstrip("/")))
+        if not package_path.startswith("xl/media/"):
+            continue
+        relationships[relationship_id] = package_path
+
+    images = {}
+    cellimages_root = ElementTree.fromstring(cellimages_xml)
+    for cell_image in cellimages_root.iter():
+        if cell_image.tag.rsplit("}", 1)[-1] != "cellImage":
+            continue
+        image_name = ""
+        relationship_id = ""
+        for descendant in cell_image.iter():
+            local_name = descendant.tag.rsplit("}", 1)[-1]
+            if local_name == "cNvPr" and not image_name:
+                image_name = str(descendant.attrib.get("name") or "").strip()
+            elif local_name == "blip" and not relationship_id:
+                relationship_id = str(descendant.attrib.get(RELATIONSHIP_EMBED_ATTRIBUTE) or "").strip()
+        package_path = relationships.get(relationship_id)
+        if not image_name or not package_path:
+            continue
+        extension = Path(package_path).suffix.lower()
+        content_type = EMBEDDED_IMAGE_CONTENT_TYPES.get(extension)
+        if not content_type:
+            continue
+        try:
+            content = zip_file.read(package_path)
+        except KeyError:
+            continue
+        if not content:
+            continue
+        images[image_name] = {
+            "original_filename": Path(package_path).name,
+            "extension": extension,
+            "content": content,
+            "content_type": content_type,
+        }
+    return images
+
+
+def parse_image_mapping_workbook_with_embedded_images(file_obj) -> tuple[list[dict], list[dict]]:
+    """Parse a mapping workbook and extract WPS/Excel DISPIMG cell images."""
+    if hasattr(file_obj, "seek"):
+        file_obj.seek(0)
+    workbook_bytes = file_obj.read()
+    try:
+        with ZipFile(BytesIO(workbook_bytes)) as zip_file:
+            embedded_images_by_id = _embedded_image_relationships(zip_file)
+    except (BadZipFile, ElementTree.ParseError) as error:
+        raise ValueError("图片映射 Excel 不是有效的 xlsx 文件。") from error
+
+    workbook = load_workbook(BytesIO(workbook_bytes), data_only=False)
+    return _parse_image_mapping_rows(workbook[workbook.sheetnames[0]], embedded_images_by_id)
 
 
 def export_excel_image(image_bytes: bytes) -> ExcelImage:

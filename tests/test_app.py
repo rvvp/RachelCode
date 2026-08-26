@@ -11,6 +11,7 @@ from unittest.mock import patch
 from urllib.parse import unquote_plus
 from urllib.parse import urlencode
 from wsgiref.util import setup_testing_defaults
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import Workbook, load_workbook
 from PIL import Image as PillowImage
@@ -230,6 +231,53 @@ class CatalogAppTests(unittest.TestCase):
             worksheet.append([style_color, image_filename])
         output = io.BytesIO()
         workbook.save(output)
+        return output.getvalue()
+
+    def make_embedded_image_mapping_workbook_bytes(self, rows: list[tuple[str, str, bytes]]):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "图片映射"
+        worksheet.append(["款色", "图片"])
+        for style_color, image_id, _ in rows:
+            worksheet.append([style_color, f'=_xlfn.DISPIMG("{image_id}",1)'])
+
+        source = io.BytesIO()
+        workbook.save(source)
+        source.seek(0)
+        output = io.BytesIO()
+        with ZipFile(source) as source_zip, ZipFile(output, "w", ZIP_DEFLATED) as output_zip:
+            for item in source_zip.infolist():
+                output_zip.writestr(item, source_zip.read(item.filename))
+
+            cell_images = [
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+                '<etc:cellImages xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+                'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+                'xmlns:etc="http://www.wps.cn/officeDocument/2017/etCustomData">',
+            ]
+            relationships = [
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+            ]
+            for index, (_, image_id, image_bytes) in enumerate(rows, start=1):
+                image_filename = f"image{index}.png"
+                cell_images.append(
+                    f'<etc:cellImage><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{index}" name="{image_id}"/>'
+                    f'<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>'
+                    f'<xdr:blipFill><a:blip r:embed="rId{index}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+                    '</xdr:pic></etc:cellImage>'
+                )
+                relationships.append(
+                    f'<Relationship Id="rId{index}" '
+                    'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+                    f'Target="media/{image_filename}"/>'
+                )
+                output_zip.writestr(f"xl/media/{image_filename}", image_bytes)
+            cell_images.append("</etc:cellImages>")
+            relationships.append("</Relationships>")
+            output_zip.writestr("xl/cellimages.xml", "".join(cell_images))
+            output_zip.writestr("xl/_rels/cellimages.xml.rels", "".join(relationships))
         return output.getvalue()
 
     def make_png_bytes(self) -> bytes:
@@ -4303,6 +4351,41 @@ class CatalogAppTests(unittest.TestCase):
         gallery = json.loads(updated_product["image_gallery_json"])
         self.assertEqual(updated_product["image_url"], gallery[0])
 
+        media_response = self.request(updated_product["image_url"], cookie=cookie)
+        self.assertTrue(media_response["status"].startswith("200"))
+        headers = dict(media_response["headers"])
+        self.assertEqual(headers["Content-Type"], "image/png")
+
+    def test_b_editor_can_import_images_embedded_in_url_to_image_workbook(self):
+        cookie = self.login("b_editor", "demo123")
+        png_bytes = self.make_png_bytes()
+        workbook_bytes = self.make_embedded_image_mapping_workbook_bytes(
+            [("针织开衫-米白", "ID_TEST_IMAGE_1", png_bytes)]
+        )
+        response = self.request(
+            "/import-images",
+            method="POST",
+            body=self.build_multi_multipart(
+                files=[
+                    (
+                        "mapping_workbook",
+                        "网址转图.xlsx",
+                        workbook_bytes,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    ),
+                ],
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(response["status"].startswith("200"))
+        body = response["body"].decode("utf-8")
+        self.assertIn("接收 1 张图片", body)
+        self.assertIn("成功更新 1 条资料", body)
+        self.assertIn("针织开衫-米白 &lt;- image1.png -&gt; 资料 #2", body)
+
+        updated_product = db.get_product(self.db_path, 2)
+        self.assertTrue(str(updated_product["image_url"]).startswith("/media/"))
         media_response = self.request(updated_product["image_url"], cookie=cookie)
         self.assertTrue(media_response["status"].startswith("200"))
         headers = dict(media_response["headers"])
