@@ -452,6 +452,184 @@ class PlanningCenterTests(unittest.TestCase):
         user = planning_db.authenticate_user(formal_path, "owner", "ChangeMe123")
         self.assertEqual(user["role"], "admin")
 
+    def test_account_management_and_password_workflows(self):
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+
+        denied = self.wsgi_request(app, "/accounts", cookie=planner_cookie)
+        self.assertTrue(denied["status"].startswith("403"))
+        self.assertIn("只有企划管理员可以管理账号", denied["body"].decode("utf-8"))
+
+        account_page = self.wsgi_request(app, "/accounts", cookie=admin_cookie)
+        account_markup = account_page["body"].decode("utf-8")
+        self.assertTrue(account_page["status"].startswith("200"))
+        self.assertIn("账号管理", account_markup)
+        self.assertIn("新增账号", account_markup)
+        self.assertIn("修改我的密码", account_markup)
+
+        mismatch = self.wsgi_request(
+            app,
+            "/accounts",
+            method="POST",
+            cookie=admin_cookie,
+            body=urlencode(
+                {
+                    "username": "merch_f",
+                    "display_name": "商品部同事 F",
+                    "role": "planner",
+                    "password": "StartPass88",
+                    "confirm_password": "Different88",
+                }
+            ).encode(),
+        )
+        self.assertTrue(mismatch["status"].startswith("400"))
+        self.assertIn("两次输入的初始密码不一致", mismatch["body"].decode("utf-8"))
+
+        weak_password = self.wsgi_request(
+            app,
+            "/accounts",
+            method="POST",
+            cookie=admin_cookie,
+            body=urlencode(
+                {
+                    "username": "merch_f",
+                    "display_name": "商品部同事 F",
+                    "role": "planner",
+                    "password": "short",
+                    "confirm_password": "short",
+                }
+            ).encode(),
+        )
+        self.assertTrue(weak_password["status"].startswith("400"))
+        self.assertIn("密码至少需要 8 位", weak_password["body"].decode("utf-8"))
+
+        created_response = self.wsgi_request(
+            app,
+            "/accounts",
+            method="POST",
+            cookie=admin_cookie,
+            body=urlencode(
+                {
+                    "username": "merch_f",
+                    "display_name": "商品部同事 F",
+                    "role": "planner",
+                    "password": "StartPass88",
+                    "confirm_password": "StartPass88",
+                }
+            ).encode(),
+        )
+        self.assertTrue(created_response["status"].startswith("302"))
+        managed_user = next(item for item in planning_db.list_users(self.planning_db_path) if item["username"] == "merch_f")
+        self.assertEqual(managed_user["role"], "planner")
+        self.assertIsNotNone(planning_db.authenticate_user(self.planning_db_path, "merch_f", "StartPass88"))
+
+        duplicate = self.wsgi_request(
+            app,
+            "/accounts",
+            method="POST",
+            cookie=admin_cookie,
+            body=urlencode(
+                {
+                    "username": "MERCH_F",
+                    "display_name": "重复账号",
+                    "role": "planner",
+                    "password": "AnotherPass88",
+                    "confirm_password": "AnotherPass88",
+                }
+            ).encode(),
+        )
+        self.assertTrue(duplicate["status"].startswith("400"))
+        self.assertIn("该登录账号已存在", duplicate["body"].decode("utf-8"))
+
+        login = self.wsgi_request(
+            app,
+            "/login",
+            method="POST",
+            body=urlencode({"username": "merch_f", "password": "StartPass88"}).encode(),
+        )
+        managed_cookie = dict(login["headers"])["Set-Cookie"].split(";", 1)[0]
+        wrong_current_password = self.wsgi_request(
+            app,
+            "/profile/password",
+            method="POST",
+            cookie=managed_cookie,
+            body=urlencode(
+                {
+                    "current_password": "WrongPass88",
+                    "new_password": "PersonalPass99",
+                    "confirm_password": "PersonalPass99",
+                }
+            ).encode(),
+        )
+        self.assertTrue(wrong_current_password["status"].startswith("400"))
+        self.assertIn("当前密码不正确", wrong_current_password["body"].decode("utf-8"))
+
+        changed = self.wsgi_request(
+            app,
+            "/profile/password",
+            method="POST",
+            cookie=managed_cookie,
+            body=urlencode(
+                {
+                    "current_password": "StartPass88",
+                    "new_password": "PersonalPass99",
+                    "confirm_password": "PersonalPass99",
+                }
+            ).encode(),
+        )
+        self.assertTrue(changed["status"].startswith("302"))
+        self.assertIsNone(planning_db.authenticate_user(self.planning_db_path, "merch_f", "StartPass88"))
+        self.assertIsNotNone(planning_db.authenticate_user(self.planning_db_path, "merch_f", "PersonalPass99"))
+        self.assertTrue(self.wsgi_request(app, "/dashboard", cookie=managed_cookie)["status"].startswith("200"))
+
+        reset = self.wsgi_request(
+            app,
+            f"/accounts/{managed_user['id']}/reset-password",
+            method="POST",
+            cookie=admin_cookie,
+            body=urlencode({"new_password": "ResetPass101", "confirm_password": "ResetPass101"}).encode(),
+        )
+        self.assertTrue(reset["status"].startswith("302"))
+        self.assertIsNone(planning_db.authenticate_user(self.planning_db_path, "merch_f", "PersonalPass99"))
+        self.assertIsNotNone(planning_db.authenticate_user(self.planning_db_path, "merch_f", "ResetPass101"))
+        invalidated_session = self.wsgi_request(app, "/dashboard", cookie=managed_cookie)
+        self.assertEqual(dict(invalidated_session["headers"])["Location"], "/login")
+
+        disabled = self.wsgi_request(
+            app,
+            f"/accounts/{managed_user['id']}/toggle",
+            method="POST",
+            cookie=admin_cookie,
+        )
+        self.assertTrue(disabled["status"].startswith("302"))
+        self.assertIsNone(planning_db.authenticate_user(self.planning_db_path, "merch_f", "ResetPass101"))
+        self.assertFalse(planning_db.get_user(self.planning_db_path, managed_user["id"])["is_active"])
+
+        enabled = self.wsgi_request(
+            app,
+            f"/accounts/{managed_user['id']}/toggle",
+            method="POST",
+            cookie=admin_cookie,
+        )
+        self.assertTrue(enabled["status"].startswith("302"))
+        self.assertIsNotNone(planning_db.authenticate_user(self.planning_db_path, "merch_f", "ResetPass101"))
+
+        self_toggle = self.wsgi_request(
+            app,
+            f"/accounts/{planning_db.authenticate_user(self.planning_db_path, 'planning_admin', 'demo123')['id']}/toggle",
+            method="POST",
+            cookie=admin_cookie,
+        )
+        self.assertTrue(self_toggle["status"].startswith("400"))
+        self.assertIn("不能停用当前登录", self_toggle["body"].decode("utf-8"))
+
+    def test_last_active_planning_admin_cannot_be_disabled(self):
+        admin = planning_db.authenticate_user(self.planning_db_path, "planning_admin", "demo123")
+        with self.assertRaisesRegex(ValueError, "最后一个有效的企划管理员"):
+            planning_db.set_user_active(self.planning_db_path, admin["id"], False)
+        self.assertTrue(planning_db.get_user(self.planning_db_path, admin["id"])["is_active"])
+
     def test_planning_workbench_login_and_sync(self):
         app = PlanningApplication(self.planning_db_path, "http://catalog.test", "token")
         login = self.wsgi_request(app, "/login", method="POST", body=urlencode({"username": "planner", "password": "demo123"}).encode())

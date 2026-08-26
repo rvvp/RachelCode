@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from pathlib import Path
 
 DEMO_PASSWORD = "demo123"
+PASSWORD_MIN_LENGTH = 8
 UTC = timezone.utc
 
 
@@ -236,6 +237,121 @@ def authenticate_user(db_path: str | Path, username: str, password: str) -> dict
     if not row or not verify_password(password, row["password_hash"]):
         return None
     return dict(row)
+
+
+def list_users(db_path: str | Path) -> list[dict]:
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT id, username, display_name, role, is_active, created_at
+            FROM users
+            ORDER BY is_active DESC, CASE role WHEN 'admin' THEN 0 ELSE 1 END, created_at, id
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_user(db_path: str | Path, user_id: int, *, include_password: bool = False) -> dict | None:
+    columns = "*" if include_password else "id, username, display_name, role, is_active, created_at"
+    with get_connection(db_path) as connection:
+        row = connection.execute(f"SELECT {columns} FROM users WHERE id = ?", (int(user_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def _validate_account_fields(username: str, display_name: str, role: str) -> tuple[str, str, str]:
+    clean_username = str(username or "").strip()
+    clean_display_name = str(display_name or "").strip()
+    clean_role = str(role or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,39}", clean_username):
+        raise ValueError("登录账号需为 3-40 位字母、数字、点、下划线或短横线，并以字母或数字开头。")
+    if not clean_display_name:
+        raise ValueError("姓名不能为空。")
+    if len(clean_display_name) > 50:
+        raise ValueError("姓名不能超过 50 个字符。")
+    if clean_role not in {"planner", "admin"}:
+        raise ValueError("账号角色不正确。")
+    return clean_username, clean_display_name, clean_role
+
+
+def validate_account_password(password: str) -> str:
+    clean_password = str(password or "")
+    if len(clean_password) < PASSWORD_MIN_LENGTH:
+        raise ValueError(f"密码至少需要 {PASSWORD_MIN_LENGTH} 位。")
+    if len(clean_password) > 128:
+        raise ValueError("密码不能超过 128 位。")
+    return clean_password
+
+
+def create_user(db_path: str | Path, username: str, display_name: str, role: str, password: str) -> dict:
+    clean_username, clean_display_name, clean_role = _validate_account_fields(username, display_name, role)
+    clean_password = validate_account_password(password)
+    try:
+        with get_connection(db_path) as connection:
+            duplicate = connection.execute(
+                "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
+                (clean_username,),
+            ).fetchone()
+            if duplicate:
+                raise ValueError("该登录账号已存在。")
+            cursor = connection.execute(
+                """
+                INSERT INTO users (username, display_name, role, password_hash, is_active, created_at)
+                VALUES (?, ?, ?, ?, 1, ?)
+                """,
+                (clean_username, clean_display_name, clean_role, hash_password(clean_password), utc_now()),
+            )
+            user_id = int(cursor.lastrowid)
+    except sqlite3.IntegrityError as error:
+        raise ValueError("该登录账号已存在。") from error
+    return get_user(db_path, user_id)
+
+
+def set_user_active(db_path: str | Path, user_id: int, is_active: bool) -> dict:
+    with get_connection(db_path) as connection:
+        row = connection.execute("SELECT * FROM users WHERE id = ?", (int(user_id),)).fetchone()
+        if not row:
+            raise LookupError("账号不存在。")
+        if not is_active and row["role"] == "admin" and row["is_active"]:
+            active_admins = connection.execute(
+                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1"
+            ).fetchone()[0]
+            if active_admins <= 1:
+                raise ValueError("不能停用最后一个有效的企划管理员账号。")
+        connection.execute(
+            "UPDATE users SET is_active = ? WHERE id = ?",
+            (1 if is_active else 0, int(user_id)),
+        )
+    return get_user(db_path, user_id)
+
+
+def reset_user_password(db_path: str | Path, user_id: int, new_password: str) -> None:
+    clean_password = validate_account_password(new_password)
+    with get_connection(db_path) as connection:
+        cursor = connection.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(clean_password), int(user_id)),
+        )
+        if cursor.rowcount != 1:
+            raise LookupError("账号不存在。")
+
+
+def change_user_password(db_path: str | Path, user_id: int, current_password: str, new_password: str) -> None:
+    clean_password = validate_account_password(new_password)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT password_hash FROM users WHERE id = ? AND is_active = 1",
+            (int(user_id),),
+        ).fetchone()
+        if not row:
+            raise LookupError("账号不存在或已停用。")
+        if not verify_password(str(current_password or ""), row["password_hash"]):
+            raise ValueError("当前密码不正确。")
+        if verify_password(clean_password, row["password_hash"]):
+            raise ValueError("新密码不能与当前密码相同。")
+        connection.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(clean_password), int(user_id)),
+        )
 
 
 def list_source_products(db_path: str | Path, *, season_year: str = "", status: str = "") -> list[dict]:

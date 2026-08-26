@@ -36,6 +36,29 @@ class PlanningApplication:
                 return self.handle_logout(environ, start_response)
             if not user:
                 return self.redirect(start_response, "/login")
+            if path == "/profile/password":
+                if method == "GET":
+                    return self.html_response(start_response, self.render_password_change(user, query))
+                if method == "POST":
+                    return self.handle_password_change(environ, start_response, user)
+            if path == "/accounts" and method == "GET":
+                self.require_account_manager(user)
+                return self.html_response(start_response, self.render_accounts(user, query))
+            if path == "/accounts" and method == "POST":
+                return self.handle_account_create(environ, start_response, user)
+            if path.startswith("/accounts/") and path.endswith("/toggle") and method == "POST":
+                return self.handle_account_toggle(
+                    start_response,
+                    user,
+                    self.path_id(path, "/accounts/", "/toggle"),
+                )
+            if path.startswith("/accounts/") and path.endswith("/reset-password") and method == "POST":
+                return self.handle_account_reset_password(
+                    environ,
+                    start_response,
+                    user,
+                    self.path_id(path, "/accounts/", "/reset-password"),
+                )
             if path == "/":
                 return self.redirect(start_response, "/dashboard")
             if path == "/dashboard" and method == "GET":
@@ -156,6 +179,106 @@ class PlanningApplication:
             SESSIONS.pop(token.value, None)
         start_response("302 Found", [("Location", "/login"), ("Set-Cookie", "planning_session=deleted; Path=/; Max-Age=0")])
         return [b""]
+
+    def handle_account_create(self, environ, start_response, user):
+        self.require_account_manager(user)
+        form = self.parse_form(environ)
+        password = form.get("password", "")
+        if password != form.get("confirm_password", ""):
+            return self.html_response(
+                start_response,
+                self.render_accounts(user, {}, error="两次输入的初始密码不一致。", form_values=form),
+                status="400 Bad Request",
+            )
+        try:
+            created = db.create_user(
+                self.db_path,
+                form.get("username", ""),
+                form.get("display_name", ""),
+                form.get("role", "planner"),
+                password,
+            )
+        except (ValueError, LookupError) as error:
+            return self.html_response(
+                start_response,
+                self.render_accounts(user, {}, error=str(error), form_values=form),
+                status="400 Bad Request",
+            )
+        return self.redirect(
+            start_response,
+            "/accounts?notice=" + self.q(f"账号 {created['username']} 已新增。"),
+        )
+
+    def handle_account_toggle(self, start_response, user, managed_user_id: int):
+        self.require_account_manager(user)
+        managed_user = db.get_user(self.db_path, managed_user_id)
+        if not managed_user:
+            raise LookupError("账号不存在。")
+        target_active = not bool(managed_user.get("is_active"))
+        if managed_user_id == int(user["id"]) and not target_active:
+            raise ValueError("不能停用当前登录的企划管理员账号。")
+        updated = db.set_user_active(self.db_path, managed_user_id, target_active)
+        if not target_active:
+            self.revoke_user_sessions(managed_user_id)
+        action = "启用" if target_active else "停用"
+        return self.redirect(
+            start_response,
+            "/accounts?notice=" + self.q(f"账号 {updated['username']} 已{action}。"),
+        )
+
+    def handle_account_reset_password(self, environ, start_response, user, managed_user_id: int):
+        self.require_account_manager(user)
+        managed_user = db.get_user(self.db_path, managed_user_id)
+        if not managed_user:
+            raise LookupError("账号不存在。")
+        if managed_user_id == int(user["id"]):
+            raise ValueError("当前账号请使用“修改我的密码”，管理员重置只用于其他账号。")
+        form = self.parse_form(environ)
+        password = form.get("new_password", "")
+        if password != form.get("confirm_password", ""):
+            raise ValueError("两次输入的新密码不一致。")
+        db.reset_user_password(self.db_path, managed_user_id, password)
+        self.revoke_user_sessions(managed_user_id)
+        return self.redirect(
+            start_response,
+            "/accounts?notice=" + self.q(f"账号 {managed_user['username']} 的密码已重置，原登录已失效。"),
+        )
+
+    def handle_password_change(self, environ, start_response, user):
+        form = self.parse_form(environ)
+        new_password = form.get("new_password", "")
+        if new_password != form.get("confirm_password", ""):
+            return self.html_response(
+                start_response,
+                self.render_password_change(user, {}, error="两次输入的新密码不一致。"),
+                status="400 Bad Request",
+            )
+        try:
+            db.change_user_password(
+                self.db_path,
+                int(user["id"]),
+                form.get("current_password", ""),
+                new_password,
+            )
+        except (ValueError, LookupError) as error:
+            return self.html_response(
+                start_response,
+                self.render_password_change(user, {}, error=str(error)),
+                status="400 Bad Request",
+            )
+        current_token = self.session_token(environ)
+        self.revoke_user_sessions(int(user["id"]), keep_token=current_token)
+        return self.redirect(start_response, "/profile/password?notice=" + self.q("密码已修改。"))
+
+    def session_token(self, environ) -> str:
+        parsed = cookies.SimpleCookie(environ.get("HTTP_COOKIE", ""))
+        token = parsed.get("planning_session")
+        return token.value if token else ""
+
+    def revoke_user_sessions(self, user_id: int, *, keep_token: str = "") -> None:
+        for token, session_user_id in list(SESSIONS.items()):
+            if int(session_user_id) == int(user_id) and token != keep_token:
+                SESSIONS.pop(token, None)
 
     def handle_sync(self, start_response, user):
         self.require_catalog_operator(user)
@@ -560,6 +683,10 @@ class PlanningApplication:
     def require_rule_manager(self, user: dict) -> None:
         if user.get("role") != "admin":
             raise PermissionError("只有企划管理员可以维护规则。")
+
+    def require_account_manager(self, user: dict) -> None:
+        if user.get("role") != "admin":
+            raise PermissionError("只有企划管理员可以管理账号。")
 
     def require_catalog_operator(self, user: dict) -> None:
         if user.get("role") != "planner":
@@ -1306,6 +1433,99 @@ class PlanningApplication:
         """
         return self.shell("价格带统计", content, user, "stats")
 
+    def render_accounts(
+        self,
+        user: dict,
+        query: dict,
+        *,
+        error: str = "",
+        form_values: dict | None = None,
+    ) -> str:
+        accounts = db.list_users(self.db_path)
+        values = form_values or {}
+        notice = str(query.get("notice", "") or "")
+        active_count = sum(1 for account in accounts if account.get("is_active"))
+        planner_count = sum(1 for account in accounts if account.get("role") == "planner" and account.get("is_active"))
+        admin_count = sum(1 for account in accounts if account.get("role") == "admin" and account.get("is_active"))
+        role_value = str(values.get("role") or "planner")
+        rows = []
+        for account in accounts:
+            account_id = int(account["id"])
+            is_self = account_id == int(user["id"])
+            is_active = bool(account.get("is_active"))
+            role_label = "企划管理员" if account.get("role") == "admin" else "商品部初审人员"
+            status_label = "使用中" if is_active else "已停用"
+            status_class = "status-account-active" if is_active else "status-account-disabled"
+            if is_self:
+                toggle_control = "<span class='account-self-note'>当前账号不可停用</span>"
+                reset_control = "<a class='compact-button button' href='/profile/password'>修改我的密码</a>"
+            else:
+                toggle_label = "停用" if is_active else "启用"
+                confirmation = f"确定{toggle_label}账号 {account['username']} 吗？"
+                checked_attribute = "checked" if is_active else ""
+                cancel_checked = "true" if is_active else "false"
+                toggle_control = f"""
+                <form class='account-toggle-form' method='post' action='/accounts/{account_id}/toggle' onsubmit="if (!confirm('{html.escape(confirmation, quote=True)}')) {{ this.querySelector('input').checked = {cancel_checked}; return false; }}">
+                  <label class='account-switch' title='{html.escape(confirmation, quote=True)}'>
+                    <input type='checkbox' {checked_attribute} aria-label='{html.escape(toggle_label + "账号 " + str(account["username"]), quote=True)}' onchange='this.form.requestSubmit()'>
+                    <span aria-hidden='true'></span><em>{toggle_label}</em>
+                  </label>
+                </form>"""
+                reset_control = f"""
+                <details class='account-reset'>
+                  <summary>重置密码</summary>
+                  <form method='post' action='/accounts/{account_id}/reset-password'>
+                    <label>新密码<input name='new_password' type='password' minlength='{db.PASSWORD_MIN_LENGTH}' maxlength='128' autocomplete='new-password' required></label>
+                    <label>确认新密码<input name='confirm_password' type='password' minlength='{db.PASSWORD_MIN_LENGTH}' maxlength='128' autocomplete='new-password' required></label>
+                    <button type='submit'>确认重置</button>
+                  </form>
+                </details>"""
+            created_at = str(account.get("created_at") or "").replace("T", " ").replace("Z", "")
+            rows.append(f"""
+              <tr>
+                <td><strong>{html.escape(account.get('display_name') or '')}</strong>{'<small>当前登录</small>' if is_self else ''}</td>
+                <td>{html.escape(account.get('username') or '')}</td>
+                <td><span class='account-role account-role-{html.escape(account.get('role') or 'planner', quote=True)}'>{role_label}</span></td>
+                <td><span class='status {status_class}'>{status_label}</span></td>
+                <td>{html.escape(created_at)}</td>
+                <td><div class='account-actions'>{toggle_control}{reset_control}</div></td>
+              </tr>""")
+        content = f"""
+        <section class='page-heading'><div><div class='eyebrow'>ACCESS CONTROL</div><h1>账号管理</h1><p>由企划管理员维护商品企划中心的使用人员、账号状态和登录密码。</p></div><a class='button' href='/profile/password'>修改我的密码</a></section>
+        {self.alert(notice, 'success') if notice else ''}{self.alert(error, 'error') if error else ''}
+        <section class='account-metrics' aria-label='账号概况'><div><span>有效账号</span><strong>{active_count}</strong></div><div><span>商品部初审人员</span><strong>{planner_count}</strong></div><div><span>企划管理员</span><strong>{admin_count}</strong></div></section>
+        <section class='panel account-create-panel'><div class='panel-head'><div><div class='eyebrow'>NEW ACCOUNT</div><h2>新增账号</h2><p class='hint'>初始密码至少 {db.PASSWORD_MIN_LENGTH} 位，账号创建后请通知使用人及时修改。</p></div></div>
+          <form class='account-create-form' method='post' action='/accounts'>
+            <label>登录账号<input name='username' value='{html.escape(str(values.get('username') or ''), quote=True)}' minlength='3' maxlength='40' pattern='[A-Za-z0-9][A-Za-z0-9._-]{{2,39}}' autocomplete='off' placeholder='例如 merch_f' required></label>
+            <label>姓名<input name='display_name' value='{html.escape(str(values.get('display_name') or ''), quote=True)}' maxlength='50' autocomplete='off' placeholder='使用人姓名' required></label>
+            <label>角色<select name='role'><option value='planner' {'selected' if role_value == 'planner' else ''}>商品部初审人员</option><option value='admin' {'selected' if role_value == 'admin' else ''}>企划管理员</option></select></label>
+            <label>初始密码<input name='password' type='password' minlength='{db.PASSWORD_MIN_LENGTH}' maxlength='128' autocomplete='new-password' required></label>
+            <label>确认初始密码<input name='confirm_password' type='password' minlength='{db.PASSWORD_MIN_LENGTH}' maxlength='128' autocomplete='new-password' required></label>
+            <button class='primary' type='submit'>新增账号</button>
+          </form>
+        </section>
+        <section class='panel account-list-panel'><div class='panel-head'><div><div class='eyebrow'>ACCOUNT DIRECTORY</div><h2>现有账号</h2></div><span class='count'>共 {len(accounts)} 个</span></div>
+          <div class='table-wrap'><table class='account-table'><thead><tr><th>姓名</th><th>登录账号</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
+          <p class='account-security-note'>停用账号后，该账号已有登录会立即失效；重置密码后，原密码和已有登录同时失效。</p>
+        </section>"""
+        return self.shell("账号管理", content, user, "accounts")
+
+    def render_password_change(self, user: dict, query: dict, *, error: str = "") -> str:
+        notice = str(query.get("notice", "") or "")
+        content = f"""
+        <section class='page-heading'><div><div class='eyebrow'>ACCOUNT SECURITY</div><h1>修改密码</h1><p>修改当前账号的登录密码，其他已登录设备会自动退出。</p></div>{"<a class='button' href='/accounts'>返回账号管理</a>" if user.get('role') == 'admin' else ''}</section>
+        {self.alert(notice, 'success') if notice else ''}{self.alert(error, 'error') if error else ''}
+        <section class='panel password-panel'>
+          <div class='password-account'><span>当前账号</span><strong>{html.escape(user.get('display_name') or '')}</strong><small>{html.escape(user.get('username') or '')}</small></div>
+          <form class='password-form' method='post' action='/profile/password'>
+            <label>当前密码<input name='current_password' type='password' autocomplete='current-password' required></label>
+            <label>新密码<input name='new_password' type='password' minlength='{db.PASSWORD_MIN_LENGTH}' maxlength='128' autocomplete='new-password' required><small>至少 {db.PASSWORD_MIN_LENGTH} 位，且不能与当前密码相同。</small></label>
+            <label>确认新密码<input name='confirm_password' type='password' minlength='{db.PASSWORD_MIN_LENGTH}' maxlength='128' autocomplete='new-password' required></label>
+            <button class='primary' type='submit'>确认修改密码</button>
+          </form>
+        </section>"""
+        return self.shell("修改密码", content, user, "password")
+
     def render_settings(self, user: dict) -> str:
         content = f"<section class='page-heading'><div><div class='eyebrow'>CONNECTION</div><h1>连接设置</h1><p>商品企划中心通过藏宝阁专用内部接口读取资料和发布价格。</p></div></section><section class='panel settings'><dl><dt>藏宝阁接口地址</dt><dd>{html.escape(self.catalog_api_url)}</dd><dt>内部 Token</dt><dd>{'已配置（启动时注入）' if self.catalog_api_token else '未配置'}</dd><dt>本地数据库</dt><dd>{html.escape(self.db_path)}</dd></dl><p class='muted'>Token 不写入数据库或页面。正式部署时请通过服务环境变量注入，并限制接口仅监听公司内网。</p></section>"
         return self.shell("连接设置", content, user, "settings")
@@ -1318,8 +1538,12 @@ class PlanningApplication:
         return f"<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{html.escape(title)}</title><style>{self.css()}</style></head><body class='{body_class}'>{content}</body></html>"
 
     def shell(self, title: str, content: str, user: dict, current: str) -> str:
-        nav = ''.join(f"<a class='{'active' if current == key else ''}' href='{href}'>{label}</a>" for key, href, label in [("dashboard", "/dashboard", "企划总览"), ("category-planning", "/category-planning", "品类企划"), ("workbench", "/workbench", "上新定价"), ("rules", "/rules", "规则"), ("stats", "/stats", "价格带统计"), ("settings", "/settings", "连接设置")])
-        content = f"<div class='app-shell'><header><a class='brand' href='/dashboard'><span>PC</span><div><strong>商品企划中心</strong><small>Merchandise Planning</small></div></a><nav>{nav}</nav><div class='user'><span>{html.escape(user.get('display_name',''))}</span><form method='post' action='/logout'><button type='submit' aria-label='退出登录'>退出</button></form></div></header><main class='main'>{content}</main><footer>商品企划中心 · 成本来源：藏宝阁跟单部含税价</footer></div>"
+        nav_items = [("dashboard", "/dashboard", "企划总览"), ("category-planning", "/category-planning", "品类企划"), ("workbench", "/workbench", "上新定价"), ("rules", "/rules", "规则"), ("stats", "/stats", "价格带统计")]
+        if user.get("role") == "admin":
+            nav_items.append(("accounts", "/accounts", "账号管理"))
+        nav_items.append(("settings", "/settings", "连接设置"))
+        nav = ''.join(f"<a class='{'active' if current == key else ''}' href='{href}'>{label}</a>" for key, href, label in nav_items)
+        content = f"<div class='app-shell'><header><a class='brand' href='/dashboard'><span>PC</span><div><strong>商品企划中心</strong><small>Merchandise Planning</small></div></a><nav>{nav}</nav><div class='user'><span>{html.escape(user.get('display_name',''))}</span><a class='profile-password-link' href='/profile/password'>修改密码</a><form method='post' action='/logout'><button type='submit' aria-label='退出登录'>退出</button></form></div></header><main class='main'>{content}</main><footer>商品企划中心 · 成本来源：藏宝阁跟单部含税价</footer></div>"
         return self.page(title, content, user)
 
     def render_message(self, title: str, message: str) -> str:
@@ -1347,6 +1571,9 @@ class PlanningApplication:
 
     def css(self) -> str:
         return """
+        .account-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));background:#fff;border:1px solid var(--line);margin-bottom:24px}.account-metrics>div{padding:16px 20px;border-right:1px solid var(--line);display:flex;align-items:baseline;justify-content:space-between;gap:12px}.account-metrics>div:last-child{border-right:0}.account-metrics span{color:var(--muted);font-size:12px}.account-metrics strong{font:25px Georgia,serif;color:var(--deep)}.account-create-form{display:grid;grid-template-columns:1.1fr 1.1fr .9fr 1fr 1fr auto;align-items:end;gap:9px}.account-create-form label,.password-form label,.account-reset label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.account-create-form button{height:42px;white-space:nowrap}.account-table{min-width:960px}.account-table th:last-child,.account-table td:last-child{min-width:275px}.account-role{display:inline-block;padding:3px 7px;border-radius:3px;font-size:12px}.account-role-admin{background:#fff1e7;color:#98431d}.account-role-planner{background:#eaf0eb;color:#315447}.status-account-active{background:#e5f2e9;color:#2d6b42}.status-account-disabled{background:#f0f1ef;color:#68736a}.account-actions{display:flex;align-items:center;gap:9px}.account-actions>form{margin:0}.account-self-note{color:var(--muted);font-size:12px}.account-switch{display:flex;align-items:center;gap:7px;cursor:pointer}.account-switch input{position:absolute;opacity:0;pointer-events:none}.account-switch>span{position:relative;width:34px;height:18px;border-radius:9px;background:#bfc6c1;transition:background .15s}.account-switch>span::after{content:'';position:absolute;top:3px;left:3px;width:12px;height:12px;border-radius:50%;background:#fff;transition:transform .15s}.account-switch input:checked+span{background:var(--deep)}.account-switch input:checked+span::after{transform:translateX(16px)}.account-switch input:focus-visible+span{outline:2px solid var(--accent);outline-offset:2px}.account-switch em{font-style:normal;color:var(--muted);font-size:12px}.account-reset{position:relative}.account-reset summary{cursor:pointer;color:var(--deep);font-size:12px;list-style:none;border:1px solid #cbd5ce;border-radius:4px;padding:5px 9px;white-space:nowrap}.account-reset summary::-webkit-details-marker{display:none}.account-reset[open] summary{border-color:var(--accent);color:var(--accent)}.account-reset form{display:grid;grid-template-columns:1fr 1fr auto;align-items:end;gap:7px;margin-top:9px;min-width:410px}.account-reset input{width:130px;padding:7px 8px}.account-reset button{padding:7px 9px;white-space:nowrap}.account-security-note{margin:18px 0 0;padding-top:14px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}.password-panel{max-width:700px}.password-account{display:grid;grid-template-columns:110px 1fr;align-items:baseline;padding-bottom:18px;margin-bottom:18px;border-bottom:1px solid var(--line)}.password-account span,.password-account small{color:var(--muted);font-size:12px}.password-account strong{font-size:17px}.password-account small{grid-column:2}.password-form{display:grid;gap:15px;max-width:460px}.password-form input{width:100%}.password-form label small{color:var(--muted);font-size:11px}.password-form button{justify-self:start}.profile-password-link{color:var(--deep);font-size:12px}.profile-password-link:hover{text-decoration:underline}
+        @media(max-width:1100px){.account-create-form{grid-template-columns:repeat(3,minmax(0,1fr))}.account-create-form button{width:100%}}
+        @media(max-width:700px){.account-metrics{grid-template-columns:1fr}.account-metrics>div{border-right:0;border-bottom:1px solid var(--line)}.account-metrics>div:last-child{border-bottom:0}.account-create-form{grid-template-columns:1fr}.account-actions{align-items:flex-start;flex-direction:column}.account-reset form{grid-template-columns:1fr;min-width:220px}.account-reset input{width:100%}.password-account{grid-template-columns:1fr}.password-account small{grid-column:1}.password-form button{width:100%}}
         .rule-access{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 17px;border:1px solid;margin-bottom:16px}.rule-access div{display:flex;align-items:baseline;gap:12px}.rule-access span,.rule-access small{font-size:12px}.rule-access.access-write{background:#eaf3ed;border-color:#c7d9cc;color:#315447}.rule-access.access-readonly{background:#f3f1ee;border-color:#ded8d1;color:#6f6259}.rule-logic{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));background:#fff;border:1px solid var(--line);margin-bottom:24px}.rule-logic>div{padding:20px 22px;border-right:1px solid var(--line)}.rule-logic>div:last-child{border-right:0}.rule-logic span{color:var(--accent);font:21px Georgia,serif}.rule-logic strong{display:block;font-size:17px;margin:4px 0}.rule-logic p,.range-help{margin:0;color:var(--muted);font-size:12px}.rule-form{align-items:end}.rule-form.dress-rule-form{grid-template-columns:1fr .7fr 1.5fr auto}.rule-form.cost-rule-form{grid-template-columns:1fr 1fr 1fr .7fr 1.2fr auto}.range-help{margin:-5px 0 18px}.form-actions,.rule-actions{display:flex;align-items:center;gap:6px;white-space:nowrap}.form-actions button,.form-actions .button{height:42px}.compact-button,.danger-button{padding:5px 9px;font-size:12px}.danger-button{color:#9b3e32;border-color:#efc9c2}.rule-actions form{margin:0}.workbench-summary{display:flex;align-items:baseline;gap:12px;margin:0 0 18px;color:var(--muted)}.workbench-summary strong{font:24px Georgia,serif;color:var(--deep)}.workbench-summary small{font-size:12px}.product-card-list{display:grid;gap:18px}.product-card{background:#fff;border:1px solid var(--line);padding:22px;min-width:0}.product-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:18px}.product-card-head h2{font:25px Georgia,serif;font-weight:500;margin:4px 0 0}.source-version{color:var(--muted);font-size:12px}.source-fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-top:1px solid var(--line);border-left:1px solid var(--line);margin-bottom:18px}.source-field{min-width:0;min-height:82px;padding:12px 14px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.source-field span{display:block;color:var(--muted);font-size:11px;margin-bottom:5px}.source-field strong{display:block;overflow-wrap:anywhere}.source-field-image{grid-row:span 2}.source-field-image img,.product-image-empty{display:block;width:82px;height:82px;object-fit:cover;background:#f0f3f0;border:1px solid var(--line)}.product-image-empty{display:grid;place-items:center;color:var(--muted);font-size:11px;text-align:center}.cost-value{color:var(--deep)}.pricing-panel{border:1px solid #cfdcd1;background:#f7faf7;padding:18px}.pricing-panel-empty{background:#fbfaf8;border-color:var(--line)}.pricing-panel-head{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:12px}.pricing-panel h3{font-size:18px;margin:4px 0}.pricing-panel-head p{margin:0;color:var(--muted);font-size:12px}.price-result{display:flex;align-items:baseline;gap:14px;margin:12px 0}.price-result span,.price-result small{color:var(--muted);font-size:12px}.price-result strong{font:30px Georgia,serif;color:var(--deep)}.price-result small{margin-left:auto}.pricing-calc-form,.price-review-form{display:flex;align-items:end;gap:9px;flex-wrap:wrap}.pricing-calc-form label,.price-review-form label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.pricing-calc-form input{min-width:220px}.price-review-form input{width:150px}.pricing-panel small{color:var(--muted);font-size:12px}.pricing-controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.review-controls{display:flex;align-items:end;gap:14px;flex-wrap:wrap}.review-note{color:var(--muted);font-size:12px}.status-waiting{background:#f0f1ef;color:#68736a}.status-suggested{background:#fff5e8;color:#9b5a1b}.status-review-pending{background:#fff1e7;color:#98431d}.status-confirmed{background:#e5f2e9;color:#2d6b42}.status-published{background:#dfeee5;color:#276641}.status-conflict{background:#fff0ef;color:#a23f35}.status-source{background:#eef2ee;color:#526257}.error-text{display:block;margin-top:9px;background:#fff0ef;color:#a23f35;padding:5px 7px}@media(max-width:900px){.rule-logic{grid-template-columns:1fr}.rule-logic>div{border-right:0;border-bottom:1px solid var(--line)}.rule-logic>div:last-child{border-bottom:0}.rule-form.dress-rule-form,.rule-form.cost-rule-form{grid-template-columns:1fr 1fr}.rule-form.dress-rule-form .form-actions,.rule-form.cost-rule-form .form-actions{grid-column:span 2}.source-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.source-field-image{grid-row:span 2}}@media(max-width:620px){.rule-access,.rule-access div{align-items:flex-start;flex-direction:column;gap:3px}.rule-form.dress-rule-form,.rule-form.cost-rule-form{grid-template-columns:1fr}.rule-form.dress-rule-form .form-actions,.rule-form.cost-rule-form .form-actions{grid-column:auto}.product-card{padding:16px}.product-card-head{gap:10px}.product-card-head h2{font-size:21px}.source-fields{grid-template-columns:1fr 1fr}.source-field{padding:10px}.source-field-image{grid-row:span 2}.pricing-panel-head,.review-controls{flex-direction:column;align-items:flex-start}.price-result{flex-wrap:wrap}.price-result small{margin-left:0}.pricing-calc-form,.price-review-form{align-items:stretch;flex-direction:column}.pricing-calc-form label,.price-review-form label,.pricing-calc-form input,.price-review-form input,.pricing-calc-form button,.price-review-form button{width:100%;min-width:0}.form-actions{flex-wrap:wrap}}
         .module-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px;margin-bottom:34px}.module-entry{min-width:0;min-height:252px;background:#fff;border:1px solid var(--line);border-top:3px solid var(--deep);padding:25px;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:24px}.module-entry-planned{border-top-color:#9a8172;background:#fbfaf8}.module-entry-top{width:100%;display:flex;justify-content:space-between;align-items:center}.module-index{font:29px Georgia,serif;color:#9aa19c}.phase-tag,.phase-badge{display:inline-block;background:#eeeae6;color:#745e51;padding:4px 9px;border-radius:3px;font-size:12px}.phase-tag-live{background:#e5f2e9;color:#2d6b42}.module-entry h2{font:28px Georgia,serif;font-weight:500;margin:5px 0 7px}.module-entry p{color:var(--muted);margin:0}.section-label{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:12px}.section-label h2{font-size:20px;margin:2px 0 0}.section-label>a{color:var(--deep);font-size:13px}.planning-scope{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));background:#fff;border:1px solid var(--line);margin-bottom:24px}.planning-scope>div{min-width:0;padding:28px;border-right:1px solid var(--line);display:flex;gap:18px}.planning-scope>div:last-child{border-right:0}.scope-primary{background:#f0f5f1}.scope-number{font:25px Georgia,serif;color:var(--accent)}.planning-scope div div>span{display:block;color:var(--muted);font-size:12px}.planning-scope strong{display:block;font:24px Georgia,serif;margin:3px 0 7px}.planning-scope p{margin:0;color:var(--muted)}.phase-panel{display:flex;align-items:center;justify-content:space-between;gap:28px;background:#fbfaf8;border-left:3px solid #9a8172}.phase-panel>div{max-width:760px}.phase-panel p{margin:5px 0 0;color:var(--muted)}.phase-badge{font-size:13px;padding:7px 12px}@media(max-width:900px){.planning-scope{grid-template-columns:1fr}.planning-scope>div{border-right:0;border-bottom:1px solid var(--line)}.planning-scope>div:last-child{border-bottom:0}}@media(max-width:620px){.module-grid{grid-template-columns:1fr;gap:14px}.module-entry{min-height:220px;padding:20px}.section-label,.phase-panel{align-items:flex-start;flex-direction:column}.planning-scope>div{padding:21px}}
         :root{--ink:#202421;--muted:#6c756e;--line:#dde3dc;--paper:#f6f8f5;--card:#fff;--accent:#b5572a;--deep:#315447;--soft:#eaf0eb}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif}a{color:inherit;text-decoration:none}button,.button{border:1px solid #cbd5ce;background:#fff;color:var(--ink);border-radius:4px;padding:9px 14px;font:inherit;cursor:pointer}button:hover,.button:hover{border-color:var(--accent);color:var(--accent)}button.primary,.button.primary{background:var(--deep);border-color:var(--deep);color:#fff}button:disabled{cursor:not-allowed;opacity:.45}.app-shell{width:100%;min-width:0;min-height:100vh}header{width:100%;height:72px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 34px;gap:30px;position:sticky;top:0;z-index:3}.brand{display:flex;align-items:center;gap:10px;min-width:230px}.brand>span{display:grid;place-items:center;width:34px;height:34px;background:var(--deep);color:#fff;font-weight:700;letter-spacing:.08em;border-radius:3px}.brand strong{display:block;font-size:15px}.brand small{display:block;color:var(--muted);font-size:10px;letter-spacing:.08em;text-transform:uppercase}nav{display:flex;gap:4px;flex:1;min-width:0}nav a{padding:9px 12px;color:var(--muted);border-bottom:2px solid transparent}nav a.active,nav a:hover{color:var(--deep);border-bottom-color:var(--accent)}.user{display:flex;align-items:center;gap:13px;color:var(--muted);white-space:nowrap}.user button{padding:5px 9px}.main{width:100%;min-width:0;max-width:1320px;margin:0 auto;padding:38px 34px 60px}.hero,.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;margin-bottom:25px}.hero h1,.page-heading h1{font-family:Georgia,'Times New Roman',serif;font-weight:500;font-size:42px;line-height:1.15;margin:5px 0 10px;letter-spacing:0}.hero p,.page-heading p{margin:0;color:var(--muted);max-width:680px}.eyebrow{color:var(--accent);font-size:11px;letter-spacing:.14em;font-weight:700}.hero-note{background:var(--deep);color:#fff;padding:18px 22px;min-width:190px}.hero-note span,.hero-note small{display:block;opacity:.7;font-size:12px}.hero-note strong{display:block;font-size:21px;margin:4px 0}.metrics{display:grid;grid-template-columns:repeat(3,1fr);background:#fff;border:1px solid var(--line);margin-bottom:24px}.metrics>a,.metrics>div{padding:20px 24px;border-right:1px solid var(--line)}.metrics>*:last-child{border-right:0}.metrics span,.metrics small{display:block;color:var(--muted)}.metrics strong{display:block;font:34px Georgia,serif;margin:4px 0}.split{display:grid;grid-template-columns:1.45fr 1fr;gap:24px}.panel{min-width:0;background:var(--card);border:1px solid var(--line);padding:24px;margin-bottom:24px}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:18px}.panel h2{font-size:20px;font-weight:600;margin:2px 0}.hint,.count,.muted,.meta{color:var(--muted)}.count{font-size:13px}.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.quick-grid a{border:1px solid var(--line);padding:17px;min-height:126px;display:flex;flex-direction:column;gap:3px}.quick-grid a:hover{border-color:var(--accent);background:#fffaf7}.quick-grid b{color:var(--accent);font:23px Georgia,serif}.quick-grid small{color:var(--muted);font-size:12px}.notice-panel{background:#f0f5f1}.notice-panel p{color:#53645a}.page-heading form{margin-bottom:4px}.filter-bar{background:#fff;border:1px solid var(--line);padding:14px 18px;margin-bottom:24px}.filter-bar form{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}.filter-bar label,.rule-form label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.filter-bar input,.filter-bar select{min-width:190px}input,select{border:1px solid #cfd8d1;background:#fff;padding:9px 10px;border-radius:3px;color:var(--ink);font:inherit;min-width:0}table{width:100%;border-collapse:collapse}th{text-align:left;color:var(--muted);font-size:12px;font-weight:500;background:#f7f9f7}th,td{padding:12px 11px;border-bottom:1px solid var(--line);vertical-align:middle}tbody tr:last-child td{border-bottom:0}td strong{display:block}td small{display:block;color:var(--muted);font-size:11px}.table-wrap{width:100%;max-width:100%;overflow:auto}.inline-form{display:flex;gap:6px;min-width:205px}.inline-form input{width:120px}.inline-form button{padding:7px 10px;white-space:nowrap}.status{display:inline-block;border-radius:3px;padding:3px 7px;background:var(--soft);color:var(--deep);font-size:12px}.status-confirmed{background:#fff1e7;color:#98431d}.status-published{background:#e5f2e9;color:#2d6b42}.status-conflict,.error-text{background:#fff0ef;color:#a23f35}.price{font:20px Georgia,serif;color:var(--deep)}.actions{display:flex;gap:5px;white-space:nowrap}.actions button{padding:6px 9px;font-size:12px}.empty{text-align:center;color:var(--muted);padding:30px!important}.alert{padding:11px 14px;border:1px solid;margin:0 0 20px}.alert.success{background:#edf7ef;border-color:#c8e2cd;color:#2f6741}.alert.error{background:#fff1ef;border-color:#efc9c2;color:#9b3e32}.rule-form{display:grid;grid-template-columns:1fr 1fr .7fr 1.2fr auto;gap:7px;margin-bottom:20px}.band-row{margin:19px 0}.band-label{display:flex;justify-content:space-between;gap:15px;margin-bottom:6px}.band-label span{font-weight:600}.band-label strong{color:var(--muted);font-size:13px;font-weight:500}.bar{height:11px;background:#edf1ed}.bar i{display:block;height:100%;background:var(--accent)}.settings dl{display:grid;grid-template-columns:180px 1fr;border-top:1px solid var(--line)}.settings dt,.settings dd{padding:13px 0;margin:0;border-bottom:1px solid var(--line)}.settings dt{color:var(--muted)}footer{max-width:1320px;margin:0 auto;padding:0 34px 25px;color:#909890;font-size:12px}.login-body{min-height:100vh;display:grid;place-items:center;background:#eef2ee}.login{width:min(430px,calc(100% - 36px));background:#fff;border:1px solid var(--line);padding:38px}.login-mark{color:var(--accent);font-size:12px;letter-spacing:.12em;font-weight:700}.login h1{font:36px Georgia,serif;margin:15px 0 8px}.login form{margin-top:25px}.login label{display:block;color:var(--muted);font-size:12px;margin:14px 0}.login input{width:100%;margin-top:5px}.login button{width:100%;margin-top:12px}.button{display:inline-block}.login .button{margin-top:18px} @media(max-width:900px){header{padding:0 18px;gap:16px}.brand{min-width:auto}.brand small,nav a{font-size:12px}nav{overflow:auto}.user>span{display:none}.main{padding:28px 18px 45px}.hero,.page-heading{align-items:flex-start;flex-direction:column}.hero h1,.page-heading h1{font-size:35px}.split{grid-template-columns:1fr}.rule-form{grid-template-columns:1fr 1fr}.rule-form button{grid-column:span 2}.quick-grid{grid-template-columns:1fr 1fr}}@media(max-width:620px){header{height:auto;min-height:66px;flex-wrap:wrap;padding:12px 15px}nav{order:3;flex:0 0 100%;width:100%;max-width:100%;overflow-x:auto}.metrics{grid-template-columns:1fr}.metrics>*{border-right:0;border-bottom:1px solid var(--line)}.metrics>*:last-child{border-bottom:0}.quick-grid{grid-template-columns:1fr}.rule-form{grid-template-columns:1fr}.rule-form button{grid-column:auto}.filter-bar form{align-items:stretch;flex-direction:column}.filter-bar label,.filter-bar input,.filter-bar select,.filter-bar button{width:100%}.filter-bar input,.filter-bar select{min-width:0}.panel{padding:18px}.main{padding-left:13px;padding-right:13px}.hero h1,.page-heading h1{font-size:30px}.actions{flex-direction:column}.settings dl{grid-template-columns:1fr}.settings dt{border-bottom:0;padding-bottom:3px}.settings dd{padding-top:0}.login{padding:28px 22px}}
