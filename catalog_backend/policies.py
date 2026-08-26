@@ -179,6 +179,14 @@ def can_view_logs(user: dict | None) -> bool:
     )
 
 
+def can_view_tax_included_price_history(user: dict | None) -> bool:
+    """Price history follows the existing non-C catalog visibility boundary."""
+    return bool(
+        user
+        and user.get("department") in (EDITOR_DEPARTMENTS | EXECUTIVE_READ_ONLY_DEPARTMENTS | ADMIN_DEPARTMENTS)
+    )
+
+
 def can_access_billing_module(user: dict | None) -> bool:
     return bool(
         user

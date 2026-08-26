@@ -54,6 +54,7 @@ from catalog_backend.policies import (
     can_process_brand_bills,
     can_review_product,
     can_see_product,
+    can_view_tax_included_price_history,
     can_upload_platform_bills,
     billing_platform_label,
     can_view_logs,
@@ -346,6 +347,8 @@ class CatalogApplication:
                     return self.handle_lifecycle_change(environ, start_response, user, product_id)
                 if len(parts) == 3 and parts[2] == "logs" and method == "GET":
                     return self.handle_product_logs(start_response, user, product_id, query)
+                if len(parts) == 3 and parts[2] == "price-history" and method == "GET":
+                    return self.handle_product_price_history(start_response, user, product_id)
                 if len(parts) == 3 and parts[2] == "versions" and method == "GET":
                     return self.handle_product_versions(start_response, user, product_id, query)
                 if len(parts) == 5 and parts[2] == "versions" and parts[3].isdigit() and parts[4] == "restore" and method == "POST":
@@ -1329,6 +1332,28 @@ class CatalogApplication:
             )
         return self.html_response(start_response, self.render_product_logs(user, product, query))
 
+    def handle_product_price_history(self, start_response, user, product_id: int):
+        product = db.get_product(self.db_path, product_id)
+        if not product:
+            return self.html_response(
+                start_response,
+                self.render_message_page("记录不存在", "没有找到这条商品资料。", user),
+                status="404 Not Found",
+            )
+        if not can_view_tax_included_price_history(user):
+            return self.html_response(
+                start_response,
+                self.render_message_page("权限不足", "当前账号不能查看含税价历史。", user),
+                status="403 Forbidden",
+            )
+        if not can_see_product(user, product):
+            return self.html_response(
+                start_response,
+                self.render_message_page("不可查看", "当前账号不能查看这条商品资料的含税价历史。", user),
+                status="403 Forbidden",
+            )
+        return self.html_response(start_response, self.render_product_price_history(user, product))
+
     def handle_product_versions(self, start_response, user, product_id: int, query: dict):
         product = db.get_product(self.db_path, product_id)
         if not product:
@@ -2272,14 +2297,18 @@ class CatalogApplication:
         supplier = ""
         if user.get("department") in {"A", "EXECUTIVE"} or is_admin(user):
             supplier = str(query.get("supplier", "")).strip()
+        requested_status = str(query.get("status", "")).strip()
+        tax_price_filter = "modified" if requested_status == "tax_price_modified" and (user.get("department") == "B" or is_admin(user)) else ""
+        product_status = "" if tax_price_filter else requested_status
         exact_matches = []
         for product in db.list_products(
             self.db_path,
             keyword,
             str(query.get("department", "")).strip(),
-            str(query.get("status", "")).strip(),
+            product_status,
             str(query.get("lifecycle_status", "")).strip(),
             supplier,
+            tax_price_filter,
         ):
             if not can_see_product(user, product):
                 continue
@@ -2821,6 +2850,14 @@ class CatalogApplication:
             return f"{float(clean_value):.2f}"
         except ValueError:
             return clean_value
+
+    def format_price_history_value(self, value) -> str:
+        if value is None or str(value).strip() == "":
+            return "未填写"
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return str(value)
 
     def list_value_markup(
         self,
@@ -3755,6 +3792,27 @@ class CatalogApplication:
       color: var(--muted);
       font-size: 13px;
     }}
+    .stat-card-link {{
+      color: inherit;
+      text-decoration: none;
+      transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+    }}
+    .stat-card-link:hover {{
+      color: inherit;
+      text-decoration: none;
+      transform: translateY(-2px);
+      border-color: rgba(181, 106, 45, 0.26);
+      box-shadow: 0 14px 28px rgba(75, 49, 29, 0.12);
+    }}
+    .stat-card-link small {{
+      display: block;
+      position: relative;
+      z-index: 1;
+      margin-top: 9px;
+      color: var(--accent-strong);
+      font-size: 11px;
+      font-weight: 700;
+    }}
     .tools {{
       display: flex;
       flex-wrap: wrap;
@@ -4105,6 +4163,12 @@ class CatalogApplication:
       padding: 5px 9px;
       font-size: 11px;
     }}
+    .catalog-table .tax-price-change-badge {{
+      color: #8b4f1f;
+      background: rgba(208, 137, 56, 0.14);
+      border: 1px solid rgba(208, 137, 56, 0.18);
+      white-space: nowrap;
+    }}
     .catalog-table .catalog-resizable-head {{
       user-select: none;
     }}
@@ -4165,6 +4229,17 @@ class CatalogApplication:
       color: var(--success);
       margin-bottom: 18px;
       border: 1px solid rgba(50, 111, 85, 0.16);
+    }}
+    .products-filter-result-note {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin: 0 0 14px;
+    }}
+    .products-filter-result-note .pill {{
+      margin-left: auto;
+      white-space: nowrap;
     }}
     .warning {{
       padding: 15px 18px;
@@ -4881,6 +4956,8 @@ class CatalogApplication:
       font-weight: 700;
     }}
     .products-filter-form .products-filter-submit {{
+      grid-column: 2;
+      justify-self: end;
       background: linear-gradient(180deg, rgba(181,106,45,0.1), rgba(181,106,45,0.06));
       border-color: rgba(181,106,45,0.16);
       box-shadow: none;
@@ -6835,6 +6912,10 @@ class CatalogApplication:
       .products-filter-form {{
         grid-template-columns: 1fr;
       }}
+      .products-filter-form .products-filter-submit {{
+        grid-column: 1;
+        justify-self: end;
+      }}
       .nav-session {{
         margin-left: 0;
       }}
@@ -8506,16 +8587,18 @@ class CatalogApplication:
         keyword = query.get("q", "").strip()
         supplier_search_enabled = user.get("department") in {"A", "EXECUTIVE"} or is_admin(user)
         supplier_filter = query.get("supplier", "").strip() if supplier_search_enabled else ""
+        b_dashboard_view = user.get("department") == "B" or is_admin(user)
         department_filter = query.get("department", "").strip()
         if not is_admin(user):
             department_filter = ""
             query = {**query, "department": ""}
         status_filter = query.get("status", "").strip()
+        tax_price_filter = "modified" if b_dashboard_view and status_filter == "tax_price_modified" else ""
         lifecycle_filter = query.get("lifecycle_status", "").strip()
         bulk_enabled = not is_department_monitor(user) and (
             is_admin(user) or user.get("department") in {"A", "B", "C"}
         )
-        source_status_filter = "" if user.get("department") == "C" else status_filter
+        source_status_filter = "" if user.get("department") == "C" or tax_price_filter else status_filter
         products = self.visible_products_for_user(
             db.list_products(
                 self.db_path,
@@ -8524,6 +8607,7 @@ class CatalogApplication:
                 source_status_filter,
                 lifecycle_filter,
                 supplier_filter,
+                tax_price_filter,
             ),
             user,
         )
@@ -8613,6 +8697,12 @@ class CatalogApplication:
         </nav>
         """
         configured_list_fields = self.configured_list_layout_fields(user)
+        price_changed_product_ids = set()
+        if b_dashboard_view:
+            # Keep the row marker useful in the default view. The B team can
+            # spot any historical price change without opening the filter;
+            # the overview card remains scoped to the recent seven-day queue.
+            price_changed_product_ids = db.tax_price_change_product_ids(self.db_path)
         stats = db.department_stats(self.db_path)
         workflow_stats = db.status_stats(self.db_path)
         lifecycle_stats = db.lifecycle_stats(self.db_path)
@@ -8644,6 +8734,11 @@ class CatalogApplication:
             payload = self.product_payload_for_user(product, user)
             revision_badge = self.revision_badge(product)
             actions = [f'<a href="/products/{product["id"]}">查看</a>']
+            tax_price_changed = int(product.get("id") or 0) in price_changed_product_ids
+            if tax_price_changed:
+                actions.append(
+                    f'<a href="/products/{product["id"]}/price-history" title="查看含税价历史">价历史</a>'
+                )
             if can_edit_product(user, product):
                 actions.append(f'<a href="/products/{product["id"]}/edit">编辑</a>')
             if (
@@ -8684,6 +8779,8 @@ class CatalogApplication:
             version_parts = [f'<span class="table-version-label">{html.escape(self.version_label(product))}</span>']
             if revision_badge:
                 version_parts.append(revision_badge)
+            if tax_price_changed:
+                version_parts.append('<span class="pill tax-price-change-badge">含税价已修改</span>')
             rows.append(
                 f"""
                 <tr class="catalog-row">
@@ -8757,7 +8854,11 @@ class CatalogApplication:
         elif user["department"] == "B" or is_admin(user):
             stats_markup = f"""
             <div class="stats">
-              <div class="stat-card"><span>已完成</span><strong>{b_dashboard_stats.get('completed', 0)}</strong></div>
+              <a class="stat-card stat-card-link" href="/products?status=tax_price_modified#products-list">
+                <span>近7天含税价修改</span>
+                <strong>{b_dashboard_stats.get('recent_tax_price_changes', 0)}</strong>
+                <small>点击查看变动款式</small>
+              </a>
               <div class="stat-card"><span>近7天新增</span><strong>{b_dashboard_stats.get('recent_submitted_to_b', 0)}</strong></div>
               <div class="stat-card"><span>待完成</span><strong>{b_dashboard_stats.get('pending_completion', 0)}</strong></div>
               <div class="stat-card"><span>待接收</span><strong>{b_dashboard_stats.get('awaiting_receipt', 0)}</strong></div>
@@ -8808,6 +8909,7 @@ class CatalogApplication:
                 <option value="">全部状态</option>
                 <option value="pending" {"selected" if status_filter == "pending" else ""}>待完成</option>
                 <option value="published" {"selected" if status_filter == "published" else ""}>已完成</option>
+                <option value="tax_price_modified" {"selected" if status_filter == "tax_price_modified" else ""}>含税价修改</option>
               </select>
             """
         else:
@@ -8818,6 +8920,7 @@ class CatalogApplication:
                 <option value="pending" {"selected" if status_filter == "pending" else ""}>待商品部填写</option>
                 <option value="published" {"selected" if status_filter == "published" else ""}>已完成</option>
                 <option value="received" {"selected" if status_filter == "received" else ""}>已接收</option>
+                {'<option value="tax_price_modified" selected>含税价修改</option>' if tax_price_filter else '<option value="tax_price_modified">含税价修改</option>' if b_dashboard_view else ''}
               </select>
             """
         department_filter_markup = (
@@ -8897,6 +9000,12 @@ class CatalogApplication:
             if supplier_search_enabled
             else ""
         )
+        price_filter_note = ""
+        if tax_price_filter == "modified":
+            price_filter_note = (
+                '<div class="notice products-filter-result-note">已展示全部含税价修改资料，按最近一次修改时间倒序排列。'
+                '<a class="pill" href="/products#products-list">清除筛选</a></div>'
+            )
         if user["department"] == "C" and not is_department_monitor(user):
             c_note = ""
         layout_settings_button = (
@@ -8947,6 +9056,7 @@ class CatalogApplication:
             </div>
             {bulk_tools_markup}
           </div>
+          {price_filter_note}
           {pagination_top_markup}
           <form id="products-export-form" method="get" action="/export.xlsx">
             <input type="hidden" name="selected" id="export-selected-products" value="">
@@ -10775,6 +10885,11 @@ class CatalogApplication:
             if is_admin(user)
             else ""
         )
+        price_history_link = (
+            f'<a class="pill" href="/products/{product["id"]}/price-history">含税价历史</a>'
+            if can_view_tax_included_price_history(user)
+            else ""
+        )
         status_cards = []
         for status_value, action_label in available_status_actions(user, product):
             if user.get("department") == "C" and status_value == "received" and product.get("c_received"):
@@ -10869,6 +10984,7 @@ class CatalogApplication:
                 <div class="tools">
                   <a class="pill" href="/products">返回列表</a>
                   {edit_link}
+                  {price_history_link}
                   {log_link}
                   {version_link}
                 </div>
@@ -11578,6 +11694,71 @@ class CatalogApplication:
         </section>
         """
         return self.page(f"日志 #{product['id']} - 商品资料后台", content, user, current_page="products", back_href=f"/products/{product['id']}")
+
+    def render_product_price_history(self, user, product: dict) -> str:
+        history = db.list_product_price_history(self.db_path, product["id"])
+        current_price = self.format_price_history_value(product.get("tax_included_price"))
+        rows = []
+        for item in history:
+            version_no = int(item.get("version_no") or 1)
+            source_version_no = item.get("source_version_no")
+            source_label = f"V{int(source_version_no)}" if source_version_no else "-"
+            actor_name = item.get("actor_name") or "系统记录"
+            actor_department = department_label(item.get("actor_department")) if item.get("actor_department") else "-"
+            rows.append(
+                f"""
+                <tr>
+                  <td>{self.display_value(item.get('created_at'))}</td>
+                  <td><strong>{self.format_price_history_value(item.get('old_price'))}</strong></td>
+                  <td><strong class="price-history-current">{self.format_price_history_value(item.get('new_price'))}</strong></td>
+                  <td>V{version_no}</td>
+                  <td>{html.escape(source_label)}</td>
+                  <td>{html.escape(str(actor_name))}<span class="meta" style="display:block; margin-top:4px;">{html.escape(actor_department)}</span></td>
+                  <td>{html.escape(str(item.get('note') or ''))}</td>
+                </tr>
+                """
+            )
+        version_link = (
+            f'<a class="pill" href="/products/{product["id"]}/versions">版本记录</a>'
+            if is_admin(user)
+            else ""
+        )
+        content = f"""
+        <section class="panel">
+          <div class="detail-panel-head">
+            <div class="detail-panel-main">
+              <h1>含税价历史</h1>
+              <p class="meta">{html.escape(self.product_brief_label(product))} · 当前含税价 <strong>{html.escape(current_price)}</strong></p>
+            </div>
+            <div class="detail-panel-tools">
+              <div class="tools">
+                <a class="pill" href="/products/{product['id']}">返回详情</a>
+                {version_link}
+              </div>
+            </div>
+          </div>
+          <div class="notice" style="margin-top:18px;">初始含税价会作为 V1 保留；之后每次调整都会记录原价格、新价格、操作人和时间，当前资料始终使用最新价格。</div>
+          <div class="table-wrap" style="margin-top:18px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>变更时间</th>
+                  <th>原含税价</th>
+                  <th>新含税价</th>
+                  <th>修改版本</th>
+                  <th>来源版本</th>
+                  <th>操作人</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                {''.join(rows) if rows else '<tr><td colspan="7">暂无含税价历史记录。</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </section>
+        """
+        return self.page(f"含税价历史 #{product['id']} - 商品资料后台", content, user, current_page="products", back_href=f"/products/{product['id']}")
 
     def render_product_versions(self, user, product: dict, query: dict | None = None) -> str:
         versions = db.list_product_versions(self.db_path, product["id"])

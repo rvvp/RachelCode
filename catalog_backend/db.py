@@ -355,6 +355,24 @@ def init_db(
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                version_no INTEGER NOT NULL,
+                source_version_no INTEGER,
+                old_price REAL,
+                new_price REAL,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                UNIQUE(product_id, version_no),
+                FOREIGN KEY(product_id) REFERENCES products(id),
+                FOREIGN KEY(created_by) REFERENCES users(id)
+            )
+            """
+        )
         existing_log_columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(product_logs)").fetchall()
@@ -774,6 +792,9 @@ def init_db(
             "CREATE INDEX IF NOT EXISTS idx_product_versions_product_id ON product_versions(product_id)"
         )
         connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_product_price_history_product_id ON product_price_history(product_id, created_at DESC)"
+        )
+        connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_created_at ON admin_audit_logs(created_at)"
         )
         connection.execute(
@@ -840,6 +861,7 @@ def init_db(
         backfill_supplier_product_list_layout_fields(connection)
         backfill_placeholder_product_dates(connection)
         backfill_product_completion_timestamps(connection)
+        backfill_product_price_history(connection)
         backfill_billing_month_platform_snapshots(connection)
         backfill_supplier_master_data(connection)
         connection.commit()
@@ -970,6 +992,126 @@ def backfill_product_completion_timestamps(connection: sqlite3.Connection) -> No
         WHERE status IN ('published', 'received') AND completed_to_c_at IS NULL
         """
     )
+
+
+def _normalized_price_for_history(value):
+    if value in (None, ""):
+        return None
+    try:
+        price = Decimal(str(value).strip())
+    except (InvalidOperation, AttributeError, TypeError, ValueError):
+        return None
+    if not price.is_finite():
+        return None
+    return price.quantize(Decimal("0.01"))
+
+
+def prices_differ_for_history(old_value, new_value) -> bool:
+    return _normalized_price_for_history(old_value) != _normalized_price_for_history(new_value)
+
+
+def _price_history_storage_value(value):
+    normalized = _normalized_price_for_history(value)
+    return float(normalized) if normalized is not None else None
+
+
+def record_product_price_history(
+    connection: sqlite3.Connection,
+    product_id: int,
+    *,
+    version_no: int,
+    old_price,
+    new_price,
+    created_by: int | None,
+    note: str,
+    source_version_no: int | None = None,
+    created_at: str | None = None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO product_price_history (
+            product_id, version_no, source_version_no, old_price, new_price,
+            created_by, created_at, note
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(product_id, version_no) DO NOTHING
+        """,
+        (
+            product_id,
+            int(version_no),
+            source_version_no,
+            _price_history_storage_value(old_price),
+            _price_history_storage_value(new_price),
+            created_by,
+            created_at or utc_now(),
+            note,
+        ),
+    )
+
+
+def list_product_price_history(db_path: str | Path, product_id: int) -> list[dict]:
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT h.*, u.display_name AS actor_name, u.department AS actor_department
+            FROM product_price_history h
+            LEFT JOIN users u ON u.id = h.created_by
+            WHERE h.product_id = ?
+            ORDER BY h.created_at DESC, h.id DESC
+            """,
+            (product_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def backfill_product_price_history(connection: sqlite3.Connection) -> None:
+    """Rebuild price events for records created before the dedicated ledger existed."""
+    product_rows = connection.execute("SELECT id, tax_included_price, created_by, created_at FROM products").fetchall()
+    for product_row in product_rows:
+        product_id = int(product_row["id"])
+        version_rows = connection.execute(
+            """
+            SELECT version_no, snapshot_json, created_by, created_at, source_version_no
+            FROM product_versions
+            WHERE product_id = ?
+            ORDER BY version_no ASC, id ASC
+            """,
+            (product_id,),
+        ).fetchall()
+        previous_price = None
+        for version_row in version_rows:
+            try:
+                snapshot = json.loads(version_row["snapshot_json"] or "{}")
+            except json.JSONDecodeError:
+                snapshot = {}
+            current_price = snapshot.get("tax_included_price")
+            if not prices_differ_for_history(previous_price, current_price):
+                previous_price = current_price
+                continue
+            version_no = int(version_row["version_no"] or 1)
+            note = "初始含税价" if version_no == 1 and previous_price is None else "从修改版本回溯"
+            record_product_price_history(
+                connection,
+                product_id,
+                version_no=version_no,
+                source_version_no=version_row["source_version_no"],
+                old_price=previous_price,
+                new_price=current_price,
+                created_by=version_row["created_by"],
+                created_at=version_row["created_at"],
+                note=note,
+            )
+            previous_price = current_price
+        if not version_rows and prices_differ_for_history(None, product_row["tax_included_price"]):
+            record_product_price_history(
+                connection,
+                product_id,
+                version_no=1,
+                old_price=None,
+                new_price=product_row["tax_included_price"],
+                created_by=product_row["created_by"],
+                created_at=product_row["created_at"],
+                note="初始含税价",
+            )
 
 
 def seed_demo_users(connection: sqlite3.Connection) -> None:
@@ -1954,6 +2096,16 @@ def create_product(
         created_by=created_by,
         note="初始版本",
     )
+    if prices_differ_for_history(None, payload.get("tax_included_price")):
+        record_product_price_history(
+            connection,
+            product_id,
+            version_no=1,
+            old_price=None,
+            new_price=payload.get("tax_included_price"),
+            created_by=created_by,
+            note="初始含税价",
+        )
     log_product_action(
         connection,
         product_id,
@@ -2036,6 +2188,17 @@ def update_product(connection: sqlite3.Connection, product_id: int, raw_values: 
             created_by=actor_user_id,
             note="资料修改后生成的新版本",
         )
+        if prices_differ_for_history(before_product.get("tax_included_price"), payload.get("tax_included_price")):
+            record_product_price_history(
+                connection,
+                product_id,
+                version_no=next_version_no,
+                source_version_no=int(before_product.get("current_version_no") or 1),
+                old_price=before_product.get("tax_included_price"),
+                new_price=payload.get("tax_included_price"),
+                created_by=actor_user_id,
+                note="含税价调整",
+            )
         details = "编辑了商品资料字段内容，并将状态重置为 A 填写阶段等待再次提交流转。"
         if actor_department == "A" and before_product.get("status") == "pending":
             details = "跟单部在已提交给商品部后更新了主体资料，资料继续保留在待商品部填写阶段，并标记为已更新。"
@@ -2047,6 +2210,8 @@ def update_product(connection: sqlite3.Connection, product_id: int, raw_values: 
             details = "补充了 B 部门负责的品类、图片、上新价格、上新渠道和资料完成字段，资料仍保留在待B填写阶段。"
         elif actor_department == "B" and before_product.get("status") == "published":
             details = "更新了 B 部门负责的品类、图片、上新价格、上新渠道和资料完成字段，资料已重新进入待B填写阶段，完成后可再次开放给 C。"
+        if prices_differ_for_history(before_product.get("tax_included_price"), payload.get("tax_included_price")):
+            details += " 含税价已调整，具体变更请查看含税价历史。"
         log_product_action(
             connection,
             product_id,
@@ -2566,6 +2731,17 @@ def restore_product_version(
         source_version_no=target_version_no,
         note=f"管理员恢复自 V{target_version_no}",
     )
+    if prices_differ_for_history(product.get("tax_included_price"), payload.get("tax_included_price")):
+        record_product_price_history(
+            connection,
+            product_id,
+            version_no=next_version_no,
+            source_version_no=target_version_no,
+            old_price=product.get("tax_included_price"),
+            new_price=payload.get("tax_included_price"),
+            created_by=actor_user_id,
+            note="管理员恢复版本时调整含税价",
+        )
     log_product_action(
         connection,
         product_id,
@@ -2685,9 +2861,11 @@ def list_products(
     status: str = "",
     lifecycle_status: str = "",
     supplier: str = "",
+    tax_price_changed: str = "",
 ) -> list[dict]:
     like_query = f"%{query.strip()}%"
     supplier_query = f"%{supplier.strip()}%"
+    tax_price_filter = "modified" if str(tax_price_changed or "").strip() == "modified" else ""
     with get_connection(db_path) as connection:
         rows = connection.execute(
             """
@@ -2706,7 +2884,31 @@ def list_products(
             AND (? = '' OR p.status = ?)
             AND (? = '' OR p.lifecycle_status = ?)
             AND (? = '' OR COALESCE(p.supplier, '') LIKE ?)
-            ORDER BY p.updated_at DESC, p.id DESC
+            AND (
+                ? = ''
+                OR EXISTS (
+                    SELECT 1
+                    FROM product_price_history price_history
+                    JOIN users price_actor ON price_actor.id = price_history.created_by
+                    WHERE price_history.product_id = p.id
+                      AND price_history.version_no > 1
+                      AND price_actor.department = 'A'
+                )
+            )
+            ORDER BY
+                CASE WHEN ? <> '' THEN COALESCE(
+                    (
+                        SELECT MAX(price_history_sort.created_at)
+                        FROM product_price_history price_history_sort
+                        JOIN users price_actor_sort ON price_actor_sort.id = price_history_sort.created_by
+                        WHERE price_history_sort.product_id = p.id
+                          AND price_history_sort.version_no > 1
+                          AND price_actor_sort.department = 'A'
+                    ),
+                    ''
+                ) ELSE '' END DESC,
+                p.updated_at DESC,
+                p.id DESC
             """,
             (
                 query.strip(),
@@ -2721,6 +2923,8 @@ def list_products(
                 lifecycle_status.strip(),
                 supplier.strip(),
                 supplier_query,
+                tax_price_filter,
+                tax_price_filter,
             ),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -2779,13 +2983,51 @@ def b_workflow_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
             """,
             (cutoff,),
         ).fetchone()
+        recent_tax_price_changes = connection.execute(
+            """
+            SELECT COUNT(DISTINCT price_history.product_id) AS total
+            FROM product_price_history price_history
+            JOIN users price_actor ON price_actor.id = price_history.created_by
+            JOIN products product ON product.id = price_history.product_id
+            WHERE price_history.created_at >= ?
+              AND price_history.version_no > 1
+              AND price_actor.department = 'A'
+              AND product.lifecycle_status = 'active'
+            """,
+            (cutoff,),
+        ).fetchone()
     return {
         "completed": int(current["completed"] or 0),
         "recent_submitted_to_b": int(recent["recent_submitted_to_b"] or 0),
         "pending_completion": int(current["pending_completion"] or 0),
         "awaiting_receipt": int(current["awaiting_receipt"] or 0),
         "recent_returned_to_a": int(recent["recent_returned_to_a"] or 0),
+        "recent_tax_price_changes": int(recent_tax_price_changes["total"] or 0),
     }
+
+
+def tax_price_change_product_ids(db_path: str | Path, days: int | None = None) -> set[int]:
+    date_clause = ""
+    params: tuple[object, ...] = ()
+    if days is not None:
+        date_clause = "AND price_history.created_at >= ?"
+        params = (iso_days_ago(days),)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT DISTINCT price_history.product_id
+            FROM product_price_history price_history
+            JOIN users price_actor ON price_actor.id = price_history.created_by
+            JOIN products product ON product.id = price_history.product_id
+            WHERE 1 = 1
+              {date_clause}
+              AND price_history.version_no > 1
+              AND price_actor.department = 'A'
+              AND product.lifecycle_status = 'active'
+            """,
+            params,
+        ).fetchall()
+    return {int(row["product_id"]) for row in rows}
 
 
 def c_receipt_stats(db_path: str | Path) -> dict[str, int]:

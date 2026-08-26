@@ -284,10 +284,11 @@ class CatalogAppTests(unittest.TestCase):
         b_summary_block = b_body[b_summary_start:b_body.index("</section>", b_summary_start)]
         self.assertNotIn("总资料数", b_summary_block)
         self.assertNotIn("待商品部填写", b_summary_block)
-        self.assertLess(b_summary_block.index("已完成"), b_summary_block.index("近7天新增"))
+        self.assertLess(b_summary_block.index("近7天含税价修改"), b_summary_block.index("近7天新增"))
         self.assertLess(b_summary_block.index("近7天新增"), b_summary_block.index("待完成"))
         self.assertLess(b_summary_block.index("待完成"), b_summary_block.index("待接收"))
         self.assertLess(b_summary_block.index("待接收"), b_summary_block.index("近7天退回"))
+        self.assertIn('href="/products?status=tax_price_modified#products-list"', b_summary_block)
 
     def test_b_workflow_stats_tracks_handoffs_and_returns(self):
         initial = db.b_workflow_stats(self.db_path)
@@ -308,6 +309,124 @@ class CatalogAppTests(unittest.TestCase):
         updated = db.b_workflow_stats(self.db_path)
         self.assertEqual(updated["pending_completion"], 0)
         self.assertEqual(updated["recent_returned_to_a"], 1)
+
+    def test_b_can_find_tax_price_changes_from_summary_and_filter(self):
+        initial_stats = db.b_workflow_stats(self.db_path)
+        self.assertEqual(initial_stats["recent_tax_price_changes"], 0)
+
+        a_cookie = self.login("a_editor", "demo123")
+        update_response = self.request(
+            "/products/1/edit",
+            method="POST",
+            body=urlencode(
+                {
+                    "product_name": "褶皱短袖连衣裙",
+                    "style_code": "NH-2601",
+                    "tax_included_price": "150",
+                }
+            ).encode("utf-8"),
+            cookie=a_cookie,
+        )
+        self.assertTrue(update_response["status"].startswith("302"))
+
+        self.assertEqual(db.b_workflow_stats(self.db_path)["recent_tax_price_changes"], 1)
+        changed_products = db.list_products(self.db_path, tax_price_changed="modified")
+        self.assertEqual([product["id"] for product in changed_products], [1])
+
+        b_cookie = self.login("b_editor", "demo123")
+        b_body = self.request("/products", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertIn("含税价已修改", b_body)
+        self.assertIn('href="/products/1/price-history"', b_body)
+        b_form_start = b_body.index('<form class="products-filter-form"')
+        b_form = b_body[b_form_start:b_body.index("</form>", b_form_start)]
+        self.assertNotIn('name="tax_price_changed"', b_form)
+        self.assertIn('name="status"', b_form)
+        self.assertIn('value="tax_price_modified"', b_form)
+        self.assertIn("含税价修改", b_form)
+        self.assertNotIn("已修改（全部）", b_form)
+        self.assertNotIn("近7天已修改", b_form)
+
+        filtered_body = self.request(
+            "/products?status=tax_price_modified",
+            cookie=b_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn("已展示全部含税价修改资料", filtered_body)
+        self.assertIn("按最近一次修改时间倒序排列", filtered_body)
+        self.assertIn('option value="tax_price_modified" selected', filtered_body)
+        self.assertIn("#1", filtered_body)
+
+        a_body = self.request("/products", cookie=a_cookie)["body"].decode("utf-8")
+        self.assertNotIn('value="tax_price_modified"', a_body)
+        c_body = self.request("/products", cookie=self.login("c_viewer", "demo123"))["body"].decode("utf-8")
+        self.assertNotIn('value="tax_price_modified"', c_body)
+
+    def test_tax_price_filter_orders_by_latest_change_and_supports_all_history(self):
+        self.make_product_two_a_complete()
+        a_cookie = self.login("a_editor", "demo123")
+        a_user = next(user for user in db.list_users(self.db_path) if user["username"] == "a_editor")
+        with db.get_connection(self.db_path) as connection:
+            db.update_product(
+                connection,
+                2,
+                self.a_complete_fields_payload(
+                    brand_name="Studio Pine",
+                    season_year="2026秋",
+                    image_url="https://example.com/images/sp-8420.jpg",
+                    style_color="针织开衫-米白",
+                    style_code="SP-8420",
+                    color_name="燕麦白",
+                    product_name="毛感针织开衫",
+                    category="针织衫",
+                    has_accessories="有",
+                    supplier="嘉兴尚品针织",
+                    cooperation_mode="联营",
+                    supply_chain_manager="周岚",
+                    tax_included_price="189",
+                    tag_price="399",
+                    size_range="F",
+                    size_f="48",
+                    material="针织",
+                    composition_en="SHELL: 46% ACRYLIC 30% POLYESTER 24% NYLON",
+                    washing_method="建议平铺晾干",
+                    washing_method_en="Dry flat",
+                    safety_category="B类",
+                    standard_code="FZ/T 73018",
+                    detection_report="已归档",
+                    shipping_warehouse="嘉兴二仓",
+                    launch_price="269",
+                    launch_channel="门店首发",
+                ),
+                actor_user_id=a_user["id"],
+            )
+        update_response = self.request(
+            "/products/1/edit",
+            method="POST",
+            body=urlencode(
+                {
+                    "product_name": "褶皱短袖连衣裙",
+                    "style_code": "NH-2601",
+                    "tax_included_price": "150",
+                }
+            ).encode("utf-8"),
+            cookie=a_cookie,
+        )
+        self.assertTrue(update_response["status"].startswith("302"))
+
+        all_products = db.list_products(self.db_path, tax_price_changed="modified")
+        all_ids = [product["id"] for product in all_products[:2]]
+        self.assertEqual(set(all_ids), {1, 2})
+        latest_change_at = {
+            product_id: db.list_product_price_history(self.db_path, product_id)[0]["created_at"]
+            for product_id in all_ids
+        }
+        self.assertGreaterEqual(latest_change_at[all_ids[0]], latest_change_at[all_ids[1]])
+        b_cookie = self.login("b_editor", "demo123")
+        filtered_body = self.request(
+            "/products?status=tax_price_modified",
+            cookie=b_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn("已展示全部含税价修改资料", filtered_body)
+        self.assertIn('option value="tax_price_modified" selected', filtered_body)
 
     def test_department_filter_controls_follow_each_account_workflow(self):
         def filter_form(body: str) -> str:
@@ -3668,7 +3787,55 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('name="launch_channel"', body)
         self.assertIn('name="completion_flag"', body)
         self.assertNotIn('name="brand_name"', body)
+        self.assertNotIn('name="tax_included_price"', body)
         self.assertNotIn('name="size_chart"', body)
+
+    def test_a_can_update_tax_price_and_trace_initial_and_current_values(self):
+        a_cookie = self.login("a_editor", "demo123")
+        edit_response = self.request("/products/1/edit", cookie=a_cookie)
+        self.assertIn('name="tax_included_price"', edit_response["body"].decode("utf-8"))
+        initial_history = db.list_product_price_history(self.db_path, 1)
+        self.assertEqual(len(initial_history), 1)
+        self.assertEqual(initial_history[0]["version_no"], 1)
+        self.assertEqual(initial_history[0]["old_price"], None)
+        self.assertEqual(initial_history[0]["new_price"], 359.0)
+
+        update_response = self.request(
+            "/products/1/edit",
+            method="POST",
+            body=urlencode(
+                {
+                    "product_name": "褶皱短袖连衣裙",
+                    "style_code": "NH-2601",
+                    "tax_included_price": "150",
+                }
+            ).encode("utf-8"),
+            cookie=a_cookie,
+        )
+        self.assertTrue(update_response["status"].startswith("302"))
+        self.assertEqual(db.get_product(self.db_path, 1)["tax_included_price"], 150.0)
+
+        history = db.list_product_price_history(self.db_path, 1)
+        self.assertEqual([(item["version_no"], item["old_price"], item["new_price"]) for item in history], [(2, 359.0, 150.0), (1, None, 359.0)])
+        history_response = self.request("/products/1/price-history", cookie=a_cookie)
+        history_body = history_response["body"].decode("utf-8")
+        self.assertTrue(history_response["status"].startswith("200"))
+        self.assertIn("含税价历史", history_body)
+        self.assertIn("359.00", history_body)
+        self.assertIn("150.00", history_body)
+        self.assertIn("V2", history_body)
+        self.assertIn("含税价调整", history_body)
+
+        detail_response = self.request("/products/1", cookie=a_cookie)
+        self.assertIn('href="/products/1/price-history"', detail_response["body"].decode("utf-8"))
+        logs = db.get_product_logs(self.db_path, 1)
+        update_log = next(item for item in logs if item["action"] == "update")
+        self.assertIn("含税价历史", update_log["details"])
+
+        c_cookie = self.login("c_viewer", "demo123")
+        c_history_response = self.request("/products/1/price-history", cookie=c_cookie)
+        self.assertTrue(c_history_response["status"].startswith("403"))
+        self.assertNotIn("150.00", c_history_response["body"].decode("utf-8"))
 
     def test_admin_can_review_and_view_logs(self):
         admin_cookie = self.login("admin_reviewer", "demo123")
