@@ -92,6 +92,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
+CATALOG_BUILD_VERSION = "2026.08.26-catalog-card-layout-v2"
 LIST_LAYOUT_VIRTUAL_FIELDS: tuple[FieldDef, ...] = ()
 LIST_LAYOUT_VIRTUAL_FIELD_MAP = {}
 LIST_LAYOUT_HIDDEN_FIELD_KEYS = {
@@ -1143,6 +1144,7 @@ class CatalogApplication:
         payload = json.dumps(
             {
                 "status": "ok",
+                "build_version": CATALOG_BUILD_VERSION,
                 "db_path": self.db_path,
                 "db_exists": db_exists,
                 "uploads_path": self.upload_dir,
@@ -1154,7 +1156,12 @@ class CatalogApplication:
         ).encode("utf-8")
         start_response(
             "200 OK",
-            [("Content-Type", "application/json; charset=utf-8"), ("Content-Length", str(len(payload)))],
+            [
+                ("Content-Type", "application/json; charset=utf-8"),
+                ("Cache-Control", "no-store"),
+                ("X-Catalog-Build", CATALOG_BUILD_VERSION),
+                ("Content-Length", str(len(payload))),
+            ],
         )
         return [payload]
 
@@ -2255,7 +2262,14 @@ class CatalogApplication:
 
     def html_response(self, start_response, body: str, status: str = "200 OK"):
         payload = body.encode("utf-8")
-        headers = [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(payload)))]
+        headers = [
+            ("Content-Type", "text/html; charset=utf-8"),
+            ("Cache-Control", "no-store, no-cache, must-revalidate"),
+            ("Pragma", "no-cache"),
+            ("Expires", "0"),
+            ("X-Catalog-Build", CATALOG_BUILD_VERSION),
+            ("Content-Length", str(len(payload))),
+        ]
         start_response(status, headers)
         return [payload]
 
@@ -3293,6 +3307,7 @@ class CatalogApplication:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="catalog-build" content="{CATALOG_BUILD_VERSION}">
   <title>{html.escape(title.replace('商品资料后台', brand_name))}</title>
   <style>
     :root {{
@@ -4902,10 +4917,12 @@ class CatalogApplication:
       grid-template-columns: minmax(0, 1.16fr) minmax(320px, 0.84fr);
       gap: 16px;
       margin-bottom: 18px;
-      align-items: stretch;
+      align-items: start;
     }}
     .products-top-grid .panel {{
-      height: 100%;
+      height: auto;
+      min-height: 0;
+      align-self: start;
       padding: 22px 22px 20px;
       border-radius: 24px;
     }}
@@ -5022,15 +5039,17 @@ class CatalogApplication:
     }}
     .products-c-dashboard {{
       display: grid;
-      grid-template-rows: auto minmax(420px, 1fr);
+      grid-template-rows: max-content minmax(420px, 1fr);
       gap: 18px;
       min-height: calc(100vh - 300px);
+      align-content: start;
     }}
     .products-c-overview-stack {{
       display: grid;
-      grid-template-rows: auto auto;
+      grid-template-rows: max-content max-content;
       gap: 16px;
       min-height: 0;
+      align-content: start;
     }}
     .products-c-overview-stack .products-top-grid {{
       min-height: 0;
@@ -5040,7 +5059,8 @@ class CatalogApplication:
       min-height: 0;
     }}
     .products-c-overview-stack .products-insights-grid > .panel {{
-      height: 100%;
+      height: auto;
+      min-height: 0;
     }}
     .products-c-overview-stack .products-top-grid .panel {{
       padding: 16px 18px;
@@ -5103,15 +5123,17 @@ class CatalogApplication:
     }}
     .products-editor-dashboard {{
       display: grid;
-      grid-template-rows: auto minmax(420px, 1fr);
+      grid-template-rows: max-content minmax(420px, 1fr);
       gap: 18px;
       min-height: calc(100vh - 300px);
+      align-content: start;
     }}
     .products-editor-overview-stack {{
       display: grid;
-      grid-template-rows: auto auto;
+      grid-template-rows: max-content max-content;
       gap: 16px;
       min-height: 0;
+      align-content: start;
     }}
     .products-editor-dashboard .products-top-grid {{
       min-height: 0;
@@ -5142,7 +5164,8 @@ class CatalogApplication:
       min-height: 0;
     }}
     .products-editor-dashboard .products-insights-grid > .panel {{
-      height: 100%;
+      height: auto;
+      min-height: 0;
       padding: 16px 18px;
     }}
     .products-editor-dashboard .products-stats-panel .table-note {{
@@ -5179,6 +5202,10 @@ class CatalogApplication:
     }}
     .products-stats-panel .stats {{
       margin-top: 14px;
+      min-width: 0;
+    }}
+    .products-stats-panel .stat-card {{
+      min-width: 0;
     }}
     .spotlight {{
       display: grid;

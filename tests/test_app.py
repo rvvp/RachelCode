@@ -253,9 +253,11 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn(">筛选</button>", b_body)
         self.assertNotIn(">筛选资料</button>", b_body)
         self.assertIn("padding: 10px 18px 10px 10px;\n      text-align: center;", b_body)
-        self.assertIn("grid-template-rows: auto minmax(420px, 1fr);", b_body)
-        self.assertIn("grid-template-rows: auto auto;", b_body)
+        self.assertIn("grid-template-rows: max-content minmax(420px, 1fr);", b_body)
+        self.assertIn("grid-template-rows: max-content max-content;", b_body)
         self.assertNotIn("min-height: 1620px;", b_body)
+        self.assertIn("align-items: start;", b_body)
+        self.assertIn("align-self: start;", b_body)
         self.assertNotIn("当前资料协作节奏", b_body)
 
         for body in (a_body, b_body):
@@ -2718,7 +2720,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn("总资料数", summary_block)
         self.assertLess(summary_block.index("<span>总接收</span>"), summary_block.index("<span>近7天新增</span>"))
         self.assertLess(summary_block.index("<span>近7天新增</span>"), summary_block.index("<span>待接收</span>"))
-        self.assertIn("grid-template-rows: auto minmax(420px, 1fr);", list_body)
+        self.assertIn("grid-template-rows: max-content minmax(420px, 1fr);", list_body)
         self.assertNotIn("min-height: 1520px;", list_body)
 
         receive_response = self.request(
@@ -3049,8 +3051,8 @@ class CatalogAppTests(unittest.TestCase):
         response = self.request("/products", cookie=cookie)
         body = response["body"].decode("utf-8")
         self.assertTrue(response["status"].startswith("200"))
-        self.assertIn("当前账号为运营部", body)
-        self.assertIn("可查看资料", body)
+        self.assertIn('aria-label="当前部门">运营部</div>', body)
+        self.assertIn("暂无符合条件的商品资料", body)
 
     def test_api_requires_login_or_valid_c_token(self):
         anonymous_response = self.request("/api/products")
@@ -3096,6 +3098,10 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["build_version"], "2026.08.26-catalog-card-layout-v2")
+        headers = dict(response["headers"])
+        self.assertEqual(headers["X-Catalog-Build"], "2026.08.26-catalog-card-layout-v2")
+        self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
 
