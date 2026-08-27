@@ -357,7 +357,7 @@ def change_user_password(db_path: str | Path, user_id: int, current_password: st
 def list_source_products(db_path: str | Path, *, season_year: str = "", status: str = "") -> list[dict]:
     with get_connection(db_path) as connection:
         rows = connection.execute(
-            "SELECT * FROM source_products WHERE (? = '' OR season_year = ?) AND (? = '' OR status = ?) ORDER BY season_year DESC, source_updated_at DESC, id DESC",
+            "SELECT * FROM source_products WHERE status = 'pending' AND lifecycle_status = 'active' AND (? = '' OR season_year = ?) AND (? = '' OR status = ?) ORDER BY season_year DESC, source_updated_at DESC, id DESC",
             (season_year, season_year, status, status),
         ).fetchall()
     return [dict(row) for row in rows]
@@ -528,11 +528,19 @@ def validate_channel_option(db_path: str | Path, channel: str) -> str:
     return str(row["name"])
 
 
+def planning_source_item_is_eligible(item: dict) -> bool:
+    return (
+        str(item.get("status") or "").strip() == "pending"
+        and str(item.get("lifecycle_status") or "active").strip() == "active"
+    )
+
+
 def upsert_source_products(db_path: str | Path, items: list[dict]) -> int:
+    eligible_items = [item for item in items if planning_source_item_is_eligible(item)]
     now = utc_now()
     with get_connection(db_path) as connection:
         category_options = [dict(row) for row in connection.execute("SELECT * FROM category_options WHERE enabled = 1 ORDER BY sort_order, id").fetchall()]
-        for item in items:
+        for item in eligible_items:
             category_suggestion = infer_category(item.get("product_name", ""), category_options)
             connection.execute(
                 """
@@ -554,11 +562,48 @@ def upsert_source_products(db_path: str | Path, items: list[dict]) -> int:
                     int(item["id"]), item.get("style_code", ""), item.get("style_color", ""), item.get("color_name", ""),
                     item.get("product_name", ""), item.get("brand_name", ""), item.get("season_year", ""), item.get("supplier", ""),
                     item.get("supplier_code", ""), item.get("supplier_style_code", ""), category_suggestion, category_suggestion, item.get("actual_cost"),
-                    item.get("tax_included_price"), item.get("image_url", ""), item.get("status", ""), item.get("lifecycle_status", ""), int(item.get("source_version_no") or 1),
+                    item.get("tax_included_price"), item.get("image_url", ""), "pending", "active", int(item.get("source_version_no") or 1),
                     item.get("updated_at", ""), item.get("creator_name", ""), now,
                 ),
             )
-    return len(items)
+    return len(eligible_items)
+
+
+def synchronize_source_products(
+    db_path: str | Path,
+    items: list[dict],
+    *,
+    withdrawn_ids: list[int] | tuple[int, ...] | set[int] = (),
+) -> dict:
+    eligible_items = [item for item in items if planning_source_item_is_eligible(item)]
+    explicit_withdrawn_ids = {int(product_id) for product_id in withdrawn_ids}
+    synced = upsert_source_products(db_path, eligible_items)
+    removed = 0
+    withdrawn = 0
+    with get_connection(db_path) as connection:
+        source_rows = connection.execute(
+            "SELECT id, status, lifecycle_status FROM source_products"
+        ).fetchall()
+        for row in source_rows:
+            source_id = int(row["id"])
+            locally_ineligible = row["status"] != "pending" or row["lifecycle_status"] != "active"
+            if source_id not in explicit_withdrawn_ids and not locally_ineligible:
+                continue
+            has_pricing_record = connection.execute(
+                "SELECT 1 FROM pricing_records WHERE source_product_id = ? LIMIT 1",
+                (source_id,),
+            ).fetchone()
+            if has_pricing_record:
+                if row["lifecycle_status"] != "withdrawn":
+                    connection.execute(
+                        "UPDATE source_products SET lifecycle_status = 'withdrawn', synced_at = ? WHERE id = ?",
+                        (utc_now(), source_id),
+                    )
+                    withdrawn += 1
+                continue
+            connection.execute("DELETE FROM source_products WHERE id = ?", (source_id,))
+            removed += 1
+    return {"synced": synced, "removed": removed, "withdrawn": withdrawn}
 
 
 def list_category_rules(db_path: str | Path) -> list[dict]:

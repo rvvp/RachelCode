@@ -2441,7 +2441,7 @@ def _planning_source_query() -> str:
         JOIN users u ON u.id = p.created_by
         LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
         WHERE p.lifecycle_status = 'active'
-          AND p.status IN ('pending', 'published', 'received')
+          AND p.status = 'pending'
           AND EXISTS (
               SELECT 1 FROM product_logs pl
               WHERE pl.product_id = p.id AND pl.action = 'status:pending'
@@ -2490,6 +2490,26 @@ def planning_source_payloads(db_path: str | Path, product_id: int | None = None)
     return [_planning_product_payload(product) for product in list_planning_source_products(db_path, product_id)]
 
 
+def planning_withdrawn_source_ids(db_path: str | Path, product_id: int | None = None) -> list[int]:
+    query = """
+        SELECT p.id
+        FROM products p
+        WHERE NOT (p.lifecycle_status = 'active' AND p.status = 'pending')
+          AND EXISTS (
+              SELECT 1 FROM product_logs pl
+              WHERE pl.product_id = p.id AND pl.action = 'status:pending'
+          )
+    """
+    params: list[object] = []
+    if product_id is not None:
+        query += " AND p.id = ?"
+        params.append(int(product_id))
+    query += " ORDER BY p.id"
+    with get_connection(db_path) as connection:
+        rows = connection.execute(query, params).fetchall()
+    return [int(row["id"]) for row in rows]
+
+
 def publish_planning_price(
     connection: sqlite3.Connection,
     product_id: int,
@@ -2500,8 +2520,8 @@ def publish_planning_price(
     product = row_to_dict(product_row)
     if not product:
         raise LookupError("商品资料不存在。")
-    if product.get("lifecycle_status") != "active" or product.get("status") not in {"pending", "published", "received"}:
-        raise ValueError("当前商品尚未提交到商品部，不能接收商品企划回传。")
+    if product.get("lifecycle_status") != "active" or product.get("status") != "pending":
+        raise ValueError("只有状态为“待商品部填写”的正常商品才能接收商品企划回传。")
     eligible = connection.execute(
         "SELECT 1 FROM product_logs WHERE product_id = ? AND action = 'status:pending' LIMIT 1",
         (product_id,),

@@ -52,12 +52,23 @@ class PlanningCenterTests(unittest.TestCase):
 
     def test_internal_api_requires_token_and_publishes_with_version_check(self):
         app = CatalogApplication(self.catalog_db_path, Path(self.temp.name) / "uploads", planning_api_token="planning-secret")
+        pending_product = next(
+            item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending"
+        )
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            connection.execute(
+                "UPDATE products SET tax_included_price = 150 WHERE id = ?",
+                (pending_product["id"],),
+            )
         response = self.wsgi_request(app, "/api/internal/planning/products")
         self.assertTrue(response["status"].startswith("401"))
         response = self.wsgi_request(app, "/api/internal/planning/products", authorization="Bearer planning-secret")
         payload = json.loads(response["body"])
-        self.assertEqual(payload["count"], 2)
-        source = next(item for item in payload["items"] if item["actual_cost"])
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual({item["status"] for item in payload["items"]}, {"pending"})
+        self.assertEqual({item["lifecycle_status"] for item in payload["items"]}, {"active"})
+        self.assertTrue(payload["withdrawn_ids"])
+        source = payload["items"][0]
         publication = {
             "publication_id": "PC-TEST-001",
             "source_version_no": source["source_version_no"],
@@ -110,6 +121,89 @@ class PlanningCenterTests(unittest.TestCase):
             authorization="Bearer planning-secret",
         )
         self.assertTrue(response["status"].startswith("409"))
+
+        completed_product = next(
+            item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "published"
+        )
+        rejected_completed = self.wsgi_request(
+            app,
+            f"/api/internal/planning/products/{completed_product['id']}/price-publication",
+            method="POST",
+            body=json.dumps(
+                dict(
+                    publication,
+                    publication_id="PC-COMPLETED-001",
+                    source_version_no=completed_product["current_version_no"],
+                )
+            ).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(rejected_completed["status"].startswith("400"))
+        self.assertIn("待商品部填写", rejected_completed["body"].decode("utf-8"))
+
+    def test_internal_planning_image_api_serves_pending_product_media(self):
+        upload_dir = Path(self.temp.name) / "uploads"
+        upload_dir.mkdir()
+        image_bytes = b"\x89PNG\r\n\x1a\nplanning-image"
+        (upload_dir / "planning-test.png").write_bytes(image_bytes)
+        product = next(
+            item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending"
+        )
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            connection.execute(
+                "UPDATE products SET image_url = ? WHERE id = ?",
+                ("/media/planning-test.png", product["id"]),
+            )
+        app = CatalogApplication(
+            self.catalog_db_path,
+            upload_dir,
+            planning_api_token="planning-secret",
+        )
+
+        unauthorized = self.wsgi_request(
+            app,
+            f"/api/internal/planning/products/{product['id']}/image",
+        )
+        self.assertTrue(unauthorized["status"].startswith("401"))
+        response = self.wsgi_request(
+            app,
+            f"/api/internal/planning/products/{product['id']}/image",
+            authorization="Bearer planning-secret",
+        )
+
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertEqual(response["body"], image_bytes)
+        self.assertEqual(dict(response["headers"])["Content-Type"], "image/png")
+
+    def test_planning_image_proxy_uses_internal_catalog_endpoint(self):
+        source = {
+            "id": 77,
+            "style_code": "IMG-077",
+            "product_name": "图片代理测试款",
+            "image_url": "/media/planning-test.png",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 2,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test", "planning-secret")
+        cookie = self.login_cookie(app, "planner")
+        image_bytes = b"\x89PNG\r\n\x1a\nplanning-image"
+
+        with patch("planning_center.web.urlopen", return_value=io.BytesIO(image_bytes)) as mocked_urlopen:
+            response = self.wsgi_request(
+                app,
+                "/source-products/77/image?v=2",
+                cookie=cookie,
+            )
+
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertEqual(response["body"], image_bytes)
+        self.assertEqual(dict(response["headers"])["Content-Type"], "image/png")
+        request = mocked_urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://catalog.test/api/internal/planning/products/77/image")
+        self.assertEqual(request.get_header("Authorization"), "Bearer planning-secret")
 
     def test_pricing_formula_rounds_down_to_9_and_snapshots_rules(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋", None, 600, 4)
@@ -389,9 +483,9 @@ class PlanningCenterTests(unittest.TestCase):
     def test_sync_infers_category_from_product_name_with_longest_keyword(self):
         planning_db.save_category_option(self.planning_db_path, "西装", "西服,西装外套", 35)
         products = [
-            {"id": 61, "product_name": "通勤西装外套", "actual_cost": 300, "source_version_no": 1},
-            {"id": 62, "product_name": "法式连衣裙", "actual_cost": 300, "source_version_no": 1},
-            {"id": 63, "product_name": "基础测试款", "actual_cost": 300, "source_version_no": 1},
+            {"id": 61, "product_name": "通勤西装外套", "actual_cost": 300, "status": "pending", "lifecycle_status": "active", "source_version_no": 1},
+            {"id": 62, "product_name": "法式连衣裙", "actual_cost": 300, "status": "pending", "lifecycle_status": "active", "source_version_no": 1},
+            {"id": 63, "product_name": "基础测试款", "actual_cost": 300, "status": "pending", "lifecycle_status": "active", "source_version_no": 1},
         ]
         planning_db.upsert_source_products(self.planning_db_path, products)
         self.assertEqual(planning_db.get_source_product(self.planning_db_path, 61)["category_suggestion"], "西装")
@@ -409,6 +503,8 @@ class PlanningCenterTests(unittest.TestCase):
             "supplier": "测试供应商",
             "category": "毛衣",
             "actual_cost": 150,
+            "status": "pending",
+            "lifecycle_status": "active",
             "source_version_no": 1,
         }
         planning_db.upsert_source_products(self.planning_db_path, [product])
@@ -636,16 +732,83 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(login["status"].startswith("302"))
         cookie = dict(login["headers"])["Set-Cookie"].split(";", 1)[0]
         source = {"id": 9, "style_code": "M009", "product_name": "测试款", "season_year": "2026秋", "supplier": "供应商", "category": "毛衣", "actual_cost": 150, "tax_included_price": 150, "status": "pending", "lifecycle_status": "active", "source_version_no": 1, "updated_at": "", "creator_name": "跟单员"}
-        with patch.object(app, "fetch_catalog_products", return_value=[source]):
+        withdrawn_source = dict(source, id=10, style_code="M010", product_name="误同步的已完成款")
+        planning_db.upsert_source_products(self.planning_db_path, [withdrawn_source])
+        catalog_payload = {"items": [source], "withdrawn_ids": [10]}
+        with patch.object(app, "fetch_catalog_products", return_value=catalog_payload):
             response = self.wsgi_request(app, "/sync", method="POST", cookie=cookie)
         self.assertTrue(response["status"].startswith("302"))
         self.assertEqual(planning_db.get_source_product(self.planning_db_path, 9)["style_code"], "M009")
+        self.assertIsNone(planning_db.get_source_product(self.planning_db_path, 10))
 
-        with patch.object(app, "fetch_catalog_products", return_value=[source]):
+        with patch.object(app, "fetch_catalog_products", return_value=catalog_payload):
             workbench = self.wsgi_request(app, "/workbench", cookie=cookie)["body"].decode("utf-8")
-        self.assertEqual(workbench.count("已自动同步 1 条藏宝阁资料。"), 1)
+        sync_message = "已自动同步 1 条藏宝阁“待商品部填写”资料。"
+        self.assertEqual(workbench.count(sync_message), 1)
         self.assertNotIn("当前结果", workbench)
-        self.assertLess(workbench.index("已自动同步 1 条藏宝阁资料。"), workbench.index("<form class='workbench-filter'"))
+        self.assertLess(workbench.index(sync_message), workbench.index("<form class='workbench-filter'"))
+
+    def test_sync_withdraws_completed_sources_and_preserves_pricing_audit(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        pending = {
+            "id": 201,
+            "style_code": "SYNC-201",
+            "product_name": "待商品部填写毛衣",
+            "season_year": "2026秋冬",
+            "supplier": "同步供应商",
+            "category": "毛衣",
+            "actual_cost": 150,
+            "tax_included_price": 150,
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 1,
+        }
+        completed_unworked = dict(pending, id=202, style_code="SYNC-202", product_name="误同步已完成款")
+        completed_worked = dict(pending, id=203, style_code="SYNC-203", product_name="已测算后完成款")
+        planning_db.upsert_source_products(
+            self.planning_db_path,
+            [pending, completed_unworked, completed_worked],
+        )
+        pricing_record = planning_db.create_pricing_record(
+            self.planning_db_path,
+            completed_worked,
+            "测试企划员",
+        )
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                "UPDATE source_products SET status = 'published' WHERE id IN (202, 203)"
+            )
+
+        result = planning_db.synchronize_source_products(
+            self.planning_db_path,
+            [pending],
+            withdrawn_ids=[202, 203],
+        )
+
+        self.assertEqual(result, {"synced": 1, "removed": 1, "withdrawn": 1})
+        self.assertIsNone(planning_db.get_source_product(self.planning_db_path, 202))
+        self.assertEqual(planning_db.get_source_product(self.planning_db_path, 203)["lifecycle_status"], "withdrawn")
+        self.assertIsNotNone(planning_db.get_pricing_record(self.planning_db_path, pricing_record["id"]))
+        self.assertEqual([item["id"] for item in planning_db.list_source_products(self.planning_db_path)], [201])
+
+        second_result = planning_db.synchronize_source_products(self.planning_db_path, [pending])
+        self.assertEqual(second_result, {"synced": 1, "removed": 0, "withdrawn": 0})
+
+    def test_sync_does_not_withdraw_pending_source_only_because_response_omits_it(self):
+        source = {
+            "id": 204,
+            "style_code": "SYNC-204",
+            "product_name": "仍待商品部填写的款式",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+
+        result = planning_db.synchronize_source_products(self.planning_db_path, [])
+
+        self.assertEqual(result, {"synced": 0, "removed": 0, "withdrawn": 0})
+        self.assertIsNotNone(planning_db.get_source_product(self.planning_db_path, 204))
 
     def test_workbench_paginates_50_items_and_merges_filter_toolbar(self):
         products = [
@@ -676,6 +839,10 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertNotIn("当前结果", page_one)
         self.assertIn("商品资料已加载，可按条件筛选。", page_one)
         self.assertIn("每页 50 款 · 第 1 / 2 页 · 共 51 款", page_one)
+        self.assertEqual(page_one.count("aria-label='列表顶部分页'"), 1)
+        self.assertEqual(page_one.count("aria-label='列表底部分页'"), 1)
+        self.assertIn("<span>第 1 / 2 页</span>", page_one)
+        self.assertLess(page_one.index("aria-label='列表顶部分页'"), page_one.index("<form id='pricing-batch-form'"))
         self.assertIn("href='/workbench?season_year=2026%E7%A7%8B%E5%86%AC&amp;status=waiting&amp;page=2'", page_one)
         self.assertLess(page_one.index("workbench-toolbar-summary"), page_one.index("workbench-filter"))
         self.assertNotIn("<section class='filter-bar'>", page_one)
@@ -696,6 +863,15 @@ class PlanningCenterTests(unittest.TestCase):
             cookie=planner_cookie,
         )["body"].decode("utf-8")
         self.assertIn("每页 50 款 · 第 2 / 2 页 · 共 51 款", clamped_page)
+
+    def test_dashboard_uses_new_arrival_review_card_title(self):
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planner")
+
+        dashboard = self.wsgi_request(app, "/dashboard", cookie=cookie)["body"].decode("utf-8")
+
+        self.assertIn("<h2>上新审核</h2>", dashboard)
+        self.assertNotIn("<h2>上新定价</h2>", dashboard)
 
     def test_pricing_workbench_uses_one_card_and_requires_admin_review(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
@@ -783,6 +959,19 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("待初审", workbench)
         self.assertIn("确认并提交复核", workbench)
         self.assertIn("id='pricing-row-31'", workbench)
+        self.assertIn("src='https://example.com/m031.jpg'", workbench)
+        self.assertIn("loading='lazy'", workbench)
+        self.assertIn("class='product-image-zoom'", workbench)
+        self.assertIn("data-image-src='https://example.com/m031.jpg'", workbench)
+        self.assertIn("aria-label='查看 M031-黑 大图'", workbench)
+        self.assertIn("aria-haspopup='dialog'", workbench)
+        self.assertEqual(workbench.count("id='product-image-dialog'"), 1)
+        self.assertIn("imageDialog.showModal()", workbench)
+        self.assertIn("imageDialogClose?.addEventListener('click'", workbench)
+        self.assertIn("if (event.target === imageDialog) imageDialog.close()", workbench)
+        self.assertIn("if (event.key === 'Escape' && imageDialog?.open) imageDialog.close()", workbench)
+        self.assertIn("cursor:zoom-in", workbench)
+        self.assertIn(".product-image-dialog::backdrop", workbench)
         self.assertIn("planning-workbench-scroll", workbench)
         self.assertIn("tableWrap.scrollLeft", workbench)
         self.assertIn("history.replaceState", workbench)

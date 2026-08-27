@@ -177,6 +177,11 @@ class CatalogApplication:
                 return self.handle_api(environ, start_response, user, query)
             if path == "/api/internal/planning/products" and method == "GET":
                 return self.handle_planning_products_api(environ, start_response, query)
+            if path.startswith("/api/internal/planning/products/") and path.endswith("/image") and method == "GET":
+                product_id_text = path[len("/api/internal/planning/products/") : -len("/image")].strip("/")
+                if product_id_text.isdigit():
+                    return self.handle_planning_product_image_api(environ, start_response, int(product_id_text))
+                return self.json_error_response(start_response, "not_found", "商品编号格式不正确。", "404 Not Found")
             if path.startswith("/api/internal/planning/products/") and path.endswith("/price-publication") and method == "POST":
                 product_id_text = path[len("/api/internal/planning/products/") : -len("/price-publication")].strip("/")
                 if product_id_text.isdigit():
@@ -1091,6 +1096,7 @@ class CatalogApplication:
             return self.json_error_response(start_response, "unauthorized", "需要有效的商品企划内部 Token。", "401 Unauthorized")
         product_id = int(query["id"]) if str(query.get("id") or "").isdigit() else None
         products = db.planning_source_payloads(self.db_path, product_id)
+        withdrawn_ids = db.planning_withdrawn_source_ids(self.db_path, product_id)
         season_year = str(query.get("season_year") or "").strip()
         status = str(query.get("status") or "").strip()
         if season_year:
@@ -1103,9 +1109,36 @@ class CatalogApplication:
                 "source": "cangbaoge",
                 "count": len(products),
                 "items": products,
+                "withdrawn_ids": withdrawn_ids,
                 "synced_at": db.utc_now(),
             },
         )
+
+    def handle_planning_product_image_api(self, environ, start_response, product_id: int):
+        if not self.planning_api_token:
+            return self.json_error_response(start_response, "not_configured", "商品企划内部接口尚未配置 Token。", "503 Service Unavailable")
+        if not self.planning_api_authorized(environ):
+            return self.json_error_response(start_response, "unauthorized", "需要有效的商品企划内部 Token。", "401 Unauthorized")
+        products = db.planning_source_payloads(self.db_path, product_id)
+        if not products:
+            return self.json_error_response(start_response, "not_found", "当前商品不属于“待商品部填写”资料。", "404 Not Found")
+        image_url = str(products[0].get("image_url") or "").strip()
+        if not image_url.startswith(MEDIA_URL_PREFIX):
+            return self.json_error_response(start_response, "not_found", "当前商品没有可读取的藏宝阁图片。", "404 Not Found")
+        file_path = media_file_path(self.upload_dir, image_url)
+        if not file_path.exists() or not file_path.is_file():
+            return self.json_error_response(start_response, "not_found", "藏宝阁图片文件不存在。", "404 Not Found")
+        body = file_path.read_bytes()
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", media_content_type(image_url)),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "private, max-age=300"),
+                ("X-Content-Type-Options", "nosniff"),
+            ],
+        )
+        return [body]
 
     def parse_json_body(self, environ) -> dict:
         content_length = int(environ.get("CONTENT_LENGTH") or "0")
