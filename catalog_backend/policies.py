@@ -324,16 +324,16 @@ def available_status_actions(user: dict | None, product: dict | None) -> list[tu
         if status in {"published", "received"} and int(product.get("workflow_restart_required") or 0):
             actions.append(("published", "管理员代为重新提交运营部"))
         if status == "pending":
-            actions.append(("published", "管理员代为完成"))
+            actions.append(("published", "管理员代为提交运营部"))
             actions.append(("draft", "管理员退回跟单部"))
         if status == "published":
             actions.append(("draft", "管理员转回跟单部修改"))
-            actions.append(("pending", "管理员转回商品部补充"))
+            actions.append(("pending", "管理员转回 A/B 协作"))
         if status == "received":
             actions.append(("draft", "管理员转回跟单部修改"))
-            actions.append(("pending", "管理员转回商品部补充"))
+            actions.append(("pending", "管理员转回 A/B 协作"))
         if status == "draft":
-            actions.append(("pending", "管理员转交商品部填写"))
+            actions.append(("pending", "管理员开启商品部协作"))
         return actions
     return []
 

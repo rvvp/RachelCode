@@ -326,20 +326,20 @@ class CatalogAppTests(unittest.TestCase):
 
         a_summary_start = a_body.index("<h2>资料概览</h2>")
         a_summary_block = a_body[a_summary_start:a_body.index("</section>", a_summary_start)]
-        self.assertLess(a_summary_block.index("总资料数"), a_summary_block.index("已完成"))
-        self.assertLess(a_summary_block.index("已完成"), a_summary_block.index("近 7 天新增"))
-        self.assertLess(a_summary_block.index("近 7 天新增"), a_summary_block.index("待商品部填写"))
-        self.assertLess(a_summary_block.index("待商品部填写"), a_summary_block.index("已删除"))
+        self.assertLess(a_summary_block.index("总资料数"), a_summary_block.index("商品部已完成"))
+        self.assertLess(a_summary_block.index("商品部已完成"), a_summary_block.index("近 7 天新增"))
+        self.assertLess(a_summary_block.index("近 7 天新增"), a_summary_block.index("A/B协作中"))
+        self.assertLess(a_summary_block.index("A/B协作中"), a_summary_block.index("已删除"))
 
         b_summary_start = b_body.index("<h2>资料概览</h2>")
         b_summary_block = b_body[b_summary_start:b_body.index("</section>", b_summary_start)]
         self.assertNotIn("总资料数", b_summary_block)
         self.assertNotIn("待商品部填写", b_summary_block)
         self.assertLess(b_summary_block.index("近7天含税价修改"), b_summary_block.index("近7天新增"))
-        self.assertLess(b_summary_block.index("近7天新增"), b_summary_block.index("待完成"))
-        self.assertLess(b_summary_block.index("待完成"), b_summary_block.index("待接收"))
-        self.assertLess(b_summary_block.index("待接收"), b_summary_block.index("近7天退回"))
-        self.assertIn('href="/products?status=tax_price_modified#products-list"', b_summary_block)
+        self.assertLess(b_summary_block.index("近7天新增"), b_summary_block.index("A/B协作中"))
+        self.assertLess(b_summary_block.index("A/B协作中"), b_summary_block.index("待运营接收"))
+        self.assertLess(b_summary_block.index("待运营接收"), b_summary_block.index("近7天退回"))
+        self.assertIn('href="/products?marker=tax_price_modified#products-list"', b_summary_block)
 
     def test_b_workflow_stats_tracks_handoffs_and_returns(self):
         initial = db.b_workflow_stats(self.db_path)
@@ -390,26 +390,27 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('href="/products/1/price-history"', b_body)
         b_form_start = b_body.index('<form class="products-filter-form"')
         b_form = b_body[b_form_start:b_body.index("</form>", b_form_start)]
-        self.assertNotIn('name="tax_price_changed"', b_form)
         self.assertIn('name="status"', b_form)
+        self.assertIn('name="marker"', b_form)
         self.assertIn('value="tax_price_modified"', b_form)
         self.assertIn("含税价修改", b_form)
         self.assertNotIn("已修改（全部）", b_form)
         self.assertNotIn("近7天已修改", b_form)
 
         filtered_body = self.request(
-            "/products?status=tax_price_modified",
+            "/products?marker=tax_price_modified",
             cookie=b_cookie,
         )["body"].decode("utf-8")
         self.assertIn("已展示全部含税价修改资料", filtered_body)
         self.assertIn("按最近一次修改时间倒序排列", filtered_body)
+        self.assertIn('<select name="marker">', filtered_body)
         self.assertIn('option value="tax_price_modified" selected', filtered_body)
         self.assertIn("#1", filtered_body)
 
         a_body = self.request("/products", cookie=a_cookie)["body"].decode("utf-8")
-        self.assertNotIn('value="tax_price_modified"', a_body)
+        self.assertNotIn('name="marker"', a_body)
         c_body = self.request("/products", cookie=self.login("c_viewer", "demo123"))["body"].decode("utf-8")
-        self.assertNotIn('value="tax_price_modified"', c_body)
+        self.assertNotIn('name="marker"', c_body)
 
     def test_tax_price_filter_orders_by_latest_change_and_supports_all_history(self):
         self.make_product_two_a_complete()
@@ -473,7 +474,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertGreaterEqual(latest_change_at[all_ids[0]], latest_change_at[all_ids[1]])
         b_cookie = self.login("b_editor", "demo123")
         filtered_body = self.request(
-            "/products?status=tax_price_modified",
+            "/products?marker=tax_price_modified",
             cookie=b_cookie,
         )["body"].decode("utf-8")
         self.assertIn("已展示全部含税价修改资料", filtered_body)
@@ -484,6 +485,10 @@ class CatalogAppTests(unittest.TestCase):
             start = body.index('<form class="products-filter-form"')
             return body[start:body.index("</form>", start)]
 
+        def select_markup(form: str, name: str) -> str:
+            start = form.index(f'<select name="{name}">')
+            return form[start:form.index("</select>", start)]
+
         a_form = filter_form(self.request("/products", cookie=self.login("a_editor", "demo123"))["body"].decode("utf-8"))
         self.assertIn('class="filter-department-context"', a_form)
         self.assertIn(">跟单部</div>", a_form)
@@ -491,7 +496,14 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('value="draft"', a_form)
         self.assertIn('value="pending"', a_form)
         self.assertIn('value="published"', a_form)
-        self.assertNotIn('value="received"', a_form)
+        self.assertIn('value="received"', a_form)
+        self.assertIn('value="workflow_restart"', a_form)
+        self.assertIn(">跟单整理中</option>", a_form)
+        self.assertIn(">待运营接收</option>", a_form)
+        self.assertIn(">待商品部重新提交</option>", a_form)
+        self.assertNotIn(">待完成</option>", a_form)
+        self.assertNotIn(">已完成</option>", a_form)
+        self.assertEqual(select_markup(a_form, "status").count("<option"), 6)
         self.assertLess(a_form.index('name="lifecycle_status"'), a_form.index(">跟单部</div>"))
 
         b_form = filter_form(self.request("/products", cookie=self.login("b_editor", "demo123"))["body"].decode("utf-8"))
@@ -499,13 +511,71 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('value="pending"', b_form)
         self.assertIn('value="published"', b_form)
         self.assertNotIn('value="draft"', b_form)
-        self.assertNotIn('value="received"', b_form)
+        self.assertIn('value="received"', b_form)
+        self.assertIn('value="workflow_restart"', b_form)
+        self.assertIn('name="marker"', b_form)
+        self.assertIn(">A/B协作中</option>", b_form)
+        self.assertIn(">待运营接收</option>", b_form)
+        self.assertIn(">待商品部重新提交</option>", b_form)
+        self.assertNotIn(">待完成</option>", b_form)
+        self.assertNotIn(">已完成</option>", b_form)
+        self.assertEqual(select_markup(b_form, "status").count("<option"), 5)
+        self.assertEqual(select_markup(b_form, "marker").count("<option"), 2)
         self.assertLess(b_form.index(">商品部</div>"), b_form.index('name="lifecycle_status"'))
 
         c_form = filter_form(self.request("/products", cookie=self.login("c_viewer", "demo123"))["body"].decode("utf-8"))
         self.assertIn(">运营部</div>", c_form)
-        self.assertIn("全部接收状态", c_form)
+        self.assertIn("全部流程状态", c_form)
+        self.assertIn(">待运营接收</option>", c_form)
         self.assertIn('value="received"', c_form)
+        self.assertNotIn('value="workflow_restart"', c_form)
+        self.assertNotIn('name="marker"', c_form)
+        self.assertEqual(select_markup(c_form, "status").count("<option"), 3)
+
+        admin_form = filter_form(
+            self.request("/products", cookie=self.login("admin_reviewer", "demo123"))["body"].decode("utf-8")
+        )
+        admin_status = select_markup(admin_form, "status")
+        for label in ("跟单整理中", "A/B协作中", "待运营接收", "已接收", "待商品部重新提交"):
+            self.assertIn(f">{label}</option>", admin_status)
+        self.assertEqual(admin_status.count("<option"), 6)
+        self.assertEqual(select_markup(admin_form, "marker").count("<option"), 2)
+
+    def test_workflow_status_filters_are_mutually_exclusive_and_b_hides_drafts(self):
+        users = {user["department"]: user for user in db.list_users(self.db_path)}
+        with db.get_connection(self.db_path) as connection:
+            draft_id = db.create_product(
+                connection,
+                {"style_code": "DRAFT-HIDDEN", "product_name": "尚未开启协作的资料"},
+                users["A"]["id"],
+                "A",
+            )
+            source = next(product for product in db.list_products(self.db_path) if product["status"] == "published")
+            db.update_product(
+                connection,
+                source["id"],
+                {"product_name": f"{source['product_name']}重新流转"},
+                users["A"]["id"],
+            )
+
+        b_cookie = self.login("b_editor", "demo123")
+        b_all = self.request("/products", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertNotIn(f'href="/products/{draft_id}"', b_all)
+
+        restart_body = self.request("/products?status=workflow_restart", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertIn(f'href="/products/{source["id"]}"', restart_body)
+        self.assertIn(">待商品部重新提交</span>", restart_body)
+
+        published_body = self.request("/products?status=published", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertNotIn(f'href="/products/{source["id"]}"', published_body)
+
+        admin_cookie = self.login("admin_reviewer", "demo123")
+        admin_all = self.request("/products", cookie=admin_cookie)["body"].decode("utf-8")
+        self.assertIn(f'href="/products/{draft_id}"', admin_all)
+
+        legacy_marker_body = self.request("/products?status=tax_price_modified", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertIn('<select name="marker">', legacy_marker_body)
+        self.assertIn('option value="tax_price_modified" selected', legacy_marker_body)
 
     def test_a_summary_counts_product_after_c_receives_it(self):
         c_cookie = self.login("c_viewer", "demo123")
@@ -523,7 +593,7 @@ class CatalogAppTests(unittest.TestCase):
         a_body = a_response["body"].decode("utf-8")
         summary_start = a_body.index("<h2>资料概览</h2>")
         summary_block = a_body[summary_start:a_body.index("</section>", summary_start)]
-        self.assertIn("<span>已完成</span><strong>1</strong>", summary_block)
+        self.assertIn("<span>商品部已完成</span><strong>1</strong>", summary_block)
 
     def test_b_editor_can_upload_dashboard_excel_and_separate_flow_file(self):
         b_cookie = self.login("b_editor", "demo123")
@@ -2735,7 +2805,7 @@ class CatalogAppTests(unittest.TestCase):
         list_body = list_response["body"].decode("utf-8")
         self.assertNotIn("<th>上新价格</th>", list_body)
         self.assertNotIn("新建资料", list_body)
-        self.assertIn("已完成", list_body)
+        self.assertIn("待运营接收", list_body)
         self.assertNotIn(">待B填写<", list_body)
         self.assertNotIn("近 7 天运营概览", list_body)
         self.assertIn("历时天数", list_body)
@@ -2748,7 +2818,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn("launch_price", first_item)
         self.assertNotIn("supplier", first_item)
         self.assertEqual(first_item["status"], "published")
-        self.assertEqual(first_item["status_label"], "已完成")
+        self.assertEqual(first_item["status_label"], "待运营接收")
         self.assertIn("elapsed_days", first_item)
         self.assertIn("elapsed_days_label", first_item)
 
@@ -2762,13 +2832,13 @@ class CatalogAppTests(unittest.TestCase):
             list_body.index('<section class="products-insights-grid products-insights-single">'),
             list_body.index('<div class="products-main-stack">'),
         )
-        for label in ("总接收", "近7天新增", "待接收"):
+        for label in ("总接收", "近7天新增", "待运营接收"):
             self.assertIn(label, list_body)
         summary_start = list_body.index("<h2>资料概览</h2>")
         summary_block = list_body[summary_start:list_body.index("</section>", summary_start)]
         self.assertNotIn("总资料数", summary_block)
         self.assertLess(summary_block.index("<span>总接收</span>"), summary_block.index("<span>近7天新增</span>"))
-        self.assertLess(summary_block.index("<span>近7天新增</span>"), summary_block.index("<span>待接收</span>"))
+        self.assertLess(summary_block.index("<span>近7天新增</span>"), summary_block.index("<span>待运营接收</span>"))
         self.assertIn("grid-template-rows: max-content minmax(420px, 1fr);", list_body)
         self.assertNotIn("min-height: 1520px;", list_body)
 
@@ -2859,7 +2929,7 @@ class CatalogAppTests(unittest.TestCase):
                     a_user["id"],
                     "A",
                 )
-                db.change_product_status(connection, product_id, "pending", a_user["id"], "提交给商品部填写", "测试渠道流转。")
+                db.change_product_status(connection, product_id, "pending", a_user["id"], "开启商品部协作", "测试渠道流转。")
                 db.change_product_status(connection, product_id, "published", b_user["id"], "填写完成，开放给运营部", "测试渠道流转。")
                 created_ids.append(product_id)
         vip_product_id, same_product_id = created_ids
@@ -3147,9 +3217,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.08.26-catalog-card-layout-v2")
+        self.assertEqual(payload["build_version"], "2026.08.28-workflow-status-v2")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.08.26-catalog-card-layout-v2")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.08.28-workflow-status-v2")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -3899,8 +3969,8 @@ class CatalogAppTests(unittest.TestCase):
         queue_body = queue_response["body"].decode("utf-8")
         self.assertIn("资料流转看板", queue_body)
         self.assertIn("#2", queue_body)
-        self.assertIn("待商品部填写", queue_body)
-        self.assertIn("批量完成", queue_body)
+        self.assertIn("A/B 协作中", queue_body)
+        self.assertIn("批量提交运营部", queue_body)
         self.assertIn("最近提交", queue_body)
 
         publish_response = self.request(
@@ -3913,8 +3983,8 @@ class CatalogAppTests(unittest.TestCase):
 
         logs_response = self.request("/products/2/logs", cookie=admin_cookie)
         logs_body = logs_response["body"].decode("utf-8")
-        self.assertIn("管理员代为完成", logs_body)
-        self.assertIn("提交给商品部填写", logs_body)
+        self.assertIn("管理员代为提交运营部", logs_body)
+        self.assertIn("开启商品部协作", logs_body)
         self.assertIn("管理员确认可直接开放给 C", logs_body)
 
     def test_review_queue_supports_filter_and_bulk_publish(self):
@@ -4988,8 +5058,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(create_response["status"].startswith("302"))
         list_response = self.request("/products", cookie=editor_cookie)
         list_body = list_response["body"].decode("utf-8")
-        self.assertIn("批量流转", list_body)
-        self.assertIn("批量提交给商品部填写", list_body)
+        self.assertIn("批量开启商品部协作", list_body)
         self.assertIn('name="product_ids"', list_body)
 
         created_product = next(item for item in db.list_products(self.db_path) if item["style_code"] == "A-BULK-001")
@@ -5029,7 +5098,7 @@ class CatalogAppTests(unittest.TestCase):
         )
         self.assertTrue(submit_response["status"].startswith("400"))
         body = submit_response["body"].decode("utf-8")
-        self.assertIn("暂不能提交给商品部", body)
+        self.assertIn("开启商品部协作前", body)
         product = db.get_product(self.db_path, created_product["id"])
         self.assertEqual(product["status"], "draft")
 
@@ -5053,9 +5122,8 @@ class CatalogAppTests(unittest.TestCase):
         b_cookie = self.login("b_editor", "demo123")
         list_response = self.request("/products", cookie=b_cookie)
         list_body = list_response["body"].decode("utf-8")
-        self.assertIn("批量完成", list_body)
-        self.assertIn("批量完成并开放给运营部", list_body)
-        self.assertIn("批量退回跟单部修改", list_body)
+        self.assertIn("批量提交运营部", list_body)
+        self.assertIn("批量退回给跟单部", list_body)
         self.assertIn('name="product_ids"', list_body)
 
         complete_response = self.request(

@@ -94,7 +94,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.08.28-parallel-workflow-v1"
+CATALOG_BUILD_VERSION = "2026.08.28-workflow-status-v2"
 LIST_LAYOUT_VIRTUAL_FIELDS: tuple[FieldDef, ...] = ()
 LIST_LAYOUT_VIRTUAL_FIELD_MAP = {}
 LIST_LAYOUT_HIDDEN_FIELD_KEYS = {
@@ -613,7 +613,7 @@ class CatalogApplication:
         if not visible_products:
             return self.html_response(
                 start_response,
-                self.render_message_page("不可查看", "当前账号只能查看已完成且对本角色开放的资料。", user),
+                self.render_message_page("不可查看", "当前账号只能查看已提交运营部且对本角色开放的资料。", user),
                 status="403 Forbidden",
             )
         notice = query.get("notice", "").strip()
@@ -1613,7 +1613,7 @@ class CatalogApplication:
                         continue
                     if product.get("status") not in {"published", "received"} or int(product.get("c_release_no") or 0) <= 0:
                         skipped += 1
-                        self.append_bulk_skip_reason(skip_reasons, product, "当前资料不是待接收状态。")
+                        self.append_bulk_skip_reason(skip_reasons, product, "当前资料不是待运营接收状态。")
                         continue
                     if db.record_c_product_receipt(connection, product_id, user["id"], int(product.get("c_release_no") or 0)):
                         details = self.status_change_details(user, product, "received")
@@ -1673,7 +1673,7 @@ class CatalogApplication:
                         "published",
                         user["id"],
                         allowed["published"],
-                        "系统管理员批量将资料标记为已完成并开放给 C。",
+                        "系统管理员批量将资料提交运营部接收。",
                     )
                     updated += 1
                     continue
@@ -1697,13 +1697,13 @@ class CatalogApplication:
         if action == "submit_to_b_selected":
             action_label = "批量开启商品部协作"
         elif action == "complete_to_c_selected":
-            action_label = "批量完成并开放给运营部"
+            action_label = "批量提交运营部"
         elif action == "receive_selected":
             action_label = "批量接收资料"
         elif action == "return_to_a_selected":
             action_label = "批量退回跟单部修改"
         elif action == "publish_selected":
-            action_label = "批量完成并开放给运营部"
+            action_label = "批量提交运营部"
         elif action == "archive_selected":
             action_label = "批量归档"
         else:
@@ -1751,10 +1751,10 @@ class CatalogApplication:
                     "published",
                     user["id"],
                     allowed["published"],
-                    "系统管理员在流转看板中批量将资料标记为已完成并开放给 C。",
+                    "系统管理员在流转看板中批量将资料提交运营部接收。",
                 )
                 updated += 1
-        notice = f"批量完成并开放给运营部：成功 {updated} 条，跳过 {skipped} 条。"
+        notice = f"批量提交运营部：成功 {updated} 条，跳过 {skipped} 条。"
         return self.redirect(
             start_response,
             "/products/review?notice=" + self.urlencode_message(notice),
@@ -2405,7 +2405,7 @@ class CatalogApplication:
 
     def products_return_path(self, query: dict) -> str:
         params = {}
-        for key in ("q", "supplier", "department", "status", "lifecycle_status", "page"):
+        for key in ("q", "supplier", "department", "status", "marker", "lifecycle_status", "page"):
             value = str(query.get(key, "")).strip()
             if value:
                 params[key] = value
@@ -2421,8 +2421,13 @@ class CatalogApplication:
         if user.get("department") in {"A", "EXECUTIVE"} or is_admin(user):
             supplier = str(query.get("supplier", "")).strip()
         requested_status = str(query.get("status", "")).strip()
-        tax_price_filter = "modified" if requested_status == "tax_price_modified" and (user.get("department") == "B" or is_admin(user)) else ""
-        workflow_restart_filter = requested_status == "workflow_restart" and (user.get("department") == "B" or is_admin(user))
+        requested_marker = str(query.get("marker", "")).strip()
+        marker_filter_allowed = user.get("department") == "B" or is_admin(user)
+        if requested_status == "tax_price_modified" and marker_filter_allowed:
+            requested_status = ""
+            requested_marker = "tax_price_modified"
+        tax_price_filter = "modified" if requested_marker == "tax_price_modified" and marker_filter_allowed else ""
+        workflow_restart_filter = requested_status == "workflow_restart" and user.get("department") != "C"
         product_status = "" if tax_price_filter or workflow_restart_filter else requested_status
         exact_matches = []
         source_products = db.list_products(
@@ -2439,6 +2444,12 @@ class CatalogApplication:
             visible_source_products = self.filter_c_products_by_keyword(visible_source_products, keyword)
         for product in visible_source_products:
             if workflow_restart_filter and not int(product.get("workflow_restart_required") or 0):
+                continue
+            if (
+                user.get("department") != "C"
+                and requested_status in {"published", "received"}
+                and int(product.get("workflow_restart_required") or 0)
+            ):
                 continue
             style_code = str(product.get("style_code") or "").strip()
             if style_code.casefold() != keyword.casefold():
@@ -3101,7 +3112,7 @@ class CatalogApplication:
         if not product or not int(product.get("revision_flag") or 0):
             return ""
         if int(product.get("workflow_restart_required") or 0):
-            return '<span class="pill" style="background:rgba(178,92,46,0.13); color:#8a4324;">待重新提交</span>'
+            return '<span class="pill" style="background:rgba(178,92,46,0.13); color:#8a4324;">待商品部重新提交</span>'
         return '<span class="pill" style="background:linear-gradient(180deg, rgba(191,87,0,0.18), rgba(191,87,0,0.1)); color:#8a3e00;">已更新</span>'
 
     def version_label(self, product: dict | None) -> str:
@@ -8793,8 +8804,27 @@ class CatalogApplication:
             department_filter = ""
             query = {**query, "department": ""}
         status_filter = query.get("status", "").strip()
-        tax_price_filter = "modified" if b_dashboard_view and status_filter == "tax_price_modified" else ""
-        workflow_restart_filter = b_dashboard_view and status_filter == "workflow_restart"
+        marker_filter = query.get("marker", "").strip()
+        # Keep previously shared links working while presenting data markers in
+        # their own filter instead of mixing them with workflow states.
+        if b_dashboard_view and status_filter == "tax_price_modified":
+            status_filter = ""
+            marker_filter = "tax_price_modified"
+            query = {**query, "status": "", "marker": marker_filter}
+        allowed_statuses = {
+            "A": {"draft", "pending", "published", "received", "workflow_restart"},
+            "EXECUTIVE": {"draft", "pending", "published", "received", "workflow_restart"},
+            "B": {"pending", "published", "received", "workflow_restart"},
+            "C": {"published", "received"},
+        }.get(user.get("department"), {"draft", "pending", "published", "received", "workflow_restart"})
+        if status_filter not in allowed_statuses:
+            status_filter = ""
+            query = {**query, "status": ""}
+        tax_price_filter = "modified" if b_dashboard_view and marker_filter == "tax_price_modified" else ""
+        if not tax_price_filter:
+            marker_filter = ""
+            query = {**query, "marker": ""}
+        workflow_restart_filter = status_filter == "workflow_restart" and user.get("department") != "C"
         lifecycle_filter = query.get("lifecycle_status", "").strip()
         bulk_enabled = not is_department_monitor(user) and (
             is_admin(user) or user.get("department") in {"A", "B", "C"}
@@ -8819,8 +8849,12 @@ class CatalogApplication:
                 product for product in products
                 if self.c_effective_status(product, user) == status_filter
             ]
+        if user.get("department") == "B":
+            products = [product for product in products if product.get("status") != "draft"]
         if workflow_restart_filter:
             products = [product for product in products if int(product.get("workflow_restart_required") or 0)]
+        elif user.get("department") != "C" and status_filter in {"published", "received"}:
+            products = [product for product in products if not int(product.get("workflow_restart_required") or 0)]
         total_products = len(products)
         page_size = 100
         try:
@@ -8839,7 +8873,7 @@ class CatalogApplication:
         return_to_path = self.products_return_path(query)
 
         pagination_params = {}
-        for key in ("q", "supplier", "department", "status", "lifecycle_status", "monitor_department"):
+        for key in ("q", "supplier", "department", "status", "marker", "lifecycle_status", "monitor_department"):
             value = str(query.get(key, "")).strip()
             if value:
                 pagination_params[key] = value
@@ -9041,7 +9075,7 @@ class CatalogApplication:
             <div class="stats">
               <div class="stat-card"><span>总接收</span><strong>{c_receipt_stats.get('received', 0)}</strong></div>
               <div class="stat-card"><span>近7天新增</span><strong>{c_receipt_stats.get('recent_created', 0)}</strong></div>
-              <div class="stat-card"><span>待接收</span><strong>{c_receipt_stats.get('pending', 0)}</strong></div>
+              <div class="stat-card"><span>待运营接收</span><strong>{c_receipt_stats.get('pending', 0)}</strong></div>
             </div>
             """
             insights_grid_class += " products-insights-single"
@@ -9049,7 +9083,7 @@ class CatalogApplication:
             stats_markup = f"""
             <div class="stats">
               <div class="stat-card"><span>总资料数</span><strong>{stats.get('A', 0) + stats.get('B', 0) + stats.get('C', 0)}</strong></div>
-              <div class="stat-card"><span>已完成</span><strong>{workflow_stats.get('published', 0) + workflow_stats.get('received', 0)}</strong></div>
+              <div class="stat-card"><span>商品部已完成</span><strong>{workflow_stats.get('published', 0) + workflow_stats.get('received', 0)}</strong></div>
               <div class="stat-card"><span>近 7 天新增</span><strong>{recent_stats.get('recent_created', 0)}</strong></div>
               <div class="stat-card"><span>A/B协作中</span><strong>{workflow_stats.get('pending', 0)}</strong></div>
               <div class="stat-card"><span>已删除</span><strong>{lifecycle_stats.get('deleted', 0)}</strong></div>
@@ -9059,15 +9093,15 @@ class CatalogApplication:
         elif user["department"] == "B" or is_admin(user):
             stats_markup = f"""
             <div class="stats">
-              <a class="stat-card stat-card-link" href="/products?status=tax_price_modified#products-list">
+              <a class="stat-card stat-card-link" href="/products?marker=tax_price_modified#products-list">
                 <span>近7天含税价修改</span>
                 <strong>{b_dashboard_stats.get('recent_tax_price_changes', 0)}</strong>
                 <small>点击查看变动款式</small>
               </a>
               <div class="stat-card"><span>近7天新增</span><strong>{b_dashboard_stats.get('recent_submitted_to_b', 0)}</strong></div>
-              <div class="stat-card"><span>待完成</span><strong>{b_dashboard_stats.get('pending_completion', 0)}</strong></div>
-              <a class="stat-card stat-card-link" href="/products?status=workflow_restart#products-list"><span>待重新提交</span><strong>{b_dashboard_stats.get('restart_required', 0)}</strong><small>点击查看需重新流转款式</small></a>
-              <div class="stat-card"><span>待接收</span><strong>{b_dashboard_stats.get('awaiting_receipt', 0)}</strong></div>
+              <div class="stat-card"><span>A/B协作中</span><strong>{b_dashboard_stats.get('pending_completion', 0)}</strong></div>
+              <a class="stat-card stat-card-link" href="/products?status=workflow_restart#products-list"><span>待商品部重新提交</span><strong>{b_dashboard_stats.get('restart_required', 0)}</strong><small>点击查看需重新流转款式</small></a>
+              <div class="stat-card"><span>待运营接收</span><strong>{b_dashboard_stats.get('awaiting_receipt', 0)}</strong></div>
               <div class="stat-card"><span>近7天退回</span><strong>{b_dashboard_stats.get('recent_returned_to_a', 0)}</strong></div>
             </div>
             """
@@ -9078,7 +9112,7 @@ class CatalogApplication:
             (
                 "当前为运营部汇总监控视图，已合并天猫、唯品及同款资料，仅展示运营部可读取字段与整体接收状态。"
                 if is_department_monitor(user)
-                else "当前列表只显示本运营归属可读取字段。状态为已完成的资料可逐条或批量接收，接收状态仅记录在当前账号下。页面、Excel 导出和 JSON 调用会保持同样的渠道范围。"
+                else "当前列表只显示本运营归属可读取字段。状态为待运营接收的资料可逐条或批量接收，接收状态仅记录在当前账号下。页面、Excel 导出和 JSON 调用会保持同样的渠道范围。"
             )
             if user["department"] == "C"
             else "这里汇总了当前账号可见的商品资料。你可以按部门、协作阶段和资料完成情况快速筛选，再进入详情、日志或批量处理。"
@@ -9095,42 +9129,53 @@ class CatalogApplication:
         if user["department"] == "C":
             status_filter_markup = f"""
               <select name="status">
-                <option value="">全部接收状态</option>
-                <option value="published" {"selected" if status_filter == "published" else ""}>待接收</option>
+                <option value="">全部流程状态</option>
+                <option value="published" {"selected" if status_filter == "published" else ""}>待运营接收</option>
                 <option value="received" {"selected" if status_filter == "received" else ""}>已接收</option>
               </select>
             """
         elif user["department"] in {"A", "EXECUTIVE"}:
             status_filter_markup = f"""
               <select name="status">
-                <option value="">全部状态</option>
-                <option value="draft" {"selected" if status_filter == "draft" else ""}>跟单部填写中</option>
+                <option value="">全部流程状态</option>
+                <option value="draft" {"selected" if status_filter == "draft" else ""}>跟单整理中</option>
                 <option value="pending" {"selected" if status_filter == "pending" else ""}>A/B协作中</option>
-                <option value="published" {"selected" if status_filter == "published" else ""}>已完成</option>
+                <option value="published" {"selected" if status_filter == "published" else ""}>待运营接收</option>
+                <option value="received" {"selected" if status_filter == "received" else ""}>已接收</option>
+                <option value="workflow_restart" {"selected" if status_filter == "workflow_restart" else ""}>待商品部重新提交</option>
               </select>
             """
         elif user["department"] == "B":
             status_filter_markup = f"""
               <select name="status">
-                <option value="">全部状态</option>
-                <option value="pending" {"selected" if status_filter == "pending" else ""}>待完成</option>
-                <option value="published" {"selected" if status_filter == "published" else ""}>已完成</option>
-                <option value="workflow_restart" {"selected" if status_filter == "workflow_restart" else ""}>待重新提交</option>
-                <option value="tax_price_modified" {"selected" if status_filter == "tax_price_modified" else ""}>含税价修改</option>
+                <option value="">全部流程状态</option>
+                <option value="pending" {"selected" if status_filter == "pending" else ""}>A/B协作中</option>
+                <option value="published" {"selected" if status_filter == "published" else ""}>待运营接收</option>
+                <option value="received" {"selected" if status_filter == "received" else ""}>已接收</option>
+                <option value="workflow_restart" {"selected" if status_filter == "workflow_restart" else ""}>待商品部重新提交</option>
               </select>
             """
         else:
             status_filter_markup = f"""
               <select name="status">
-                <option value="">全部状态</option>
-                <option value="draft" {"selected" if status_filter == "draft" else ""}>跟单部填写中</option>
+                <option value="">全部流程状态</option>
+                <option value="draft" {"selected" if status_filter == "draft" else ""}>跟单整理中</option>
                 <option value="pending" {"selected" if status_filter == "pending" else ""}>A/B协作中</option>
-                <option value="published" {"selected" if status_filter == "published" else ""}>已完成</option>
+                <option value="published" {"selected" if status_filter == "published" else ""}>待运营接收</option>
                 <option value="received" {"selected" if status_filter == "received" else ""}>已接收</option>
-                <option value="workflow_restart" {"selected" if status_filter == "workflow_restart" else ""}>待重新提交</option>
-                {'<option value="tax_price_modified" selected>含税价修改</option>' if tax_price_filter else '<option value="tax_price_modified">含税价修改</option>' if b_dashboard_view else ''}
+                <option value="workflow_restart" {"selected" if status_filter == "workflow_restart" else ""}>待商品部重新提交</option>
               </select>
             """
+        marker_filter_markup = (
+            f"""
+              <select name="marker">
+                <option value="">全部资料标记</option>
+                <option value="tax_price_modified" {"selected" if marker_filter == "tax_price_modified" else ""}>含税价修改</option>
+              </select>
+            """
+            if b_dashboard_view
+            else ""
+        )
         department_filter_markup = (
             f"""
                 <select name="department">
@@ -9150,10 +9195,10 @@ class CatalogApplication:
         elif user["department"] == "C":
             filter_controls_markup = department_filter_markup + status_filter_markup
         else:
-            filter_controls_markup = department_filter_markup + status_filter_markup + lifecycle_filter_markup
+            filter_controls_markup = department_filter_markup + status_filter_markup + marker_filter_markup + lifecycle_filter_markup
         editor_dashboard = user["department"] in {"A", "B", "EXECUTIVE"} or is_admin(user)
         stats_description = (
-            "先掌握接收进度，再进入资料列表处理待接收资料。"
+            "先掌握接收进度，再进入资料列表处理待运营接收资料。"
             if user["department"] == "C"
             else (
                 "先查看资料概览，再进入资料列表处理。"
@@ -9183,9 +9228,9 @@ class CatalogApplication:
         dashboard_close = "</div>" if user["department"] == "C" or editor_dashboard else ""
         products_intro = (
             (
-                "管理员正在按运营部汇总口径查看已完成资料、待接收资料与已接收资料。"
+                "管理员正在按运营部汇总口径查看待运营接收资料与已接收资料。"
                 if is_department_monitor(user)
-                else f"{operating_channel_label(user.get('operating_channel'))}运营账号可读取本归属渠道及同款资料，并对已完成资料进行接收确认。"
+                else f"{operating_channel_label(user.get('operating_channel'))}运营账号可读取本归属渠道及同款资料，并对待运营接收资料进行接收确认。"
             )
             if user["department"] == "C"
             else (
@@ -10881,7 +10926,7 @@ class CatalogApplication:
             return """
               <div class="list-intro-actions">
                 <div class="tools bulk-tools-vertical">
-                  <button type="submit" name="bulk_action" value="complete_to_c_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量确认齐全给运营部</button>
+                  <button type="submit" name="bulk_action" value="complete_to_c_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交运营部</button>
                   <button type="submit" name="bulk_action" value="return_to_a_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk" class="ghost-button">批量退回给跟单部</button>
                 </div>
                 <div class="meta">商品部可在这里直接完成批量流转或退回跟单部。</div>
@@ -10893,7 +10938,7 @@ class CatalogApplication:
                 <div class="tools">
                   <button type="submit" name="bulk_action" value="receive_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量接收资料</button>
                 </div>
-                <div class="meta">勾选状态为已完成的资料后，可一次确认接收。</div>
+                <div class="meta">勾选状态为待运营接收的资料后，可一次确认接收。</div>
               </div>
             """
         if not is_admin(user):
@@ -10901,10 +10946,10 @@ class CatalogApplication:
         return """
           <div class="list-intro-actions">
             <div class="tools">
-              <button type="submit" name="bulk_action" value="publish_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量完成并开放给C</button>
+              <button type="submit" name="bulk_action" value="publish_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交运营部</button>
               <button type="submit" name="bulk_action" value="archive_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量归档</button>
             </div>
-            <div class="meta">管理员可在列表右上角直接执行批量开放或归档。</div>
+            <div class="meta">管理员可在列表右上角直接执行批量提交运营部或归档。</div>
           </div>
         """
 
@@ -11149,7 +11194,7 @@ class CatalogApplication:
             status_block = f"""
             <section class="panel" style="margin-top:18px;">
               <h2>阶段流转</h2>
-              <p class="meta">可记录 A 到 B 的交接说明、B 的完成说明、运营部接收确认，以及管理员的人工处理备注。</p>
+              <p class="meta">可记录 A 开启协作的说明、B 提交运营部的说明、运营部接收确认，以及管理员的人工处理备注。</p>
               <div class="detail-grid">
                 {''.join(status_cards)}
               </div>
@@ -11185,7 +11230,7 @@ class CatalogApplication:
         workflow_notice = (
             "状态流转：跟单整理中 -> A/B协作中 -> 待运营接收 -> 已接收"
             if user["department"] != "C"
-            else "状态为已完成表示资料等待你接收；确认后会更新为已接收。"
+            else "状态为待运营接收表示资料等待你接收；确认后会更新为已接收。"
         )
         owner_label = "跟单部发起资料" if product.get("owner_department") == "A" else department_label(product.get("owner_department"))
         revision_badge = self.revision_badge(product)
@@ -11334,7 +11379,7 @@ class CatalogApplication:
             stat_three_value = "批量流转到运营部"
             section_title = "导入商品部补充文件"
             button_text = "开始导入商品部 Excel"
-            hint_text = "导入后请回到资料列表，勾选对应条目，再使用“批量完成并开放给运营部”继续流转。空白的商品部字段不会覆盖原值。"
+            hint_text = "导入后请回到资料列表，勾选对应条目，再使用“批量提交运营部”继续流转。空白的商品部字段不会覆盖原值。"
         else:
             page_title = "从参考模板导入 Excel"
             intro_text = "导入时会读取第一张工作表，并按模板第一行表头识别字段。若发现与你本人已录入的同款号、同颜色、同商品名记录，则更新；否则新增。"
@@ -11785,7 +11830,7 @@ class CatalogApplication:
           <div class="panel">
             <div class="eyebrow">{html.escape(console_eyebrow)}</div>
             <h1>资料流转看板</h1>
-            <p class="meta">这里主要追踪已经由跟单部提交、等待商品部上传图片并补充资料完成标记的资料；品类、上新价格和上新渠道由商品企划中心维护。系统管理员也可以在详情页人工干预流转。</p>
+            <p class="meta">这里主要追踪已经开启 A/B 协作、等待双方继续完善的资料；品类、上新价格和上新渠道由商品企划中心维护。系统管理员也可以在详情页人工干预流转。</p>
             {notice_block}
           </div>
           <div class="panel">
@@ -11824,9 +11869,9 @@ class CatalogApplication:
           <section class="panel" style="margin-bottom:18px;">
             <div class="eyebrow">Batch Workflow</div>
             <h2>批量完成</h2>
-            <p class="meta">勾选后可直接批量标记为已完成并开放给运营部；不符合条件的资料会自动跳过。</p>
+            <p class="meta">勾选后可直接批量提交运营部；不符合条件的资料会自动跳过。</p>
             <div class="tools" style="margin-bottom:0;">
-              <button type="submit">批量完成并开放给运营部</button>
+              <button type="submit">批量提交运营部</button>
             </div>
           </section>
           <section class="panel">
@@ -12238,7 +12283,7 @@ class CatalogApplication:
           <div class="panel">
             <div class="eyebrow">{html.escape(console_eyebrow)}</div>
             <h1>C 部门字段开放设置</h1>
-            <p class="meta">这里决定运营部在所有已完成资料里能看到哪些字段列，也可以管理给外部系统调用的只读 API 令牌。</p>
+            <p class="meta">这里决定运营部在所有已提交运营部资料里能看到哪些字段列，也可以管理给外部系统调用的只读 API 令牌。</p>
             <p class="meta">当前已开放 {len(selected)} 个字段。{html.escape(matching_text)}</p>
             {notice_block}
             {error_block}
@@ -12416,7 +12461,7 @@ class CatalogApplication:
                 details = f"{actor} 已补齐款式识别字段并开启商品部协作，A/B 可按各自字段权限并行完善资料。"
                 note_prefix = "交接说明"
             else:
-                details = f"{actor} 将资料转回商品部补充阶段。"
+                details = f"{actor} 将资料转回 A/B 协作阶段。"
                 note_prefix = "处理说明"
         elif target_status == "published":
             if user.get("department") == "B":
@@ -12425,7 +12470,7 @@ class CatalogApplication:
                     details = f"{actor} 已确认修订资料并重新提交运营部，系统将按新版本重新分配接收。"
                 note_prefix = "完成说明"
             else:
-                details = f"{actor} 将资料标记为已完成并开放给运营部。"
+                details = f"{actor} 将资料提交为待运营接收。"
                 note_prefix = "处理说明"
         elif target_status == "received":
             details = f"{actor} 已确认接收商品部完成并开放的资料。"
