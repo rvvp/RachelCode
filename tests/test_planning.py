@@ -11,6 +11,7 @@ from wsgiref.util import setup_testing_defaults
 
 from catalog_backend import CatalogApplication, init_db as init_catalog_db
 from catalog_backend import db as catalog_db
+from catalog_backend.policies import editable_field_keys_for_user
 from planning_center import PlanningApplication
 from planning_center import db as planning_db
 
@@ -69,6 +70,22 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual({item["lifecycle_status"] for item in payload["items"]}, {"active"})
         self.assertTrue(payload["withdrawn_ids"])
         source = payload["items"][0]
+        b_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["username"] == "b_editor")
+        before_image_version = int(source["image_version_no"])
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.update_product(
+                connection,
+                source["id"],
+                {
+                    "image_url": "https://example.com/images/pending-professional.jpg",
+                    "image_gallery_json": json.dumps(["https://example.com/images/pending-professional.jpg"]),
+                },
+                b_user["id"],
+            )
+        refreshed_source = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(refreshed_source["current_version_no"], source["source_version_no"])
+        self.assertEqual(refreshed_source["image_version_no"], before_image_version + 1)
+        source = catalog_db.planning_source_payloads(self.catalog_db_path, source["id"])[0]
         publication = {
             "publication_id": "PC-TEST-001",
             "source_version_no": source["source_version_no"],
@@ -140,7 +157,7 @@ class PlanningCenterTests(unittest.TestCase):
             authorization="Bearer planning-secret",
         )
         self.assertTrue(rejected_completed["status"].startswith("400"))
-        self.assertIn("待商品部填写", rejected_completed["body"].decode("utf-8"))
+        self.assertIn("已完成资料", rejected_completed["body"].decode("utf-8"))
 
     def test_internal_planning_image_api_serves_pending_product_media(self):
         upload_dir = Path(self.temp.name) / "uploads"
@@ -175,6 +192,275 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         self.assertEqual(response["body"], image_bytes)
         self.assertEqual(dict(response["headers"])["Content-Type"], "image/png")
+
+    def test_planning_revision_publication_updates_same_catalog_product(self):
+        app = CatalogApplication(
+            self.catalog_db_path,
+            Path(self.temp.name) / "uploads",
+            planning_api_token="planning-secret",
+        )
+        source = next(
+            item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending"
+        )
+        initial = {
+            "publication_id": "PC-REVISION-INITIAL",
+            "source_version_no": source["current_version_no"],
+            "category": "毛衣",
+            "launch_channel": "唯品",
+            "launch_price": 599,
+        }
+        response = self.wsgi_request(
+            app,
+            f"/api/internal/planning/products/{source['id']}/price-publication",
+            method="POST",
+            body=json.dumps(initial).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(response["status"].startswith("200"))
+        b_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["username"] == "b_editor")
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.change_product_status(
+                connection,
+                source["id"],
+                "published",
+                b_user["id"],
+                "填写完成，开放给运营部",
+                "测试同款修订回传。",
+            )
+        completed = catalog_db.get_product(self.catalog_db_path, source["id"])
+        revision = dict(
+            initial,
+            publication_id="PC-REVISION-SECOND",
+            source_version_no=completed["current_version_no"],
+            category="连衣裙",
+            launch_channel="天猫",
+            launch_price=629,
+            revision=True,
+        )
+        response = self.wsgi_request(
+            app,
+            f"/api/internal/planning/products/{source['id']}/price-publication",
+            method="POST",
+            body=json.dumps(revision).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(response["status"].startswith("200"))
+        updated = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(updated["status"], "published")
+        self.assertEqual(updated["current_version_no"], completed["current_version_no"] + 1)
+        self.assertEqual(updated["category"], "连衣裙")
+        self.assertEqual(updated["launch_channel"], "天猫")
+        self.assertEqual(updated["launch_price"], 629)
+        self.assertEqual(updated["workflow_restart_required"], 1)
+        self.assertEqual(updated["c_published_version_no"], completed["c_published_version_no"])
+        c_formal = catalog_db.products_for_c_published_versions(self.catalog_db_path, [updated])[0]
+        self.assertEqual(c_formal["launch_channel"], "唯品")
+        self.assertEqual(c_formal["launch_price"], 599)
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.change_product_status(
+                connection,
+                source["id"],
+                "published",
+                b_user["id"],
+                "重新提交给运营部",
+                "测试企划字段触发后的新运营批次。",
+            )
+        republished = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(republished["workflow_restart_required"], 0)
+        self.assertEqual(republished["c_release_no"], completed["c_release_no"] + 1)
+        c_republished = catalog_db.products_for_c_published_versions(self.catalog_db_path, [republished])[0]
+        self.assertEqual(c_republished["launch_channel"], "天猫")
+        self.assertEqual(c_republished["launch_price"], 629)
+
+    def test_configured_planning_channel_is_accepted_by_catalog_callback(self):
+        planning_db.save_channel_option(self.planning_db_path, "直播首发", 40)
+        app = CatalogApplication(
+            self.catalog_db_path,
+            Path(self.temp.name) / "uploads",
+            planning_api_token="planning-secret",
+        )
+        source = next(
+            item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending"
+        )
+        response = self.wsgi_request(
+            app,
+            f"/api/internal/planning/products/{source['id']}/price-publication",
+            method="POST",
+            body=json.dumps(
+                {
+                    "publication_id": "PC-CONFIGURED-CHANNEL",
+                    "source_version_no": source["current_version_no"],
+                    "category": "毛衣",
+                    "launch_channel": "直播首发",
+                    "launch_price": 599,
+                }
+            ).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertEqual(catalog_db.get_product(self.catalog_db_path, source["id"])["launch_channel"], "直播首发")
+
+    def test_catalog_image_gate_and_image_only_refresh_preserve_workflow(self):
+        catalog_app = CatalogApplication(
+            self.catalog_db_path,
+            Path(self.temp.name) / "uploads",
+            planning_api_token="planning-secret",
+        )
+        pending = next(
+            item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending"
+        )
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            connection.execute(
+                "UPDATE products SET image_url = '', image_gallery_json = '[]' WHERE id = ?",
+                (pending["id"],),
+            )
+        response = self.wsgi_request(
+            catalog_app,
+            "/api/internal/planning/products",
+            authorization="Bearer planning-secret",
+        )
+        payload = json.loads(response["body"])
+        self.assertTrue(payload["image_gate"])
+        self.assertNotIn(pending["id"], {item["id"] for item in payload["items"]})
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            connection.execute(
+                "UPDATE products SET image_gallery_json = ?, image_url = '' WHERE id = ?",
+                (json.dumps(["https://example.com/images/gallery-only.jpg"]), pending["id"]),
+            )
+        response = self.wsgi_request(
+            catalog_app,
+            "/api/internal/planning/products",
+            authorization="Bearer planning-secret",
+        )
+        payload = json.loads(response["body"])
+        gallery_only = next(item for item in payload["items"] if item["id"] == pending["id"])
+        self.assertEqual(gallery_only["image_url"], "https://example.com/images/gallery-only.jpg")
+
+        completed = next(
+            item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "published"
+        )
+        before = catalog_db.get_product(self.catalog_db_path, completed["id"])
+        b_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["username"] == "b_editor")
+        changed = dict(before)
+        changed["image_url"] = "https://example.com/images/professional-replacement.jpg"
+        changed["image_gallery_json"] = json.dumps([changed["image_url"]])
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.update_product(connection, completed["id"], changed, b_user["id"])
+        after = catalog_db.get_product(self.catalog_db_path, completed["id"])
+        self.assertEqual(after["status"], before["status"])
+        self.assertEqual(after["current_version_no"], before["current_version_no"])
+        self.assertEqual(after["c_published_version_no"], before["c_published_version_no"])
+        self.assertEqual(after["revision_flag"], before["revision_flag"])
+        self.assertEqual(after["image_version_no"], before["image_version_no"] + 1)
+        c_formal_after_image = catalog_db.products_for_c_published_versions(self.catalog_db_path, [after])[0]
+        self.assertEqual(c_formal_after_image["image_url"], changed["image_url"])
+
+        response = self.wsgi_request(
+            catalog_app,
+            f"/api/internal/planning/products?known_ids={completed['id']}",
+            authorization="Bearer planning-secret",
+        )
+        payload = json.loads(response["body"])
+        update = next(item for item in payload["image_updates"] if item["id"] == completed["id"])
+        self.assertEqual(update["image_url"], changed["image_url"])
+        self.assertEqual(update["image_version_no"], after["image_version_no"])
+
+        replacement_form = {
+            "image_url": "https://example.com/images/professional-main.jpg",
+            "image_gallery_existing__0": "https://example.com/images/snapshot.jpg",
+            "image_gallery_manual__0": "https://example.com/images/snapshot.jpg",
+        }
+        catalog_app.apply_image_upload(
+            replacement_form,
+            {},
+            existing_image_url="https://example.com/images/snapshot.jpg",
+        )
+        self.assertEqual(
+            json.loads(replacement_form["image_gallery_json"]),
+            ["https://example.com/images/professional-main.jpg"],
+        )
+        preserved_form = {}
+        catalog_app.apply_image_upload(
+            preserved_form,
+            {},
+            existing_image_url="https://example.com/images/professional-main.jpg",
+            existing_image_gallery=json.dumps(
+                [
+                    "https://example.com/images/professional-main.jpg",
+                    "https://example.com/images/detail.jpg",
+                ]
+            ),
+        )
+        self.assertEqual(
+            json.loads(preserved_form["image_gallery_json"]),
+            [
+                "https://example.com/images/professional-main.jpg",
+                "https://example.com/images/detail.jpg",
+            ],
+        )
+
+        forbidden = dict(after, launch_price=999)
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            with self.assertRaisesRegex(PermissionError, "上新价格只能由商品企划中心"):
+                catalog_db.update_product(connection, completed["id"], forbidden, b_user["id"])
+
+        a_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["username"] == "a_editor")
+        forbidden_image = dict(after, image_url="https://example.com/images/a-cannot-replace.jpg")
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            with self.assertRaisesRegex(PermissionError, "图片只能由商品部"):
+                catalog_db.update_product(connection, completed["id"], forbidden_image, a_user["id"])
+        self.assertEqual(
+            editable_field_keys_for_user(b_user, {**after, "status": "received"}),
+            ("image_url", "completion_flag"),
+        )
+
+    def test_planning_revision_reuses_same_source_and_is_visible_in_published_filter(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        source = {
+            "id": 901,
+            "style_code": "REV-901",
+            "product_name": "修订测试毛衣",
+            "season_year": "2026秋冬",
+            "supplier": "修订供应商",
+            "category": "毛衣",
+            "actual_cost": 150,
+            "image_url": "https://example.com/images/rev-901.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 2,
+            "image_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+        first = planning_db.create_pricing_record(self.planning_db_path, source, "商品部企划员")
+        planning_db.mark_record_published(self.planning_db_path, first["id"], {"status": "published"})
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                "UPDATE source_products SET lifecycle_status = 'withdrawn' WHERE id = ?",
+                (source["id"],),
+            )
+
+        history = planning_db.list_published_source_products(self.planning_db_path)
+        self.assertEqual([item["id"] for item in history], [source["id"]])
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+        page = self.wsgi_request(app, "/workbench?status=published", cookie=planner_cookie)["body"].decode("utf-8")
+        self.assertIn("发起同款修订", page)
+        self.assertIn(f"action='/pricing/{source['id']}/revise'", page)
+
+        response = self.wsgi_request(
+            app,
+            f"/pricing/{source['id']}/revise",
+            method="POST",
+            cookie=planner_cookie,
+        )
+        self.assertTrue(response["status"].startswith("302"))
+        records = planning_db.list_pricing_records(self.planning_db_path)
+        self.assertEqual(len(records), 2)
+        self.assertEqual({record["source_product_id"] for record in records}, {source["id"]})
+        self.assertEqual(planning_db.get_source_product(self.planning_db_path, source["id"])["lifecycle_status"], "active")
 
     def test_planning_image_proxy_uses_internal_catalog_endpoint(self):
         source = {

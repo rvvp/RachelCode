@@ -17,8 +17,36 @@ EDITOR_DEPARTMENTS = {"A", "B"}
 EXECUTIVE_READ_ONLY_DEPARTMENTS = {"EXECUTIVE"}
 ADMIN_DEPARTMENTS = {"ADMIN"}
 MANAGEABLE_DEPARTMENTS = ("A", "B", "C", "EXECUTIVE", "ADMIN")
+# These fields are completed across the two applications.  The planning center
+# owns the three planning outputs; the catalog remains the source of truth for
+# the image and the completion flag.
 B_STAGE_FIELD_KEYS = {"category", "image_url", "launch_price", "launch_channel", "completion_flag"}
+B_PLANNING_MANAGED_FIELD_KEYS = {"category", "launch_price", "launch_channel"}
 A_STAGE_FIELD_KEYS = tuple(field.key for field in PRODUCT_FIELDS if field.key not in B_STAGE_FIELD_KEYS)
+COLLABORATION_START_FIELD_KEYS = (
+    "brand_name",
+    "season_year",
+    "style_code",
+    "style_color",
+    "product_name",
+    "tax_included_price",
+)
+WORKFLOW_RESTART_FIELD_KEYS = frozenset(
+    {
+        "style_code",
+        "style_color",
+        "product_name",
+        "color_name",
+        "tag_price",
+        "launch_price",
+        "launch_channel",
+        "material",
+        "composition_en",
+        "washing_method",
+        "safety_category",
+        "standard_code",
+    }
+)
 C_OPERATING_CHANNELS = {
     "tmall": "天猫类",
     "vip": "唯品类",
@@ -45,9 +73,9 @@ def is_department_monitor(user: dict | None) -> bool:
     return bool(user and user.get("monitor_department") in {"A", "B", "C"})
 
 STATUS_LABELS = {
-    "draft": "跟单部填写中",
-    "pending": "待商品部填写",
-    "published": "已完成",
+    "draft": "跟单整理中",
+    "pending": "A/B协作中",
+    "published": "待运营接收",
     "received": "已接收",
 }
 
@@ -261,7 +289,9 @@ def editable_field_keys_for_user(user: dict | None, product: dict | None = None)
         if not product or product.get("lifecycle_status") != "active":
             return ()
         if product.get("status") in {"pending", "published"}:
-            return tuple(B_STAGE_FIELD_KEYS)
+            return ("image_url", "completion_flag")
+        if product.get("status") == "received":
+            return ("image_url", "completion_flag")
         return ()
     return ()
 
@@ -275,26 +305,24 @@ def available_status_actions(user: dict | None, product: dict | None) -> list[tu
     if user.get("department") == "A" and user.get("id") == product.get("created_by"):
         actions = []
         if status == "draft":
-            actions.append(("pending", "提交给商品部填写"))
-        if status in {"published", "received"}:
-            if int(product.get("revision_flag") or 0):
-                actions.append(("pending", "修改后重新提交给商品部"))
-            actions.append(("draft", "重新发起跟单部修改"))
+            actions.append(("pending", "开启商品部协作"))
         return actions
     if user.get("department") == "B":
         actions = []
         if status == "pending":
-            actions.append(("published", "填写完成，开放给运营部"))
+            actions.append(("published", "确认资料齐全，提交运营部"))
             actions.append(("draft", "退回跟单部补充"))
-        if status == "published":
-            actions.append(("pending", "重新进入商品部补充"))
+        if status in {"published", "received"} and int(product.get("workflow_restart_required") or 0):
+            actions.append(("published", "重新提交给运营部"))
         return actions
     if user.get("department") == "C":
-        if status in {"published", "received"}:
+        if status in {"published", "received"} and not int(product.get("workflow_restart_required") or 0):
             return [("received", "接收资料")]
         return []
     if can_review_product(user, product):
         actions = []
+        if status in {"published", "received"} and int(product.get("workflow_restart_required") or 0):
+            actions.append(("published", "管理员代为重新提交运营部"))
         if status == "pending":
             actions.append(("published", "管理员代为完成"))
             actions.append(("draft", "管理员退回跟单部"))

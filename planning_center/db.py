@@ -75,6 +75,7 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
                 status TEXT NOT NULL DEFAULT '',
                 lifecycle_status TEXT NOT NULL DEFAULT '',
                 source_version_no INTEGER NOT NULL DEFAULT 1,
+                image_version_no INTEGER NOT NULL DEFAULT 1,
                 source_updated_at TEXT NOT NULL DEFAULT '',
                 creator_name TEXT NOT NULL DEFAULT '',
                 synced_at TEXT NOT NULL
@@ -169,6 +170,8 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
             connection.execute("ALTER TABLE source_products ADD COLUMN image_url TEXT NOT NULL DEFAULT ''")
         if "category_suggestion" not in source_columns:
             connection.execute("ALTER TABLE source_products ADD COLUMN category_suggestion TEXT NOT NULL DEFAULT ''")
+        if "image_version_no" not in source_columns:
+            connection.execute("ALTER TABLE source_products ADD COLUMN image_version_no INTEGER NOT NULL DEFAULT 1")
         pricing_columns = {row["name"] for row in connection.execute("PRAGMA table_info(pricing_records)").fetchall()}
         if "calculated_price" not in pricing_columns:
             connection.execute("ALTER TABLE pricing_records ADD COLUMN calculated_price REAL")
@@ -363,6 +366,33 @@ def list_source_products(db_path: str | Path, *, season_year: str = "", status: 
     return [dict(row) for row in rows]
 
 
+def list_published_source_products(db_path: str | Path, *, season_year: str = "") -> list[dict]:
+    """Return completed source rows so operators can start a same-style revision."""
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT sp.*
+            FROM source_products sp
+            WHERE sp.lifecycle_status = 'withdrawn'
+              AND EXISTS (
+                  SELECT 1 FROM pricing_records pr
+                  WHERE pr.source_product_id = sp.id AND pr.status = 'published'
+              )
+              AND (? = '' OR sp.season_year = ?)
+            ORDER BY sp.season_year DESC, sp.source_updated_at DESC, sp.id DESC
+            """,
+            (season_year, season_year),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_all_source_products(db_path: str | Path) -> list[dict]:
+    """Return local source history ids so image-only refreshes can be requested."""
+    with get_connection(db_path) as connection:
+        rows = connection.execute("SELECT * FROM source_products ORDER BY id").fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_source_product(db_path: str | Path, product_id: int) -> dict | None:
     with get_connection(db_path) as connection:
         row = connection.execute("SELECT * FROM source_products WHERE id = ?", (product_id,)).fetchone()
@@ -532,11 +562,26 @@ def planning_source_item_is_eligible(item: dict) -> bool:
     return (
         str(item.get("status") or "").strip() == "pending"
         and str(item.get("lifecycle_status") or "active").strip() == "active"
+        and bool(str(item.get("image_url") or "").strip() or str(item.get("image_gallery_json") or "").strip() not in {"", "[]"})
     )
 
 
-def upsert_source_products(db_path: str | Path, items: list[dict]) -> int:
-    eligible_items = [item for item in items if planning_source_item_is_eligible(item)]
+def _source_item_has_image(item: dict) -> bool:
+    image_url = str(item.get("image_url") or "").strip()
+    if image_url:
+        return True
+    gallery = str(item.get("image_gallery_json") or "").strip()
+    return gallery not in {"", "[]"}
+
+
+def upsert_source_products(db_path: str | Path, items: list[dict], *, require_image: bool = False) -> int:
+    eligible_items = [
+        item
+        for item in items
+        if str(item.get("status") or "").strip() == "pending"
+        and str(item.get("lifecycle_status") or "active").strip() == "active"
+        and (not require_image or _source_item_has_image(item))
+    ]
     now = utc_now()
     with get_connection(db_path) as connection:
         category_options = [dict(row) for row in connection.execute("SELECT * FROM category_options WHERE enabled = 1 ORDER BY sort_order, id").fetchall()]
@@ -547,26 +592,72 @@ def upsert_source_products(db_path: str | Path, items: list[dict]) -> int:
                 INSERT INTO source_products (
                     id, style_code, style_color, color_name, product_name, brand_name, season_year,
                     supplier, supplier_code, supplier_style_code, category, category_suggestion, actual_cost, tax_included_price,
-                    image_url, status, lifecycle_status, source_version_no, source_updated_at, creator_name, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    image_url, status, lifecycle_status, source_version_no, image_version_no, source_updated_at, creator_name, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     style_code=excluded.style_code, style_color=excluded.style_color, color_name=excluded.color_name,
                     product_name=excluded.product_name, brand_name=excluded.brand_name, season_year=excluded.season_year,
                     supplier=excluded.supplier, supplier_code=excluded.supplier_code, supplier_style_code=excluded.supplier_style_code,
                     category=CASE WHEN NOT EXISTS (SELECT 1 FROM pricing_records WHERE source_product_id = excluded.id) THEN excluded.category ELSE source_products.category END,
                     category_suggestion=excluded.category_suggestion, actual_cost=excluded.actual_cost, tax_included_price=excluded.tax_included_price, image_url=excluded.image_url,
-                    status=excluded.status, lifecycle_status=excluded.lifecycle_status, source_version_no=excluded.source_version_no,
+                    status=excluded.status, lifecycle_status=excluded.lifecycle_status, source_version_no=excluded.source_version_no, image_version_no=excluded.image_version_no,
                     source_updated_at=excluded.source_updated_at, creator_name=excluded.creator_name, synced_at=excluded.synced_at
                 """,
                 (
                     int(item["id"]), item.get("style_code", ""), item.get("style_color", ""), item.get("color_name", ""),
                     item.get("product_name", ""), item.get("brand_name", ""), item.get("season_year", ""), item.get("supplier", ""),
                     item.get("supplier_code", ""), item.get("supplier_style_code", ""), category_suggestion, category_suggestion, item.get("actual_cost"),
-                    item.get("tax_included_price"), item.get("image_url", ""), "pending", "active", int(item.get("source_version_no") or 1),
+                    item.get("tax_included_price"), item.get("image_url", ""), "pending", "active", int(item.get("source_version_no") or 1), int(item.get("image_version_no") or 1),
                     item.get("updated_at", ""), item.get("creator_name", ""), now,
                 ),
             )
     return len(eligible_items)
+
+
+def upsert_source_image_updates(db_path: str | Path, items: list[dict]) -> int:
+    """Apply image-only updates to existing source rows without reopening work."""
+    updated = 0
+    now = utc_now()
+    with get_connection(db_path) as connection:
+        for item in items:
+            if not _source_item_has_image(item):
+                continue
+            source_id = int(item.get("id") or 0)
+            if source_id <= 0:
+                continue
+            existing = connection.execute(
+                "SELECT image_url, image_version_no, source_version_no FROM source_products WHERE id = ?",
+                (source_id,),
+            ).fetchone()
+            if not existing:
+                continue
+            incoming_version = int(item.get("image_version_no") or 1)
+            current_version = int(existing["image_version_no"] or 1)
+            incoming_image = str(item.get("image_url") or "").strip()
+            incoming_source_version = int(item.get("source_version_no") or 1)
+            image_changed = (
+                incoming_version > current_version
+                or incoming_image != str(existing["image_url"] or "").strip()
+            )
+            if (
+                not image_changed
+                and incoming_source_version == int(existing["source_version_no"] or 1)
+            ):
+                continue
+            connection.execute(
+                "UPDATE source_products SET image_url = ?, image_version_no = ?, source_version_no = ?, source_updated_at = ?, synced_at = ? WHERE id = ?",
+                (
+                    incoming_image,
+                    max(incoming_version, current_version + 1) if image_changed else max(incoming_version, current_version),
+                    incoming_source_version,
+                    item.get("updated_at", ""),
+                    now,
+                    source_id,
+                ),
+            )
+            if image_changed:
+                updated += 1
+    return updated
 
 
 def synchronize_source_products(
@@ -574,10 +665,38 @@ def synchronize_source_products(
     items: list[dict],
     *,
     withdrawn_ids: list[int] | tuple[int, ...] | set[int] = (),
+    image_updates: list[dict] | tuple[dict, ...] = (),
+    require_image: bool = True,
 ) -> dict:
-    eligible_items = [item for item in items if planning_source_item_is_eligible(item)]
+    eligible_items = [
+        item
+        for item in items
+        if (
+            planning_source_item_is_eligible(item)
+            if require_image
+            else str(item.get("status") or "").strip() == "pending"
+            and str(item.get("lifecycle_status") or "active").strip() == "active"
+        )
+    ]
+    # Keep already imported legacy rows usable when they predate the image gate;
+    # new rows still require a real image before entering the workbench.
+    strict_ids = {int(item.get("id") or 0) for item in eligible_items}
+    legacy_items = []
+    with get_connection(db_path) as connection:
+        existing_ids = {
+            int(row["id"])
+            for row in connection.execute("SELECT id FROM source_products").fetchall()
+        }
+    for item in items:
+        source_id = int(item.get("id") or 0)
+        if source_id in existing_ids and source_id not in strict_ids:
+            if str(item.get("status") or "").strip() == "pending" and str(item.get("lifecycle_status") or "active").strip() == "active":
+                legacy_items.append(item)
     explicit_withdrawn_ids = {int(product_id) for product_id in withdrawn_ids}
-    synced = upsert_source_products(db_path, eligible_items)
+    synced = upsert_source_products(db_path, eligible_items, require_image=require_image)
+    if legacy_items:
+        synced += upsert_source_products(db_path, legacy_items, require_image=False)
+    image_updated = upsert_source_image_updates(db_path, list(image_updates))
     removed = 0
     withdrawn = 0
     with get_connection(db_path) as connection:
@@ -588,6 +707,19 @@ def synchronize_source_products(
             source_id = int(row["id"])
             locally_ineligible = row["status"] != "pending" or row["lifecycle_status"] != "active"
             if source_id not in explicit_withdrawn_ids and not locally_ineligible:
+                continue
+            latest_record = connection.execute(
+                "SELECT status FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (source_id,),
+            ).fetchone()
+            if (
+                latest_record
+                and latest_record["status"] in {"suggested", "review_pending", "confirmed", "conflict"}
+                and row["status"] == "pending"
+                and row["lifecycle_status"] == "active"
+            ):
+                # A revision is intentionally kept in the workbench even while
+                # the catalog reports the prior published version.
                 continue
             has_pricing_record = connection.execute(
                 "SELECT 1 FROM pricing_records WHERE source_product_id = ? LIMIT 1",
@@ -603,7 +735,10 @@ def synchronize_source_products(
                 continue
             connection.execute("DELETE FROM source_products WHERE id = ?", (source_id,))
             removed += 1
-    return {"synced": synced, "removed": removed, "withdrawn": withdrawn}
+    result = {"synced": synced, "removed": removed, "withdrawn": withdrawn}
+    if image_updated:
+        result["image_updated"] = image_updated
+    return result
 
 
 def list_category_rules(db_path: str | Path) -> list[dict]:
@@ -959,6 +1094,67 @@ def create_pricing_records(db_path: str | Path, products: list[dict], operator_n
 
 def create_pricing_record(db_path: str | Path, product: dict, operator_name: str) -> dict:
     return create_pricing_records(db_path, [product], operator_name)[0]
+
+
+def start_pricing_revision(db_path: str | Path, source_product_id: int, operator_name: str) -> dict:
+    """Reopen the same source product for a new planning review cycle."""
+    source = get_source_product(db_path, source_product_id)
+    if not source:
+        raise LookupError("同步商品不存在。")
+    if not _source_item_has_image(source):
+        raise ValueError("当前商品没有图片，不能发起企划修订。")
+    with get_connection(db_path) as connection:
+        latest = connection.execute(
+            "SELECT * FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            (int(source_product_id),),
+        ).fetchone()
+        if not latest or latest["status"] != "published":
+            raise ValueError("只有已回传的商品才能发起新的企划修订。")
+        active_revision = connection.execute(
+            "SELECT * FROM pricing_records WHERE source_product_id = ? AND status IN ('suggested', 'review_pending', 'confirmed', 'conflict') ORDER BY created_at DESC, id DESC LIMIT 1",
+            (int(source_product_id),),
+        ).fetchone()
+        if active_revision:
+            return dict(active_revision)
+    category = str(source.get("category") or latest["category"] or "").strip()
+    calculation = calculate_pricing(
+        db_path,
+        source.get("season_year", ""),
+        category,
+        source.get("supplier", ""),
+        source.get("actual_cost"),
+    )
+    now = utc_now()
+    source_version = int(source.get("source_version_no") or 1)
+    publication_id = f"PC-{int(source_product_id)}-REV-V{source_version}-{secrets.token_hex(4).upper()}"
+    with get_connection(db_path) as connection:
+        connection.execute(
+            "UPDATE source_products SET status = 'pending', lifecycle_status = 'active', category = ?, synced_at = ? WHERE id = ?",
+            (category, now, int(source_product_id)),
+        )
+        connection.execute(
+            "INSERT INTO pricing_records (publication_id, source_product_id, source_version_no, season_year, style_code, product_name, supplier, category, channel, cost, fixed_multiplier, supplier_coefficient, raw_price, calculated_price, launch_price, status, operator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)",
+            (
+                publication_id,
+                int(source_product_id),
+                source_version,
+                source.get("season_year", ""),
+                source.get("style_code", ""),
+                source.get("product_name", ""),
+                source.get("supplier", ""),
+                category,
+                source.get("actual_cost"),
+                calculation["fixed_multiplier"],
+                calculation["supplier_coefficient"],
+                calculation["raw_price"],
+                calculation["calculated_price"],
+                calculation["calculated_price"],
+                operator_name,
+                now,
+            ),
+        )
+        row = connection.execute("SELECT * FROM pricing_records WHERE publication_id = ?", (publication_id,)).fetchone()
+    return dict(row)
 
 
 def list_pricing_records(db_path: str | Path, *, season_year: str = "", status: str = "") -> list[dict]:

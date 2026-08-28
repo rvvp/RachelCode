@@ -83,6 +83,8 @@ class PlanningApplication:
                 return self.handle_confirm(start_response, user, self.path_id(path, "/pricing/", "/confirm"))
             if path.startswith("/pricing/") and path.endswith("/recalculate") and method == "POST":
                 return self.handle_recalculate(environ, start_response, user, self.path_id(path, "/pricing/", "/recalculate"))
+            if path.startswith("/pricing/") and path.endswith("/revise") and method == "POST":
+                return self.handle_revision(start_response, user, self.path_id(path, "/pricing/", "/revise"))
             if path.startswith("/pricing/") and path.endswith("/submit-review") and method == "POST":
                 return self.handle_submit_review(environ, start_response, user, self.path_id(path, "/pricing/", "/submit-review"))
             if path.startswith("/pricing/") and path.endswith("/review-save") and method == "POST":
@@ -288,9 +290,15 @@ class PlanningApplication:
 
     def handle_sync(self, start_response, user):
         self.require_catalog_operator(user)
-        payload = self.fetch_catalog_products()
-        items, withdrawn_ids = self.catalog_sync_items(payload)
-        result = db.synchronize_source_products(self.db_path, items, withdrawn_ids=withdrawn_ids)
+        payload = self.fetch_catalog_products(self.known_source_product_ids())
+        items, withdrawn_ids, image_updates = self.catalog_sync_details(payload)
+        result = db.synchronize_source_products(
+            self.db_path,
+            items,
+            withdrawn_ids=withdrawn_ids,
+            image_updates=image_updates,
+            require_image=self.catalog_sync_requires_image(payload),
+        )
         return self.redirect(start_response, "/workbench?notice=" + self.q(self.source_sync_message(result)))
 
     def source_sync_message(self, result: dict, *, automatic: bool = False) -> str:
@@ -305,11 +313,18 @@ class PlanningApplication:
             message += "；".join(cleanup) + "。"
         return message
 
-    def fetch_catalog_products(self) -> dict:
+    def known_source_product_ids(self) -> list[int]:
+        return [int(item["id"]) for item in db.list_all_source_products(self.db_path)]
+
+    def fetch_catalog_products(self, known_ids: list[int] | tuple[int, ...] = ()) -> dict:
         if not self.catalog_api_token:
             raise ValueError("尚未配置藏宝阁内部 Token，请在启动环境变量中设置 PLANNING_CATALOG_API_TOKEN。")
+        query = ""
+        clean_ids = [str(int(item_id)) for item_id in known_ids if str(item_id).isdigit()]
+        if clean_ids:
+            query = "?" + urlencode({"known_ids": ",".join(clean_ids)})
         request = Request(
-            f"{self.catalog_api_url}/api/internal/planning/products",
+            f"{self.catalog_api_url}/api/internal/planning/products{query}",
             headers={"Authorization": f"Bearer {self.catalog_api_token}", "Accept": "application/json"},
         )
         try:
@@ -322,21 +337,36 @@ class PlanningApplication:
         return payload
 
     def catalog_sync_items(self, payload: dict | list[dict]) -> tuple[list[dict], list[int]]:
+        items, withdrawn_ids, _ = self.catalog_sync_details(payload)
+        return items, withdrawn_ids
+
+    def catalog_sync_details(self, payload: dict | list[dict]) -> tuple[list[dict], list[int], list[dict]]:
         # List-only payloads are retained for tests and older integrations. Without an
         # explicit withdrawal list, absence from a response must not remove local data.
         if isinstance(payload, list):
-            return payload, []
+            return payload, [], []
         if not isinstance(payload, dict):
             raise ValueError("藏宝阁返回内容异常。")
         items = payload.get("items") or []
         withdrawn_ids = payload.get("withdrawn_ids") or []
-        if not isinstance(items, list) or not isinstance(withdrawn_ids, list):
+        image_updates = payload.get("image_updates") or []
+        if not isinstance(items, list) or not isinstance(withdrawn_ids, list) or not isinstance(image_updates, list):
             raise ValueError("藏宝阁同步资料格式不正确。")
-        return items, withdrawn_ids
+        return items, withdrawn_ids, image_updates
+
+    @staticmethod
+    def catalog_sync_requires_image(payload: dict | list[dict]) -> bool:
+        # The catalog API advertises the image gate explicitly.  Older test and
+        # on-premise integrations can continue importing their already shaped
+        # payloads while they are upgraded.
+        return bool(isinstance(payload, dict) and payload.get("image_gate"))
 
     def handle_source_product_image(self, start_response, product_id: int):
         product = db.get_source_product(self.db_path, product_id)
-        if not product or not db.planning_source_item_is_eligible(product):
+        # Completed source rows remain available in the history filter so a
+        # planner can inspect the current image before starting a same-style
+        # revision. The catalog API still enforces the internal token.
+        if not product:
             raise LookupError("同步商品不存在或已退出工作台。")
         image_url = str(product.get("image_url") or "").strip()
         if not image_url:
@@ -387,6 +417,20 @@ class PlanningApplication:
             start_response,
             "/workbench?notice="
             + self.q(f"已生成 {record['style_code'] or record['product_name']} 的测算上新价 {record['calculated_price']:g}。")
+            + f"#pricing-row-{int(record['source_product_id'])}",
+        )
+
+    def handle_revision(self, start_response, user, source_product_id: int):
+        self.require_catalog_operator(user)
+        record = db.start_pricing_revision(
+            self.db_path,
+            source_product_id,
+            user.get("display_name", "商品部企划员"),
+        )
+        return self.redirect(
+            start_response,
+            "/workbench?notice="
+            + self.q(f"{record['style_code'] or record['product_name']} 已发起新的企划审核周期。")
             + f"#pricing-row-{int(record['source_product_id'])}",
         )
 
@@ -609,6 +653,13 @@ class PlanningApplication:
     def publish_pricing_record(self, record: dict, user: dict) -> dict:
         if not self.catalog_api_token:
             raise ValueError("尚未配置藏宝阁内部 Token。")
+        source = db.get_source_product(self.db_path, int(record["source_product_id"])) or {}
+        prior_publications = [
+            item
+            for item in db.list_pricing_records(self.db_path)
+            if int(item.get("source_product_id") or 0) == int(record["source_product_id"])
+            and item.get("status") == "published"
+        ]
         payload = {
             "publication_id": record["publication_id"],
             "source_version_no": record["source_version_no"],
@@ -618,6 +669,11 @@ class PlanningApplication:
             "fixed_multiplier": record["fixed_multiplier"],
             "supplier_coefficient": record["supplier_coefficient"],
             "raw_price": record["raw_price"],
+            # A previously published/received catalog item is a revision of the
+            # same product, never a new catalog style.
+            "revision": bool(prior_publications)
+            or source.get("status") in {"published", "received"}
+            or source.get("lifecycle_status") == "withdrawn",
             "operator_name": user.get("display_name", "商品企划中心"),
         }
         request = Request(
@@ -835,14 +891,27 @@ class PlanningApplication:
             requested_page = 1
         if self.catalog_api_token and user.get("role") == "planner":
             try:
-                payload = self.fetch_catalog_products()
-                items, withdrawn_ids = self.catalog_sync_items(payload)
-                result = db.synchronize_source_products(self.db_path, items, withdrawn_ids=withdrawn_ids)
+                payload = self.fetch_catalog_products(self.known_source_product_ids())
+                items, withdrawn_ids, image_updates = self.catalog_sync_details(payload)
+                result = db.synchronize_source_products(
+                    self.db_path,
+                    items,
+                    withdrawn_ids=withdrawn_ids,
+                    image_updates=image_updates,
+                    require_image=self.catalog_sync_requires_image(payload),
+                )
                 sync_message = self.source_sync_message(result, automatic=True)
             except ValueError as sync_error:
                 if not error:
                     error = str(sync_error)
         products = db.list_source_products(self.db_path, season_year=season)
+        if status == "published":
+            known_product_ids = {int(item["id"]) for item in products}
+            products.extend(
+                item
+                for item in db.list_published_source_products(self.db_path, season_year=season)
+                if int(item["id"]) not in known_product_ids
+            )
         records = db.list_pricing_records(self.db_path, season_year=season)
         category_options = db.list_category_options(self.db_path, enabled_only=True)
         channel_options = db.list_channel_options(self.db_path, enabled_only=True)
@@ -946,7 +1015,7 @@ class PlanningApplication:
             display_image_url = (
                 image_url
                 if image_url.startswith(("http://", "https://"))
-                else f"/source-products/{int(item['id'])}/image?v={int(item.get('source_version_no') or 1)}"
+                else f"/source-products/{int(item['id'])}/image?v={int(item.get('image_version_no') or 1)}"
             )
             image_label = str(item.get("style_color") or item.get("style_code") or "商品图片")
             image_title = " ".join(
@@ -990,6 +1059,8 @@ class PlanningApplication:
             else:
                 record_status = str(record.get("status") or "")
                 status_label = workflow_labels.get(record_status, record_status)
+                if record_status == "published":
+                    source_status_label = "已完成"
                 status_class = workflow_classes.get(record_status, "waiting")
                 record_error = f"<small class='error-text'>{html.escape(record['error_message'])}</small>" if record.get("error_message") else ""
                 calculated_price = float(record.get("calculated_price") or record["launch_price"])
@@ -1037,6 +1108,8 @@ class PlanningApplication:
                     controls = f"<form class='table-action-form' method='post' action='/pricing/{record['id']}/publish'><button class='primary' type='submit'>回传藏宝阁</button></form>"
                 elif record_status == "confirmed" and user.get("role") == "admin":
                     controls = "<span class='review-note'>复核已通过，待商品部回传</span>"
+                elif record_status == "published" and user.get("role") == "planner":
+                    controls = f"<span class='review-note'>已完成回传</span><form class='table-action-form' method='post' action='/pricing/{int(record['source_product_id'])}/revise'><button type='submit'>发起同款修订</button></form>"
                 elif record_status == "published":
                     controls = "<span class='review-note'>已完成回传</span>"
                 else:
@@ -1658,7 +1731,7 @@ class PlanningApplication:
         return f"<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{html.escape(title)}</title><style>{self.css()}</style></head><body class='{body_class}'>{content}</body></html>"
 
     def shell(self, title: str, content: str, user: dict, current: str) -> str:
-        nav_items = [("dashboard", "/dashboard", "企划总览"), ("category-planning", "/category-planning", "品类企划"), ("workbench", "/workbench", "上新定价"), ("rules", "/rules", "规则"), ("stats", "/stats", "价格带统计")]
+        nav_items = [("dashboard", "/dashboard", "企划总览"), ("category-planning", "/category-planning", "品类企划"), ("workbench", "/workbench", "上新审核"), ("rules", "/rules", "规则"), ("stats", "/stats", "价格带统计")]
         if user.get("role") == "admin":
             nav_items.append(("accounts", "/accounts", "账号管理"))
         nav_items.append(("settings", "/settings", "连接设置"))

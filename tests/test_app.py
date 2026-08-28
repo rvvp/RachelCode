@@ -18,6 +18,7 @@ from PIL import Image as PillowImage
 
 from catalog_backend import CatalogApplication, init_db
 from catalog_backend import db
+from catalog_backend.policies import available_status_actions
 
 
 class CatalogAppTests(unittest.TestCase):
@@ -5317,6 +5318,206 @@ class CatalogAppTests(unittest.TestCase):
         )
         self.assertTrue(delete_response["status"].startswith("302"))
         self.assertEqual(db.get_product(self.db_path, 2)["lifecycle_status"], "deleted")
+
+    def test_a_can_start_collaboration_early_and_a_b_updates_merge_by_field(self):
+        users = {user["department"]: user for user in db.list_users(self.db_path)}
+        partial_payload = {
+            "brand_name": "思安娜",
+            "season_year": "2026秋",
+            "style_code": "COLLAB-001",
+            "style_color": "COLLAB-001-黑",
+            "product_name": "协作测试款",
+            "tax_included_price": 200,
+        }
+        with db.get_connection(self.db_path) as connection:
+            product_id = db.create_product(connection, partial_payload, users["A"]["id"], "A")
+        product = db.get_product(self.db_path, product_id)
+        self.assertEqual(self.app.status_transition_validation_error(product, "pending"), "")
+        with db.get_connection(self.db_path) as connection:
+            db.change_product_status(
+                connection,
+                product_id,
+                "pending",
+                users["A"]["id"],
+                "开启商品部协作",
+                "专项测试",
+            )
+            db.update_product(connection, product_id, {"supplier": "协作供应商"}, users["A"]["id"])
+            db.update_product(
+                connection,
+                product_id,
+                {
+                    "image_url": "https://example.com/collaboration.jpg",
+                    "image_gallery_json": '["https://example.com/collaboration.jpg"]',
+                    "completion_flag": "Y",
+                },
+                users["B"]["id"],
+            )
+        updated = db.get_product(self.db_path, product_id)
+        self.assertEqual(updated["status"], "pending")
+        self.assertEqual(updated["supplier"], "协作供应商")
+        self.assertEqual(updated["image_url"], "https://example.com/collaboration.jpg")
+        self.assertIn("主体资料还未完成", self.app.status_transition_validation_error(updated, "published"))
+
+    def test_post_publication_trigger_fields_preserve_c_version_until_b_resubmits(self):
+        users = {user["department"]: user for user in db.list_users(self.db_path)}
+        source = next(product for product in db.list_products(self.db_path) if product["status"] == "published")
+        original_name = source["product_name"]
+        original_release = int(source["c_release_no"])
+        with db.get_connection(self.db_path) as connection:
+            self.assertTrue(
+                db.record_c_product_receipt(connection, source["id"], users["C"]["id"], original_release)
+            )
+            db.change_product_status(
+                connection,
+                source["id"],
+                "received",
+                users["C"]["id"],
+                "接收资料",
+                "专项测试",
+            )
+            db.update_product(
+                connection,
+                source["id"],
+                {"supplier": "非触发字段供应商"},
+                users["A"]["id"],
+            )
+        non_trigger = db.get_product(self.db_path, source["id"])
+        self.assertEqual(non_trigger["workflow_restart_required"], 0)
+        self.assertEqual(non_trigger["c_published_version_no"], non_trigger["current_version_no"])
+
+        with db.get_connection(self.db_path) as connection:
+            db.update_product(
+                connection,
+                source["id"],
+                {"product_name": original_name + "修订"},
+                users["A"]["id"],
+            )
+        triggered = db.get_product(self.db_path, source["id"])
+        self.assertEqual(triggered["workflow_restart_required"], 1)
+        self.assertIn("product_name", json.loads(triggered["workflow_restart_fields_json"]))
+        c_formal = db.products_for_c_published_versions(self.db_path, [triggered])[0]
+        self.assertEqual(c_formal["product_name"], original_name)
+        self.assertIn("published", dict(available_status_actions(users["B"], triggered)))
+        c_visible = self.app.visible_products_for_user([triggered], users["C"])
+        self.assertEqual(len(c_visible), 1)
+        self.assertEqual(c_visible[0]["product_name"], original_name)
+        c_cookie = self.login("c_viewer", "demo123")
+        old_name_response = self.request(
+            "/api/products?" + urlencode({"q": original_name}),
+            cookie=c_cookie,
+        )
+        self.assertEqual(json.loads(old_name_response["body"])["count"], 1)
+        work_name_response = self.request(
+            "/api/products?" + urlencode({"q": original_name + "修订"}),
+            cookie=c_cookie,
+        )
+        self.assertEqual(json.loads(work_name_response["body"])["count"], 0)
+
+        other_c_id = db.create_user(
+            self.db_path,
+            "c_unreceived_revision_test",
+            "未接收运营",
+            "C",
+            "demo123",
+            must_change_password=False,
+            operating_channel="tmall",
+            billing_platform_codes=["tmall"],
+        )
+        other_c = next(user for user in db.list_users(self.db_path) if user["id"] == other_c_id)
+        self.assertEqual(self.app.visible_products_for_user([triggered], other_c), [])
+
+        with db.get_connection(self.db_path) as connection:
+            db.update_product(
+                connection,
+                source["id"],
+                {"product_name": original_name},
+                users["A"]["id"],
+            )
+        reverted = db.get_product(self.db_path, source["id"])
+        self.assertEqual(reverted["workflow_restart_required"], 0)
+        self.assertEqual(reverted["c_published_version_no"], reverted["current_version_no"])
+
+        with db.get_connection(self.db_path) as connection:
+            db.update_product(
+                connection,
+                source["id"],
+                {"product_name": original_name + "最终修订"},
+                users["A"]["id"],
+            )
+            before_resubmit = db.get_product(self.db_path, source["id"])
+            db.change_product_status(
+                connection,
+                source["id"],
+                "published",
+                users["B"]["id"],
+                "重新提交给运营部",
+                "专项测试",
+            )
+        republished = db.get_product(self.db_path, source["id"])
+        self.assertEqual(republished["workflow_restart_required"], 0)
+        self.assertEqual(republished["c_release_no"], int(before_resubmit["c_release_no"]) + 1)
+        self.assertEqual(
+            db.products_for_c_published_versions(self.db_path, [republished])[0]["product_name"],
+            original_name + "最终修订",
+        )
+
+    def test_admin_restore_uses_same_post_publication_restart_rule(self):
+        users = {user["department"]: user for user in db.list_users(self.db_path)}
+        with db.get_connection(self.db_path) as connection:
+            product_id = db.create_product(
+                connection,
+                {
+                    "brand_name": "思安娜",
+                    "season_year": "2026秋",
+                    "style_code": "RESTORE-001",
+                    "style_color": "RESTORE-001-黑",
+                    "product_name": "初始名称",
+                    "tax_included_price": 200,
+                },
+                users["A"]["id"],
+                "A",
+            )
+            db.update_product(
+                connection,
+                product_id,
+                {"product_name": "正式发布名称"},
+                users["A"]["id"],
+            )
+            db.change_product_status(
+                connection,
+                product_id,
+                "pending",
+                users["A"]["id"],
+                "开启商品部协作",
+                "专项测试",
+            )
+            db.change_product_status(
+                connection,
+                product_id,
+                "published",
+                users["B"]["id"],
+                "确认资料齐全，提交运营部",
+                "专项测试",
+            )
+            db.restore_product_version(connection, product_id, 1, users["ADMIN"]["id"])
+        restored = db.get_product(self.db_path, product_id)
+        self.assertEqual(restored["status"], "published")
+        self.assertEqual(restored["product_name"], "初始名称")
+        self.assertEqual(restored["workflow_restart_required"], 1)
+        c_formal = db.products_for_c_published_versions(self.db_path, [restored])[0]
+        self.assertEqual(c_formal["product_name"], "正式发布名称")
+
+    def test_init_backfills_missing_current_and_c_published_version_snapshots(self):
+        with db.get_connection(self.db_path) as connection:
+            connection.execute("DELETE FROM product_versions WHERE product_id = 1")
+            connection.execute("UPDATE products SET c_published_version_no = NULL WHERE id = 1")
+        init_db(self.db_path)
+        product = db.get_product(self.db_path, 1)
+        self.assertEqual(product["c_published_version_no"], product["current_version_no"])
+        version = db.get_product_version(self.db_path, 1, int(product["current_version_no"]))
+        self.assertIsNotNone(version)
+        self.assertEqual(version["snapshot"]["product_name"], product["product_name"])
 
     def build_multipart(
         self,

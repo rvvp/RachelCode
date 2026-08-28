@@ -36,6 +36,7 @@ from catalog_backend.fields import CATALOG_EXPORT_FIELD_ORDER, FIELDS_BY_GROUP, 
 from catalog_backend.policies import (
     B_STAGE_FIELD_KEYS,
     BILLING_PLATFORM_OPTIONS,
+    COLLABORATION_START_FIELD_KEYS,
     C_OPERATING_CHANNELS,
     available_lifecycle_actions,
     available_status_actions,
@@ -72,6 +73,7 @@ from catalog_backend.policies import (
     status_label,
     visible_fields_for_department,
     visible_fields_from_keys,
+    WORKFLOW_RESTART_FIELD_KEYS,
 )
 from catalog_backend.uploads import (
     generic_content_type,
@@ -92,7 +94,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.08.26-catalog-card-layout-v2"
+CATALOG_BUILD_VERSION = "2026.08.28-parallel-workflow-v1"
 LIST_LAYOUT_VIRTUAL_FIELDS: tuple[FieldDef, ...] = ()
 LIST_LAYOUT_VIRTUAL_FIELD_MAP = {}
 LIST_LAYOUT_HIDDEN_FIELD_KEYS = {
@@ -127,7 +129,7 @@ class CatalogApplication:
             "brand_name": "思安娜的\n藏寶閣",
             "brand_mark": "Sienna",
             "brand_tagline": "让商品资料从分散表格进入统一底库",
-            "brand_subtitle": "面向跟单部、商品部与运营部协作的内部资料后台，支持跟单部主体填写、商品部补充品类、图片、上新价格、上新渠道和资料完成，运营部只读开放与结构化调用。",
+            "brand_subtitle": "面向跟单部、商品部与运营部协作的内部资料后台，支持跟单部主体填写、商品部维护图片与完成标记，商品企划中心统一维护品类、上新价格和上新渠道。",
             "brand_eyebrow": "Sienna Treasure Pavilion",
             "brand_console_eyebrow": "Sienna Treasure Workspace",
             "accent": "#bc6c25",
@@ -565,9 +567,15 @@ class CatalogApplication:
                 ),
             )
         form, files = self.parse_form(environ)
-        self.apply_image_upload(form, files, existing_image_url=product.get("image_url"))
+        self.apply_image_upload(
+            form,
+            files,
+            existing_image_url=product.get("image_url"),
+            existing_image_gallery=product.get("image_gallery_json"),
+        )
+        editable_keys = self.editable_field_keys_for_request(user, product)
         form = self.normalized_form_for_stage(user, product, form)
-        errors = self.validate_product_form(form)
+        errors = self.validate_product_form(form, editable_keys=editable_keys)
         if errors:
             merged = {**product, **form}
             return self.html_response(
@@ -596,14 +604,18 @@ class CatalogApplication:
                 self.render_message_page("记录不存在", "没有找到这条商品资料。", user),
                 status="404 Not Found",
             )
-        if not can_see_product(user, product):
+        if user.get("department") == "C":
+            visible_products = self.visible_products_for_user([product], user)
+            if visible_products:
+                product = visible_products[0]
+        else:
+            visible_products = [product] if can_see_product(user, product) else []
+        if not visible_products:
             return self.html_response(
                 start_response,
                 self.render_message_page("不可查看", "当前账号只能查看已完成且对本角色开放的资料。", user),
                 status="403 Forbidden",
             )
-        if user.get("department") == "C":
-            product = self.visible_products_for_user([product], user)[0]
         notice = query.get("notice", "").strip()
         return self.html_response(start_response, self.render_product_detail(user, product, notice))
 
@@ -669,7 +681,9 @@ class CatalogApplication:
                 product = editable_candidates[0]
                 updated_payload = {field.key: product.get(field.key) for field in PRODUCT_FIELDS}
                 changed = False
-                for field_key in ("category", "image_url", "launch_price", "launch_channel", "completion_flag"):
+                # The three planning outputs are write-protected in the catalog;
+                # only the image and completion marker remain B-stage inputs.
+                for field_key in ("image_url", "completion_flag"):
                     value = row.get(field_key)
                     if value in (None, ""):
                         continue
@@ -956,12 +970,14 @@ class CatalogApplication:
         visible_products = self.visible_products_for_user(
             db.list_products(
                 self.db_path,
-                query=query.get("q", ""),
+                query="" if user.get("department") == "C" else query.get("q", ""),
                 department=query.get("department", ""),
                 status=source_status_filter,
             ),
             user,
         )
+        if user.get("department") == "C":
+            visible_products = self.filter_c_products_by_keyword(visible_products, query.get("q", ""))
         if user.get("department") == "C" and query.get("status", ""):
             visible_products = [
                 product for product in visible_products
@@ -1036,12 +1052,14 @@ class CatalogApplication:
         visible_products = self.visible_products_for_user(
             db.list_products(
                 self.db_path,
-                query=query.get("q", ""),
+                query="" if api_user.get("department") == "C" else query.get("q", ""),
                 department=query.get("department", ""),
                 status=source_status_filter,
             ),
             api_user,
         )
+        if api_user.get("department") == "C":
+            visible_products = self.filter_c_products_by_keyword(visible_products, query.get("q", ""))
         if api_user.get("department") == "C" and query.get("status", ""):
             visible_products = [
                 product for product in visible_products
@@ -1097,6 +1115,12 @@ class CatalogApplication:
         product_id = int(query["id"]) if str(query.get("id") or "").isdigit() else None
         products = db.planning_source_payloads(self.db_path, product_id)
         withdrawn_ids = db.planning_withdrawn_source_ids(self.db_path, product_id)
+        known_ids = []
+        raw_known_ids = str(query.get("known_ids") or "")
+        for value in raw_known_ids.split(","):
+            if value.strip().isdigit():
+                known_ids.append(int(value.strip()))
+        image_updates = db.planning_source_image_payloads(self.db_path, known_ids)
         season_year = str(query.get("season_year") or "").strip()
         status = str(query.get("status") or "").strip()
         if season_year:
@@ -1107,8 +1131,10 @@ class CatalogApplication:
             start_response,
             {
                 "source": "cangbaoge",
+                "image_gate": True,
                 "count": len(products),
                 "items": products,
+                "image_updates": image_updates,
                 "withdrawn_ids": withdrawn_ids,
                 "synced_at": db.utc_now(),
             },
@@ -1119,9 +1145,9 @@ class CatalogApplication:
             return self.json_error_response(start_response, "not_configured", "商品企划内部接口尚未配置 Token。", "503 Service Unavailable")
         if not self.planning_api_authorized(environ):
             return self.json_error_response(start_response, "unauthorized", "需要有效的商品企划内部 Token。", "401 Unauthorized")
-        products = db.planning_source_payloads(self.db_path, product_id)
+        products = db.planning_source_image_payloads(self.db_path, [product_id])
         if not products:
-            return self.json_error_response(start_response, "not_found", "当前商品不属于“待商品部填写”资料。", "404 Not Found")
+            return self.json_error_response(start_response, "not_found", "当前商品没有可读取的藏宝阁图片。", "404 Not Found")
         image_url = str(products[0].get("image_url") or "").strip()
         if not image_url.startswith(MEDIA_URL_PREFIX):
             return self.json_error_response(start_response, "not_found", "当前商品没有可读取的藏宝阁图片。", "404 Not Found")
@@ -1224,7 +1250,13 @@ class CatalogApplication:
                 self.render_message_page("记录不存在", "没有找到这条商品资料。", user),
                 status="404 Not Found",
             )
-        if not can_see_product(user, product):
+        if user.get("department") == "C":
+            visible_products = self.visible_products_for_user([product], user)
+            if visible_products:
+                product = visible_products[0]
+        else:
+            visible_products = [product] if can_see_product(user, product) else []
+        if not visible_products:
             return self.html_response(
                 start_response,
                 self.render_message_page("不可操作", "当前账号不能处理其他运营归属的资料。", user),
@@ -1234,6 +1266,12 @@ class CatalogApplication:
         target_status = form.get("status", "").strip()
         review_note = " ".join(str(form.get("review_note", "")).split())
         if user.get("department") == "C" and target_status == "received":
+            if int(product.get("workflow_restart_required") or 0):
+                return self.html_response(
+                    start_response,
+                    self.render_message_page("不可操作", "当前资料正在修订，需等待商品部重新提交后再接收。", user),
+                    status="403 Forbidden",
+                )
             if product.get("status") not in {"published", "received"}:
                 return self.html_response(
                     start_response,
@@ -1523,7 +1561,7 @@ class CatalogApplication:
                     allowed = dict(available_status_actions(user, product))
                     if "pending" not in allowed:
                         skipped += 1
-                        self.append_bulk_skip_reason(skip_reasons, product, "当前状态不能提交给商品部。")
+                        self.append_bulk_skip_reason(skip_reasons, product, "当前状态不能开启商品部协作。")
                         continue
                     validation_error = self.status_transition_validation_error(product, "pending")
                     if validation_error:
@@ -1558,14 +1596,20 @@ class CatalogApplication:
                         "published",
                         user["id"],
                         allowed["published"],
-                        "商品部批量补齐品类、图片、上新价格、上新渠道和资料完成，并开放给运营部读取。",
+                        "商品部批量补齐图片与资料完成，并开放给运营部读取。品类、上新价格和上新渠道来自商品企划中心。",
                     )
                     updated += 1
                     continue
                 if action == "receive_selected":
-                    if user.get("department") != "C" or not can_see_product(user, product):
+                    visible_c_products = self.visible_products_for_user([product], user) if user.get("department") == "C" else []
+                    if not visible_c_products:
                         skipped += 1
                         self.append_bulk_skip_reason(skip_reasons, product, "当前账号不能接收其他运营归属的资料。")
+                        continue
+                    product = visible_c_products[0]
+                    if int(product.get("workflow_restart_required") or 0):
+                        skipped += 1
+                        self.append_bulk_skip_reason(skip_reasons, product, "资料正在修订，需等待商品部重新提交。")
                         continue
                     if product.get("status") not in {"published", "received"} or int(product.get("c_release_no") or 0) <= 0:
                         skipped += 1
@@ -1651,7 +1695,7 @@ class CatalogApplication:
                     continue
                 skipped += 1
         if action == "submit_to_b_selected":
-            action_label = "批量提交给商品部填写"
+            action_label = "批量开启商品部协作"
         elif action == "complete_to_c_selected":
             action_label = "批量完成并开放给运营部"
         elif action == "receive_selected":
@@ -1684,7 +1728,7 @@ class CatalogApplication:
         if not product_ids:
             return self.redirect(
                 start_response,
-                "/products/review?notice=" + self.urlencode_message("请先勾选至少一条待商品部填写资料。"),
+                "/products/review?notice=" + self.urlencode_message("请先勾选至少一条 A/B 协作资料。"),
             )
         updated = 0
         skipped = 0
@@ -1897,8 +1941,8 @@ class CatalogApplication:
                 status="404 Not Found",
             )
         media_is_visible = any(
-            path in self.image_gallery_values(product) and can_see_product(user, product)
-            for product in db.list_products(self.db_path)
+            path in self.image_gallery_values(product)
+            for product in self.visible_products_for_user(db.list_products(self.db_path), user)
         )
         if not media_is_visible:
             return self.html_response(
@@ -2157,15 +2201,15 @@ class CatalogApplication:
             "/settings/c-fields?notice=" + self.urlencode_message(notice),
         )
 
-    def validate_product_form(self, form):
+    def validate_product_form(self, form, editable_keys: set[str] | None = None):
         errors = []
         if not form.get("product_name", "").strip():
             errors.append("商品名称不能为空。")
         if not form.get("style_code", "").strip():
             errors.append("款号不能为空。")
         launch_channel = str(form.get("launch_channel", "")).strip()
-        if launch_channel and not normalize_launch_channel(launch_channel):
-            errors.append("上新渠道仅支持天猫、唯品、同款。")
+        if (editable_keys is None or "launch_channel" in editable_keys) and launch_channel and not normalize_launch_channel(launch_channel):
+            errors.append("上新渠道需使用商品企划中心规则中的有效选项。")
         for numeric_field in (
             "tax_included_price",
             "tag_price",
@@ -2181,6 +2225,8 @@ class CatalogApplication:
             "total_quantity",
         ):
             raw_value = form.get(numeric_field, "")
+            if editable_keys is not None and numeric_field not in editable_keys:
+                continue
             if raw_value is None:
                 continue
             value = str(raw_value).strip()
@@ -2202,16 +2248,31 @@ class CatalogApplication:
                 errors.append("上新价格必须是大于 0 的整数，不保留小数位。")
         return errors
 
-    def apply_image_upload(self, form: dict, files: dict, existing_image_url: str | None):
-        existing_gallery = self.image_gallery_values({"image_gallery_json": form.get("image_gallery_json"), "image_url": existing_image_url})
+    def apply_image_upload(
+        self,
+        form: dict,
+        files: dict,
+        existing_image_url: str | None,
+        existing_image_gallery: str | list[str] | None = None,
+    ):
+        existing_gallery = self.image_gallery_values(
+            {
+                "image_gallery_json": existing_image_gallery or form.get("image_gallery_json"),
+                "image_url": existing_image_url,
+            }
+        )
         retained_gallery = self.collect_gallery_values(form, "image_gallery_existing")
-        manual_gallery = self.collect_gallery_values(form, "image_gallery_manual")
+        manual_gallery = self.collect_gallery_inputs(form, "image_gallery_manual")
         upload_payloads = read_validated_image_uploads(files.get("image_uploads"))
         upload_payload = read_validated_image_upload(files.get("image_upload"))
         manual_value = str(form.get("image_url", "")).strip()
         gallery_values = []
         if retained_gallery:
-            gallery_values.extend(retained_gallery)
+            for index, original in enumerate(retained_gallery):
+                replacement = manual_gallery[index] if index < len(manual_gallery) else original
+                if replacement:
+                    gallery_values.append(replacement)
+            gallery_values.extend(value for value in manual_gallery[len(retained_gallery):] if value)
         elif existing_gallery and not manual_value and not upload_payload and not upload_payloads and "image_gallery_existing__0" not in form:
             gallery_values.extend(existing_gallery)
         for value in manual_gallery:
@@ -2226,7 +2287,19 @@ class CatalogApplication:
             if new_media_path not in gallery_values:
                 gallery_values.insert(0, new_media_path)
         elif manual_value and manual_value not in gallery_values:
-            gallery_values.insert(0, manual_value)
+            # Editing the primary image URL represents a replacement (for
+            # example, a professional photo replacing a temporary snapshot),
+            # so do not leave the superseded first image in the gallery.
+            if retained_gallery and gallery_values and manual_value != retained_gallery[0]:
+                gallery_values[0] = manual_value
+            elif not retained_gallery or not manual_gallery:
+                gallery_values.insert(0, manual_value)
+        if not upload_payload and retained_gallery and gallery_values:
+            # The per-image editor is also allowed to replace the first image;
+            # preserve the remaining gallery order while promoting its value.
+            primary_manual = manual_gallery[0] if manual_gallery else ""
+            if primary_manual and primary_manual != retained_gallery[0]:
+                gallery_values[0] = primary_manual
         gallery_values = self.normalize_gallery_values(gallery_values)
         removed_local_media = {
             value for value in existing_gallery
@@ -2349,18 +2422,23 @@ class CatalogApplication:
             supplier = str(query.get("supplier", "")).strip()
         requested_status = str(query.get("status", "")).strip()
         tax_price_filter = "modified" if requested_status == "tax_price_modified" and (user.get("department") == "B" or is_admin(user)) else ""
-        product_status = "" if tax_price_filter else requested_status
+        workflow_restart_filter = requested_status == "workflow_restart" and (user.get("department") == "B" or is_admin(user))
+        product_status = "" if tax_price_filter or workflow_restart_filter else requested_status
         exact_matches = []
-        for product in db.list_products(
+        source_products = db.list_products(
             self.db_path,
-            keyword,
+            "" if user.get("department") == "C" else keyword,
             str(query.get("department", "")).strip(),
             product_status,
             str(query.get("lifecycle_status", "")).strip(),
             supplier,
             tax_price_filter,
-        ):
-            if not can_see_product(user, product):
+        )
+        visible_source_products = self.visible_products_for_user(source_products, user)
+        if user.get("department") == "C":
+            visible_source_products = self.filter_c_products_by_keyword(visible_source_products, keyword)
+        for product in visible_source_products:
+            if workflow_restart_filter and not int(product.get("workflow_restart_required") or 0):
                 continue
             style_code = str(product.get("style_code") or "").strip()
             if style_code.casefold() != keyword.casefold():
@@ -2815,18 +2893,40 @@ class CatalogApplication:
         return visible_fields_for_department(user["department"])
 
     def visible_products_for_user(self, products: list[dict], user: dict) -> list[dict]:
-        visible_products = [product for product in products if can_see_product(user, product)]
-        if user.get("department") != "C" or not visible_products:
-            return visible_products
+        if user.get("department") != "C":
+            return [product for product in products if can_see_product(user, product)]
+        published_products = db.products_for_c_published_versions(
+            self.db_path,
+            [product for product in products if product.get("status") in {"published", "received"}],
+        )
         if is_department_monitor(user):
+            visible_products = [product for product in published_products if can_see_product(user, product)]
             for product in visible_products:
                 product["c_received"] = product.get("status") == "received"
             return visible_products
         receipt_releases = db.c_receipt_release_numbers(self.db_path, int(user["id"]))
-        for product in visible_products:
+        visible_products = []
+        for product in published_products:
+            if not can_see_product(user, product):
+                continue
             release_no = int(product.get("c_release_no") or 0)
-            product["c_received"] = release_no in receipt_releases.get(int(product["id"]), set())
+            c_received = release_no in receipt_releases.get(int(product["id"]), set())
+            if int(product.get("workflow_restart_required") or 0) and not c_received:
+                continue
+            product["c_received"] = c_received
+            visible_products.append(product)
         return visible_products
+
+    def filter_c_products_by_keyword(self, products: list[dict], keyword: str) -> list[dict]:
+        clean_keyword = str(keyword or "").strip().casefold()
+        if not clean_keyword:
+            return products
+        searchable_keys = ("product_name", "style_code", "brand_name")
+        return [
+            product
+            for product in products
+            if any(clean_keyword in str(product.get(field_key) or "").casefold() for field_key in searchable_keys)
+        ]
 
     def c_effective_status(self, product: dict, user: dict) -> str:
         status = str(product.get("status") or "")
@@ -2839,15 +2939,18 @@ class CatalogApplication:
     def product_payload_for_user(self, product: dict, user: dict) -> dict:
         visible_fields = self.visible_fields_for_c_product(product) if user.get("department") == "C" else self.visible_fields_for_user(user)
         effective_status = self.c_effective_status(product, user)
+        effective_status_label = status_label(effective_status)
+        if user.get("department") != "C" and int(product.get("workflow_restart_required") or 0):
+            effective_status_label = "待商品部重新提交"
         payload = {
             "id": product.get("id"),
             "owner_department": product.get("owner_department"),
             "creator_name": product.get("creator_name"),
             "creator_username": product.get("creator_username"),
             "created_at": product.get("created_at"),
-            "updated_at": product.get("updated_at"),
+            "updated_at": product.get("c_view_updated_at") or product.get("updated_at"),
             "status": effective_status,
-            "status_label": status_label(effective_status),
+            "status_label": effective_status_label,
             "revision_flag": int(product.get("revision_flag") or 0),
             "revision_label": "已更新" if int(product.get("revision_flag") or 0) else "",
             "elapsed_days": self.elapsed_days_value(product.get("created_at"), product.get("completed_to_c_at")),
@@ -2959,14 +3062,18 @@ class CatalogApplication:
         b_stage_field_keys = set(B_STAGE_FIELD_KEYS)
         b_stage_field_order = ("category", "image_url", "launch_price", "launch_channel", "completion_flag")
         if target_status == "pending":
-            missing_keys = db.completion_missing_field_keys(product, excluded_keys=b_stage_field_keys)
+            missing_keys = [
+                field_key
+                for field_key in COLLABORATION_START_FIELD_KEYS
+                if not db.has_meaningful_value(product.get(field_key))
+            ]
             if not missing_keys:
                 return ""
             missing_labels = [PRODUCT_FIELD_MAP[key].label for key in missing_keys if key in PRODUCT_FIELD_MAP]
             preview = "、".join(missing_labels[:6])
             if len(missing_labels) > 6:
                 preview = f"{preview} 等 {len(missing_labels)} 项"
-            return f"跟单部资料还未完成，暂不能提交给商品部。请先补齐这些字段：{preview}。"
+            return f"开启商品部协作前，请先补齐这些识别字段：{preview}。"
         if target_status == "published":
             missing_keys = db.completion_missing_field_keys(product, excluded_keys=b_stage_field_keys)
             if missing_keys:
@@ -2986,17 +3093,19 @@ class CatalogApplication:
                     missing_fields.append(PRODUCT_FIELD_MAP[field_key].label)
             if missing_fields:
                 return f"商品部还未补齐 { '、'.join(missing_fields) }，暂不能流转给运营部。"
-            if not normalize_launch_channel(product.get("launch_channel")):
-                return "上新渠道仅支持天猫、唯品、同款，确认后才能流转给运营部。"
+            if not str(product.get("launch_channel") or "").strip():
+                return "上新渠道尚未由商品企划中心回传，确认后才能流转给运营部。"
         return ""
 
     def revision_badge(self, product: dict | None) -> str:
         if not product or not int(product.get("revision_flag") or 0):
             return ""
+        if int(product.get("workflow_restart_required") or 0):
+            return '<span class="pill" style="background:rgba(178,92,46,0.13); color:#8a4324;">待重新提交</span>'
         return '<span class="pill" style="background:linear-gradient(180deg, rgba(191,87,0,0.18), rgba(191,87,0,0.1)); color:#8a3e00;">已更新</span>'
 
     def version_label(self, product: dict | None) -> str:
-        version_no = int((product or {}).get("current_version_no") or 1)
+        version_no = int((product or {}).get("c_view_version_no") or (product or {}).get("current_version_no") or 1)
         return f"V{version_no}"
 
     def version_badges(self, version: dict, current_version_no: int) -> str:
@@ -3098,6 +3207,18 @@ class CatalogApplication:
             values.append(value)
             seen.add(value)
         return values
+
+    def collect_gallery_inputs(self, form: dict, field_name: str) -> list[str]:
+        """Read indexed gallery inputs while retaining blank positions for removal."""
+        indexed_values = []
+        for key, value in form.items():
+            if not key.startswith(field_name + "__"):
+                continue
+            suffix = key.split("__", 1)[1]
+            sort_key = int(suffix) if suffix.isdigit() else float("inf")
+            indexed_values.append((sort_key, str(value).strip()))
+        indexed_values.sort(key=lambda item: item[0])
+        return [value for _, value in indexed_values]
 
     def normalize_gallery_values(self, values) -> list[str]:
         normalized = []
@@ -4299,6 +4420,22 @@ class CatalogApplication:
       color: var(--warning);
       margin-bottom: 18px;
       border: 1px solid rgba(157, 97, 45, 0.14);
+    }}
+    .workflow-rule-note {{
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid rgba(94, 67, 40, 0.12);
+    }}
+    .workflow-rule-note summary {{
+      width: fit-content;
+      color: var(--accent-strong);
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .workflow-rule-note p {{
+      margin: 10px 0 0;
+      max-width: 880px;
     }}
     .board-row-warning {{
       background: rgba(191, 124, 48, 0.10) !important;
@@ -7092,7 +7229,7 @@ class CatalogApplication:
   </div>
   <script>
     {monitor_script}
-    document.querySelectorAll("details").forEach(function(menu) {{
+    document.querySelectorAll("details.nav-menu, details.export-menu").forEach(function(menu) {{
       let closeTimer = null;
       const cancelPendingClose = function() {{
         if (closeTimer !== null) {{
@@ -7118,7 +7255,7 @@ class CatalogApplication:
       }});
       menu.addEventListener("toggle", function() {{
         if (menu.open) {{
-          document.querySelectorAll("details[open]").forEach(function(otherMenu) {{
+          document.querySelectorAll("details.nav-menu[open], details.export-menu[open]").forEach(function(otherMenu) {{
             if (otherMenu !== menu) {{
               otherMenu.open = false;
             }}
@@ -8657,15 +8794,16 @@ class CatalogApplication:
             query = {**query, "department": ""}
         status_filter = query.get("status", "").strip()
         tax_price_filter = "modified" if b_dashboard_view and status_filter == "tax_price_modified" else ""
+        workflow_restart_filter = b_dashboard_view and status_filter == "workflow_restart"
         lifecycle_filter = query.get("lifecycle_status", "").strip()
         bulk_enabled = not is_department_monitor(user) and (
             is_admin(user) or user.get("department") in {"A", "B", "C"}
         )
-        source_status_filter = "" if user.get("department") == "C" or tax_price_filter else status_filter
+        source_status_filter = "" if user.get("department") == "C" or tax_price_filter or workflow_restart_filter else status_filter
         products = self.visible_products_for_user(
             db.list_products(
                 self.db_path,
-                keyword,
+                "" if user.get("department") == "C" else keyword,
                 department_filter,
                 source_status_filter,
                 lifecycle_filter,
@@ -8674,11 +8812,15 @@ class CatalogApplication:
             ),
             user,
         )
+        if user.get("department") == "C":
+            products = self.filter_c_products_by_keyword(products, keyword)
         if user.get("department") == "C" and status_filter:
             products = [
                 product for product in products
                 if self.c_effective_status(product, user) == status_filter
             ]
+        if workflow_restart_filter:
+            products = [product for product in products if int(product.get("workflow_restart_required") or 0)]
         total_products = len(products)
         page_size = 100
         try:
@@ -8854,7 +8996,7 @@ class CatalogApplication:
                   <td class="table-version-cell"><div class="table-version-stack">{''.join(version_parts)}</div></td>
                   <td class="table-days-cell">{self.list_value_markup(payload.get('elapsed_days_label', '未开始'), mono=True)}</td>
                   <td class="table-initiator-cell">{self.list_value_markup(product.get('creator_name'))}</td>
-                  <td class="table-updated-cell">{self.list_value_markup(self.format_list_timestamp(product.get('updated_at')), mono=True)}</td>
+                  <td class="table-updated-cell">{self.list_value_markup(self.format_list_timestamp(payload.get('updated_at')), mono=True)}</td>
                   <td class="table-actions-cell"><div class="table-action-links">{"".join(actions)}</div></td>
                 </tr>
                 """
@@ -8909,7 +9051,7 @@ class CatalogApplication:
               <div class="stat-card"><span>总资料数</span><strong>{stats.get('A', 0) + stats.get('B', 0) + stats.get('C', 0)}</strong></div>
               <div class="stat-card"><span>已完成</span><strong>{workflow_stats.get('published', 0) + workflow_stats.get('received', 0)}</strong></div>
               <div class="stat-card"><span>近 7 天新增</span><strong>{recent_stats.get('recent_created', 0)}</strong></div>
-              <div class="stat-card"><span>待商品部填写</span><strong>{workflow_stats.get('pending', 0)}</strong></div>
+              <div class="stat-card"><span>A/B协作中</span><strong>{workflow_stats.get('pending', 0)}</strong></div>
               <div class="stat-card"><span>已删除</span><strong>{lifecycle_stats.get('deleted', 0)}</strong></div>
             </div>
             """
@@ -8924,6 +9066,7 @@ class CatalogApplication:
               </a>
               <div class="stat-card"><span>近7天新增</span><strong>{b_dashboard_stats.get('recent_submitted_to_b', 0)}</strong></div>
               <div class="stat-card"><span>待完成</span><strong>{b_dashboard_stats.get('pending_completion', 0)}</strong></div>
+              <a class="stat-card stat-card-link" href="/products?status=workflow_restart#products-list"><span>待重新提交</span><strong>{b_dashboard_stats.get('restart_required', 0)}</strong><small>点击查看需重新流转款式</small></a>
               <div class="stat-card"><span>待接收</span><strong>{b_dashboard_stats.get('awaiting_receipt', 0)}</strong></div>
               <div class="stat-card"><span>近7天退回</span><strong>{b_dashboard_stats.get('recent_returned_to_a', 0)}</strong></div>
             </div>
@@ -8962,7 +9105,7 @@ class CatalogApplication:
               <select name="status">
                 <option value="">全部状态</option>
                 <option value="draft" {"selected" if status_filter == "draft" else ""}>跟单部填写中</option>
-                <option value="pending" {"selected" if status_filter == "pending" else ""}>待商品部填写</option>
+                <option value="pending" {"selected" if status_filter == "pending" else ""}>A/B协作中</option>
                 <option value="published" {"selected" if status_filter == "published" else ""}>已完成</option>
               </select>
             """
@@ -8972,6 +9115,7 @@ class CatalogApplication:
                 <option value="">全部状态</option>
                 <option value="pending" {"selected" if status_filter == "pending" else ""}>待完成</option>
                 <option value="published" {"selected" if status_filter == "published" else ""}>已完成</option>
+                <option value="workflow_restart" {"selected" if status_filter == "workflow_restart" else ""}>待重新提交</option>
                 <option value="tax_price_modified" {"selected" if status_filter == "tax_price_modified" else ""}>含税价修改</option>
               </select>
             """
@@ -8980,9 +9124,10 @@ class CatalogApplication:
               <select name="status">
                 <option value="">全部状态</option>
                 <option value="draft" {"selected" if status_filter == "draft" else ""}>跟单部填写中</option>
-                <option value="pending" {"selected" if status_filter == "pending" else ""}>待商品部填写</option>
+                <option value="pending" {"selected" if status_filter == "pending" else ""}>A/B协作中</option>
                 <option value="published" {"selected" if status_filter == "published" else ""}>已完成</option>
                 <option value="received" {"selected" if status_filter == "received" else ""}>已接收</option>
+                <option value="workflow_restart" {"selected" if status_filter == "workflow_restart" else ""}>待重新提交</option>
                 {'<option value="tax_price_modified" selected>含税价修改</option>' if tax_price_filter else '<option value="tax_price_modified">含税价修改</option>' if b_dashboard_view else ''}
               </select>
             """
@@ -9046,7 +9191,7 @@ class CatalogApplication:
             else (
                 "当前为总经办只读模式，可查看与跟单部相同范围的商品资料，并下载所需资料。"
                 if is_executive_read_only(user)
-                else "用一套资料底库承接 Excel 模板、多人协作、权限隔离和后续系统调用。跟单部负责主体资料，商品部补充品类、图片、上新价格、上新渠道和资料完成，运营部只读取管理员开放的完成资料。"
+                else "用一套资料底库承接 Excel 模板、多人协作、权限隔离和后续系统调用。跟单部负责主体资料，商品部维护图片与完成标记，商品企划中心统一维护品类、上新价格和上新渠道。"
             )
         )
         filter_intro = (
@@ -9076,6 +9221,17 @@ class CatalogApplication:
             if not is_executive_read_only(user)
             else ""
         )
+        workflow_rule_note = ""
+        if is_admin(user) and not is_department_monitor(user):
+            restart_labels = "、".join(
+                field.label for field in PRODUCT_FIELDS if field.key in WORKFLOW_RESTART_FIELD_KEYS
+            )
+            workflow_rule_note = f"""
+            <details class="workflow-rule-note">
+              <summary>资料修改重新流转规则</summary>
+              <p class="table-note">资料提交运营部后，修改以下字段会要求商品部重新确认提交：{html.escape(restart_labels)}。其他字段仅更新版本，不要求运营部重新接收。</p>
+            </details>
+            """
         content = f"""
         {dashboard_open}
         <section class="products-top-grid">
@@ -9092,6 +9248,7 @@ class CatalogApplication:
               {self.export_menu(user)}
               {'<a class="pill" href="/products/review">流转看板</a>' if is_admin(user) else ''}
             </div>
+            {workflow_rule_note}
           </div>
           <section id="products-search-filter" class="panel products-filter-card query-anchor">
             <div class="eyebrow">List Workspace</div>
@@ -10715,16 +10872,16 @@ class CatalogApplication:
             return """
               <div class="list-intro-actions">
                 <div class="tools">
-                  <button type="submit" name="bulk_action" value="submit_to_b_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交给商品部</button>
+                  <button type="submit" name="bulk_action" value="submit_to_b_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量开启商品部协作</button>
                 </div>
-                <div class="meta">先勾选资料，再一键流转给商品部继续补充。</div>
+                <div class="meta">先勾选已具备识别字段的资料，再一键开启 A/B 并行协作。</div>
               </div>
             """
         if user.get("department") == "B":
             return """
               <div class="list-intro-actions">
                 <div class="tools bulk-tools-vertical">
-                  <button type="submit" name="bulk_action" value="complete_to_c_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量完成给运营部</button>
+                  <button type="submit" name="bulk_action" value="complete_to_c_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量确认齐全给运营部</button>
                   <button type="submit" name="bulk_action" value="return_to_a_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk" class="ghost-button">批量退回给跟单部</button>
                 </div>
                 <div class="meta">商品部可在这里直接完成批量流转或退回跟单部。</div>
@@ -10767,17 +10924,30 @@ class CatalogApplication:
             sections.append(f'<section class="panel"><h2>{html.escape(group)}</h2><div class="form-grid">{inputs}</div></section>')
         department = user.get("department")
         if department == "A":
-            intro_text = "当前由跟单部维护除品类、图片、上新价格、上新渠道、资料完成以外的主体资料字段。完成后请把资料提交给商品部补充这 5 项内容。"
+            intro_text = "跟单部可先补齐款式识别信息并开启商品部协作，之后继续完善其余主体字段；商品部可同步处理图片与完成标记。"
             mode_title = "跟单部主体资料填写"
-            next_action = "提交给商品部填写"
+            next_action = "开启商品部协作"
         elif department == "B":
-            intro_text = "当前由商品部补充品类、图片、上新价格、上新渠道和资料完成。完成后即可开放给运营部读取。"
+            intro_text = "商品部可在跟单部继续补充主体资料的同时维护图片与完成标记；确认资料齐全后再统一提交运营部。"
             mode_title = "商品部资料补充"
-            next_action = "填写完成后开放给运营部"
+            next_action = "确认齐全后提交运营部"
         else:
             intro_text = "当前页面用于维护商品资料底库。"
             mode_title = "资料维护"
             next_action = "保存资料"
+        planning_readonly = ""
+        if department == "B":
+            planning_readonly = f"""
+            <section class="panel" style="margin-top:18px;">
+              <h2>商品企划字段（只读）</h2>
+              <p class="table-note">品类、上新价格、上新渠道只能在商品企划中心完成初审与复核后回传。</p>
+              <div class="form-grid">
+                <label class="field"><span>品类</span><input value="{html.escape(str(values.get('category') or ''))}" readonly></label>
+                <label class="field"><span>上新价格</span><input value="{html.escape(str(values.get('launch_price') or ''))}" readonly></label>
+                <label class="field"><span>上新渠道</span><input value="{html.escape(str(values.get('launch_channel') or ''))}" readonly></label>
+              </div>
+            </section>
+            """
         content = f"""
         <section class="hero">
           <div class="panel">
@@ -10809,6 +10979,7 @@ class CatalogApplication:
           {error_block}
           <form method="post" action="{html.escape(action)}" enctype="multipart/form-data">
             {''.join(sections)}
+            {planning_readonly}
             <section class="panel" style="margin-top:18px;">
               <div class="tools" style="margin-bottom:0;">
                 <a class="pill" href="/products">返回资料列表</a>
@@ -11012,7 +11183,7 @@ class CatalogApplication:
         )
         notice_block = f'<div class="notice">{html.escape(notice)}</div>' if notice else ""
         workflow_notice = (
-            "状态流转：跟单部填写中 -> 待商品部填写 -> 已完成 -> 已接收"
+            "状态流转：跟单整理中 -> A/B协作中 -> 待运营接收 -> 已接收"
             if user["department"] != "C"
             else "状态为已完成表示资料等待你接收；确认后会更新为已接收。"
         )
@@ -11154,7 +11325,7 @@ class CatalogApplication:
         error_block = f'<div class="warning">{html.escape(error)}</div>' if error else ""
         if user.get("department") == "B":
             page_title = "导入商品部补充 Excel"
-            intro_text = "商品部收到跟单部流转过来的资料后，可以先导出 Excel，在表内补充“品类”“图片”“上新价格”“上新渠道”“资料完成”，再回到这里导入。系统不会新增资料，只会按款号、商品名称以及款色或颜色去匹配既有条目，并仅回填商品部负责字段。"
+            intro_text = "商品部收到跟单部流转过来的资料后，可以先导出 Excel，在表内补充“图片”“资料完成”，再回到这里导入。品类、上新价格和上新渠道由商品企划中心维护并回传。系统不会新增资料，只会按款号、商品名称以及款色或颜色去匹配既有条目，并仅回填商品部负责字段。"
             stat_one = "匹配方式"
             stat_one_value = "既有资料精确匹配"
             stat_two = "更新范围"
@@ -11614,13 +11785,13 @@ class CatalogApplication:
           <div class="panel">
             <div class="eyebrow">{html.escape(console_eyebrow)}</div>
             <h1>资料流转看板</h1>
-            <p class="meta">这里主要追踪已经由跟单部提交、等待商品部补充品类、图片、上新价格、上新渠道和资料完成的资料。系统管理员也可以在详情页人工干预流转。</p>
+            <p class="meta">这里主要追踪已经由跟单部提交、等待商品部上传图片并补充资料完成标记的资料；品类、上新价格和上新渠道由商品企划中心维护。系统管理员也可以在详情页人工干预流转。</p>
             {notice_block}
           </div>
           <div class="panel">
             <div class="eyebrow">Workflow Board</div>
             <div class="stats">
-              <div class="stat-card"><span>当前待商品部填写</span><strong>{len(products)}</strong></div>
+              <div class="stat-card"><span>当前 A/B 协作中</span><strong>{len(products)}</strong></div>
               <div class="stat-card"><span>优先排序</span><strong>最近提交</strong></div>
               <div class="stat-card"><span>管理员动作</span><strong>人工流转</strong></div>
             </div>
@@ -11628,12 +11799,12 @@ class CatalogApplication:
         </section>
         <section id="review-filter" class="panel query-anchor">
           <div class="eyebrow">Workflow Filters</div>
-          <h2>筛选待商品部填写资料</h2>
+          <h2>筛选 A/B 协作资料</h2>
           <form method="get" action="/products/review#review-filter">
             <div class="form-grid">
               <label class="field">
                 <span>关键词</span>
-                <input name="q" value="{html.escape(keyword)}" placeholder="按商品名称、款号搜索待商品部填写资料">
+                <input name="q" value="{html.escape(keyword)}" placeholder="按商品名称、款号搜索 A/B 协作资料">
               </label>
               <label class="field">
                 <span>发起部门</span>
@@ -11644,7 +11815,7 @@ class CatalogApplication:
               </label>
             </div>
             <div class="tools" style="margin-top:16px; margin-bottom:0;">
-              <button type="submit">筛选待商品部填写资料</button>
+              <button type="submit">筛选 A/B 协作资料</button>
               <a class="pill" href="/products/review">清空筛选</a>
             </div>
           </form>
@@ -11674,7 +11845,7 @@ class CatalogApplication:
                 </tr>
               </thead>
               <tbody>
-                {''.join(rows) if rows else '<tr><td colspan="8">当前没有待商品部填写资料。</td></tr>'}
+                {''.join(rows) if rows else '<tr><td colspan="8">当前没有 A/B 协作资料。</td></tr>'}
               </tbody>
               </table>
             </div>
@@ -12221,11 +12392,9 @@ class CatalogApplication:
 
     def status_note_placeholder(self, user, product: dict, target_status: str) -> str:
         if target_status == "pending":
-            if user.get("department") == "A" and (product.get("status") or "") in {"published", "received"}:
-                return "例如：这条已完成资料的主体字段刚有调整，请商品部按当前版本重新补充并复核品类、图片、上新价格、上新渠道和资料完成。"
-            return "例如：主体资料与合规信息已补齐，请商品部补充品类、图片、上新价格、上新渠道和资料完成。"
+            return "例如：款式识别信息已补齐，可以开始图片和上新准备工作。"
         if target_status == "published":
-            return "例如：品类、图片、上新价格、上新渠道和资料完成已补完，可以开放给运营部读取。"
+            return "例如：已确认当前资料齐全，可以提交运营部接收。"
         if target_status == "received":
             return "例如：资料已核对接收。"
         return "例如：说明本次撤回或下线转草稿的原因。"
@@ -12244,17 +12413,16 @@ class CatalogApplication:
         actor = department_label(user.get("department"))
         if target_status == "pending":
             if user.get("department") == "A":
-                if (product.get("status") or "") in {"published", "received"}:
-                    details = f"{actor} 将已完成或已接收后又修改过的资料重新提交给商品部补充品类、图片、上新价格、上新渠道和资料完成，并重新走一遍 A→B→C 流程。"
-                else:
-                    details = f"{actor} 完成主体字段填写并转交商品部补充品类、图片、上新价格、上新渠道和资料完成。"
+                details = f"{actor} 已补齐款式识别字段并开启商品部协作，A/B 可按各自字段权限并行完善资料。"
                 note_prefix = "交接说明"
             else:
                 details = f"{actor} 将资料转回商品部补充阶段。"
                 note_prefix = "处理说明"
         elif target_status == "published":
             if user.get("department") == "B":
-                details = f"{actor} 已补齐品类、图片、上新价格、上新渠道和资料完成，并开放给运营部读取。"
+                details = f"{actor} 已确认当前资料齐全并提交运营部读取。"
+                if int(product.get("workflow_restart_required") or 0):
+                    details = f"{actor} 已确认修订资料并重新提交运营部，系统将按新版本重新分配接收。"
                 note_prefix = "完成说明"
             else:
                 details = f"{actor} 将资料标记为已完成并开放给运营部。"

@@ -10,7 +10,15 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from catalog_backend.fields import CATALOG_EXPORT_FIELD_ORDER, PRODUCT_FIELDS, PRODUCT_FIELD_MAP
-from catalog_backend.policies import B_STAGE_FIELD_KEYS, c_visible_launch_channels, normalize_billing_platform_codes
+from catalog_backend.policies import (
+    A_STAGE_FIELD_KEYS,
+    B_PLANNING_MANAGED_FIELD_KEYS,
+    B_STAGE_FIELD_KEYS,
+    WORKFLOW_RESTART_FIELD_KEYS,
+    c_visible_launch_channels,
+    normalize_launch_channel,
+    normalize_billing_platform_codes,
+)
 
 
 DEMO_PASSWORD = "demo123"
@@ -195,16 +203,23 @@ def init_db(
                 lifecycle_status TEXT NOT NULL DEFAULT 'active',
                 revision_flag INTEGER NOT NULL DEFAULT 0,
                 current_version_no INTEGER NOT NULL DEFAULT 1,
+                image_version_no INTEGER NOT NULL DEFAULT 1,
                 last_reviewed_by INTEGER,
                 last_reviewed_at TEXT,
                 completed_to_c_at TEXT,
                 c_release_no INTEGER NOT NULL DEFAULT 0,
+                c_published_version_no INTEGER,
+                workflow_restart_required INTEGER NOT NULL DEFAULT 0,
+                workflow_restart_fields_json TEXT NOT NULL DEFAULT '[]',
+                workflow_restart_started_by INTEGER,
+                workflow_restart_started_at TEXT,
                 received_by INTEGER,
                 received_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(created_by) REFERENCES users(id),
                 FOREIGN KEY(last_reviewed_by) REFERENCES users(id),
+                FOREIGN KEY(workflow_restart_started_by) REFERENCES users(id),
                 FOREIGN KEY(received_by) REFERENCES users(id)
             )
             """
@@ -230,6 +245,9 @@ def init_db(
         if "current_version_no" not in existing_columns:
             connection.execute("ALTER TABLE products ADD COLUMN current_version_no INTEGER NOT NULL DEFAULT 1")
             existing_columns.add("current_version_no")
+        if "image_version_no" not in existing_columns:
+            connection.execute("ALTER TABLE products ADD COLUMN image_version_no INTEGER NOT NULL DEFAULT 1")
+            existing_columns.add("image_version_no")
         if "last_reviewed_by" not in existing_columns:
             connection.execute("ALTER TABLE products ADD COLUMN last_reviewed_by INTEGER")
             existing_columns.add("last_reviewed_by")
@@ -242,6 +260,21 @@ def init_db(
         if "c_release_no" not in existing_columns:
             connection.execute("ALTER TABLE products ADD COLUMN c_release_no INTEGER NOT NULL DEFAULT 0")
             existing_columns.add("c_release_no")
+        if "c_published_version_no" not in existing_columns:
+            connection.execute("ALTER TABLE products ADD COLUMN c_published_version_no INTEGER")
+            existing_columns.add("c_published_version_no")
+        if "workflow_restart_required" not in existing_columns:
+            connection.execute("ALTER TABLE products ADD COLUMN workflow_restart_required INTEGER NOT NULL DEFAULT 0")
+            existing_columns.add("workflow_restart_required")
+        if "workflow_restart_fields_json" not in existing_columns:
+            connection.execute("ALTER TABLE products ADD COLUMN workflow_restart_fields_json TEXT NOT NULL DEFAULT '[]'")
+            existing_columns.add("workflow_restart_fields_json")
+        if "workflow_restart_started_by" not in existing_columns:
+            connection.execute("ALTER TABLE products ADD COLUMN workflow_restart_started_by INTEGER")
+            existing_columns.add("workflow_restart_started_by")
+        if "workflow_restart_started_at" not in existing_columns:
+            connection.execute("ALTER TABLE products ADD COLUMN workflow_restart_started_at TEXT")
+            existing_columns.add("workflow_restart_started_at")
         if "received_by" not in existing_columns:
             connection.execute("ALTER TABLE products ADD COLUMN received_by INTEGER")
             existing_columns.add("received_by")
@@ -783,6 +816,9 @@ def init_db(
             "CREATE INDEX IF NOT EXISTS idx_products_status ON products(status)"
         )
         connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_products_workflow_restart ON products(workflow_restart_required, status)"
+        )
+        connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_products_lifecycle_status ON products(lifecycle_status)"
         )
         connection.execute(
@@ -861,6 +897,8 @@ def init_db(
         backfill_supplier_product_list_layout_fields(connection)
         backfill_placeholder_product_dates(connection)
         backfill_product_completion_timestamps(connection)
+        backfill_current_product_versions(connection)
+        backfill_c_published_versions(connection)
         backfill_product_price_history(connection)
         backfill_billing_month_platform_snapshots(connection)
         backfill_supplier_master_data(connection)
@@ -990,6 +1028,45 @@ def backfill_product_completion_timestamps(connection: sqlite3.Connection) -> No
             created_at
         )
         WHERE status IN ('published', 'received') AND completed_to_c_at IS NULL
+        """
+    )
+
+
+def backfill_current_product_versions(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT p.*
+        FROM products p
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM product_versions version
+            WHERE version.product_id = p.id
+              AND version.version_no = p.current_version_no
+        )
+        """
+    ).fetchall()
+    for row in rows:
+        product = row_to_dict(row) or {}
+        payload = normalize_product_data(product)
+        record_product_version(
+            connection,
+            int(product["id"]),
+            version_no=int(product.get("current_version_no") or 1),
+            snapshot=product_snapshot_from_payload(payload, product),
+            summary_json=[],
+            change_count=0,
+            created_by=int(product["created_by"]),
+            note="系统补建当前版本快照",
+        )
+
+
+def backfill_c_published_versions(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        UPDATE products
+        SET c_published_version_no = current_version_no
+        WHERE status IN ('published', 'received')
+          AND c_published_version_no IS NULL
         """
     )
 
@@ -1226,16 +1303,16 @@ def seed_sample_products(connection: sqlite3.Connection) -> None:
         first_product_id,
         "pending",
         a_user_id,
-        "提交给商品部填写",
-        "系统预置演示数据：跟单部已完成主体字段，转交商品部补充品类、图片、上新价格、上新渠道和资料完成。",
+        "开启商品部协作",
+        "系统预置演示数据：跟单部已补齐识别字段并开启商品部协作。",
     )
     change_product_status(
         connection,
         first_product_id,
         "published",
         b_user_id,
-        "填写完成，开放给运营部",
-        "系统预置演示数据：商品部已补齐品类、图片、上新价格、上新渠道和资料完成，资料已开放给运营部。",
+        "确认资料齐全，提交运营部",
+        "系统预置演示数据：商品部确认资料齐全，资料已提交运营部。",
     )
 
     second_product_id = create_product(connection, sample_rows[1], a_user_id, "A")
@@ -1244,8 +1321,8 @@ def seed_sample_products(connection: sqlite3.Connection) -> None:
         second_product_id,
         "pending",
         a_user_id,
-        "提交给商品部填写",
-        "系统预置演示数据：跟单部已完成主体字段，等待商品部补充品类、图片、上新价格、上新渠道和资料完成。",
+        "开启商品部协作",
+        "系统预置演示数据：跟单部已补齐识别字段，A/B 正在并行完善资料。",
     )
 
 
@@ -2117,11 +2194,173 @@ def create_product(
     return product_id
 
 
+def product_version_snapshot(
+    connection: sqlite3.Connection,
+    product_id: int,
+    version_no: int | None,
+) -> dict | None:
+    if not version_no:
+        return None
+    row = connection.execute(
+        "SELECT snapshot_json FROM product_versions WHERE product_id = ? AND version_no = ?",
+        (product_id, int(version_no)),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        snapshot = json.loads(row["snapshot_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def workflow_restart_fields_against_published(
+    connection: sqlite3.Connection,
+    before_product: dict,
+    after_payload: dict,
+) -> list[str]:
+    if before_product.get("status") not in {"published", "received"}:
+        return []
+    snapshot = product_version_snapshot(
+        connection,
+        int(before_product["id"]),
+        before_product.get("c_published_version_no"),
+    )
+    if not snapshot:
+        return []
+    return [
+        field.key
+        for field in PRODUCT_FIELDS
+        if field.key in WORKFLOW_RESTART_FIELD_KEYS
+        and normalize_diff_value(snapshot.get(field.key))
+        != normalize_diff_value(after_payload.get(field.key))
+    ]
+
+
+def apply_workflow_restart_state(
+    connection: sqlite3.Connection,
+    product_id: int,
+    before_product: dict,
+    after_payload: dict,
+    next_version_no: int,
+    actor_user_id: int,
+    timestamp: str,
+) -> list[str]:
+    if before_product.get("status") not in {"published", "received"}:
+        return []
+    restart_fields = workflow_restart_fields_against_published(
+        connection,
+        before_product,
+        after_payload,
+    )
+    if restart_fields:
+        started_by = before_product.get("workflow_restart_started_by")
+        started_at = before_product.get("workflow_restart_started_at")
+        if not int(before_product.get("workflow_restart_required") or 0):
+            started_by = actor_user_id
+            started_at = timestamp
+        connection.execute(
+            """
+            UPDATE products
+            SET workflow_restart_required = 1,
+                workflow_restart_fields_json = ?,
+                workflow_restart_started_by = ?,
+                workflow_restart_started_at = ?,
+                revision_flag = 1
+            WHERE id = ?
+            """,
+            (json.dumps(restart_fields, ensure_ascii=False), started_by, started_at, product_id),
+        )
+        return restart_fields
+    connection.execute(
+        """
+        UPDATE products
+        SET c_published_version_no = ?,
+            workflow_restart_required = 0,
+            workflow_restart_fields_json = '[]',
+            workflow_restart_started_by = NULL,
+            workflow_restart_started_at = NULL,
+            revision_flag = 0
+        WHERE id = ?
+        """,
+        (next_version_no, product_id),
+    )
+    return []
+
+
 def update_product(connection: sqlite3.Connection, product_id: int, raw_values: dict, actor_user_id: int | None = None) -> None:
-    payload = normalize_product_data(raw_values)
     before_row = connection.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
     before_product = row_to_dict(before_row) or {}
+    if not before_product:
+        raise LookupError("商品资料不存在。")
+    requested_payload = normalize_product_data({**before_product, **raw_values})
+    actor_department = ""
+    actor_username = ""
+    allowed_field_keys = {field.key for field in PRODUCT_FIELDS}
+    if actor_user_id:
+        actor_row = connection.execute(
+            "SELECT department, username FROM users WHERE id = ?",
+            (actor_user_id,),
+        ).fetchone()
+        actor_department = str(actor_row["department"] if actor_row else "")
+        actor_username = str(actor_row["username"] if actor_row else "")
+        if actor_username == "planning_service":
+            allowed_field_keys = set(B_PLANNING_MANAGED_FIELD_KEYS)
+        elif actor_department == "A":
+            allowed_field_keys = set(A_STAGE_FIELD_KEYS)
+        elif actor_department == "B":
+            allowed_field_keys = {"image_url", "completion_flag"}
+        else:
+            allowed_field_keys = set()
+        requested_changes = {
+            field.key
+            for field in PRODUCT_FIELDS
+            if normalize_diff_value(before_product.get(field.key))
+            != normalize_diff_value(requested_payload.get(field.key))
+        }
+        forbidden_planning_changes = requested_changes & B_PLANNING_MANAGED_FIELD_KEYS
+        if forbidden_planning_changes and actor_username != "planning_service":
+            labels = {
+                "category": "品类",
+                "launch_price": "上新价格",
+                "launch_channel": "上新渠道",
+            }
+            changed_labels = "、".join(labels.get(key, key) for key in sorted(forbidden_planning_changes))
+            raise PermissionError(f"{changed_labels}只能由商品企划中心维护并回传，藏宝阁不允许人工修改。")
+        if "image_url" in requested_changes and actor_department != "B":
+            raise PermissionError("图片只能由商品部在藏宝阁维护，其他账号不能直接修改。")
+        forbidden_changes = requested_changes - allowed_field_keys
+        if forbidden_changes:
+            changed_labels = "、".join(
+                PRODUCT_FIELD_MAP[key].label for key in sorted(forbidden_changes) if key in PRODUCT_FIELD_MAP
+            )
+            raise PermissionError(f"当前账号不能修改这些字段：{changed_labels}。")
+    merged_values = dict(before_product)
+    for field_key in allowed_field_keys:
+        if field_key in raw_values:
+            merged_values[field_key] = raw_values.get(field_key)
+    if "image_url" in allowed_field_keys and "image_gallery_json" in raw_values:
+        merged_values["image_gallery_json"] = raw_values.get("image_gallery_json")
+    payload = normalize_product_data(merged_values)
     diff_items = build_product_diff(before_product, payload)
+    image_changed = (
+        normalize_diff_value(before_product.get("image_url"))
+        != normalize_diff_value(payload.get("image_url"))
+        or normalize_image_gallery(before_product) != payload.get("image_gallery_json", "[]")
+    )
+    if image_changed and actor_user_id and "image_url" not in allowed_field_keys:
+        raise PermissionError("图片只能由商品部在藏宝阁维护，其他账号不能直接修改。")
+    if image_changed and not any(item.get("field_key") == "image_url" for item in diff_items):
+        diff_items.append(
+            {
+                "field_key": "image_url",
+                "field_label": PRODUCT_FIELD_MAP["image_url"].label,
+                "before": normalize_image_gallery(before_product),
+                "after": payload.get("image_gallery_json", "[]"),
+            }
+        )
+    if not diff_items and not image_changed:
+        return
     assignments = ", ".join([*(f"{field.key} = ?" for field in PRODUCT_FIELDS), "image_gallery_json = ?"])
     values = [payload[field.key] for field in PRODUCT_FIELDS]
     values.append(payload["image_gallery_json"])
@@ -2131,46 +2370,47 @@ def update_product(connection: sqlite3.Connection, product_id: int, raw_values: 
         f"UPDATE products SET {assignments}, updated_at = ? WHERE id = ?",
         values,
     )
-    if actor_user_id:
-        if not diff_items:
-            return
-        next_status = before_product.get("status") or "draft"
-        reset_reviewer = False
-        revision_flag = int(before_product.get("revision_flag") or 0)
-        next_version_no = int(before_product.get("current_version_no") or 1) + 1
-        actor_department_row = connection.execute(
-            "SELECT department FROM users WHERE id = ?",
-            (actor_user_id,),
-        ).fetchone()
-        actor_department = actor_department_row["department"] if actor_department_row else ""
-        if actor_department == "A":
-            if before_product.get("status") == "draft":
-                next_status = "draft"
-                revision_flag = 0
-            elif before_product.get("status") in {"pending", "published", "received"}:
-                next_status = before_product.get("status")
-                revision_flag = 1
-        if actor_department == "B" and before_product.get("status") in {"pending", "published"}:
-            next_status = "pending"
-            reset_reviewer = before_product.get("status") == "published"
-            revision_flag = 0
-        connection.execute(
-            """
-            UPDATE products
-            SET status = ?, revision_flag = ?, current_version_no = ?, last_reviewed_by = ?, last_reviewed_at = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                next_status,
-                revision_flag,
-                next_version_no,
-                None if reset_reviewer else before_product.get("last_reviewed_by"),
-                None if reset_reviewer else before_product.get("last_reviewed_at"),
-                timestamp,
-                product_id,
-            ),
-        )
-        summary_items = summarize_diff_items(diff_items)
+    if not actor_user_id:
+        return
+    non_image_diff_items = [item for item in diff_items if item.get("field_key") != "image_url"]
+    image_only_change = bool(image_changed and not non_image_diff_items)
+    next_status = before_product.get("status") or "draft"
+    current_version_no = int(before_product.get("current_version_no") or 1)
+    next_version_no = current_version_no if image_only_change else current_version_no + 1
+    next_image_version = int(before_product.get("image_version_no") or 1) + (1 if image_changed else 0)
+    next_revision_flag = int(before_product.get("revision_flag") or 0) if image_only_change else 0
+    connection.execute(
+        """
+        UPDATE products
+        SET status = ?, revision_flag = ?, current_version_no = ?, image_version_no = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (next_status, next_revision_flag, next_version_no, next_image_version, timestamp, product_id),
+    )
+    summary_items = summarize_diff_items(diff_items)
+    restart_fields = []
+    if image_only_change:
+        # Images have an independent version. Keep the current business version
+        # and formal published snapshot stable while replacing its media.
+        published_version_no = before_product.get("c_published_version_no")
+        if published_version_no:
+            snapshot_row = connection.execute(
+                "SELECT snapshot_json FROM product_versions WHERE product_id = ? AND version_no = ?",
+                (product_id, int(published_version_no)),
+            ).fetchone()
+            if snapshot_row:
+                try:
+                    published_snapshot = json.loads(snapshot_row["snapshot_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    published_snapshot = {}
+                if isinstance(published_snapshot, dict):
+                    published_snapshot["image_url"] = payload.get("image_url") or ""
+                    published_snapshot["image_gallery_json"] = payload.get("image_gallery_json", "[]")
+                    connection.execute(
+                        "UPDATE product_versions SET snapshot_json = ? WHERE product_id = ? AND version_no = ?",
+                        (json.dumps(published_snapshot, ensure_ascii=False), product_id, int(published_version_no)),
+                    )
+    else:
         record_product_version(
             connection,
             product_id,
@@ -2188,40 +2428,49 @@ def update_product(connection: sqlite3.Connection, product_id: int, raw_values: 
             created_by=actor_user_id,
             note="资料修改后生成的新版本",
         )
-        if prices_differ_for_history(before_product.get("tax_included_price"), payload.get("tax_included_price")):
-            record_product_price_history(
-                connection,
-                product_id,
-                version_no=next_version_no,
-                source_version_no=int(before_product.get("current_version_no") or 1),
-                old_price=before_product.get("tax_included_price"),
-                new_price=payload.get("tax_included_price"),
-                created_by=actor_user_id,
-                note="含税价调整",
-            )
-        details = "编辑了商品资料字段内容，并将状态重置为 A 填写阶段等待再次提交流转。"
-        if actor_department == "A" and before_product.get("status") == "pending":
-            details = "跟单部在已提交给商品部后更新了主体资料，资料继续保留在待商品部填写阶段，并标记为已更新。"
-        elif actor_department == "A" and before_product.get("status") == "published":
-            details = "跟单部在已完成资料上更新了主体资料，资料继续保持已完成状态，并标记为已更新。"
-        elif actor_department == "A" and before_product.get("status") == "received":
-            details = "跟单部在运营部已接收的资料上更新了主体资料，资料保持已接收状态并标记为已更新；重新提交后将再次流转给商品部和运营部。"
-        if actor_department == "B" and before_product.get("status") == "pending":
-            details = "补充了 B 部门负责的品类、图片、上新价格、上新渠道和资料完成字段，资料仍保留在待B填写阶段。"
-        elif actor_department == "B" and before_product.get("status") == "published":
-            details = "更新了 B 部门负责的品类、图片、上新价格、上新渠道和资料完成字段，资料已重新进入待B填写阶段，完成后可再次开放给 C。"
-        if prices_differ_for_history(before_product.get("tax_included_price"), payload.get("tax_included_price")):
-            details += " 含税价已调整，具体变更请查看含税价历史。"
-        log_product_action(
+        restart_fields = apply_workflow_restart_state(
             connection,
             product_id,
+            before_product,
+            payload,
+            next_version_no,
             actor_user_id,
-            "update",
-            "更新资料",
-            f"{details} 当前修改版本 V{next_version_no}。",
-            diff_json=summary_items,
-            diff_count=len(diff_items),
+            timestamp,
         )
+    if prices_differ_for_history(before_product.get("tax_included_price"), payload.get("tax_included_price")):
+        record_product_price_history(
+            connection,
+            product_id,
+            version_no=next_version_no,
+            source_version_no=int(before_product.get("current_version_no") or 1),
+            old_price=before_product.get("tax_included_price"),
+            new_price=payload.get("tax_included_price"),
+            created_by=actor_user_id,
+            note="含税价调整",
+        )
+    if image_only_change:
+        details = "仅替换图片，图片版本已更新；业务资料版本、已有判断和流程状态保持不变。"
+    elif before_product.get("status") == "pending":
+        details = "在 A/B 协作阶段更新了负责字段，资料继续保留在协作阶段。"
+    elif restart_fields:
+        labels = "、".join(PRODUCT_FIELD_MAP[key].label for key in restart_fields)
+        details = f"修改涉及重新流转字段（{labels}），已标记为待商品部重新提交；运营部继续读取上一正式版本。"
+    elif before_product.get("status") in {"published", "received"}:
+        details = "更新了非重新流转字段，资料版本已更新，运营部无需重新接收。"
+    else:
+        details = "更新了当前负责的商品资料字段。"
+    if prices_differ_for_history(before_product.get("tax_included_price"), payload.get("tax_included_price")):
+        details += " 含税价已调整，具体变更请查看含税价历史。"
+    log_product_action(
+        connection,
+        product_id,
+        actor_user_id,
+        "update",
+        "更新资料",
+        f"{details} 当前修改版本 V{next_version_no}。",
+        diff_json=summary_items,
+        diff_count=len(diff_items),
+    )
 
 
 def record_product_version(
@@ -2325,36 +2574,68 @@ def change_product_status(
     revision_flag_override: int | None = None,
 ) -> None:
     current_row = connection.execute(
-        "SELECT status, completed_to_c_at, c_release_no, received_by, received_at FROM products WHERE id = ?",
+        """
+        SELECT status, completed_to_c_at, c_release_no, current_version_no,
+               c_published_version_no, workflow_restart_required,
+               received_by, received_at
+        FROM products
+        WHERE id = ?
+        """,
         (product_id,),
     ).fetchone()
+    if not current_row:
+        raise LookupError("商品资料不存在。")
     current_completed_to_c_at = current_row["completed_to_c_at"] if current_row else None
     timestamp = utc_now()
     completed_to_c_at = current_completed_to_c_at
     received_by = current_row["received_by"] if current_row else None
     received_at = current_row["received_at"] if current_row else None
     c_release_no = int(current_row["c_release_no"] or 0) if current_row else 0
+    c_published_version_no = current_row["c_published_version_no"] if current_row else None
+    workflow_restart_required = int(current_row["workflow_restart_required"] or 0) if current_row else 0
     revision_flag = 0 if revision_flag_override is None else int(revision_flag_override)
     if status == "published":
         if not current_completed_to_c_at:
             completed_to_c_at = timestamp
-        if not current_row or current_row["status"] != "published":
+        if current_row["status"] not in {"published", "received"} or workflow_restart_required:
             c_release_no += 1
+            received_by = None
+            received_at = None
+        c_published_version_no = int(current_row["current_version_no"] or 1)
+        workflow_restart_required = 0
     if status == "received":
         received_by = actor_user_id
         received_at = timestamp
-    if status in {"draft", "pending", "published"}:
+    if status in {"draft", "pending"}:
         received_by = None
         received_at = None
+        workflow_restart_required = 0
     if status in {"draft", "pending"}:
         completed_to_c_at = None
     connection.execute(
         """
         UPDATE products
-        SET status = ?, revision_flag = ?, last_reviewed_by = ?, last_reviewed_at = ?, completed_to_c_at = ?, c_release_no = ?, received_by = ?, received_at = ?, updated_at = ?
+        SET status = ?, revision_flag = ?, last_reviewed_by = ?, last_reviewed_at = ?,
+            completed_to_c_at = ?, c_release_no = ?, c_published_version_no = ?,
+            workflow_restart_required = ?, workflow_restart_fields_json = '[]',
+            workflow_restart_started_by = NULL, workflow_restart_started_at = NULL,
+            received_by = ?, received_at = ?, updated_at = ?
         WHERE id = ?
         """,
-        (status, revision_flag, actor_user_id, timestamp, completed_to_c_at, c_release_no, received_by, received_at, timestamp, product_id),
+        (
+            status,
+            revision_flag,
+            actor_user_id,
+            timestamp,
+            completed_to_c_at,
+            c_release_no,
+            c_published_version_no,
+            workflow_restart_required,
+            received_by,
+            received_at,
+            timestamp,
+            product_id,
+        ),
     )
     log_product_action(connection, product_id, actor_user_id, f"status:{status}", action_label, details)
 
@@ -2433,6 +2714,54 @@ def get_product(db_path: str | Path, product_id: int) -> dict | None:
         return row_to_dict(row)
 
 
+def products_for_c_published_versions(db_path: str | Path, products: list[dict]) -> list[dict]:
+    version_pairs = {
+        (int(product["id"]), int(product["c_published_version_no"]))
+        for product in products
+        if product.get("id") and product.get("c_published_version_no")
+    }
+    if not version_pairs:
+        return [dict(product) for product in products]
+    product_ids = sorted({product_id for product_id, _ in version_pairs})
+    placeholders = ", ".join("?" for _ in product_ids)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT product_id, version_no, snapshot_json, created_at
+            FROM product_versions
+            WHERE product_id IN ({placeholders})
+            """,
+            product_ids,
+        ).fetchall()
+    snapshots: dict[tuple[int, int], tuple[dict, str]] = {}
+    for row in rows:
+        pair = (int(row["product_id"]), int(row["version_no"]))
+        if pair not in version_pairs:
+            continue
+        try:
+            snapshot = json.loads(row["snapshot_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(snapshot, dict):
+            snapshots[pair] = (snapshot, str(row["created_at"] or ""))
+    result = []
+    for product in products:
+        item = dict(product)
+        version_no = item.get("c_published_version_no")
+        snapshot_record = snapshots.get((int(item["id"]), int(version_no))) if version_no else None
+        if snapshot_record:
+            snapshot, version_created_at = snapshot_record
+            for field in PRODUCT_FIELDS:
+                if field.key in snapshot:
+                    item[field.key] = snapshot.get(field.key)
+            if "image_gallery_json" in snapshot:
+                item["image_gallery_json"] = snapshot.get("image_gallery_json")
+            item["c_view_version_no"] = int(version_no)
+            item["c_view_updated_at"] = version_created_at
+        result.append(item)
+    return result
+
+
 def _planning_source_query() -> str:
     return """
         SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
@@ -2445,6 +2774,10 @@ def _planning_source_query() -> str:
           AND EXISTS (
               SELECT 1 FROM product_logs pl
               WHERE pl.product_id = p.id AND pl.action = 'status:pending'
+          )
+          AND (
+              TRIM(COALESCE(p.image_url, '')) != ''
+              OR TRIM(COALESCE(p.image_gallery_json, '')) NOT IN ('', '[]')
           )
     """
 
@@ -2461,12 +2794,31 @@ def list_planning_source_products(db_path: str | Path, product_id: int | None = 
     return [dict(row) for row in rows]
 
 
+def _planning_image_url(product: dict) -> str:
+    image_url = str(product.get("image_url") or "").strip()
+    if image_url:
+        return image_url
+    raw_gallery = product.get("image_gallery_json")
+    if isinstance(raw_gallery, str):
+        try:
+            raw_gallery = json.loads(raw_gallery)
+        except json.JSONDecodeError:
+            raw_gallery = []
+    if isinstance(raw_gallery, list):
+        for item in raw_gallery:
+            value = str(item or "").strip()
+            if value:
+                return value
+    return ""
+
+
 def _planning_product_payload(product: dict) -> dict:
     return {
         "id": int(product["id"]),
         "style_code": product.get("style_code") or "",
         "style_color": product.get("style_color") or "",
-        "image_url": product.get("image_url") or "",
+        "image_url": _planning_image_url(product),
+        "image_gallery_json": product.get("image_gallery_json") or "[]",
         "color_name": product.get("color_name") or "",
         "product_name": product.get("product_name") or "",
         "brand_name": product.get("brand_name") or "",
@@ -2480,6 +2832,7 @@ def _planning_product_payload(product: dict) -> dict:
         "status": product.get("status") or "",
         "lifecycle_status": product.get("lifecycle_status") or "",
         "source_version_no": int(product.get("current_version_no") or 1),
+        "image_version_no": int(product.get("image_version_no") or 1),
         "updated_at": product.get("updated_at") or "",
         "created_at": product.get("created_at") or "",
         "creator_name": product.get("creator_name") or "",
@@ -2488,6 +2841,36 @@ def _planning_product_payload(product: dict) -> dict:
 
 def planning_source_payloads(db_path: str | Path, product_id: int | None = None) -> list[dict]:
     return [_planning_product_payload(product) for product in list_planning_source_products(db_path, product_id)]
+
+
+def planning_source_image_payloads(db_path: str | Path, product_ids: list[int] | tuple[int, ...] | set[int]) -> list[dict]:
+    """Return image metadata for already-known products without reopening workflow work."""
+    ids = sorted({int(product_id) for product_id in product_ids if str(product_id).isdigit()})
+    if not ids:
+        return []
+    placeholders = ", ".join("?" for _ in ids)
+    query = f"""
+        SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
+               reviewer.display_name AS reviewer_name
+        FROM products p
+        JOIN users u ON u.id = p.created_by
+        LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
+        WHERE p.id IN ({placeholders})
+          AND (
+              p.lifecycle_status IN ('active', 'withdrawn')
+              OR EXISTS (
+                  SELECT 1 FROM planning_publications pp
+                  WHERE pp.product_id = p.id
+              )
+          )
+          AND (
+              TRIM(COALESCE(p.image_url, '')) != ''
+              OR TRIM(COALESCE(p.image_gallery_json, '')) NOT IN ('', '[]')
+          )
+    """
+    with get_connection(db_path) as connection:
+        rows = connection.execute(query, ids).fetchall()
+    return [_planning_product_payload(dict(row)) for row in rows]
 
 
 def planning_withdrawn_source_ids(db_path: str | Path, product_id: int | None = None) -> list[int]:
@@ -2520,14 +2903,23 @@ def publish_planning_price(
     product = row_to_dict(product_row)
     if not product:
         raise LookupError("商品资料不存在。")
-    if product.get("lifecycle_status") != "active" or product.get("status") != "pending":
-        raise ValueError("只有状态为“待商品部填写”的正常商品才能接收商品企划回传。")
-    eligible = connection.execute(
-        "SELECT 1 FROM product_logs WHERE product_id = ? AND action = 'status:pending' LIMIT 1",
-        (product_id,),
-    ).fetchone()
-    if not eligible:
-        raise ValueError("当前商品没有有效的提交商品部记录。")
+    if product.get("lifecycle_status") != "active":
+        raise ValueError("只有正常商品才能接收商品企划回传。")
+    if not product_has_image(product):
+        raise ValueError("回传前必须先在藏宝阁上传图片。")
+    is_initial_publication = product.get("status") == "pending"
+    is_revision_publication = product.get("status") in {"published", "received"}
+    if not is_initial_publication and not is_revision_publication:
+        raise ValueError("当前商品不在可接收商品企划回传的流程状态；初次回传仅支持状态为“A/B协作中”的资料。")
+    if is_initial_publication:
+        eligible = connection.execute(
+            "SELECT 1 FROM product_logs WHERE product_id = ? AND action = 'status:pending' LIMIT 1",
+            (product_id,),
+        ).fetchone()
+        if not eligible:
+            raise ValueError("当前商品没有有效的提交商品部记录。")
+    elif not payload.get("revision"):
+        raise ValueError("已完成资料只能通过商品企划中心发起修订后回传；初次回传仅支持状态为“A/B协作中”的资料。")
     publication_id = str(payload.get("publication_id") or "").strip()
     if not publication_id:
         raise ValueError("回传必须包含企划定价记录号。")
@@ -2549,6 +2941,12 @@ def publish_planning_price(
     if not category:
         raise ValueError("回传必须包含品类。")
     launch_channel = str(payload.get("launch_channel") or "").strip()
+    if not launch_channel:
+        raise ValueError("回传必须包含规则中有效的上新渠道。")
+    # The planning center owns the configurable channel vocabulary. Keep the
+    # catalog's legacy aliases normalized, while allowing a newly configured
+    # planning option to pass through the trusted internal API unchanged.
+    launch_channel = normalize_launch_channel(launch_channel) or launch_channel
     try:
         launch_price_value = Decimal(str(payload.get("launch_price")).strip())
     except (InvalidOperation, AttributeError, TypeError, ValueError):
@@ -2564,19 +2962,18 @@ def publish_planning_price(
     after = dict(product)
     after["category"] = category
     after["launch_price"] = launch_price
-    if launch_channel:
-        after["launch_channel"] = launch_channel
+    after["launch_channel"] = launch_channel
     diff_items = build_product_diff(product, after)
     timestamp = utc_now()
     connection.execute(
         """
         UPDATE products
-        SET category = ?, launch_channel = CASE WHEN ? = '' THEN launch_channel ELSE ? END,
+        SET category = ?, launch_channel = ?,
             launch_price = ?, current_version_no = ?, revision_flag = 0,
             last_reviewed_by = ?, last_reviewed_at = ?, updated_at = ?
         WHERE id = ?
         """,
-        (category, launch_channel, launch_channel, launch_price, next_version, actor_user_id, timestamp, timestamp, product_id),
+        (category, launch_channel, launch_price, next_version, actor_user_id, timestamp, timestamp, product_id),
     )
     record_product_version(
         connection,
@@ -2591,6 +2988,15 @@ def publish_planning_price(
         created_by=actor_user_id,
         source_version_no=expected_version,
         note=f"商品企划中心回传定价 {publication_id}",
+    )
+    restart_fields = apply_workflow_restart_state(
+        connection,
+        product_id,
+        product,
+        after,
+        next_version,
+        actor_user_id,
+        timestamp,
     )
     operator_name = str(payload.get("operator_name") or "商品企划中心").strip() or "商品企划中心"
     connection.execute(
@@ -2620,7 +3026,11 @@ def publish_planning_price(
         actor_user_id,
         "planning_publish",
         "接收商品企划定价",
-        f"商品企划中心回传定价记录 {publication_id}，品类：{category}，渠道：{launch_channel or '未调整'}，上新价格：{launch_price:g}，来源资料 V{expected_version}。",
+        (
+            f"商品企划中心回传定价记录 {publication_id}，品类：{category}，渠道：{launch_channel or '未调整'}，"
+            f"上新价格：{launch_price:g}，来源资料 V{expected_version}。"
+            + (" 本次修改涉及重新流转字段，已转为待商品部重新提交。" if restart_fields else "")
+        ),
         diff_json=summarize_diff_items(diff_items),
         diff_count=len(diff_items),
     )
@@ -2696,18 +3106,27 @@ def restore_product_version(
     version = row_to_dict(version_row) or {}
     snapshot = json.loads(version.get("snapshot_json") or "{}")
     payload = normalize_product_data(snapshot)
+    # Historical restores cannot become a side door for changing planning
+    # outputs. Those values remain owned by the planning center.
+    for field_key in B_PLANNING_MANAGED_FIELD_KEYS:
+        payload[field_key] = product.get(field_key)
     next_version_no = int(product.get("current_version_no") or 1) + 1
+    image_changed = (
+        normalize_diff_value(product.get("image_url")) != normalize_diff_value(payload.get("image_url"))
+        or normalize_image_gallery(product) != payload.get("image_gallery_json", "[]")
+    )
     assignments = ", ".join([*(f"{field.key} = ?" for field in PRODUCT_FIELDS), "image_gallery_json = ?"])
     values = [payload[field.key] for field in PRODUCT_FIELDS]
     values.append(payload["image_gallery_json"])
     timestamp = utc_now()
     values.extend(
         [
-            snapshot.get("status") or product.get("status") or "draft",
-            snapshot.get("lifecycle_status") or product.get("lifecycle_status") or "active",
-            snapshot.get("completed_to_c_at") or product.get("completed_to_c_at"),
-            1 if next_version_no > 1 else 0,
+            product.get("status") or "draft",
+            product.get("lifecycle_status") or "active",
+            product.get("completed_to_c_at"),
+            0,
             next_version_no,
+            int(product.get("image_version_no") or 1) + (1 if image_changed else 0),
             actor_user_id,
             timestamp,
             timestamp,
@@ -2723,6 +3142,7 @@ def restore_product_version(
             completed_to_c_at = ?,
             revision_flag = ?,
             current_version_no = ?,
+            image_version_no = ?,
             last_reviewed_by = ?,
             last_reviewed_at = ?,
             updated_at = ?
@@ -2740,9 +3160,9 @@ def restore_product_version(
             payload,
             {
                 **product,
-                "status": snapshot.get("status") or product.get("status"),
-                "lifecycle_status": snapshot.get("lifecycle_status") or product.get("lifecycle_status"),
-                "completed_to_c_at": snapshot.get("completed_to_c_at") or product.get("completed_to_c_at"),
+                "status": product.get("status"),
+                "lifecycle_status": product.get("lifecycle_status"),
+                "completed_to_c_at": product.get("completed_to_c_at"),
             },
         ),
         summary_json=summary_items,
@@ -2750,6 +3170,15 @@ def restore_product_version(
         created_by=actor_user_id,
         source_version_no=target_version_no,
         note=f"管理员恢复自 V{target_version_no}",
+    )
+    restart_fields = apply_workflow_restart_state(
+        connection,
+        product_id,
+        product,
+        payload,
+        next_version_no,
+        actor_user_id,
+        timestamp,
     )
     if prices_differ_for_history(product.get("tax_included_price"), payload.get("tax_included_price")):
         record_product_price_history(
@@ -2768,7 +3197,10 @@ def restore_product_version(
         actor_user_id,
         "version_restore",
         "恢复版本",
-        f"管理员将资料恢复到 V{target_version_no}，并生成当前版本 V{next_version_no}。",
+        (
+            f"管理员将资料恢复到 V{target_version_no}，并生成当前版本 V{next_version_no}。"
+            + (" 恢复内容涉及重新流转字段，已转为待商品部重新提交。" if restart_fields else "")
+        ),
         diff_json=summary_items,
         diff_count=len(diff_items),
     )
@@ -2981,7 +3413,8 @@ def b_workflow_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
             SELECT
                 COALESCE(SUM(CASE WHEN status IN ('published', 'received') THEN 1 ELSE 0 END), 0) AS completed,
                 COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_completion,
-                COALESCE(SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END), 0) AS awaiting_receipt
+                COALESCE(SUM(CASE WHEN status = 'published' AND workflow_restart_required = 0 THEN 1 ELSE 0 END), 0) AS awaiting_receipt,
+                COALESCE(SUM(CASE WHEN workflow_restart_required = 1 THEN 1 ELSE 0 END), 0) AS restart_required
             FROM products
             WHERE lifecycle_status = 'active'
             """
@@ -3021,6 +3454,7 @@ def b_workflow_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
         "recent_submitted_to_b": int(recent["recent_submitted_to_b"] or 0),
         "pending_completion": int(current["pending_completion"] or 0),
         "awaiting_receipt": int(current["awaiting_receipt"] or 0),
+        "restart_required": int(current["restart_required"] or 0),
         "recent_returned_to_a": int(recent["recent_returned_to_a"] or 0),
         "recent_tax_price_changes": int(recent_tax_price_changes["total"] or 0),
     }
@@ -3143,33 +3577,36 @@ def c_user_receipt_stats(db_path: str | Path, user: dict) -> dict[str, int]:
     visible_channels = c_visible_launch_channels(user)
     if not visible_channels:
         return {"total": 0, "received": 0, "pending": 0, "recent_created": 0}
-    placeholders = ", ".join("?" for _ in visible_channels)
     cutoff = iso_days_ago(7)
-    with get_connection(db_path) as connection:
-        row = connection.execute(
-            f"""
-            SELECT
-                COUNT(*) AS total,
-                COALESCE(SUM(CASE WHEN receipt.product_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS received,
-                COALESCE(SUM(CASE WHEN receipt.product_id IS NULL THEN 1 ELSE 0 END), 0) AS pending,
-                COALESCE(SUM(CASE WHEN p.created_at >= ? THEN 1 ELSE 0 END), 0) AS recent_created
-            FROM products p
-            LEFT JOIN product_c_receipts receipt
-              ON receipt.product_id = p.id
-             AND receipt.recipient_user_id = ?
-             AND receipt.release_no = p.c_release_no
-            WHERE p.owner_department IN ('A', 'B')
-              AND p.lifecycle_status = 'active'
-              AND p.status IN ('published', 'received')
-              AND p.launch_channel IN ({placeholders})
-            """,
-            (cutoff, int(user["id"]), *visible_channels),
-        ).fetchone()
+    source_products = [
+        product
+        for product in list_products(db_path)
+        if product.get("owner_department") in {"A", "B"}
+        and product.get("lifecycle_status") == "active"
+        and product.get("status") in {"published", "received"}
+    ]
+    products = products_for_c_published_versions(db_path, source_products)
+    receipt_releases = c_receipt_release_numbers(db_path, int(user["id"]))
+    received = 0
+    pending = 0
+    recent_created = 0
+    total = 0
+    for product in products:
+        if product.get("launch_channel") not in visible_channels:
+            continue
+        release_no = int(product.get("c_release_no") or 0)
+        is_received = release_no in receipt_releases.get(int(product["id"]), set())
+        if int(product.get("workflow_restart_required") or 0) and not is_received:
+            continue
+        total += 1
+        received += int(is_received)
+        pending += int(not is_received)
+        recent_created += int(str(product.get("created_at") or "") >= cutoff)
     return {
-        "total": int(row["total"] or 0),
-        "received": int(row["received"] or 0),
-        "pending": int(row["pending"] or 0),
-        "recent_created": int(row["recent_created"] or 0),
+        "total": total,
+        "received": received,
+        "pending": pending,
+        "recent_created": recent_created,
     }
 
 
