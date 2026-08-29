@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from io import BytesIO
+import math
 import posixpath
 from pathlib import Path
 import re
@@ -591,15 +592,17 @@ def parse_supplier_bill_workbook(file_obj) -> list[dict]:
             quantity_number = float(quantity_value)
         except (TypeError, ValueError) as error:
             raise ValueError(f"第 {row_index} 行的数量必须是整数。") from error
-        if quantity_number < 0 or not quantity_number.is_integer():
-            raise ValueError(f"第 {row_index} 行的数量必须是非负整数。")
+        if not math.isfinite(quantity_number) or not quantity_number.is_integer():
+            raise ValueError(f"第 {row_index} 行的数量必须是整数，退货可填写负整数。")
         try:
             tax_included_price = float(payload.get("tax_included_price"))
             settlement_amount = float(payload.get("settlement_amount"))
         except (TypeError, ValueError) as error:
             raise ValueError(f"第 {row_index} 行的含税价和结算金额必须是数字。") from error
-        if tax_included_price < 0 or settlement_amount < 0:
-            raise ValueError(f"第 {row_index} 行的含税价和结算金额不能小于 0。")
+        if not math.isfinite(tax_included_price) or tax_included_price < 0:
+            raise ValueError(f"第 {row_index} 行的含税价必须是非负数字。")
+        if not math.isfinite(settlement_amount):
+            raise ValueError(f"第 {row_index} 行的结算金额必须是数字，退货可填写负数。")
         rows.append(
             {
                 "source_row_no": row_index,

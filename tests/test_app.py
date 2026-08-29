@@ -2640,9 +2640,116 @@ class CatalogAppTests(unittest.TestCase):
             cookie=a_cookie,
         )
         self.assertTrue(response["status"].startswith("302"))
-        self.assertIn("数量必须是非负整数", unquote_plus(dict(response["headers"])["Location"]))
+        self.assertIn("数量必须是整数，退货可填写负整数", unquote_plus(dict(response["headers"])["Location"]))
         result = db.query_supplier_bill_lines(self.db_path, "2026-06", "2026-06", "S002")
         self.assertEqual(result["items"], [])
+
+    def test_a_supplier_bill_import_accepts_negative_return_quantity_and_amount(self):
+        a_cookie = self.login("a_editor", "demo123")
+        self.request(
+            "/billing/supplier-settlements/master",
+            method="POST",
+            body=urlencode(
+                {
+                    "supplier_code": "S003",
+                    "supplier_name": "退货测试供应商",
+                    "supply_chain_manager": "李四",
+                }
+            ).encode("utf-8"),
+            cookie=a_cookie,
+        )
+        workbook = self.make_supplier_bill_workbook_bytes(
+            [
+                ["S003", "退货测试供应商", "经销", "李四", "S-01", "马天奴", "测试款", 5, 100, 500],
+                ["S003", "退货测试供应商", "经销", "李四", "S-01", "马天奴", "测试款", -2, 100, -200],
+            ]
+        )
+        response = self.request(
+            "/billing/supplier-settlements/bills/import",
+            method="POST",
+            body=self.build_multi_multipart(
+                fields=[("period_month", "2026-06")],
+                files=[
+                    (
+                        "bill_workbook",
+                        "return-quantity.xlsx",
+                        workbook,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                ],
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=a_cookie,
+        )
+        self.assertTrue(response["status"].startswith("302"))
+        self.assertIn("共 2 条明细", unquote_plus(dict(response["headers"])["Location"]))
+
+        result = db.query_supplier_bill_lines(self.db_path, "2026-06", "2026-06", "S003")
+        self.assertEqual(result["quantity_total"], 3)
+        self.assertEqual(result["settlement_amount_total"], 300.0)
+        self.assertEqual([item["quantity"] for item in result["items"]], [5, -2])
+        self.assertEqual([item["settlement_amount"] for item in result["items"]], [500.0, -200.0])
+
+        page_body = self.request(
+            "/billing/supplier-settlements?start_month=2026-06&end_month=2026-06&supplier_code=S003",
+            cookie=a_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn("退货明细可填写负整数数量和负结算金额", page_body)
+        self.assertIn("300.00", page_body)
+
+        export_response = self.request(
+            "/billing/supplier-settlements/bills/export.xlsx?"
+            + urlencode(
+                {
+                    "start_month": "2026-06",
+                    "end_month": "2026-06",
+                    "supplier_code": "S003",
+                }
+            ),
+            cookie=a_cookie,
+        )
+        self.assertTrue(export_response["status"].startswith("200"))
+        export_sheet = load_workbook(io.BytesIO(export_response["body"]), data_only=True).active
+        self.assertEqual(export_sheet["I3"].value, -2)
+        self.assertEqual(export_sheet["K3"].value, -200)
+
+    def test_a_supplier_bill_import_still_rejects_negative_tax_included_price(self):
+        a_cookie = self.login("a_editor", "demo123")
+        self.request(
+            "/billing/supplier-settlements/master",
+            method="POST",
+            body=urlencode(
+                {
+                    "supplier_code": "S004",
+                    "supplier_name": "负单价校验供应商",
+                    "supply_chain_manager": "李四",
+                }
+            ).encode("utf-8"),
+            cookie=a_cookie,
+        )
+        workbook = self.make_supplier_bill_workbook_bytes(
+            [["S004", "负单价校验供应商", "经销", "李四", "S-02", "马天奴", "退货款", -1, -100, -100]]
+        )
+        response = self.request(
+            "/billing/supplier-settlements/bills/import",
+            method="POST",
+            body=self.build_multi_multipart(
+                fields=[("period_month", "2026-06")],
+                files=[
+                    (
+                        "bill_workbook",
+                        "negative-price.xlsx",
+                        workbook,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                ],
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=a_cookie,
+        )
+        self.assertTrue(response["status"].startswith("302"))
+        self.assertIn("含税价必须是非负数字", unquote_plus(dict(response["headers"])["Location"]))
+        self.assertEqual(db.query_supplier_bill_lines(self.db_path, "2026-06", "2026-06", "S004")["items"], [])
 
     def test_a_supplier_master_excel_import_and_bidirectional_lookup(self):
         a_cookie = self.login("a_editor", "demo123")

@@ -10763,6 +10763,7 @@ class CatalogApplication:
                   <button class="supplier-bill-import-button" type="submit">导入账单</button>
                 </div>
               </div>
+              <p class="meta supplier-bill-import-note">退货明细可填写负整数数量和负结算金额；数量不接受小数，含税价不能为负数。</p>
               {supplier_bill_delete_note}
             </form>
             """
