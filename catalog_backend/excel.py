@@ -6,6 +6,8 @@ import math
 import posixpath
 from pathlib import Path
 import re
+from shutil import copyfileobj
+from tempfile import SpooledTemporaryFile
 from typing import Callable
 from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree
@@ -18,6 +20,7 @@ from PIL import ImageOps
 
 from catalog_backend.db import normalize_optional_date_text, normalize_product_data
 from catalog_backend.fields import EXCEL_HEADERS, PRODUCT_FIELDS
+from catalog_backend.uploads import MAX_IMAGE_BYTES, UPLOAD_COPY_CHUNK_BYTES, formatted_size_limit
 
 
 CATALOG_EXPORT_HIDDEN_FIELD_KEYS = {
@@ -296,15 +299,24 @@ def _embedded_image_relationships(zip_file: ZipFile) -> dict[str, dict]:
         if not content_type:
             continue
         try:
-            content = zip_file.read(package_path)
+            archive_item = zip_file.getinfo(package_path)
         except KeyError:
             continue
-        if not content:
+        if archive_item.file_size <= 0:
             continue
+        if archive_item.file_size > MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"图片映射 Excel 中的内嵌图片不能超过 {formatted_size_limit(MAX_IMAGE_BYTES)}。"
+            )
+        content_file = SpooledTemporaryFile(max_size=16 * 1024 * 1024, mode="w+b")
+        with zip_file.open(archive_item, "r") as source:
+            copyfileobj(source, content_file, length=UPLOAD_COPY_CHUNK_BYTES)
+        content_file.seek(0)
         images[image_name] = {
             "original_filename": Path(package_path).name,
             "extension": extension,
-            "content": content,
+            "file": content_file,
+            "size_bytes": archive_item.file_size,
             "content_type": content_type,
         }
     return images
@@ -314,14 +326,14 @@ def parse_image_mapping_workbook_with_embedded_images(file_obj) -> tuple[list[di
     """Parse a mapping workbook and extract WPS/Excel DISPIMG cell images."""
     if hasattr(file_obj, "seek"):
         file_obj.seek(0)
-    workbook_bytes = file_obj.read()
     try:
-        with ZipFile(BytesIO(workbook_bytes)) as zip_file:
+        with ZipFile(file_obj) as zip_file:
             embedded_images_by_id = _embedded_image_relationships(zip_file)
     except (BadZipFile, ElementTree.ParseError) as error:
         raise ValueError("图片映射 Excel 不是有效的 xlsx 文件。") from error
 
-    workbook = load_workbook(BytesIO(workbook_bytes), data_only=False)
+    file_obj.seek(0)
+    workbook = load_workbook(file_obj, data_only=False)
     return _parse_image_mapping_rows(workbook[workbook.sheetnames[0]], embedded_images_by_id)
 
 

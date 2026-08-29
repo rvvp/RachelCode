@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from mimetypes import guess_type
+import os
 from pathlib import Path
+from shutil import copyfileobj
+from time import time
 from uuid import uuid4
 
 
 MEDIA_URL_PREFIX = "/media/"
-MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_BYTES = 3 * 1024 * 1024 * 1024
 MAX_GENERIC_UPLOAD_BYTES = 20 * 1024 * 1024
+IMAGE_BACKUP_RETENTION_SECONDS = 2 * 24 * 60 * 60
+UPLOAD_COPY_CHUNK_BYTES = 8 * 1024 * 1024
 ALLOWED_IMAGE_EXTENSIONS = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -43,6 +48,24 @@ def upload_file_path(upload_dir: str | Path, stored_path: str) -> Path:
     return candidate
 
 
+def upload_stream_size(file_obj) -> int:
+    try:
+        file_obj.seek(0, 2)
+        size = int(file_obj.tell())
+        file_obj.seek(0)
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise ValueError("上传文件无法读取，请重新选择文件后再试。") from error
+    return size
+
+
+def formatted_size_limit(max_bytes: int) -> str:
+    if max_bytes % (1024 * 1024 * 1024) == 0:
+        return f"{max_bytes // (1024 * 1024 * 1024)}GB"
+    if max_bytes % (1024 * 1024) == 0:
+        return f"{max_bytes // (1024 * 1024)}MB"
+    return f"{max_bytes} 字节"
+
+
 def read_validated_image_upload(file_item) -> dict | None:
     if file_item is None or not getattr(file_item, "filename", ""):
         return None
@@ -50,15 +73,16 @@ def read_validated_image_upload(file_item) -> dict | None:
     extension = Path(original_filename).suffix.lower()
     if extension not in ALLOWED_IMAGE_EXTENSIONS:
         raise ValueError("图片只支持 JPG、PNG、WEBP 或 GIF 格式。")
-    content = file_item.file.read()
-    if not content:
+    size_bytes = upload_stream_size(file_item.file)
+    if not size_bytes:
         return None
-    if len(content) > MAX_IMAGE_BYTES:
-        raise ValueError("图片大小不能超过 5MB。")
+    if size_bytes > MAX_IMAGE_BYTES:
+        raise ValueError(f"图片大小不能超过 {formatted_size_limit(MAX_IMAGE_BYTES)}。")
     return {
         "original_filename": original_filename,
         "extension": extension,
-        "content": content,
+        "file": file_item.file,
+        "size_bytes": size_bytes,
         "content_type": ALLOWED_IMAGE_EXTENSIONS[extension],
     }
 
@@ -81,6 +105,7 @@ def read_validated_file_upload(
     *,
     allowed_extensions: dict[str, str] | None = None,
     max_bytes: int = MAX_GENERIC_UPLOAD_BYTES,
+    load_content: bool = True,
 ) -> dict | None:
     if file_item is None or not getattr(file_item, "filename", ""):
         return None
@@ -89,17 +114,23 @@ def read_validated_file_upload(
     extension = Path(original_filename).suffix.lower()
     if extension not in allowed_extensions:
         raise ValueError("文件只支持 Excel、CSV、ZIP、PDF 或常见图片格式。")
-    content = file_item.file.read()
-    if not content:
+    size_bytes = upload_stream_size(file_item.file)
+    if not size_bytes:
         return None
-    if len(content) > max_bytes:
-        raise ValueError("上传文件大小不能超过 20MB。")
-    return {
+    if size_bytes > max_bytes:
+        raise ValueError(f"上传文件大小不能超过 {formatted_size_limit(max_bytes)}。")
+    payload = {
         "original_filename": original_filename,
         "extension": extension,
-        "content": content,
+        "size_bytes": size_bytes,
         "content_type": allowed_extensions.get(extension, "application/octet-stream"),
     }
+    if load_content:
+        payload["content"] = file_item.file.read()
+        file_item.file.seek(0)
+    else:
+        payload["file"] = file_item.file
+    return payload
 
 
 def read_validated_file_uploads(
@@ -127,7 +158,19 @@ def read_validated_file_uploads(
 def save_image_upload(upload_dir: str | Path, upload_payload: dict) -> str:
     path = ensure_upload_dir(upload_dir)
     filename = f"{uuid4().hex}{upload_payload['extension']}"
-    (path / filename).write_bytes(upload_payload["content"])
+    destination = path / filename
+    try:
+        with destination.open("wb") as output:
+            if upload_payload.get("file") is not None:
+                source = upload_payload["file"]
+                source.seek(0)
+                copyfileobj(source, output, length=UPLOAD_COPY_CHUNK_BYTES)
+                source.seek(0)
+            else:
+                output.write(upload_payload.get("content") or b"")
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
     return MEDIA_URL_PREFIX + filename
 
 
@@ -167,6 +210,52 @@ def delete_local_media(upload_dir: str | Path, media_path: str | None) -> None:
     file_path = media_file_path(upload_dir, str(media_path))
     if file_path.exists():
         file_path.unlink()
+
+
+def retain_local_media_backup(
+    upload_dir: str | Path,
+    media_path: str | None,
+    *,
+    retained_at: float | None = None,
+) -> None:
+    if not is_local_media_path(media_path):
+        return
+    file_path = media_file_path(upload_dir, str(media_path))
+    if not file_path.exists() or not file_path.is_file():
+        return
+    timestamp = float(retained_at if retained_at is not None else time())
+    os.utime(file_path, (timestamp, timestamp))
+
+
+def cleanup_expired_local_media_backups(
+    upload_dir: str | Path,
+    referenced_media_paths,
+    *,
+    now: float | None = None,
+    retention_seconds: int = IMAGE_BACKUP_RETENTION_SECONDS,
+) -> list[str]:
+    upload_path = ensure_upload_dir(upload_dir)
+    referenced = {str(value or "").strip() for value in referenced_media_paths if str(value or "").strip()}
+    cutoff = float(now if now is not None else time()) - max(0, int(retention_seconds))
+    removed = []
+    for file_path in upload_path.iterdir():
+        if file_path.is_symlink() or not file_path.is_file():
+            continue
+        if file_path.suffix.lower() not in ALLOWED_IMAGE_EXTENSIONS:
+            continue
+        media_path = MEDIA_URL_PREFIX + file_path.name
+        try:
+            modified_at = file_path.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if media_path in referenced or modified_at > cutoff:
+            continue
+        try:
+            file_path.unlink()
+        except FileNotFoundError:
+            continue
+        removed.append(media_path)
+    return removed
 
 
 def media_content_type(media_path: str) -> str:

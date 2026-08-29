@@ -2028,36 +2028,25 @@ def parsed_size_tokens(size_range: str | None) -> set[str]:
 
 
 def completion_required_field_keys(product: dict) -> list[str]:
-    required = [
-        "shooting_date",
-        "inspection_date",
-        "detection_report",
-        "shipping_warehouse",
-        "brand_name",
-        "season_year",
+    return [
         "image_url",
         "style_color",
         "style_code",
         "color_name",
         "product_name",
         "category",
-        "has_accessories",
         "supplier",
         "cooperation_mode",
-        "supply_chain_manager",
         "tax_included_price",
         "tag_price",
+        "launch_price",
+        "launch_channel",
         "size_range",
         "material",
-        "composition_en",
         "washing_method",
-        "washing_method_en",
         "safety_category",
         "standard_code",
     ]
-    size_keys = sorted(parsed_size_tokens(product.get("size_range")))
-    required.extend(size_keys)
-    return required
 
 
 def completion_missing_field_keys(product: dict, excluded_keys=None) -> list[str]:
@@ -2309,7 +2298,7 @@ def update_product(connection: sqlite3.Connection, product_id: int, raw_values: 
         elif actor_department == "A":
             allowed_field_keys = set(A_STAGE_FIELD_KEYS)
         elif actor_department == "B":
-            allowed_field_keys = {"image_url", "completion_flag"}
+            allowed_field_keys = {"image_url"}
         else:
             allowed_field_keys = set()
         requested_changes = {
@@ -2698,20 +2687,46 @@ def normalize_diff_value(value):
     return str(value)
 
 
+def get_product_from_connection(connection: sqlite3.Connection, product_id: int) -> dict | None:
+    row = connection.execute(
+        """
+        SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
+               reviewer.display_name AS reviewer_name
+        FROM products p
+        JOIN users u ON u.id = p.created_by
+        LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
+        WHERE p.id = ?
+        """,
+        (product_id,),
+    ).fetchone()
+    return row_to_dict(row)
+
+
 def get_product(db_path: str | Path, product_id: int) -> dict | None:
     with get_connection(db_path) as connection:
-        row = connection.execute(
-            """
-            SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
-                   reviewer.display_name AS reviewer_name
-            FROM products p
-            JOIN users u ON u.id = p.created_by
-            LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
-            WHERE p.id = ?
-            """,
-            (product_id,),
-        ).fetchone()
-        return row_to_dict(row)
+        return get_product_from_connection(connection, product_id)
+
+
+def current_local_media_paths(db_path: str | Path) -> set[str]:
+    referenced: set[str] = set()
+    with get_connection(db_path) as connection:
+        rows = connection.execute("SELECT image_url, image_gallery_json FROM products").fetchall()
+    for row in rows:
+        image_url = str(row["image_url"] or "").strip()
+        if image_url.startswith("/media/"):
+            referenced.add(image_url)
+        try:
+            gallery = json.loads(str(row["image_gallery_json"] or "[]"))
+        except json.JSONDecodeError:
+            gallery = []
+        if not isinstance(gallery, list):
+            continue
+        referenced.update(
+            str(value).strip()
+            for value in gallery
+            if str(value or "").strip().startswith("/media/")
+        )
+    return referenced
 
 
 def products_for_c_published_versions(db_path: str | Path, products: list[dict]) -> list[dict]:

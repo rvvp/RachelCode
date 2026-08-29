@@ -19,7 +19,7 @@ ADMIN_DEPARTMENTS = {"ADMIN"}
 MANAGEABLE_DEPARTMENTS = ("A", "B", "C", "EXECUTIVE", "ADMIN")
 # These fields are completed across the two applications.  The planning center
 # owns the three planning outputs; the catalog remains the source of truth for
-# the image and the completion flag.
+# the image. The completion flag is derived by the system and is never edited.
 B_STAGE_FIELD_KEYS = {"category", "image_url", "launch_price", "launch_channel", "completion_flag"}
 B_PLANNING_MANAGED_FIELD_KEYS = {"category", "launch_price", "launch_channel"}
 A_STAGE_FIELD_KEYS = tuple(field.key for field in PRODUCT_FIELDS if field.key not in B_STAGE_FIELD_KEYS)
@@ -289,9 +289,9 @@ def editable_field_keys_for_user(user: dict | None, product: dict | None = None)
         if not product or product.get("lifecycle_status") != "active":
             return ()
         if product.get("status") in {"pending", "published"}:
-            return ("image_url", "completion_flag")
+            return ("image_url",)
         if product.get("status") == "received":
-            return ("image_url", "completion_flag")
+            return ("image_url",)
         return ()
     return ()
 

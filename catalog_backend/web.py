@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from http import cookies
 from mimetypes import guess_type
 from pathlib import Path
+from time import monotonic
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
@@ -79,6 +80,8 @@ from catalog_backend.uploads import (
     generic_content_type,
     MEDIA_URL_PREFIX,
     MAX_IMAGE_BYTES,
+    UPLOAD_COPY_CHUNK_BYTES,
+    cleanup_expired_local_media_backups,
     delete_generic_upload,
     delete_local_media,
     media_content_type,
@@ -87,6 +90,7 @@ from catalog_backend.uploads import (
     read_validated_file_uploads,
     read_validated_image_upload,
     read_validated_image_uploads,
+    retain_local_media_backup,
     save_image_upload,
     save_generic_upload,
     upload_file_path,
@@ -94,7 +98,9 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.08.28-workflow-status-v2"
+CATALOG_BUILD_VERSION = "2026.08.29-image-retention-v1"
+MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
+IMAGE_BACKUP_CLEANUP_INTERVAL_SECONDS = 60 * 60
 LIST_LAYOUT_VIRTUAL_FIELDS: tuple[FieldDef, ...] = ()
 LIST_LAYOUT_VIRTUAL_FIELD_MAP = {}
 LIST_LAYOUT_HIDDEN_FIELD_KEYS = {
@@ -117,19 +123,29 @@ BRAND_TITLE_ASSET_URL = "/assets/cangbaoge-weibei-mask.png?v=1"
 BRAND_TITLE_ASSET_PATH = Path(__file__).resolve().parent / "assets" / "cangbaoge-weibei-mask.png"
 
 
+def file_response_chunks(file_path: Path):
+    with file_path.open("rb") as source:
+        while True:
+            chunk = source.read(UPLOAD_COPY_CHUNK_BYTES)
+            if not chunk:
+                break
+            yield chunk
+
+
 class CatalogApplication:
     def __init__(self, db_path: str | Path, upload_dir: str | Path, brand_config: dict | None = None, planning_api_token: str = ""):
         self.db_path = str(db_path)
         self.upload_dir = str(upload_dir)
         self.brand_config = self.build_brand_config(brand_config or {})
         self.planning_api_token = str(planning_api_token or "").strip()
+        self._last_image_backup_cleanup_at: float | None = None
 
     def build_brand_config(self, overrides: dict) -> dict:
         config = {
             "brand_name": "思安娜的\n藏寶閣",
             "brand_mark": "Sienna",
             "brand_tagline": "让商品资料从分散表格进入统一底库",
-            "brand_subtitle": "面向跟单部、商品部与运营部协作的内部资料后台，支持跟单部主体填写、商品部维护图片与完成标记，商品企划中心统一维护品类、上新价格和上新渠道。",
+            "brand_subtitle": "面向跟单部、商品部与运营部协作的内部资料后台，支持跟单部主体填写、商品部维护图片、商品企划中心统一维护品类、上新价格和上新渠道，系统自动判断资料完成。",
             "brand_eyebrow": "Sienna Treasure Pavilion",
             "brand_console_eyebrow": "Sienna Treasure Workspace",
             "accent": "#bc6c25",
@@ -144,7 +160,22 @@ class CatalogApplication:
                 config[key] = clean_value
         return config
 
+    def maybe_cleanup_expired_image_backups(self) -> None:
+        current_time = monotonic()
+        if (
+            self._last_image_backup_cleanup_at is not None
+            and current_time - self._last_image_backup_cleanup_at < IMAGE_BACKUP_CLEANUP_INTERVAL_SECONDS
+        ):
+            return
+        self._last_image_backup_cleanup_at = current_time
+        try:
+            referenced_paths = db.current_local_media_paths(self.db_path)
+            cleanup_expired_local_media_backups(self.upload_dir, referenced_paths)
+        except Exception:
+            return
+
     def __call__(self, environ, start_response):
+        self.maybe_cleanup_expired_image_backups()
         method = environ.get("REQUEST_METHOD", "GET").upper()
         path = environ.get("PATH_INFO", "/")
         query = {
@@ -681,9 +712,9 @@ class CatalogApplication:
                 product = editable_candidates[0]
                 updated_payload = {field.key: product.get(field.key) for field in PRODUCT_FIELDS}
                 changed = False
-                # The three planning outputs are write-protected in the catalog;
-                # only the image and completion marker remain B-stage inputs.
-                for field_key in ("image_url", "completion_flag"):
+                # The completion marker is derived from the full record. B-stage
+                # imports only maintain the image field in this application.
+                for field_key in ("image_url",):
                     value = row.get(field_key)
                     if value in (None, ""):
                         continue
@@ -719,6 +750,8 @@ class CatalogApplication:
                     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     ".xls": "application/vnd.ms-excel",
                 },
+                max_bytes=MAX_IMAGE_BYTES,
+                load_content=False,
             )
             upload_payloads = read_validated_image_uploads(files.get("image_files"))
         except ValueError as error:
@@ -731,7 +764,7 @@ class CatalogApplication:
         if mapping_workbook:
             try:
                 mapping_rows, embedded_image_payloads = parse_image_mapping_workbook_with_embedded_images(
-                    io.BytesIO(mapping_workbook["content"])
+                    mapping_workbook["file"]
                 )
             except ValueError as error:
                 return self.html_response(
@@ -954,7 +987,7 @@ class CatalogApplication:
             raise
         for old_media_path in existing_gallery:
             if old_media_path != media_path:
-                delete_local_media(self.upload_dir, old_media_path)
+                retain_local_media_backup(self.upload_dir, old_media_path)
 
     def handle_export(self, start_response, user, query):
         selected_product_ids = {
@@ -1011,6 +1044,8 @@ class CatalogApplication:
             file_path = media_file_path(self.upload_dir, source)
             if not file_path.exists():
                 raise ValueError("图片文件不存在。")
+            if file_path.stat().st_size > MAX_EXPORT_IMAGE_BYTES:
+                raise ValueError("图片超过 20MB，无法直接嵌入 Excel。")
             content = file_path.read_bytes()
         else:
             parsed = urlparse(source)
@@ -1021,9 +1056,9 @@ class CatalogApplication:
                 headers={"User-Agent": "Sienna-Catalog-Export/1.0", "Accept": "image/*"},
             )
             with urlopen(request, timeout=8) as response:
-                content = response.read(MAX_IMAGE_BYTES + 1)
-        if not content or len(content) > MAX_IMAGE_BYTES:
-            raise ValueError("图片文件为空或超过 5MB。")
+                content = response.read(MAX_EXPORT_IMAGE_BYTES + 1)
+        if not content or len(content) > MAX_EXPORT_IMAGE_BYTES:
+            raise ValueError("图片文件为空或超过 20MB，无法直接嵌入 Excel。")
         return content
 
     def handle_api(self, environ, start_response, user, query):
@@ -1154,17 +1189,16 @@ class CatalogApplication:
         file_path = media_file_path(self.upload_dir, image_url)
         if not file_path.exists() or not file_path.is_file():
             return self.json_error_response(start_response, "not_found", "藏宝阁图片文件不存在。", "404 Not Found")
-        body = file_path.read_bytes()
         start_response(
             "200 OK",
             [
                 ("Content-Type", media_content_type(image_url)),
-                ("Content-Length", str(len(body))),
+                ("Content-Length", str(file_path.stat().st_size)),
                 ("Cache-Control", "private, max-age=300"),
                 ("X-Content-Type-Options", "nosniff"),
             ],
         )
-        return [body]
+        return file_response_chunks(file_path)
 
     def parse_json_body(self, environ) -> dict:
         content_length = int(environ.get("CONTENT_LENGTH") or "0")
@@ -1540,19 +1574,23 @@ class CatalogApplication:
                 status="403 Forbidden",
             )
         form, _ = self.parse_form(environ)
-        product_ids = self.collect_numeric_values(form, "product_ids")
+        selection_scope = form.get("selection_scope", "selected").strip()
+        if selection_scope == "filtered":
+            product_ids = self.parse_numeric_csv(form.get("filtered_product_ids", ""))
+        else:
+            product_ids = self.collect_numeric_values(form, "product_ids")
         action = form.get("bulk_action", "").strip()
         if not product_ids:
             return self.redirect(
                 start_response,
-                "/products?notice=" + self.urlencode_message("请先勾选至少一条资料。"),
+                self.products_notice_path(form.get("return_to", ""), "请先勾选至少一条资料。"),
             )
         updated = 0
         skipped = 0
         skip_reasons: list[str] = []
         with db.get_connection(self.db_path) as connection:
             for product_id in product_ids:
-                product = db.get_product(self.db_path, product_id)
+                product = db.get_product_from_connection(connection, product_id)
                 if not product:
                     skipped += 1
                     self.append_bulk_skip_reason(skip_reasons, None, "资料不存在或已被删除。")
@@ -1596,7 +1634,7 @@ class CatalogApplication:
                         "published",
                         user["id"],
                         allowed["published"],
-                        "商品部批量补齐图片与资料完成，并开放给运营部读取。品类、上新价格和上新渠道来自商品企划中心。",
+                        "商品部批量提交系统已判定资料完成的条目，并开放给运营部读取。",
                     )
                     updated += 1
                     continue
@@ -1701,7 +1739,7 @@ class CatalogApplication:
         elif action == "receive_selected":
             action_label = "批量接收资料"
         elif action == "return_to_a_selected":
-            action_label = "批量退回跟单部修改"
+            action_label = "批量退回跟单部"
         elif action == "publish_selected":
             action_label = "批量提交运营部"
         elif action == "archive_selected":
@@ -1711,10 +1749,7 @@ class CatalogApplication:
         notice = f"{action_label}完成：成功 {updated} 条，跳过 {skipped} 条。"
         if skip_reasons:
             notice = f"{notice} 主要原因：{'；'.join(skip_reasons)}"
-        return self.redirect(
-            start_response,
-            "/products?notice=" + self.urlencode_message(notice),
-        )
+        return self.redirect(start_response, self.products_notice_path(form.get("return_to", ""), notice))
 
     def handle_review_bulk(self, environ, start_response, user):
         if not is_admin(user):
@@ -1950,15 +1985,14 @@ class CatalogApplication:
                 self.render_message_page("不可查看", "当前账号不能查看这张图片。", user),
                 status="403 Forbidden",
             )
-        body = file_path.read_bytes()
         start_response(
             "200 OK",
             [
                 ("Content-Type", media_content_type(path)),
-                ("Content-Length", str(len(body))),
+                ("Content-Length", str(file_path.stat().st_size)),
             ],
         )
-        return [body]
+        return file_response_chunks(file_path)
 
     def handle_password_change(self, environ, start_response, user):
         form, _ = self.parse_form(environ)
@@ -2284,8 +2318,10 @@ class CatalogApplication:
                 gallery_values.append(media_path)
         if upload_payload:
             new_media_path = save_image_upload(self.upload_dir, upload_payload)
-            if new_media_path not in gallery_values:
-                gallery_values.insert(0, new_media_path)
+            if gallery_values:
+                gallery_values[0] = new_media_path
+            else:
+                gallery_values.append(new_media_path)
         elif manual_value and manual_value not in gallery_values:
             # Editing the primary image URL represents a replacement (for
             # example, a professional photo replacing a temporary snapshot),
@@ -2306,7 +2342,7 @@ class CatalogApplication:
             if value not in gallery_values
         }
         for media_path in removed_local_media:
-            delete_local_media(self.upload_dir, media_path)
+            retain_local_media_backup(self.upload_dir, media_path)
         form["image_gallery_json"] = json.dumps(gallery_values, ensure_ascii=False)
         if gallery_values:
             form["image_url"] = gallery_values[0]
@@ -2413,6 +2449,15 @@ class CatalogApplication:
             return "/products"
         return "/products?" + urlencode(params)
 
+    def products_notice_path(self, return_to: str, notice: str) -> str:
+        safe_path = self.safe_internal_path(return_to) or "/products"
+        parsed = urlparse(safe_path)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        params["notice"] = [notice]
+        query_string = urlencode(params, doseq=True)
+        fragment = parsed.fragment or "products-list"
+        return f"{parsed.path}{'?' + query_string if query_string else ''}#{fragment}"
+
     def style_code_detail_redirect_target(self, user, query: dict) -> str:
         keyword = str(query.get("q", "")).strip()
         if not keyword:
@@ -2427,8 +2472,9 @@ class CatalogApplication:
             requested_status = ""
             requested_marker = "tax_price_modified"
         tax_price_filter = "modified" if requested_marker == "tax_price_modified" and marker_filter_allowed else ""
+        completion_ready_filter = requested_marker == "completion_ready" and marker_filter_allowed
         workflow_restart_filter = requested_status == "workflow_restart" and user.get("department") != "C"
-        product_status = "" if tax_price_filter or workflow_restart_filter else requested_status
+        product_status = "" if tax_price_filter or completion_ready_filter or workflow_restart_filter else requested_status
         exact_matches = []
         source_products = db.list_products(
             self.db_path,
@@ -2443,6 +2489,8 @@ class CatalogApplication:
         if user.get("department") == "C":
             visible_source_products = self.filter_c_products_by_keyword(visible_source_products, keyword)
         for product in visible_source_products:
+            if completion_ready_filter and not self.product_is_ready_for_b_submission(product):
+                continue
             if workflow_restart_filter and not int(product.get("workflow_restart_required") or 0):
                 continue
             if (
@@ -2466,6 +2514,14 @@ class CatalogApplication:
     def style_color_match_key(self, value) -> str:
         normalized = " ".join(str(value or "").replace("\u3000", " ").split())
         return normalized.casefold()
+
+    def product_is_ready_for_b_submission(self, product: dict) -> bool:
+        if str(product.get("lifecycle_status") or "active") != "active":
+            return False
+        needs_submission = product.get("status") == "pending" or bool(
+            int(product.get("workflow_restart_required") or 0)
+        )
+        return needs_submission and db.completion_flag(product) == "Y"
 
     def style_color_name_from_filename(self, filename: str | None) -> str:
         clean_filename = Path(str(filename or "")).name
@@ -2972,8 +3028,8 @@ class CatalogApplication:
         }
         for field in visible_fields:
             field_value = product.get(field.key)
-            if field.key == "completion_flag" and field_value is None:
-                field_value = ""
+            if field.key == "completion_flag":
+                field_value = db.completion_flag(product)
             payload[field.key] = field_value
         return payload
 
@@ -3007,12 +3063,21 @@ class CatalogApplication:
         return parsed_value.astimezone().strftime("%Y-%m-%d")
 
     def format_list_decimal(self, value) -> str:
-        clean_value = str(value or "").strip()
+        clean_value = "" if value is None else str(value).strip()
         if not clean_value:
             return ""
         try:
             return f"{float(clean_value):.2f}"
-        except ValueError:
+        except (TypeError, ValueError):
+            return clean_value
+
+    def format_list_integer(self, value) -> str:
+        clean_value = "" if value is None else str(value).strip()
+        if not clean_value:
+            return ""
+        try:
+            return f"{float(clean_value):.0f}"
+        except (TypeError, ValueError):
             return clean_value
 
     def format_price_history_value(self, value) -> str:
@@ -3061,6 +3126,11 @@ class CatalogApplication:
                 self.format_list_decimal(payload.get(field.key)),
                 mono=True,
             )
+        if field.key in {"tag_price", "launch_price"}:
+            return self.list_value_markup(
+                self.format_list_integer(payload.get(field.key)),
+                mono=True,
+            )
         if field.key == "image_url":
             return self.list_value_markup(
                 payload.get(field.key),
@@ -3070,8 +3140,6 @@ class CatalogApplication:
         return self.list_value_markup(payload.get(field.key), mono=field.input_type == "number")
 
     def status_transition_validation_error(self, product: dict, target_status: str) -> str:
-        b_stage_field_keys = set(B_STAGE_FIELD_KEYS)
-        b_stage_field_order = ("category", "image_url", "launch_price", "launch_channel", "completion_flag")
         if target_status == "pending":
             missing_keys = [
                 field_key
@@ -3086,26 +3154,13 @@ class CatalogApplication:
                 preview = f"{preview} 等 {len(missing_labels)} 项"
             return f"开启商品部协作前，请先补齐这些识别字段：{preview}。"
         if target_status == "published":
-            missing_keys = db.completion_missing_field_keys(product, excluded_keys=b_stage_field_keys)
+            missing_keys = db.completion_missing_field_keys(product)
             if missing_keys:
                 missing_labels = [PRODUCT_FIELD_MAP[key].label for key in missing_keys if key in PRODUCT_FIELD_MAP]
                 preview = "、".join(missing_labels[:6])
                 if len(missing_labels) > 6:
                     preview = f"{preview} 等 {len(missing_labels)} 项"
-                return f"主体资料还未完成，暂不能流转给运营部。请先补齐这些字段：{preview}。"
-            missing_fields = []
-            for field_key in b_stage_field_order:
-                if field_key == "image_url":
-                    if db.product_has_image(product):
-                        continue
-                elif db.has_meaningful_value(product.get(field_key)):
-                    continue
-                if field_key in PRODUCT_FIELD_MAP:
-                    missing_fields.append(PRODUCT_FIELD_MAP[field_key].label)
-            if missing_fields:
-                return f"商品部还未补齐 { '、'.join(missing_fields) }，暂不能流转给运营部。"
-            if not str(product.get("launch_channel") or "").strip():
-                return "上新渠道尚未由商品企划中心回传，确认后才能流转给运营部。"
+                return f"资料尚未完成，暂不能提交运营部。请先补齐这些字段：{preview}。"
         return ""
 
     def revision_badge(self, product: dict | None) -> str:
@@ -5207,6 +5262,42 @@ class CatalogApplication:
       justify-content: center;
       box-shadow: none;
     }}
+    .products-selection-toolbar {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin: 0 0 12px;
+      padding: 10px 12px;
+      border: 1px solid rgba(94, 67, 40, 0.1);
+      border-radius: 14px;
+      background: rgba(255, 252, 247, 0.76);
+    }}
+    .products-selection-summary {{
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+    }}
+    .products-selection-summary strong {{
+      color: var(--accent-strong);
+    }}
+    .products-selection-actions {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .products-selection-actions button {{
+      width: auto;
+      min-height: 34px;
+      padding: 7px 12px;
+      border-radius: 11px;
+      box-shadow: none;
+      font-size: 13px;
+      white-space: nowrap;
+    }}
     .pagination-page-current {{
       background: var(--accent);
       border-color: var(--accent);
@@ -5456,6 +5547,10 @@ class CatalogApplication:
       flex-direction: column;
       align-items: flex-end;
       gap: 8px;
+    }}
+    .list-intro-actions .tools.bulk-tools-vertical > button {{
+      width: 148px;
+      min-width: 148px;
     }}
     .list-intro-actions .meta {{
       color: var(--muted);
@@ -8821,7 +8916,11 @@ class CatalogApplication:
             status_filter = ""
             query = {**query, "status": ""}
         tax_price_filter = "modified" if b_dashboard_view and marker_filter == "tax_price_modified" else ""
-        if not tax_price_filter:
+        completion_ready_filter = b_dashboard_view and marker_filter == "completion_ready"
+        if completion_ready_filter:
+            status_filter = ""
+            query = {**query, "status": ""}
+        if not tax_price_filter and not completion_ready_filter:
             marker_filter = ""
             query = {**query, "marker": ""}
         workflow_restart_filter = status_filter == "workflow_restart" and user.get("department") != "C"
@@ -8829,7 +8928,7 @@ class CatalogApplication:
         bulk_enabled = not is_department_monitor(user) and (
             is_admin(user) or user.get("department") in {"A", "B", "C"}
         )
-        source_status_filter = "" if user.get("department") == "C" or tax_price_filter or workflow_restart_filter else status_filter
+        source_status_filter = "" if user.get("department") == "C" or tax_price_filter or completion_ready_filter or workflow_restart_filter else status_filter
         products = self.visible_products_for_user(
             db.list_products(
                 self.db_path,
@@ -8851,11 +8950,14 @@ class CatalogApplication:
             ]
         if user.get("department") == "B":
             products = [product for product in products if product.get("status") != "draft"]
-        if workflow_restart_filter:
+        if completion_ready_filter:
+            products = [product for product in products if self.product_is_ready_for_b_submission(product)]
+        elif workflow_restart_filter:
             products = [product for product in products if int(product.get("workflow_restart_required") or 0)]
         elif user.get("department") != "C" and status_filter in {"published", "received"}:
             products = [product for product in products if not int(product.get("workflow_restart_required") or 0)]
         total_products = len(products)
+        filtered_product_ids = [int(product["id"]) for product in products if product.get("id")]
         page_size = 100
         try:
             requested_page = max(1, int(str(query.get("page", "1") or "1")))
@@ -8865,12 +8967,33 @@ class CatalogApplication:
         current_page = min(requested_page, total_pages)
         page_start = (current_page - 1) * page_size
         products = products[page_start:page_start + page_size]
+        page_product_count = len(products)
         query = {
             **query,
             "supplier": supplier_filter,
             "page": str(current_page) if current_page > 1 else "",
         }
         return_to_path = self.products_return_path(query)
+        filtered_product_ids_value = ",".join(str(product_id) for product_id in filtered_product_ids)
+        select_all_filtered_button = (
+            f'<button class="ghost-button" type="button" id="select-all-filtered-products">选择全部筛选结果（{total_products}）</button>'
+            if total_products > page_product_count
+            else ""
+        )
+        selection_toolbar_markup = (
+            f"""
+            <div class="products-selection-toolbar" id="products-selection-toolbar">
+              <span class="products-selection-summary" id="products-selection-summary">当前未勾选，本页共 {page_product_count} 条</span>
+              <div class="products-selection-actions">
+                <button class="ghost-button" type="button" id="select-current-page-products">勾选本页（{page_product_count}）</button>
+                {select_all_filtered_button}
+                <button class="ghost-button" type="button" id="clear-product-selection" hidden>清除选择</button>
+              </div>
+            </div>
+            """
+            if bulk_enabled and page_product_count
+            else ""
+        )
 
         pagination_params = {}
         for key in ("q", "supplier", "department", "status", "marker", "lifecycle_status", "monitor_department"):
@@ -9170,6 +9293,7 @@ class CatalogApplication:
             f"""
               <select name="marker">
                 <option value="">全部资料标记</option>
+                <option value="completion_ready" {"selected" if marker_filter == "completion_ready" else ""}>资料完成Y</option>
                 <option value="tax_price_modified" {"selected" if marker_filter == "tax_price_modified" else ""}>含税价修改</option>
               </select>
             """
@@ -9236,7 +9360,7 @@ class CatalogApplication:
             else (
                 "当前为总经办只读模式，可查看与跟单部相同范围的商品资料，并下载所需资料。"
                 if is_executive_read_only(user)
-                else "用一套资料底库承接 Excel 模板、多人协作、权限隔离和后续系统调用。跟单部负责主体资料，商品部维护图片与完成标记，商品企划中心统一维护品类、上新价格和上新渠道。"
+                else "用一套资料底库承接 Excel 模板、多人协作、权限隔离和后续系统调用。跟单部负责主体资料，商品部维护图片，商品企划中心统一维护品类、上新价格和上新渠道，系统自动判断资料完成。"
             )
         )
         filter_intro = (
@@ -9253,10 +9377,15 @@ class CatalogApplication:
             if supplier_search_enabled
             else ""
         )
-        price_filter_note = ""
+        marker_filter_note = ""
         if tax_price_filter == "modified":
-            price_filter_note = (
+            marker_filter_note = (
                 '<div class="notice products-filter-result-note">已展示全部含税价修改资料，按最近一次修改时间倒序排列。'
+                '<a class="pill" href="/products#products-list">清除筛选</a></div>'
+            )
+        elif completion_ready_filter:
+            marker_filter_note = (
+                '<div class="notice products-filter-result-note">已展示资料完成为 Y 且等待商品部提交运营部的资料；提交后会自动移出此列表。'
                 '<a class="pill" href="/products#products-list">清除筛选</a></div>'
             )
         if user["department"] == "C" and not is_department_monitor(user):
@@ -9321,7 +9450,7 @@ class CatalogApplication:
             </div>
             {bulk_tools_markup}
           </div>
-          {price_filter_note}
+          {marker_filter_note}
           {pagination_top_markup}
           <form id="products-export-form" method="get" action="/export.xlsx">
             <input type="hidden" name="selected" id="export-selected-products" value="">
@@ -9329,6 +9458,9 @@ class CatalogApplication:
           <form id="products-bulk-form" method="post" action="/products/bulk">
             <input type="hidden" name="confirm_text" id="list-delete-confirm-text" value="">
             <input type="hidden" name="return_to" value="{html.escape(return_to_path)}">
+            <input type="hidden" name="selection_scope" id="products-selection-scope" value="selected">
+            <input type="hidden" name="filtered_product_ids" value="{html.escape(filtered_product_ids_value, quote=True)}">
+          {selection_toolbar_markup}
           <div class="table-wrap products-list-scroll-wrap">
             <table class="catalog-table">
               <thead>
@@ -9356,14 +9488,18 @@ class CatalogApplication:
               const bulkForm = document.getElementById("products-bulk-form");
               const exportField = document.getElementById("export-selected-products");
               const toggleAll = document.getElementById("toggle-all-products");
+              const selectionScope = document.getElementById("products-selection-scope");
+              const selectionSummary = document.getElementById("products-selection-summary");
+              const selectCurrentPage = document.getElementById("select-current-page-products");
+              const selectAllFiltered = document.getElementById("select-all-filtered-products");
+              const clearSelection = document.getElementById("clear-product-selection");
+              const totalProducts = {total_products};
               if (!bulkForm) return;
               const rowCheckboxes = () => Array.from(bulkForm.querySelectorAll('input[name="product_ids"]'));
               let lastFocusedCheckbox = null;
               const syncSelected = () => {{
-                const selectedValue = rowCheckboxes()
-                  .filter((item) => item.checked)
-                  .map((item) => item.value)
-                  .join(",");
+                const selectedItems = rowCheckboxes().filter((item) => item.checked);
+                const selectedValue = selectedItems.map((item) => item.value).join(",");
                 if (exportField) {{
                   exportField.value = selectedValue;
                 }}
@@ -9371,6 +9507,22 @@ class CatalogApplication:
                   const baseHref = item.getAttribute("data-base-href") || "/export.xlsx?mode=selected";
                   item.setAttribute("href", selectedValue ? `${{baseHref}}&selected=${{encodeURIComponent(selectedValue)}}` : baseHref);
                 }});
+                const allFilteredSelected = selectionScope && selectionScope.value === "filtered";
+                if (selectionSummary) {{
+                  if (allFilteredSelected) {{
+                    selectionSummary.textContent = `已选择全部筛选结果 ${{totalProducts}} 条（用于批量操作）`;
+                  }} else if (selectedItems.length) {{
+                    selectionSummary.textContent = `已勾选本页 ${{selectedItems.length}} 条`;
+                  }} else {{
+                    selectionSummary.textContent = `当前未勾选，本页共 ${{rowCheckboxes().length}} 条`;
+                  }}
+                }}
+                if (selectAllFiltered) {{
+                  selectAllFiltered.hidden = allFilteredSelected;
+                }}
+                if (clearSelection) {{
+                  clearSelection.hidden = !allFilteredSelected && selectedItems.length === 0;
+                }}
               }};
               const syncToggleAllState = () => {{
                 if (!toggleAll) return;
@@ -9394,11 +9546,36 @@ class CatalogApplication:
               }};
               if (toggleAll) {{
                 toggleAll.addEventListener("change", () => {{
+                  if (selectionScope) selectionScope.value = "selected";
                   rowCheckboxes().forEach((item) => {{
                     item.checked = toggleAll.checked;
                     item.dataset.rangeIntent = "0";
                   }});
                   toggleAll.indeterminate = false;
+                  syncSelected();
+                }});
+              }}
+              if (selectCurrentPage) {{
+                selectCurrentPage.addEventListener("click", () => {{
+                  if (selectionScope) selectionScope.value = "selected";
+                  rowCheckboxes().forEach((item) => {{ item.checked = true; }});
+                  syncToggleAllState();
+                  syncSelected();
+                }});
+              }}
+              if (selectAllFiltered) {{
+                selectAllFiltered.addEventListener("click", () => {{
+                  if (selectionScope) selectionScope.value = "filtered";
+                  rowCheckboxes().forEach((item) => {{ item.checked = true; }});
+                  syncToggleAllState();
+                  syncSelected();
+                }});
+              }}
+              if (clearSelection) {{
+                clearSelection.addEventListener("click", () => {{
+                  if (selectionScope) selectionScope.value = "selected";
+                  rowCheckboxes().forEach((item) => {{ item.checked = false; }});
+                  syncToggleAllState();
                   syncSelected();
                 }});
               }}
@@ -9412,6 +9589,7 @@ class CatalogApplication:
                   }}
                 }});
                 item.addEventListener("change", () => {{
+                  if (selectionScope) selectionScope.value = "selected";
                   if (item.dataset.rangeIntent === "1") {{
                     applyRangeSelection(item);
                   }}
@@ -9420,6 +9598,15 @@ class CatalogApplication:
                   syncToggleAllState();
                   syncSelected();
                 }});
+              }});
+              bulkForm.addEventListener("submit", (event) => {{
+                const submitter = event.submitter;
+                if (!(submitter instanceof HTMLButtonElement) || submitter.name !== "bulk_action") return;
+                if (!selectionScope || selectionScope.value !== "filtered") return;
+                const actionLabel = (submitter.textContent || "批量操作").trim();
+                if (!window.confirm(`将对当前筛选结果的全部 ${{totalProducts}} 条资料执行“${{actionLabel}}”。系统会逐条校验，不符合条件的资料将自动跳过。确认继续吗？`)) {{
+                  event.preventDefault();
+                }}
               }});
               syncToggleAllState();
               syncSelected();
@@ -10928,7 +11115,7 @@ class CatalogApplication:
               <div class="list-intro-actions">
                 <div class="tools bulk-tools-vertical">
                   <button type="submit" name="bulk_action" value="complete_to_c_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交运营部</button>
-                  <button type="submit" name="bulk_action" value="return_to_a_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk" class="ghost-button">批量退回给跟单部</button>
+                  <button type="submit" name="bulk_action" value="return_to_a_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk" class="ghost-button">批量退回跟单部</button>
                 </div>
                 <div class="meta">商品部可在这里直接完成批量流转或退回跟单部。</div>
               </div>
@@ -10970,11 +11157,11 @@ class CatalogApplication:
             sections.append(f'<section class="panel"><h2>{html.escape(group)}</h2><div class="form-grid">{inputs}</div></section>')
         department = user.get("department")
         if department == "A":
-            intro_text = "跟单部可先补齐款式识别信息并开启商品部协作，之后继续完善其余主体字段；商品部可同步处理图片与完成标记。"
+            intro_text = "跟单部可先补齐款式识别信息并开启商品部协作，之后继续完善其余主体字段；商品部可同步处理图片，系统自动判断资料完成。"
             mode_title = "跟单部主体资料填写"
             next_action = "开启商品部协作"
         elif department == "B":
-            intro_text = "商品部可在跟单部继续补充主体资料的同时维护图片与完成标记；确认资料齐全后再统一提交运营部。"
+            intro_text = "商品部可在跟单部继续补充主体资料的同时维护图片；系统自动判断资料完成，判定为 Y 后可提交运营部。"
             mode_title = "商品部资料补充"
             next_action = "确认齐全后提交运营部"
         else:
@@ -11079,6 +11266,7 @@ class CatalogApplication:
               <span>{label}</span>
               <input type="text" name="{field.key}" value="{html.escape(value)}" placeholder="{placeholder}">
               <span class="meta">可直接填写主图链接，也可以在下方上传多张本地图片或维护图库顺序。保存后第一张会自动作为主图。</span>
+              <span class="meta">上传主图（替换当前第一张，旧本地图片保留 2 天）</span>
               <input type="file" name="image_upload" accept="image/png,image/jpeg,image/webp,image/gif">
               <span class="meta">多图上传</span>
               <input type="file" name="image_uploads" accept="image/png,image/jpeg,image/webp,image/gif" multiple>
@@ -11135,7 +11323,15 @@ class CatalogApplication:
             for field in group_fields:
                 if field not in visible_fields:
                     continue
-                field_value_markup = self.display_value(product.get(field.key))
+                field_value = payload.get(field.key) if field.key == "completion_flag" else product.get(field.key)
+                if field.key == "tax_included_price":
+                    field_value = self.format_list_decimal(field_value)
+                elif field.key in {"tag_price", "launch_price"}:
+                    field_value = self.format_list_integer(field_value)
+                if field.key == "completion_flag" and not field_value:
+                    field_value_markup = '<span class="table-cell-empty" aria-hidden="true"></span>'
+                else:
+                    field_value_markup = self.display_value(field_value)
                 if field.key == "image_url":
                     field_value_markup = self.display_image_gallery(product)
                 rows.append(
@@ -11248,7 +11444,7 @@ class CatalogApplication:
         ]
         if completion_flag_visible:
             detail_summary_items.append(
-                f'<span class="detail-summary-chip">资料完成 <strong>{html.escape(completion_flag or "空白")}</strong></span>'
+                f'<span class="detail-summary-chip">资料完成 <strong>{html.escape(completion_flag)}</strong></span>'
             )
         quick_tools_block = self.render_product_quick_tools(product, payload_json, copy_summary)
         content = f"""
@@ -11371,7 +11567,7 @@ class CatalogApplication:
         error_block = f'<div class="warning">{html.escape(error)}</div>' if error else ""
         if user.get("department") == "B":
             page_title = "导入商品部补充 Excel"
-            intro_text = "商品部收到跟单部流转过来的资料后，可以先导出 Excel，在表内补充“图片”“资料完成”，再回到这里导入。品类、上新价格和上新渠道由商品企划中心维护并回传。系统不会新增资料，只会按款号、商品名称以及款色或颜色去匹配既有条目，并仅回填商品部负责字段。"
+            intro_text = "商品部收到跟单部流转过来的资料后，可以先导出 Excel，在表内补充“图片”，再回到这里导入。品类、上新价格和上新渠道由商品企划中心维护并回传，资料完成由系统自动判断。系统不会新增资料，只会按款号、商品名称以及款色或颜色匹配既有条目。"
             stat_one = "匹配方式"
             stat_one_value = "既有资料精确匹配"
             stat_two = "更新范围"
@@ -11511,13 +11707,13 @@ class CatalogApplication:
               <div class="stat-card"><span>方式一</span><strong>文件名对款色</strong></div>
               <div class="stat-card"><span>方式二</span><strong>Excel 对图片</strong></div>
               <div class="stat-card"><span>更新范围</span><strong>商品部可编辑资料</strong></div>
-              <div class="stat-card"><span>图片策略</span><strong>覆盖当前图片</strong></div>
+              <div class="stat-card"><span>图片策略</span><strong>覆盖，旧图保留2天</strong></div>
             </div>
           </div>
         </section>
         <section class="panel">
           <h2>导入图片</h2>
-          <p class="meta">方式一示例：如果资料里的款色是“短袖连衣裙-蓝”，图片文件名就命名为“短袖连衣裙-蓝.jpg”。方式二支持两种 Excel：包含“款色”和“图片文件名”的传统映射表需要同时选择图片；WPS/Excel“网址转图片”格式如果图片已嵌入表格，可只选择这一份 xlsx，系统会按款色一一写回资料。</p>
+          <p class="meta">方式一示例：如果资料里的款色是“短袖连衣裙-蓝”，图片文件名就命名为“短袖连衣裙-蓝.jpg”。方式二支持传统映射表和包含内嵌图片的 WPS/Excel 文件。单个图片或图片映射文件最大 3GB；新图覆盖后，旧本地图片保留 2 天再自动清理。</p>
           {error_block}
           {report_block}
           <form method="post" action="/import-images" enctype="multipart/form-data">

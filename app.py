@@ -3,9 +3,14 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from wsgiref.simple_server import make_server
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import WSGIServer, make_server
 
 from catalog_backend import CatalogApplication, DEMO_PASSWORD, init_db
+
+
+class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
 
 
 def load_env_file(env_path: str | Path) -> None:
@@ -128,7 +133,7 @@ def main():
         print("  建议首次登录后立即修改密码。")
     else:
         print("当前未注入演示账号。请先通过初始化管理员参数创建首个管理员账号。")
-    with make_server(args.host, args.port, app) as server:
+    with make_server(args.host, args.port, app, server_class=ThreadingWSGIServer) as server:
         server.serve_forever()
 
 

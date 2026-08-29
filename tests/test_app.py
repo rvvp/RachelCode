@@ -7,6 +7,7 @@ import unittest
 from base64 import b64decode
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import unquote_plus
 from urllib.parse import urlencode
@@ -19,6 +20,14 @@ from PIL import Image as PillowImage
 from catalog_backend import CatalogApplication, init_db
 from catalog_backend import db
 from catalog_backend.policies import available_status_actions
+from catalog_backend.uploads import (
+    IMAGE_BACKUP_RETENTION_SECONDS,
+    MAX_IMAGE_BYTES,
+    cleanup_expired_local_media_backups,
+    media_file_path,
+    read_validated_image_upload,
+    retain_local_media_backup,
+)
 
 
 class CatalogAppTests(unittest.TestCase):
@@ -3257,6 +3266,10 @@ class CatalogAppTests(unittest.TestCase):
         first_body = first_response["body"].decode("utf-8")
         self.assertEqual(first_body.count('<tr class="catalog-row">'), 100)
         self.assertIn("共 101 条，第 1 / 2 页，每页 100 条", first_body)
+        self.assertIn('id="select-current-page-products">勾选本页（100）</button>', first_body)
+        self.assertIn('id="select-all-filtered-products">选择全部筛选结果（101）</button>', first_body)
+        self.assertIn('name="selection_scope" id="products-selection-scope" value="selected"', first_body)
+        self.assertIn('name="filtered_product_ids"', first_body)
         self.assertIn("supplier=%E5%88%86%E9%A1%B5&amp;page=2#products-list", first_body)
         self.assertIn('aria-label="资料列表顶部分页"', first_body)
         self.assertIn('aria-label="资料列表底部分页"', first_body)
@@ -3268,6 +3281,8 @@ class CatalogAppTests(unittest.TestCase):
         second_body = second_response["body"].decode("utf-8")
         self.assertEqual(second_body.count('<tr class="catalog-row">'), 1)
         self.assertIn("共 101 条，第 2 / 2 页，每页 100 条", second_body)
+        self.assertIn('id="select-current-page-products">勾选本页（1）</button>', second_body)
+        self.assertIn('id="select-all-filtered-products">选择全部筛选结果（101）</button>', second_body)
         self.assertIn("supplier=%E5%88%86%E9%A1%B5#products-list", second_body)
 
     def test_c_viewer_products_page_does_not_error_when_no_published_products(self):
@@ -3324,9 +3339,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.08.28-workflow-status-v2")
+        self.assertEqual(payload["build_version"], "2026.08.29-image-retention-v1")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.08.28-workflow-status-v2")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.08.29-image-retention-v1")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -3819,6 +3834,38 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('class="table-cell-empty"', list_body)
         self.assertNotIn('<span class="meta">未填写</span>', list_body)
 
+    def test_product_pages_format_price_fields_by_business_precision(self):
+        with db.get_connection(self.db_path) as connection:
+            connection.execute(
+                "UPDATE products SET tax_included_price = ?, tag_price = ?, launch_price = ? WHERE id = 1",
+                (123.4, 499.6, 269.4),
+            )
+        db.set_setting(self.db_path, "list_layout_fields_A", "tax_included_price,tag_price")
+        db.set_setting(self.db_path, "list_layout_customized_A", "1")
+        db.set_setting(self.db_path, "list_layout_fields_B", "launch_price")
+        db.set_setting(self.db_path, "list_layout_customized_B", "1")
+
+        a_cookie = self.login("a_editor", "demo123")
+        a_list_body = self.request("/products", cookie=a_cookie)["body"].decode("utf-8")
+        self.assertIn('<span class="table-cell-text table-cell-mono" title="123.40">123.40</span>', a_list_body)
+        self.assertIn('<span class="table-cell-text table-cell-mono" title="500">500</span>', a_list_body)
+        self.assertNotIn('title="499.6">499.6</span>', a_list_body)
+
+        b_cookie = self.login("b_editor", "demo123")
+        b_list_body = self.request("/products", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertIn('<span class="table-cell-text table-cell-mono" title="269">269</span>', b_list_body)
+        self.assertNotIn('title="269.4">269.4</span>', b_list_body)
+
+        detail_body = self.request("/products/1", cookie=a_cookie)["body"].decode("utf-8")
+        self.assertIn('<span class="detail-label">含税价</span>\n                      <div>123.40</div>', detail_body)
+        self.assertIn('<span class="detail-label">吊牌价</span>\n                      <div>500</div>', detail_body)
+        self.assertIn('<span class="detail-label">上新价格</span>\n                      <div>269</div>', detail_body)
+
+        stored_product = db.get_product(self.db_path, 1)
+        self.assertEqual(stored_product["tax_included_price"], 123.4)
+        self.assertEqual(stored_product["tag_price"], 499.6)
+        self.assertEqual(stored_product["launch_price"], 269.4)
+
     def test_placeholder_excel_date_does_not_break_products_page(self):
         with db.get_connection(self.db_path) as connection:
             connection.execute("UPDATE products SET inspection_date = '1900' WHERE id = 2")
@@ -4008,16 +4055,18 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn('name="completion_flag"', body)
         self.assertNotIn('name="size_chart"', body)
 
-    def test_b_editor_only_sees_launch_fields_in_edit_form(self):
+    def test_b_editor_only_edits_images_and_sees_planning_fields_read_only(self):
         cookie = self.login("b_editor", "demo123")
         response = self.request("/products/2/edit", cookie=cookie)
         body = response["body"].decode("utf-8")
         self.assertIn("上新价格", body)
         self.assertIn("上新渠道", body)
-        self.assertIn("资料完成", body)
-        self.assertIn('name="launch_price"', body)
-        self.assertIn('name="launch_channel"', body)
-        self.assertIn('name="completion_flag"', body)
+        self.assertIn("系统自动判断资料完成", body)
+        self.assertIn("商品企划字段（只读）", body)
+        self.assertNotIn('name="launch_price"', body)
+        self.assertNotIn('name="launch_channel"', body)
+        self.assertNotIn('name="completion_flag"', body)
+        self.assertIn('name="image_url"', body)
         self.assertNotIn('name="brand_name"', body)
         self.assertNotIn('name="tax_included_price"', body)
         self.assertNotIn('name="size_chart"', body)
@@ -4369,7 +4418,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIsNotNone(db.authenticate_user(self.db_path, "a_editor", "newpass123"))
 
     def test_editor_can_upload_product_image_and_preview_media(self):
-        cookie = self.login("a_editor", "demo123")
+        cookie = self.login("b_editor", "demo123")
         png_bytes = b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wn3FoAAAAAASUVORK5CYII="
         )
@@ -4377,16 +4426,10 @@ class CatalogAppTests(unittest.TestCase):
             "image_upload",
             "sample.png",
             png_bytes,
-            extra_fields={
-                "product_name": "上传图片测试款",
-                "style_code": "PIC-001",
-                "brand_name": "Image Brand",
-                "category": "上衣",
-            },
             file_content_type="image/png",
         )
         response = self.request(
-            "/products/new",
+            "/products/2/edit",
             method="POST",
             body=multipart_body,
             content_type='multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest',
@@ -4394,18 +4437,87 @@ class CatalogAppTests(unittest.TestCase):
         )
         self.assertTrue(response["status"].startswith("302"))
 
-        created_product = db.list_products(self.db_path, query="PIC-001")[0]
-        self.assertTrue(str(created_product["image_url"]).startswith("/media/"))
+        updated_product = db.get_product(self.db_path, 2)
+        self.assertTrue(str(updated_product["image_url"]).startswith("/media/"))
 
-        detail_response = self.request(f"/products/{created_product['id']}", cookie=cookie)
+        detail_response = self.request("/products/2", cookie=cookie)
         detail_body = detail_response["body"].decode("utf-8")
-        self.assertIn(created_product["image_url"], detail_body)
+        self.assertIn(updated_product["image_url"], detail_body)
 
-        media_response = self.request(created_product["image_url"], cookie=cookie)
+        media_response = self.request(updated_product["image_url"], cookie=cookie)
         self.assertTrue(media_response["status"].startswith("200"))
         headers = dict(media_response["headers"])
         self.assertEqual(headers["Content-Type"], "image/png")
         self.assertGreater(len(media_response["body"]), 10)
+
+    def test_image_upload_uses_stream_payload_and_rejects_more_than_three_gb(self):
+        png_bytes = self.make_png_bytes()
+        source = io.BytesIO(png_bytes)
+        payload = read_validated_image_upload(
+            SimpleNamespace(filename="streamed.png", file=source)
+        )
+        self.assertIs(payload["file"], source)
+        self.assertNotIn("content", payload)
+        self.assertEqual(payload["size_bytes"], len(png_bytes))
+
+        with tempfile.TemporaryFile() as oversized:
+            oversized.seek(MAX_IMAGE_BYTES)
+            oversized.write(b"x")
+            oversized.seek(0)
+            with self.assertRaisesRegex(ValueError, "3GB"):
+                read_validated_image_upload(
+                    SimpleNamespace(filename="oversized.png", file=oversized)
+                )
+
+    def test_expired_unreferenced_image_backups_are_cleaned_without_touching_current_images(self):
+        now = 2_000_000_000.0
+        old_path = self.upload_dir / "old.png"
+        fresh_path = self.upload_dir / "fresh.png"
+        current_path = self.upload_dir / "current.png"
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        for path in (old_path, fresh_path, current_path):
+            path.write_bytes(self.make_png_bytes())
+        retain_local_media_backup(
+            self.upload_dir,
+            "/media/old.png",
+            retained_at=now - IMAGE_BACKUP_RETENTION_SECONDS - 1,
+        )
+        retain_local_media_backup(
+            self.upload_dir,
+            "/media/fresh.png",
+            retained_at=now - IMAGE_BACKUP_RETENTION_SECONDS + 1,
+        )
+        retain_local_media_backup(
+            self.upload_dir,
+            "/media/current.png",
+            retained_at=now - IMAGE_BACKUP_RETENTION_SECONDS - 1,
+        )
+
+        removed = cleanup_expired_local_media_backups(
+            self.upload_dir,
+            {"/media/current.png"},
+            now=now,
+        )
+
+        self.assertEqual(removed, ["/media/old.png"])
+        self.assertFalse(old_path.exists())
+        self.assertTrue(fresh_path.exists())
+        self.assertTrue(current_path.exists())
+
+    def test_first_request_automatically_cleans_expired_image_backup(self):
+        expired_path = self.upload_dir / "expired.png"
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        expired_path.write_bytes(self.make_png_bytes())
+        retain_local_media_backup(
+            self.upload_dir,
+            "/media/expired.png",
+            retained_at=datetime.now(timezone.utc).timestamp() - IMAGE_BACKUP_RETENTION_SECONDS - 1,
+        )
+
+        response = self.request("/healthz")
+
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertFalse(expired_path.exists())
 
     def test_editor_can_upload_multiple_images_and_reorder_gallery(self):
         cookie = self.login("a_editor", "demo123")
@@ -4534,6 +4646,59 @@ class CatalogAppTests(unittest.TestCase):
         headers = dict(media_response["headers"])
         self.assertEqual(headers["Content-Type"], "image/png")
 
+    def test_b_image_reimport_replaces_primary_and_retains_previous_file_for_two_days(self):
+        cookie = self.login("b_editor", "demo123")
+        workbook_bytes = self.make_image_mapping_workbook_bytes(
+            [("针织开衫-米白", "professional.png")]
+        )
+
+        first_response = self.request(
+            "/import-images",
+            method="POST",
+            body=self.build_multi_multipart(
+                files=[
+                    ("mapping_workbook", "image-map.xlsx", workbook_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                    ("image_files", "professional.png", self.make_png_bytes(), "image/png"),
+                ],
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(first_response["status"].startswith("200"))
+        first_media_path = db.get_product(self.db_path, 2)["image_url"]
+        first_file_path = media_file_path(self.upload_dir, first_media_path)
+        self.assertTrue(first_file_path.exists())
+
+        second_response = self.request(
+            "/import-images",
+            method="POST",
+            body=self.build_multi_multipart(
+                files=[
+                    ("mapping_workbook", "image-map.xlsx", workbook_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                    ("image_files", "professional.png", self.make_png_bytes(), "image/png"),
+                ],
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(second_response["status"].startswith("200"))
+        current_product = db.get_product(self.db_path, 2)
+        current_media_path = current_product["image_url"]
+        self.assertNotEqual(current_media_path, first_media_path)
+        self.assertEqual(json.loads(current_product["image_gallery_json"]), [current_media_path])
+        self.assertTrue(first_file_path.exists())
+        self.assertTrue(media_file_path(self.upload_dir, current_media_path).exists())
+
+        retained_at = first_file_path.stat().st_mtime
+        removed = cleanup_expired_local_media_backups(
+            self.upload_dir,
+            db.current_local_media_paths(self.db_path),
+            now=retained_at + IMAGE_BACKUP_RETENTION_SECONDS + 1,
+        )
+        self.assertIn(first_media_path, removed)
+        self.assertFalse(first_file_path.exists())
+        self.assertTrue(media_file_path(self.upload_dir, current_media_path).exists())
+
     def test_b_editor_can_import_images_embedded_in_url_to_image_workbook(self):
         cookie = self.login("b_editor", "demo123")
         png_bytes = self.make_png_bytes()
@@ -4615,6 +4780,37 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(target_item["elapsed_days_label"], f"{expected_days} 天")
 
     def test_completion_flag_is_auto_calculated_and_exported(self):
+        expected_required_keys = [
+            "image_url",
+            "style_color",
+            "style_code",
+            "color_name",
+            "product_name",
+            "category",
+            "supplier",
+            "cooperation_mode",
+            "tax_included_price",
+            "tag_price",
+            "launch_price",
+            "launch_channel",
+            "size_range",
+            "material",
+            "washing_method",
+            "safety_category",
+            "standard_code",
+        ]
+        first_product = db.get_product(self.db_path, 1)
+        self.assertEqual(db.completion_required_field_keys(first_product), expected_required_keys)
+        self.assertEqual(db.completion_flag(first_product), "Y")
+        for field_key in expected_required_keys:
+            incomplete_product = dict(first_product)
+            incomplete_product[field_key] = ""
+            if field_key == "image_url":
+                incomplete_product["image_gallery_json"] = "[]"
+            self.assertEqual(db.completion_flag(incomplete_product), "", field_key)
+
+        with db.get_connection(self.db_path) as connection:
+            connection.execute("UPDATE products SET completion_flag = 'Y' WHERE id = 2")
         cookie = self.login("a_editor", "demo123")
         api_response = self.request("/api/products", cookie=cookie)
         payload = json.loads(api_response["body"].decode("utf-8"))
@@ -4623,6 +4819,11 @@ class CatalogAppTests(unittest.TestCase):
 
         second_item = next(item for item in payload["items"] if item["id"] == 2)
         self.assertEqual(second_item["completion_flag"], "")
+
+        incomplete_detail = self.request("/products/2", cookie=cookie)["body"].decode("utf-8")
+        self.assertIn("资料完成 <strong></strong>", incomplete_detail)
+        self.assertNotIn("资料完成 <strong>空白</strong>", incomplete_detail)
+        self.assertNotIn("资料完成 <strong>未填写</strong>", incomplete_detail)
 
         export_response = self.request("/export.xlsx", cookie=cookie)
         workbook = load_workbook(io.BytesIO(export_response["body"]))
@@ -4636,6 +4837,47 @@ class CatalogAppTests(unittest.TestCase):
                 break
         self.assertIsNotNone(target_row)
         self.assertEqual(workbook.active.cell(target_row, completion_col).value, "Y")
+
+    def test_b_completion_ready_filter_is_a_live_submission_queue(self):
+        self.make_product_two_a_complete()
+        with db.get_connection(self.db_path) as connection:
+            connection.execute(
+                "UPDATE products SET launch_channel = ?, completion_flag = ? WHERE id = 2",
+                ("天猫", ""),
+            )
+
+        b_cookie = self.login("b_editor", "demo123")
+        ready_path = "/products?marker=completion_ready"
+        ready_body = self.request(ready_path, cookie=b_cookie)["body"].decode("utf-8")
+        self.assertIn('<option value="completion_ready" selected>资料完成Y</option>', ready_body)
+        self.assertIn("毛感针织开衫", ready_body)
+        self.assertNotIn("褶皱短袖连衣裙", ready_body)
+        self.assertIn("提交后会自动移出此列表", ready_body)
+
+        submit_response = self.request(
+            "/products/bulk",
+            method="POST",
+            body=urlencode(
+                [
+                    ("product_ids", "2"),
+                    ("bulk_action", "complete_to_c_selected"),
+                ]
+            ).encode("utf-8"),
+            cookie=b_cookie,
+        )
+        self.assertTrue(submit_response["status"].startswith("302"))
+        self.assertEqual(db.get_product(self.db_path, 2)["status"], "published")
+        submitted_body = self.request(ready_path, cookie=b_cookie)["body"].decode("utf-8")
+        self.assertNotIn("毛感针织开衫", submitted_body)
+
+        a_user = next(user for user in db.list_users(self.db_path) if user["department"] == "A")
+        with db.get_connection(self.db_path) as connection:
+            db.update_product(connection, 2, {"tag_price": 459}, a_user["id"])
+        restarted = db.get_product(self.db_path, 2)
+        self.assertEqual(restarted["workflow_restart_required"], 1)
+        self.assertEqual(db.completion_flag(restarted), "Y")
+        restarted_body = self.request(ready_path, cookie=b_cookie)["body"].decode("utf-8")
+        self.assertIn("毛感针织开衫", restarted_body)
 
     def test_c_product_detail_quick_json_respects_visible_fields(self):
         cookie = self.login("c_viewer", "demo123")
@@ -5230,7 +5472,9 @@ class CatalogAppTests(unittest.TestCase):
         list_response = self.request("/products", cookie=b_cookie)
         list_body = list_response["body"].decode("utf-8")
         self.assertIn("批量提交运营部", list_body)
-        self.assertIn("批量退回给跟单部", list_body)
+        self.assertIn("批量退回跟单部", list_body)
+        self.assertNotIn("批量退回给跟单部", list_body)
+        self.assertIn("width: 148px;", list_body)
         self.assertIn('name="product_ids"', list_body)
 
         complete_response = self.request(
@@ -5253,9 +5497,31 @@ class CatalogAppTests(unittest.TestCase):
         )
         self.assertTrue(return_response["status"].startswith("302"))
         notice = unquote_plus(dict(return_response["headers"])["Location"])
-        self.assertIn("批量退回跟单部修改完成：成功 1 条", notice)
+        self.assertIn("批量退回跟单部完成：成功 1 条", notice)
         product = db.get_product(self.db_path, 2)
         self.assertEqual(product["status"], "draft")
+
+    def test_b_editor_can_submit_all_filtered_results_without_page_checkboxes(self):
+        self.make_product_two_a_complete()
+        b_cookie = self.login("b_editor", "demo123")
+        complete_response = self.request(
+            "/products/bulk",
+            method="POST",
+            body=urlencode(
+                {
+                    "selection_scope": "filtered",
+                    "filtered_product_ids": "2",
+                    "bulk_action": "complete_to_c_selected",
+                    "return_to": "/products?marker=completion_ready",
+                }
+            ).encode("utf-8"),
+            cookie=b_cookie,
+        )
+        self.assertTrue(complete_response["status"].startswith("302"))
+        location = unquote_plus(dict(complete_response["headers"])["Location"])
+        self.assertIn("marker=completion_ready", location)
+        self.assertIn("批量提交运营部完成：成功 1 条", location)
+        self.assertEqual(db.get_product(self.db_path, 2)["status"], "published")
 
     def test_b_editor_bulk_return_skips_non_pending_products(self):
         b_cookie = self.login("b_editor", "demo123")
@@ -5311,7 +5577,7 @@ class CatalogAppTests(unittest.TestCase):
         self.make_product_two_a_complete()
         with db.get_connection(self.db_path) as connection:
             connection.execute(
-                "UPDATE products SET completion_flag = 'Y', inspection_date = '' WHERE id = 2"
+                "UPDATE products SET completion_flag = 'Y', material = '' WHERE id = 2"
             )
         b_cookie = self.login("b_editor", "demo123")
         complete_response = self.request(
@@ -5323,7 +5589,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(complete_response["status"].startswith("302"))
         notice = unquote_plus(dict(complete_response["headers"])["Location"])
         self.assertIn("跳过 1 条", notice)
-        self.assertIn("送检时间", notice)
+        self.assertIn("材质", notice)
         product = db.get_product(self.db_path, 2)
         self.assertEqual(product["status"], "pending")
 
@@ -5524,7 +5790,6 @@ class CatalogAppTests(unittest.TestCase):
                 {
                     "image_url": "https://example.com/collaboration.jpg",
                     "image_gallery_json": '["https://example.com/collaboration.jpg"]',
-                    "completion_flag": "Y",
                 },
                 users["B"]["id"],
             )
@@ -5532,7 +5797,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(updated["status"], "pending")
         self.assertEqual(updated["supplier"], "协作供应商")
         self.assertEqual(updated["image_url"], "https://example.com/collaboration.jpg")
-        self.assertIn("主体资料还未完成", self.app.status_transition_validation_error(updated, "published"))
+        self.assertIn("资料尚未完成", self.app.status_transition_validation_error(updated, "published"))
 
     def test_post_publication_trigger_fields_preserve_c_version_until_b_resubmits(self):
         users = {user["department"]: user for user in db.list_users(self.db_path)}
