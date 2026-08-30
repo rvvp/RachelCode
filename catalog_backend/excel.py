@@ -611,10 +611,10 @@ def parse_supplier_bill_workbook(file_obj) -> list[dict]:
             settlement_amount = float(payload.get("settlement_amount"))
         except (TypeError, ValueError) as error:
             raise ValueError(f"第 {row_index} 行的含税价和结算金额必须是数字。") from error
-        if not math.isfinite(tax_included_price) or tax_included_price < 0:
-            raise ValueError(f"第 {row_index} 行的含税价必须是非负数字。")
+        if not math.isfinite(tax_included_price):
+            raise ValueError(f"第 {row_index} 行的含税价必须是数字，可填写负数。")
         if not math.isfinite(settlement_amount):
-            raise ValueError(f"第 {row_index} 行的结算金额必须是数字，退货可填写负数。")
+            raise ValueError(f"第 {row_index} 行的结算金额必须是数字，可填写负数。")
         rows.append(
             {
                 "source_row_no": row_index,

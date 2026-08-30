@@ -306,10 +306,14 @@ class CatalogAppTests(unittest.TestCase):
         b_cookie = self.login("b_editor", "demo123")
         b_response = self.request("/products", cookie=b_cookie)
         b_body = b_response["body"].decode("utf-8")
-        self.assertIn('class="tools bulk-tools-vertical"', b_body)
+        self.assertIn('class="tools bulk-tools-inline"', b_body)
+        self.assertLess(b_body.index("批量退回跟单部"), b_body.index("批量提交运营部"))
         self.assertIn('class="products-filter-submit"', b_body)
-        self.assertIn(">筛选</button>", b_body)
+        self.assertIn(">搜索筛选</button>", b_body)
         self.assertNotIn(">筛选资料</button>", b_body)
+        self.assertIn('class="products-filter-form" method="get" action="/products#products-list"', b_body)
+        self.assertNotIn('action="/products#products-search-filter"', b_body)
+        self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr));", b_body)
         self.assertIn("padding: 10px 18px 10px 10px;\n      text-align: center;", b_body)
         self.assertIn("grid-template-rows: max-content minmax(420px, 1fr);", b_body)
         self.assertIn("grid-template-rows: max-content max-content;", b_body)
@@ -320,9 +324,31 @@ class CatalogAppTests(unittest.TestCase):
 
         for body in (a_body, b_body):
             self.assertIn('<div class="products-editor-dashboard">', body)
+            self.assertIn('class="panel products-overview-card products-overview-card-spaced"', body)
+            self.assertIn(".products-overview-card-spaced > h1 {\n      margin-bottom: 16px;", body)
+            self.assertIn(".products-top-grid {\n      display: grid;\n      grid-template-columns: repeat(2, minmax(0, 1fr));", body)
+            self.assertIn(".products-editor-dashboard .products-stats-panel .stats {\n      grid-template-columns: repeat(3, minmax(0, 1fr));", body)
+            self.assertIn('class="stats products-stats-row"', body)
+            self.assertNotIn('<a class="pill" href="/products">资料列表</a>', body)
+            self.assertNotIn("用一套资料底库承接", body)
+            self.assertNotIn("先查看资料概览，再进入资料列表处理", body)
+            self.assertNotIn("输入款号会在精确且唯一命中时", body)
+            self.assertNotIn("所有账号都可先勾选资料", body)
             self.assertLess(
                 body.index('<section class="products-top-grid">'),
                 body.index('<div class="products-main-stack">'),
+            )
+            self.assertLess(
+                body.index("<h1>商品资料后台</h1>"),
+                body.index("<h2>资料概览</h2>"),
+            )
+            self.assertLess(
+                body.index("<h2>资料概览</h2>"),
+                body.index("<h2>搜索与筛选</h2>"),
+            )
+            self.assertLess(
+                body.index("<h2>搜索与筛选</h2>"),
+                body.index("<h2>资料列表</h2>"),
             )
             self.assertLess(
                 body.index('<section class="products-insights-grid products-insights-single">'),
@@ -344,11 +370,20 @@ class CatalogAppTests(unittest.TestCase):
         b_summary_block = b_body[b_summary_start:b_body.index("</section>", b_summary_start)]
         self.assertNotIn("总资料数", b_summary_block)
         self.assertNotIn("待商品部填写", b_summary_block)
-        self.assertLess(b_summary_block.index("近7天含税价修改"), b_summary_block.index("近7天新增"))
         self.assertLess(b_summary_block.index("近7天新增"), b_summary_block.index("A/B协作中"))
         self.assertLess(b_summary_block.index("A/B协作中"), b_summary_block.index("待运营接收"))
         self.assertLess(b_summary_block.index("待运营接收"), b_summary_block.index("近7天退回"))
+        self.assertLess(b_summary_block.index("近7天退回"), b_summary_block.index("待商品部重新提交"))
+        self.assertLess(b_summary_block.index("待商品部重新提交"), b_summary_block.index("近7天含税价修改"))
         self.assertIn('href="/products?marker=tax_price_modified#products-list"', b_summary_block)
+        self.assertNotIn("先勾选已具备识别字段的资料", a_body)
+        self.assertNotIn("商品部可在这里直接完成批量流转", b_body)
+
+        c_cookie = self.login("c_viewer", "demo123")
+        c_response = self.request("/products", cookie=c_cookie)
+        c_body = c_response["body"].decode("utf-8")
+        self.assertNotIn('class="panel products-overview-card products-overview-card-spaced"', c_body)
+        self.assertNotIn("勾选状态为待运营接收的资料后", c_body)
 
     def test_b_workflow_stats_tracks_handoffs_and_returns(self):
         initial = db.b_workflow_stats(self.db_path)
@@ -491,7 +526,7 @@ class CatalogAppTests(unittest.TestCase):
 
     def test_department_filter_controls_follow_each_account_workflow(self):
         def filter_form(body: str) -> str:
-            start = body.index('<form class="products-filter-form"')
+            start = body.index('<form class="products-filter-form')
             return body[start:body.index("</form>", start)]
 
         def select_markup(form: str, name: str) -> str:
@@ -499,8 +534,7 @@ class CatalogAppTests(unittest.TestCase):
             return form[start:form.index("</select>", start)]
 
         a_form = filter_form(self.request("/products", cookie=self.login("a_editor", "demo123"))["body"].decode("utf-8"))
-        self.assertIn('class="filter-department-context"', a_form)
-        self.assertIn(">跟单部</div>", a_form)
+        self.assertNotIn('class="filter-department-context"', a_form)
         self.assertNotIn('<select name="department">', a_form)
         self.assertIn('value="draft"', a_form)
         self.assertIn('value="pending"', a_form)
@@ -513,10 +547,12 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn(">待完成</option>", a_form)
         self.assertNotIn(">已完成</option>", a_form)
         self.assertEqual(select_markup(a_form, "status").count("<option"), 6)
-        self.assertLess(a_form.index('name="lifecycle_status"'), a_form.index(">跟单部</div>"))
+        self.assertLess(a_form.index('name="status"'), a_form.index('name="lifecycle_status"'))
 
         b_form = filter_form(self.request("/products", cookie=self.login("b_editor", "demo123"))["body"].decode("utf-8"))
-        self.assertIn(">商品部</div>", b_form)
+        self.assertNotIn("products-filter-form-c", b_form)
+        self.assertNotIn('class="filter-department-context"', b_form)
+        self.assertNotIn('<select name="department">', b_form)
         self.assertIn('value="pending"', b_form)
         self.assertIn('value="published"', b_form)
         self.assertNotIn('value="draft"', b_form)
@@ -529,11 +565,13 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn(">待完成</option>", b_form)
         self.assertNotIn(">已完成</option>", b_form)
         self.assertEqual(select_markup(b_form, "status").count("<option"), 5)
-        self.assertEqual(select_markup(b_form, "marker").count("<option"), 2)
-        self.assertLess(b_form.index(">商品部</div>"), b_form.index('name="lifecycle_status"'))
+        self.assertEqual(select_markup(b_form, "marker").count("<option"), 3)
+        self.assertLess(b_form.index('name="status"'), b_form.index('name="lifecycle_status"'))
 
         c_form = filter_form(self.request("/products", cookie=self.login("c_viewer", "demo123"))["body"].decode("utf-8"))
-        self.assertIn(">运营部</div>", c_form)
+        self.assertIn('class="products-filter-form products-filter-form-c"', c_form)
+        self.assertNotIn('class="filter-department-context"', c_form)
+        self.assertNotIn('<select name="department">', c_form)
         self.assertIn("全部流程状态", c_form)
         self.assertIn(">待运营接收</option>", c_form)
         self.assertIn('value="received"', c_form)
@@ -548,7 +586,7 @@ class CatalogAppTests(unittest.TestCase):
         for label in ("跟单整理中", "A/B协作中", "待运营接收", "已接收", "待商品部重新提交"):
             self.assertIn(f">{label}</option>", admin_status)
         self.assertEqual(admin_status.count("<option"), 6)
-        self.assertEqual(select_markup(admin_form, "marker").count("<option"), 2)
+        self.assertEqual(select_markup(admin_form, "marker").count("<option"), 3)
 
     def test_workflow_status_filters_are_mutually_exclusive_and_b_hides_drafts(self):
         users = {user["department"]: user for user in db.list_users(self.db_path)}
@@ -2703,7 +2741,7 @@ class CatalogAppTests(unittest.TestCase):
             "/billing/supplier-settlements?start_month=2026-06&end_month=2026-06&supplier_code=S003",
             cookie=a_cookie,
         )["body"].decode("utf-8")
-        self.assertIn("退货明细可填写负整数数量和负结算金额", page_body)
+        self.assertIn("含税价和结算金额均可填写负数", page_body)
         self.assertIn("300.00", page_body)
 
         export_response = self.request(
@@ -2722,7 +2760,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(export_sheet["I3"].value, -2)
         self.assertEqual(export_sheet["K3"].value, -200)
 
-    def test_a_supplier_bill_import_still_rejects_negative_tax_included_price(self):
+    def test_a_supplier_bill_import_accepts_negative_tax_included_price(self):
         a_cookie = self.login("a_editor", "demo123")
         self.request(
             "/billing/supplier-settlements/master",
@@ -2757,8 +2795,13 @@ class CatalogAppTests(unittest.TestCase):
             cookie=a_cookie,
         )
         self.assertTrue(response["status"].startswith("302"))
-        self.assertIn("含税价必须是非负数字", unquote_plus(dict(response["headers"])["Location"]))
-        self.assertEqual(db.query_supplier_bill_lines(self.db_path, "2026-06", "2026-06", "S004")["items"], [])
+        self.assertIn("共 1 条明细", unquote_plus(dict(response["headers"])["Location"]))
+        result = db.query_supplier_bill_lines(self.db_path, "2026-06", "2026-06", "S004")
+        self.assertEqual(result["quantity_total"], -1)
+        self.assertEqual(result["settlement_amount_total"], -100.0)
+        self.assertEqual(result["items"][0]["quantity"], -1)
+        self.assertEqual(result["items"][0]["tax_included_price"], -100.0)
+        self.assertEqual(result["items"][0]["settlement_amount"], -100.0)
 
     def test_a_supplier_master_excel_import_and_bidirectional_lookup(self):
         a_cookie = self.login("a_editor", "demo123")
@@ -2944,6 +2987,12 @@ class CatalogAppTests(unittest.TestCase):
         list_body = list_response["body"].decode("utf-8")
         self.assertIn("批量接收资料", list_body)
         self.assertIn(">接收</button>", list_body)
+        self.assertNotIn("先掌握接收进度", list_body)
+        self.assertNotIn("按款号、商品名称或品牌筛选资料", list_body)
+        self.assertNotIn("当前列表只显示本运营归属可读取字段", list_body)
+        self.assertLess(list_body.index("<h1>商品资料后台</h1>"), list_body.index("<h2>资料概览</h2>"))
+        self.assertLess(list_body.index("<h2>资料概览</h2>"), list_body.index("<h2>搜索与筛选</h2>"))
+        self.assertLess(list_body.index("<h2>搜索与筛选</h2>"), list_body.index("<h2>资料列表</h2>"))
         self.assertLess(
             list_body.index('<section class="products-insights-grid products-insights-single">'),
             list_body.index('<div class="products-main-stack">'),
@@ -2958,10 +3007,23 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("grid-template-rows: max-content minmax(420px, 1fr);", list_body)
         self.assertNotIn("min-height: 1520px;", list_body)
 
+        pending_response = self.request("/products?status=published", cookie=cookie)
+        pending_body = pending_response["body"].decode("utf-8")
+        self.assertIn('id="select-all-filtered-products">选择全部待接收资料（1）</button>', pending_body)
+        self.assertIn('name="selection_scope" id="products-selection-scope" value="selected"', pending_body)
+        self.assertIn('name="filtered_product_ids" value="1"', pending_body)
+
         receive_response = self.request(
             "/products/bulk",
             method="POST",
-            body=urlencode([("product_ids", "1"), ("bulk_action", "receive_selected")]).encode("utf-8"),
+            body=urlencode(
+                {
+                    "selection_scope": "filtered",
+                    "filtered_product_ids": "1",
+                    "bulk_action": "receive_selected",
+                    "return_to": "/products?status=published",
+                }
+            ).encode("utf-8"),
             cookie=cookie,
         )
         self.assertTrue(receive_response["status"].startswith("302"))
@@ -3268,11 +3330,18 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("共 101 条，第 1 / 2 页，每页 100 条", first_body)
         self.assertIn('id="select-current-page-products">勾选本页（100）</button>', first_body)
         self.assertIn('id="select-all-filtered-products">选择全部筛选结果（101）</button>', first_body)
+        self.assertEqual(first_body.count('id="select-current-page-products"'), 1)
+        self.assertEqual(first_body.count('id="select-all-filtered-products"'), 1)
         self.assertIn('name="selection_scope" id="products-selection-scope" value="selected"', first_body)
         self.assertIn('name="filtered_product_ids"', first_body)
         self.assertIn("supplier=%E5%88%86%E9%A1%B5&amp;page=2#products-list", first_body)
         self.assertIn('aria-label="资料列表顶部分页"', first_body)
         self.assertIn('aria-label="资料列表底部分页"', first_body)
+        control_start = first_body.index('<nav class="products-list-control-bar"')
+        control_end = first_body.index('</nav>', control_start)
+        control_body = first_body[control_start:control_end]
+        self.assertLess(control_body.index("products-list-page-row"), control_body.index("select-current-page-products"))
+        self.assertLess(control_body.index("select-current-page-products"), control_body.index("共 101 条，第 1 / 2 页"))
 
         second_response = self.request(
             "/products?supplier=%E5%88%86%E9%A1%B5&page=2",
@@ -3283,6 +3352,8 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("共 101 条，第 2 / 2 页，每页 100 条", second_body)
         self.assertIn('id="select-current-page-products">勾选本页（1）</button>', second_body)
         self.assertIn('id="select-all-filtered-products">选择全部筛选结果（101）</button>', second_body)
+        self.assertEqual(second_body.count('id="select-current-page-products"'), 1)
+        self.assertEqual(second_body.count('id="select-all-filtered-products"'), 1)
         self.assertIn("supplier=%E5%88%86%E9%A1%B5#products-list", second_body)
 
     def test_c_viewer_products_page_does_not_error_when_no_published_products(self):
@@ -3292,7 +3363,7 @@ class CatalogAppTests(unittest.TestCase):
         response = self.request("/products", cookie=cookie)
         body = response["body"].decode("utf-8")
         self.assertTrue(response["status"].startswith("200"))
-        self.assertIn('aria-label="当前部门">运营部</div>', body)
+        self.assertNotIn('aria-label="当前部门">运营部</div>', body)
         self.assertIn("暂无符合条件的商品资料", body)
 
     def test_api_requires_login_or_valid_c_token(self):
@@ -3339,9 +3410,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.08.29-image-retention-v1")
+        self.assertEqual(payload["build_version"], "2026.08.30-supplier-negative-tax-v1")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.08.29-image-retention-v1")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.08.30-supplier-negative-tax-v1")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)

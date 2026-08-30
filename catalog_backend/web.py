@@ -98,7 +98,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.08.29-image-retention-v1"
+CATALOG_BUILD_VERSION = "2026.08.30-supplier-negative-tax-v1"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 IMAGE_BACKUP_CLEANUP_INTERVAL_SECONDS = 60 * 60
 LIST_LAYOUT_VIRTUAL_FIELDS: tuple[FieldDef, ...] = ()
@@ -5153,7 +5153,7 @@ class CatalogApplication:
     }}
     .products-top-grid {{
       display: grid;
-      grid-template-columns: minmax(0, 1.16fr) minmax(320px, 0.84fr);
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 16px;
       margin-bottom: 18px;
       align-items: stretch;
@@ -5162,12 +5162,25 @@ class CatalogApplication:
       height: auto;
       min-height: 0;
       align-self: stretch;
-      padding: 22px 22px 20px;
+      padding: 14px 16px;
       border-radius: 24px;
+    }}
+    .products-top-grid > .products-insights-grid {{
+      display: flex;
+      min-width: 0;
+      min-height: 0;
+      align-items: stretch;
+    }}
+    .products-top-grid > .products-insights-grid > .panel {{
+      flex: 1 1 auto;
+      min-height: 0;
     }}
     .products-overview-card h1,
     .products-filter-card h2 {{
       margin-bottom: 8px;
+    }}
+    .products-overview-card-spaced > h1 {{
+      margin-bottom: 16px;
     }}
     .products-overview-card {{
       overflow: visible;
@@ -5178,7 +5191,30 @@ class CatalogApplication:
       margin-bottom: 14px;
     }}
     .products-overview-card .tools {{
-      margin-bottom: 14px;
+      gap: 10px;
+      margin-bottom: 0;
+    }}
+    .products-top-grid .products-stats-panel .stats {{
+      grid-template-columns: none;
+      grid-auto-flow: column;
+      grid-auto-columns: minmax(0, 1fr);
+      gap: 8px;
+      margin-top: 8px;
+    }}
+    .products-top-grid .products-stats-panel .stat-card {{
+      padding: 10px 10px 9px;
+      border-radius: 16px;
+    }}
+    .products-top-grid .products-stats-panel .stat-card strong {{
+      margin-top: 7px;
+      font-size: 23px;
+    }}
+    .products-top-grid .products-stats-panel .stat-card span {{
+      font-size: 12px;
+    }}
+    .products-top-grid .products-stats-panel .stat-card-link small {{
+      margin-top: 4px;
+      font-size: 10px;
     }}
     .products-overview-card .spotlight {{
       margin-top: 14px;
@@ -5193,27 +5229,17 @@ class CatalogApplication:
     }}
     .products-filter-form {{
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px;
     }}
     .products-filter-form .products-search-field,
     .products-filter-form .products-supplier-field {{
       min-width: 0;
     }}
-    .products-filter-form .filter-department-context {{
-      display: flex;
-      align-items: center;
-      min-height: 48px;
-      padding: 13px 15px;
-      border: 1px solid rgba(91, 58, 29, 0.14);
-      border-radius: 16px;
-      background: rgba(181, 106, 45, 0.07);
-      color: var(--accent-strong);
-      font-weight: 700;
-    }}
     .products-filter-form .products-filter-submit {{
-      grid-column: 2;
-      justify-self: end;
+      grid-column: 1 / -1;
+      justify-self: center;
+      width: calc((100% - 30px) / 4);
       background: linear-gradient(180deg, rgba(181,106,45,0.1), rgba(181,106,45,0.06));
       border-color: rgba(181,106,45,0.16);
       box-shadow: none;
@@ -5222,6 +5248,14 @@ class CatalogApplication:
     .products-filter-form .products-filter-submit:hover {{
       background: linear-gradient(180deg, rgba(181,106,45,0.14), rgba(181,106,45,0.09));
       filter: none;
+    }}
+    .products-filter-form-c {{
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }}
+    .products-filter-form-c .products-filter-submit {{
+      grid-column: auto;
+      justify-self: stretch;
+      width: 100%;
     }}
     .products-main-stack {{
       display: flex;
@@ -5232,11 +5266,16 @@ class CatalogApplication:
     }}
     .products-pagination {{
       display: flex;
+      flex-direction: column;
       align-items: center;
-      justify-content: space-between;
+      justify-content: center;
       gap: 14px;
       flex-wrap: wrap;
       margin-top: 16px;
+      padding: 10px 12px;
+      border: 1px solid rgba(94, 67, 40, 0.1);
+      border-radius: 14px;
+      background: rgba(255, 252, 247, 0.76);
     }}
     .products-pagination-top {{
       margin: 0 0 14px;
@@ -5255,6 +5294,36 @@ class CatalogApplication:
       gap: 6px;
       flex-wrap: wrap;
     }}
+    .products-list-control-bar {{
+      display: grid;
+      gap: 8px;
+      margin: 0 0 14px;
+      padding: 10px 12px;
+      border: 1px solid rgba(94, 67, 40, 0.1);
+      border-radius: 14px;
+      background: rgba(255, 252, 247, 0.76);
+    }}
+    .products-list-page-row {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+    }}
+    .products-list-control-meta {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    .products-list-control-meta > .products-selection-summary {{
+      order: 2;
+      margin-left: auto;
+    }}
+    .products-list-control-meta > .products-pagination-summary {{
+      order: 3;
+      white-space: nowrap;
+    }}
     .products-pagination-links .pill {{
       min-width: 38px;
       min-height: 36px;
@@ -5268,11 +5337,11 @@ class CatalogApplication:
       justify-content: space-between;
       gap: 12px;
       flex-wrap: wrap;
-      margin: 0 0 12px;
-      padding: 10px 12px;
-      border: 1px solid rgba(94, 67, 40, 0.1);
-      border-radius: 14px;
-      background: rgba(255, 252, 247, 0.76);
+      margin: 0;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
     }}
     .products-selection-summary {{
       color: var(--muted);
@@ -5339,6 +5408,11 @@ class CatalogApplication:
     }}
     .products-c-overview-stack .products-top-grid .panel {{
       padding: 16px 18px;
+    }}
+    .products-c-overview-stack > .products-filter-card,
+    .products-editor-overview-stack > .products-filter-card {{
+      padding: 16px 18px;
+      border-radius: 24px;
     }}
     .products-c-overview-stack .products-overview-card p,
     .products-c-overview-stack .products-filter-card p {{
@@ -5414,6 +5488,9 @@ class CatalogApplication:
       min-height: 0;
       margin-bottom: 0;
     }}
+    .products-editor-dashboard > .products-editor-overview-stack > .products-filter-card {{
+      min-height: 0;
+    }}
     .products-editor-dashboard .products-main-stack {{
       min-height: 0;
       margin-bottom: 0;
@@ -5441,20 +5518,24 @@ class CatalogApplication:
     .products-editor-dashboard .products-insights-grid > .panel {{
       height: auto;
       min-height: 0;
-      padding: 16px 18px;
+      padding: 14px 16px;
     }}
     .products-editor-dashboard .products-stats-panel .table-note {{
       display: none;
     }}
     .products-editor-dashboard .products-stats-panel .stats {{
-      margin-top: 10px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-auto-flow: row;
+      grid-auto-columns: auto;
+      margin-top: 8px;
     }}
     .products-editor-dashboard .products-stats-panel .stat-card {{
-      padding: 12px 14px;
+      padding: 10px 10px 9px;
+      border-radius: 16px;
     }}
     .products-editor-dashboard .products-stats-panel .stat-card strong {{
-      margin-top: 8px;
-      font-size: 27px;
+      margin-top: 7px;
+      font-size: 23px;
     }}
     .products-main-stack > .panel,
     .products-insights-grid > .panel {{
@@ -5549,6 +5630,15 @@ class CatalogApplication:
       gap: 8px;
     }}
     .list-intro-actions .tools.bulk-tools-vertical > button {{
+      width: 148px;
+      min-width: 148px;
+    }}
+    .list-intro-actions .tools.bulk-tools-inline {{
+      flex-direction: row;
+      align-items: center;
+      gap: 8px;
+    }}
+    .list-intro-actions .tools.bulk-tools-inline > button {{
       width: 148px;
       min-width: 148px;
     }}
@@ -7048,18 +7138,23 @@ class CatalogApplication:
       .products-editor-overview-stack {{
         display: block;
       }}
-      .products-c-overview-stack .products-insights-grid {{
-        margin-top: 18px;
-      }}
-      .products-editor-overview-stack .products-insights-grid {{
+      .products-c-overview-stack > .products-filter-card,
+      .products-editor-overview-stack > .products-filter-card {{
         margin-top: 18px;
       }}
       .products-c-dashboard .products-main-stack {{
         margin-top: 18px;
       }}
-      .products-editor-dashboard .products-main-stack,
-      .products-editor-dashboard .products-insights-grid {{
+      .products-editor-dashboard .products-main-stack {{
         margin-top: 18px;
+      }}
+      .products-top-grid > .products-insights-grid {{
+        margin-top: 0;
+      }}
+      .products-top-grid .products-stats-panel .stats {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-auto-flow: row;
+        grid-auto-columns: auto;
       }}
       .products-c-dashboard .products-main-stack > .panel {{
         display: block;
@@ -7221,6 +7316,7 @@ class CatalogApplication:
       .products-filter-form .products-filter-submit {{
         grid-column: 1;
         justify-self: end;
+        width: 100%;
       }}
       .nav-session {{
         margin-left: 0;
@@ -8975,15 +9071,23 @@ class CatalogApplication:
         }
         return_to_path = self.products_return_path(query)
         filtered_product_ids_value = ",".join(str(product_id) for product_id in filtered_product_ids)
+        c_pending_filter_active = user.get("department") == "C" and status_filter == "published"
+        show_select_all_filtered = total_products > page_product_count or (
+            c_pending_filter_active and total_products > 0
+        )
+        select_all_filtered_label = (
+            f"选择全部待接收资料（{total_products}）"
+            if c_pending_filter_active
+            else f"选择全部筛选结果（{total_products}）"
+        )
         select_all_filtered_button = (
-            f'<button class="ghost-button" type="button" id="select-all-filtered-products">选择全部筛选结果（{total_products}）</button>'
-            if total_products > page_product_count
+            f'<button class="ghost-button" type="button" id="select-all-filtered-products">{select_all_filtered_label}</button>'
+            if show_select_all_filtered
             else ""
         )
         selection_toolbar_markup = (
             f"""
             <div class="products-selection-toolbar" id="products-selection-toolbar">
-              <span class="products-selection-summary" id="products-selection-summary">当前未勾选，本页共 {page_product_count} 条</span>
               <div class="products-selection-actions">
                 <button class="ghost-button" type="button" id="select-current-page-products">勾选本页（{page_product_count}）</button>
                 {select_all_filtered_button}
@@ -9036,23 +9140,30 @@ class CatalogApplication:
             if current_page < total_pages
             else '<span class="pill pagination-disabled" aria-disabled="true">下一页</span>'
         )
-        pagination_controls = f"""
-          <span class="products-pagination-summary">共 {total_products} 条，第 {current_page} / {total_pages} 页，每页 100 条</span>
+        pagination_links_markup = f"""
           <div class="products-pagination-links">
             {previous_link}
             {''.join(page_links)}
             {next_link}
           </div>
         """
-        pagination_top_markup = (
-            f"""
-            <nav class="products-pagination products-pagination-top" aria-label="资料列表顶部分页">
-              {pagination_controls}
-            </nav>
-            """
-            if total_pages > 1
-            else ""
-        )
+        pagination_summary_markup = f"""
+          <span class="products-pagination-summary">共 {total_products} 条，第 {current_page} / {total_pages} 页，每页 100 条</span>
+        """
+        pagination_controls = f"""
+          {pagination_links_markup}
+          {pagination_summary_markup}
+        """
+        pagination_top_markup = f"""
+        <nav class="products-list-control-bar" id="products-list-control-bar" aria-label="资料列表顶部分页">
+          {f'<div class="products-list-page-row">{pagination_links_markup}</div>' if total_pages > 1 else ''}
+          <div class="products-list-control-meta">
+            {selection_toolbar_markup}
+            <span class="products-selection-summary" id="products-selection-summary">当前未勾选，本页共 {page_product_count} 条</span>
+            {pagination_summary_markup}
+          </div>
+        </nav>
+        """
         pagination_bottom_markup = f"""
         <nav class="products-pagination products-pagination-bottom" aria-label="资料列表底部分页">
           {pagination_controls}
@@ -9195,7 +9306,7 @@ class CatalogApplication:
         insights_grid_class = "products-insights-grid"
         if user["department"] == "C":
             stats_markup = f"""
-            <div class="stats">
+            <div class="stats products-stats-row">
               <div class="stat-card"><span>总接收</span><strong>{c_receipt_stats.get('received', 0)}</strong></div>
               <div class="stat-card"><span>近7天新增</span><strong>{c_receipt_stats.get('recent_created', 0)}</strong></div>
               <div class="stat-card"><span>待运营接收</span><strong>{c_receipt_stats.get('pending', 0)}</strong></div>
@@ -9204,7 +9315,7 @@ class CatalogApplication:
             insights_grid_class += " products-insights-single"
         elif user["department"] in {"A", "EXECUTIVE"}:
             stats_markup = f"""
-            <div class="stats">
+            <div class="stats products-stats-row">
               <div class="stat-card"><span>总资料数</span><strong>{stats.get('A', 0) + stats.get('B', 0) + stats.get('C', 0)}</strong></div>
               <div class="stat-card"><span>商品部已完成</span><strong>{workflow_stats.get('published', 0) + workflow_stats.get('received', 0)}</strong></div>
               <div class="stat-card"><span>近 7 天新增</span><strong>{recent_stats.get('recent_created', 0)}</strong></div>
@@ -9215,31 +9326,22 @@ class CatalogApplication:
             insights_grid_class += " products-insights-single"
         elif user["department"] == "B" or is_admin(user):
             stats_markup = f"""
-            <div class="stats">
+            <div class="stats products-stats-row">
+              <div class="stat-card"><span>近7天新增</span><strong>{b_dashboard_stats.get('recent_submitted_to_b', 0)}</strong></div>
+              <div class="stat-card"><span>A/B协作中</span><strong>{b_dashboard_stats.get('pending_completion', 0)}</strong></div>
+              <div class="stat-card"><span>待运营接收</span><strong>{b_dashboard_stats.get('awaiting_receipt', 0)}</strong></div>
+              <div class="stat-card"><span>近7天退回</span><strong>{b_dashboard_stats.get('recent_returned_to_a', 0)}</strong></div>
+              <a class="stat-card stat-card-link" href="/products?status=workflow_restart#products-list"><span>待商品部重新提交</span><strong>{b_dashboard_stats.get('restart_required', 0)}</strong><small>点击查看需重新流转款式</small></a>
               <a class="stat-card stat-card-link" href="/products?marker=tax_price_modified#products-list">
                 <span>近7天含税价修改</span>
                 <strong>{b_dashboard_stats.get('recent_tax_price_changes', 0)}</strong>
                 <small>点击查看变动款式</small>
               </a>
-              <div class="stat-card"><span>近7天新增</span><strong>{b_dashboard_stats.get('recent_submitted_to_b', 0)}</strong></div>
-              <div class="stat-card"><span>A/B协作中</span><strong>{b_dashboard_stats.get('pending_completion', 0)}</strong></div>
-              <a class="stat-card stat-card-link" href="/products?status=workflow_restart#products-list"><span>待商品部重新提交</span><strong>{b_dashboard_stats.get('restart_required', 0)}</strong><small>点击查看需重新流转款式</small></a>
-              <div class="stat-card"><span>待运营接收</span><strong>{b_dashboard_stats.get('awaiting_receipt', 0)}</strong></div>
-              <div class="stat-card"><span>近7天退回</span><strong>{b_dashboard_stats.get('recent_returned_to_a', 0)}</strong></div>
             </div>
             """
             insights_grid_class += " products-insights-single"
         else:
             stats_markup = ""
-        table_description = (
-            (
-                "当前为运营部汇总监控视图，已合并天猫、唯品及同款资料，仅展示运营部可读取字段与整体接收状态。"
-                if is_department_monitor(user)
-                else "当前列表只显示本运营归属可读取字段。状态为待运营接收的资料可逐条或批量接收，接收状态仅记录在当前账号下。页面、Excel 导出和 JSON 调用会保持同样的渠道范围。"
-            )
-            if user["department"] == "C"
-            else "这里汇总了当前账号可见的商品资料。你可以按部门、协作阶段和资料完成情况快速筛选，再进入详情、日志或批量处理。"
-        )
         bulk_tools_markup = self.render_bulk_tools(user)
         lifecycle_filter_markup = f"""
               <select name="lifecycle_status">
@@ -9300,48 +9402,23 @@ class CatalogApplication:
             if b_dashboard_view
             else ""
         )
-        department_filter_markup = (
-            f"""
-                <select name="department">
-                  <option value="">全部部门</option>
-                  <option value="A" {"selected" if department_filter == "A" else ""}>跟单部</option>
-                  <option value="B" {"selected" if department_filter == "B" else ""}>商品部</option>
-                </select>
-            """
-            if is_admin(user)
-            else f'''
-                <input type="hidden" name="department" value="">
-                <div class="filter-department-context" aria-label="当前部门">{html.escape(department_label(user.get("department")))}</div>
-            '''
-        )
         if user["department"] == "A":
-            filter_controls_markup = lifecycle_filter_markup + status_filter_markup + department_filter_markup
+            filter_controls_markup = status_filter_markup + lifecycle_filter_markup
         elif user["department"] == "C":
-            filter_controls_markup = department_filter_markup + status_filter_markup
+            filter_controls_markup = status_filter_markup
         else:
-            filter_controls_markup = department_filter_markup + status_filter_markup + marker_filter_markup + lifecycle_filter_markup
+            filter_controls_markup = status_filter_markup + lifecycle_filter_markup + marker_filter_markup
         editor_dashboard = user["department"] in {"A", "B", "EXECUTIVE"} or is_admin(user)
-        stats_description = (
-            "先掌握接收进度，再进入资料列表处理待运营接收资料。"
-            if user["department"] == "C"
-            else (
-                "先查看资料概览，再进入资料列表处理。"
-                if editor_dashboard
-                else "把阶段分布、总量和近期节奏统一放在页面最后，浏览主列表后再集中查看更清楚。"
-            )
-        )
         insights_panel = f"""
         <section class="{insights_grid_class}">
           <section class="panel products-stats-panel">
             <div class="eyebrow">Catalog Summary</div>
             <h2>资料概览</h2>
-            <p class="table-note">{stats_description}</p>
             {stats_markup}
           </section>
           {operations_panel}
         </section>
         """
-        insights_before_list = insights_panel if user["department"] == "C" or editor_dashboard else ""
         insights_after_list = "" if user["department"] == "C" or editor_dashboard else insights_panel
         dashboard_open = (
             '<div class="products-c-dashboard"><div class="products-c-overview-stack">'
@@ -9350,28 +9427,6 @@ class CatalogApplication:
         )
         overview_close = "</div>" if user["department"] == "C" or editor_dashboard else ""
         dashboard_close = "</div>" if user["department"] == "C" or editor_dashboard else ""
-        products_intro = (
-            (
-                "管理员正在按运营部汇总口径查看待运营接收资料与已接收资料。"
-                if is_department_monitor(user)
-                else f"{operating_channel_label(user.get('operating_channel'))}运营账号可读取本归属渠道及同款资料，并对待运营接收资料进行接收确认。"
-            )
-            if user["department"] == "C"
-            else (
-                "当前为总经办只读模式，可查看与跟单部相同范围的商品资料，并下载所需资料。"
-                if is_executive_read_only(user)
-                else "用一套资料底库承接 Excel 模板、多人协作、权限隔离和后续系统调用。跟单部负责主体资料，商品部维护图片，商品企划中心统一维护品类、上新价格和上新渠道，系统自动判断资料完成。"
-            )
-        )
-        filter_intro = (
-            "按款号、商品名称或品牌筛选资料。"
-            if user["department"] == "C"
-            else (
-                "可按款号、商品名称、品牌或供应商模糊搜索；款号精确且唯一命中时会直接打开资料详情。"
-                if supplier_search_enabled
-                else "输入款号会在精确且唯一命中时直接打开资料详情；输入商品名称、品牌或模糊关键词时，仍保留列表筛选结果。"
-            )
-        )
         supplier_filter_markup = (
             f'<input class="products-supplier-field" name="supplier" value="{html.escape(supplier_filter)}" placeholder="供应商名称，支持模糊搜索">'
             if supplier_search_enabled
@@ -9409,12 +9464,10 @@ class CatalogApplication:
         content = f"""
         {dashboard_open}
         <section class="products-top-grid">
-          <div class="panel products-overview-card">
+          <div class="panel products-overview-card{' products-overview-card-spaced' if user['department'] in {'A', 'B'} else ''}">
             <div class="eyebrow">{html.escape(console_eyebrow)}</div>
             <h1>商品资料后台</h1>
-            <p>{html.escape(products_intro)}</p>
             <div class="tools">
-              <a class="pill" href="/products">资料列表</a>
               {layout_settings_button}
               {new_button}
               {import_button}
@@ -9424,21 +9477,20 @@ class CatalogApplication:
             </div>
             {workflow_rule_note}
           </div>
-          <section id="products-search-filter" class="panel products-filter-card query-anchor">
-            <div class="eyebrow">List Workspace</div>
-            <h2>搜索与筛选</h2>
-            <p class="table-note">{html.escape(filter_intro)}</p>
-            {notice_block}
-            {c_note}
-            <form class="products-filter-form" method="get" action="/products#products-search-filter">
-                <input class="products-search-field" name="q" value="{html.escape(keyword)}" placeholder="款号、商品名称或品牌">
-                {supplier_filter_markup}
-                {filter_controls_markup}
-                <button class="products-filter-submit" type="submit">筛选</button>
-            </form>
-          </section>
+          {insights_panel if user["department"] == "C" or editor_dashboard else ""}
         </section>
-        {insights_before_list}
+        <section id="products-search-filter" class="panel products-filter-card query-anchor">
+          <div class="eyebrow">List Workspace</div>
+          <h2>搜索与筛选</h2>
+          {notice_block}
+          {c_note}
+          <form class="products-filter-form{' products-filter-form-c' if user['department'] == 'C' else ''}" method="get" action="/products#products-list">
+              <input class="products-search-field" name="q" value="{html.escape(keyword)}" placeholder="款号、款色">
+              {supplier_filter_markup}
+              {filter_controls_markup}
+              <button class="products-filter-submit" type="submit">搜索筛选</button>
+          </form>
+        </section>
         {overview_close}
         <div class="products-main-stack">
           <section id="products-list" class="panel query-anchor">
@@ -9446,7 +9498,6 @@ class CatalogApplication:
             <div class="list-intro-main">
               <div class="eyebrow">Catalog Table</div>
               <h2>资料列表</h2>
-              <p class="table-note">{html.escape(table_description)} 所有账号都可先勾选资料，再导出勾选条目；按住 Shift 再点击勾选框，可连续选中一段资料。</p>
             </div>
             {bulk_tools_markup}
           </div>
@@ -9460,7 +9511,6 @@ class CatalogApplication:
             <input type="hidden" name="return_to" value="{html.escape(return_to_path)}">
             <input type="hidden" name="selection_scope" id="products-selection-scope" value="selected">
             <input type="hidden" name="filtered_product_ids" value="{html.escape(filtered_product_ids_value, quote=True)}">
-          {selection_toolbar_markup}
           <div class="table-wrap products-list-scroll-wrap">
             <table class="catalog-table">
               <thead>
@@ -10950,7 +11000,7 @@ class CatalogApplication:
                   <button class="supplier-bill-import-button" type="submit">导入账单</button>
                 </div>
               </div>
-              <p class="meta supplier-bill-import-note">退货明细可填写负整数数量和负结算金额；数量不接受小数，含税价不能为负数。</p>
+              <p class="meta supplier-bill-import-note">数量可填写负整数；含税价和结算金额均可填写负数，数量不接受小数。</p>
               {supplier_bill_delete_note}
             </form>
             """
@@ -11107,17 +11157,15 @@ class CatalogApplication:
                 <div class="tools">
                   <button type="submit" name="bulk_action" value="submit_to_b_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量开启商品部协作</button>
                 </div>
-                <div class="meta">先勾选已具备识别字段的资料，再一键开启 A/B 并行协作。</div>
               </div>
             """
         if user.get("department") == "B":
             return """
               <div class="list-intro-actions">
-                <div class="tools bulk-tools-vertical">
-                  <button type="submit" name="bulk_action" value="complete_to_c_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交运营部</button>
+                <div class="tools bulk-tools-inline">
                   <button type="submit" name="bulk_action" value="return_to_a_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk" class="ghost-button">批量退回跟单部</button>
+                  <button type="submit" name="bulk_action" value="complete_to_c_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交运营部</button>
                 </div>
-                <div class="meta">商品部可在这里直接完成批量流转或退回跟单部。</div>
               </div>
             """
         if user.get("department") == "C":
@@ -11126,7 +11174,6 @@ class CatalogApplication:
                 <div class="tools">
                   <button type="submit" name="bulk_action" value="receive_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量接收资料</button>
                 </div>
-                <div class="meta">勾选状态为待运营接收的资料后，可一次确认接收。</div>
               </div>
             """
         if not is_admin(user):
@@ -11137,7 +11184,6 @@ class CatalogApplication:
               <button type="submit" name="bulk_action" value="publish_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交运营部</button>
               <button type="submit" name="bulk_action" value="archive_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量归档</button>
             </div>
-            <div class="meta">管理员可在列表右上角直接执行批量提交运营部或归档。</div>
           </div>
         """
 
