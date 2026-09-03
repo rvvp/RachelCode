@@ -366,6 +366,27 @@ def list_source_products(db_path: str | Path, *, season_year: str = "", status: 
     return [dict(row) for row in rows]
 
 
+def list_waiting_source_products(db_path: str | Path, *, season_year: str = "") -> list[dict]:
+    """Return every source item that has not entered a pricing cycle yet."""
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT sp.*
+            FROM source_products sp
+            WHERE sp.status = 'pending'
+              AND sp.lifecycle_status = 'active'
+              AND (? = '' OR sp.season_year = ?)
+              AND NOT EXISTS (
+                  SELECT 1 FROM pricing_records pr
+                  WHERE pr.source_product_id = sp.id
+              )
+            ORDER BY sp.season_year DESC, sp.source_updated_at DESC, sp.id DESC
+            """,
+            (season_year, season_year),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def list_published_source_products(db_path: str | Path, *, season_year: str = "") -> list[dict]:
     """Return completed source rows so operators can start a same-style revision."""
     with get_connection(db_path) as connection:
@@ -1166,10 +1187,117 @@ def list_pricing_records(db_path: str | Path, *, season_year: str = "", status: 
     return [dict(row) for row in rows]
 
 
+def list_initial_review_export_rows(db_path: str | Path, *, season_year: str = "") -> list[dict]:
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT pr.*, sp.style_color, sp.color_name,
+                   sp.source_version_no AS current_source_version_no
+            FROM pricing_records pr
+            JOIN source_products sp ON sp.id = pr.source_product_id
+            WHERE pr.status IN ('suggested', 'conflict')
+              AND (? = '' OR pr.season_year = ?)
+            ORDER BY pr.season_year DESC, pr.created_at DESC, pr.id DESC
+            """,
+            (season_year, season_year),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_pricing_record(db_path: str | Path, record_id: int) -> dict | None:
     with get_connection(db_path) as connection:
         row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
     return dict(row) if row else None
+
+
+def import_initial_review_edits(db_path: str | Path, rows: list[dict], operator_name: str) -> int:
+    """Validate and atomically save Excel edits without advancing the workflow."""
+    if not rows:
+        raise ValueError("Excel 中没有可导入的初审资料。")
+    prepared: list[tuple[dict, dict, str, str, int]] = []
+    seen_ids: set[int] = set()
+    with get_connection(db_path) as connection:
+        active_categories = {
+            str(row["name"])
+            for row in connection.execute("SELECT name FROM category_options WHERE enabled = 1").fetchall()
+        }
+        active_channels = {
+            str(row["name"])
+            for row in connection.execute("SELECT name FROM channel_options WHERE enabled = 1").fetchall()
+        }
+        for item in rows:
+            row_number = int(item.get("row_number") or 0)
+            record_id = int(item.get("record_id") or 0)
+            if record_id in seen_ids:
+                raise ValueError(f"第 {row_number} 行的定价记录ID重复。")
+            seen_ids.add(record_id)
+            record_row = connection.execute(
+                "SELECT * FROM pricing_records WHERE id = ?",
+                (record_id,),
+            ).fetchone()
+            if not record_row:
+                raise ValueError(f"第 {row_number} 行对应的定价记录不存在。")
+            record = dict(record_row)
+            source_row = connection.execute(
+                "SELECT source_version_no FROM source_products WHERE id = ?",
+                (int(record["source_product_id"]),),
+            ).fetchone()
+            if not source_row:
+                raise ValueError(f"第 {row_number} 行对应的来源商品不存在。")
+            if record["status"] not in {"suggested", "conflict"}:
+                raise ValueError(f"第 {row_number} 行已不在待初审阶段，请重新导出最新资料。")
+            if (
+                str(item.get("publication_id") or "") != str(record["publication_id"])
+                or int(item.get("source_product_id") or 0) != int(record["source_product_id"])
+            ):
+                raise ValueError(f"第 {row_number} 行的企划记录号或来源商品ID不匹配。")
+            imported_version = int(item.get("source_version_no") or 0)
+            if (
+                imported_version != int(record["source_version_no"])
+                or imported_version != int(source_row["source_version_no"])
+            ):
+                raise ValueError(f"第 {row_number} 行来源版本已变化，请重新导出最新资料。")
+            category = str(item.get("category") or "").strip()
+            channel = str(item.get("channel") or "").strip()
+            if category not in active_categories:
+                raise ValueError(f"第 {row_number} 行请选择规则中已启用的品类选项。")
+            if channel not in active_channels:
+                raise ValueError(f"第 {row_number} 行请选择规则中已启用的渠道选项。")
+            price = validated_launch_price(item.get("launch_price"))
+            calculation = calculate_pricing(
+                db_path,
+                record["season_year"],
+                category,
+                record["supplier"],
+                record["cost"],
+            )
+            prepared.append((record, calculation, category, channel, price))
+
+        for record, calculation, category, channel, price in prepared:
+            connection.execute(
+                """
+                UPDATE pricing_records
+                SET category = ?, channel = ?, fixed_multiplier = ?, supplier_coefficient = ?,
+                    raw_price = ?, calculated_price = ?, launch_price = ?, operator_name = ?
+                WHERE id = ?
+                """,
+                (
+                    category,
+                    channel,
+                    calculation["fixed_multiplier"],
+                    calculation["supplier_coefficient"],
+                    calculation["raw_price"],
+                    calculation["calculated_price"],
+                    price,
+                    operator_name,
+                    int(record["id"]),
+                ),
+            )
+            connection.execute(
+                "UPDATE source_products SET category = ? WHERE id = ?",
+                (category, int(record["source_product_id"])),
+            )
+    return len(prepared)
 
 
 def confirm_pricing_record(db_path: str | Path, record_id: int, operator_name: str) -> dict:

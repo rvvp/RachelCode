@@ -9,6 +9,8 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 from wsgiref.util import setup_testing_defaults
 
+from openpyxl import load_workbook
+
 from catalog_backend import CatalogApplication, init_db as init_catalog_db
 from catalog_backend import db as catalog_db
 from catalog_backend.policies import editable_field_keys_for_user
@@ -50,6 +52,15 @@ class PlanningCenterTests(unittest.TestCase):
     def login_cookie(self, app, username):
         response = self.wsgi_request(app, "/login", method="POST", body=urlencode({"username": username, "password": "demo123"}).encode())
         return dict(response["headers"])["Set-Cookie"].split(";", 1)[0]
+
+    def workbook_multipart(self, workbook_bytes: bytes, filename: str = "initial-review.xlsx") -> tuple[bytes, str]:
+        boundary = "----PlanningCenterExcelTest"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="workbook"; filename="{filename}"\r\n'
+            "Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n"
+        ).encode("utf-8") + workbook_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        return body, f"multipart/form-data; boundary={boundary}"
 
     def test_internal_api_requires_token_and_publishes_with_version_check(self):
         app = CatalogApplication(self.catalog_db_path, Path(self.temp.name) / "uploads", planning_api_token="planning-secret")
@@ -192,6 +203,43 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         self.assertEqual(response["body"], image_bytes)
         self.assertEqual(dict(response["headers"])["Content-Type"], "image/png")
+
+    def test_internal_planning_image_api_proxies_saved_external_image(self):
+        product = next(
+            item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending"
+        )
+        image_url = "http://image-host.test/styles/new-arrival.jpg"
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            connection.execute(
+                "UPDATE products SET image_url = ? WHERE id = ?",
+                (image_url, product["id"]),
+            )
+        app = CatalogApplication(
+            self.catalog_db_path,
+            Path(self.temp.name) / "uploads",
+            planning_api_token="planning-secret",
+        )
+        image_bytes = b"external-catalog-image"
+
+        class ExternalImageResponse(io.BytesIO):
+            headers = {"Content-Type": "image/jpeg"}
+
+            def geturl(self):
+                return image_url
+
+        with patch("catalog_backend.web.urlopen", return_value=ExternalImageResponse(image_bytes)) as mocked_urlopen:
+            response = self.wsgi_request(
+                app,
+                f"/api/internal/planning/products/{product['id']}/image",
+                authorization="Bearer planning-secret",
+            )
+
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertEqual(response["body"], image_bytes)
+        self.assertEqual(dict(response["headers"])["Content-Type"], "image/jpeg")
+        request = mocked_urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, image_url)
+        self.assertEqual(request.get_header("Accept"), "image/*")
 
     def test_planning_revision_publication_updates_same_catalog_product(self):
         app = CatalogApplication(
@@ -1150,6 +1198,188 @@ class PlanningCenterTests(unittest.TestCase):
         )["body"].decode("utf-8")
         self.assertIn("每页 50 款 · 第 2 / 2 页 · 共 51 款", clamped_page)
 
+    def test_cross_page_selection_prices_all_waiting_items_without_posting_every_id(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2027春夏", None, 600, 4)
+        products = [
+            {
+                "id": 3000 + index,
+                "style_code": f"ALL-{index:03d}",
+                "style_color": f"ALL-{index:03d}-黑",
+                "product_name": f"跨页批量毛衣 {index}",
+                "season_year": "2027春夏",
+                "supplier": "跨页测试供应商",
+                "actual_cost": 100,
+                "status": "pending",
+                "source_version_no": 1,
+            }
+            for index in range(101)
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+
+        page = self.wsgi_request(
+            app,
+            "/workbench?season_year=2027%E6%98%A5%E5%A4%8F&status=waiting",
+            cookie=planner_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn("选择全部待测算资料（101）", page)
+        self.assertIn("id='pricing-selection-scope'", page)
+        self.assertIn("const waitingCount = 101;", page)
+        self.assertEqual(page.count("name='suggest_ids'"), 50)
+
+        response = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode(
+                {
+                    "batch_action": "suggest",
+                    "selection_scope": "filtered",
+                    "season_year": "2027春夏",
+                }
+            ).encode("utf-8"),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(response["status"].startswith("302"))
+        self.assertIn("status=suggested", dict(response["headers"])["Location"])
+        records = planning_db.list_pricing_records(self.planning_db_path, season_year="2027春夏")
+        self.assertEqual(len(records), 101)
+        self.assertEqual({record["calculated_price"] for record in records}, {399})
+
+    def test_initial_review_excel_export_and_import_save_drafts_without_advancing(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2027秋冬", None, 600, 4)
+        planning_db.save_category_rule(self.planning_db_path, "2027秋冬", "连衣裙", 4.2)
+        products = [
+            {
+                "id": 4101,
+                "style_code": "XLSX-001",
+                "style_color": "XLSX-001-黑",
+                "product_name": "Excel 测试毛衣",
+                "season_year": "2027秋冬",
+                "supplier": "Excel 测试供应商",
+                "category": "毛衣",
+                "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 3,
+            },
+            {
+                "id": 4102,
+                "style_code": "XLSX-002",
+                "style_color": "XLSX-002-白",
+                "product_name": "Excel 测试开衫",
+                "season_year": "2027秋冬",
+                "supplier": "Excel 测试供应商",
+                "category": "毛衣",
+                "actual_cost": 120,
+                "status": "pending",
+                "source_version_no": 1,
+            },
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        planning_db.create_pricing_records(self.planning_db_path, products, "商品部企划员")
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+
+        export_response = self.wsgi_request(
+            app,
+            "/pricing/export.xlsx?season_year=2027%E7%A7%8B%E5%86%AC",
+            cookie=planner_cookie,
+        )
+        self.assertTrue(export_response["status"].startswith("200"))
+        self.assertIn("planning-initial-review.xlsx", dict(export_response["headers"])["Content-Disposition"])
+        workbook = load_workbook(io.BytesIO(export_response["body"]))
+        self.assertEqual(workbook.sheetnames, ["待初审资料", "填写说明"])
+        sheet = workbook["待初审资料"]
+        self.assertEqual(sheet.freeze_panes, "E2")
+        self.assertEqual(sheet.auto_filter.ref, "A1:R3")
+        self.assertEqual(sheet["A1"].value, "定价记录ID")
+        self.assertEqual(sheet["O1"].value, "初审品类")
+        self.assertEqual(sheet["P1"].value, "初审上新价")
+        self.assertEqual(sheet["Q1"].value, "渠道划分")
+        self.assertFalse(sheet["O2"].protection.locked)
+        self.assertTrue(sheet["N2"].protection.locked)
+        self.assertEqual(len(sheet.data_validations.dataValidation), 2)
+
+        row_by_style = {sheet.cell(row, 6).value: row for row in range(2, sheet.max_row + 1)}
+        target_row = row_by_style["XLSX-001"]
+        sheet.cell(target_row, 15).value = "连衣裙"
+        sheet.cell(target_row, 16).value = 639
+        sheet.cell(target_row, 17).value = "天猫"
+        second_row = row_by_style["XLSX-002"]
+        sheet.cell(second_row, 17).value = "唯品"
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        body, content_type = self.workbook_multipart(buffer.getvalue())
+        import_response = self.wsgi_request(
+            app,
+            "/pricing/import",
+            method="POST",
+            body=body,
+            content_type=content_type,
+            cookie=planner_cookie,
+        )
+        self.assertTrue(import_response["status"].startswith("302"))
+        self.assertIn("status=suggested", dict(import_response["headers"])["Location"])
+
+        records = {
+            record["style_code"]: record
+            for record in planning_db.list_pricing_records(self.planning_db_path, season_year="2027秋冬")
+        }
+        self.assertEqual(records["XLSX-001"]["category"], "连衣裙")
+        self.assertEqual(records["XLSX-001"]["calculated_price"], 629)
+        self.assertEqual(records["XLSX-001"]["launch_price"], 639)
+        self.assertEqual(records["XLSX-001"]["channel"], "天猫")
+        self.assertEqual(records["XLSX-001"]["status"], "suggested")
+        self.assertEqual(records["XLSX-002"]["channel"], "唯品")
+        self.assertEqual(records["XLSX-002"]["status"], "suggested")
+
+    def test_initial_review_excel_import_rejects_stale_source_version_atomically(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2027春", None, 600, 4)
+        products = [
+            {
+                "id": 4201 + index,
+                "style_code": f"STALE-{index}",
+                "product_name": f"版本测试毛衣 {index}",
+                "season_year": "2027春",
+                "supplier": "版本测试供应商",
+                "category": "毛衣",
+                "actual_cost": 100,
+                "status": "pending",
+                "source_version_no": 1,
+            }
+            for index in range(2)
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        planning_db.create_pricing_records(self.planning_db_path, products, "商品部企划员")
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+        exported = self.wsgi_request(app, "/pricing/export.xlsx", cookie=planner_cookie)
+        workbook = load_workbook(io.BytesIO(exported["body"]))
+        sheet = workbook["待初审资料"]
+        for row_number in range(2, 4):
+            sheet.cell(row_number, 16).value = 459
+            sheet.cell(row_number, 17).value = "天猫"
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("UPDATE source_products SET source_version_no = 2 WHERE id = 4202")
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        body, content_type = self.workbook_multipart(buffer.getvalue())
+
+        response = self.wsgi_request(
+            app,
+            "/pricing/import",
+            method="POST",
+            body=body,
+            content_type=content_type,
+            cookie=planner_cookie,
+        )
+        self.assertTrue(response["status"].startswith("400"))
+        self.assertIn("来源版本已变化", response["body"].decode("utf-8"))
+        records = planning_db.list_pricing_records(self.planning_db_path, season_year="2027春")
+        self.assertEqual({record["launch_price"] for record in records}, {399})
+        self.assertEqual({record["channel"] for record in records}, {""})
+
     def test_dashboard_uses_new_arrival_review_card_title(self):
         app = PlanningApplication(self.planning_db_path, "http://catalog.test")
         cookie = self.login_cookie(app, "planner")
@@ -1245,10 +1475,10 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("待初审", workbench)
         self.assertIn("确认并提交复核", workbench)
         self.assertIn("id='pricing-row-31'", workbench)
-        self.assertIn("src='https://example.com/m031.jpg'", workbench)
+        self.assertIn("src='/source-products/31/image?v=1'", workbench)
         self.assertIn("loading='lazy'", workbench)
         self.assertIn("class='product-image-zoom'", workbench)
-        self.assertIn("data-image-src='https://example.com/m031.jpg'", workbench)
+        self.assertIn("data-image-src='/source-products/31/image?v=1'", workbench)
         self.assertIn("aria-label='查看 M031-黑 大图'", workbench)
         self.assertIn("aria-haspopup='dialog'", workbench)
         self.assertEqual(workbench.count("id='product-image-dialog'"), 1)

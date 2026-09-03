@@ -98,8 +98,9 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.08.30-supplier-negative-tax-v1"
+CATALOG_BUILD_VERSION = "2026.08.31-filtered-export-v1"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_PLANNING_IMAGE_BYTES = 5 * 1024 * 1024
 IMAGE_BACKUP_CLEANUP_INTERVAL_SECONDS = 60 * 60
 LIST_LAYOUT_VIRTUAL_FIELDS: tuple[FieldDef, ...] = ()
 LIST_LAYOUT_VIRTUAL_FIELD_MAP = {}
@@ -994,32 +995,26 @@ class CatalogApplication:
             product_id for product_id in self.parse_numeric_csv(query.get("selected", ""))
         }
         export_mode = query.get("mode", "").strip()
-        if export_mode == "selected" and not selected_product_ids:
+        selection_scope = query.get("selection_scope", "selected").strip()
+        export_filtered_results = export_mode == "selected" and selection_scope == "filtered"
+        if export_mode == "selected" and not export_filtered_results and not selected_product_ids:
             return self.redirect(
                 start_response,
                 "/products?notice=" + self.urlencode_message("请先勾选至少一条资料，再导出勾选资料。"),
             )
-        source_status_filter = "" if user.get("department") == "C" else query.get("status", "")
-        visible_products = self.visible_products_for_user(
-            db.list_products(
-                self.db_path,
-                query="" if user.get("department") == "C" else query.get("q", ""),
-                department=query.get("department", ""),
-                status=source_status_filter,
-            ),
-            user,
-        )
-        if user.get("department") == "C":
-            visible_products = self.filter_c_products_by_keyword(visible_products, query.get("q", ""))
-        if user.get("department") == "C" and query.get("status", ""):
-            visible_products = [
-                product for product in visible_products
-                if self.c_effective_status(product, user) == query.get("status", "")
-            ]
+        filter_context = self.product_filter_context(user, query)
+        visible_products = filter_context["products"]
+        if export_filtered_results and not visible_products:
+            return self.redirect(
+                start_response,
+                "/products?notice=" + self.urlencode_message("当前筛选结果没有可导出的资料。"),
+            )
         products = [
             self.product_payload_for_user(product, user)
             for product in visible_products
-            if not selected_product_ids or int(product.get("id") or 0) in selected_product_ids
+            if export_filtered_results
+            or not selected_product_ids
+            or int(product.get("id") or 0) in selected_product_ids
         ]
         visible_fields = self.visible_fields_for_user(user)
         include_images = query.get("include_images", "").strip() == "1"
@@ -1184,21 +1179,67 @@ class CatalogApplication:
         if not products:
             return self.json_error_response(start_response, "not_found", "当前商品没有可读取的藏宝阁图片。", "404 Not Found")
         image_url = str(products[0].get("image_url") or "").strip()
-        if not image_url.startswith(MEDIA_URL_PREFIX):
+        if image_url.startswith(MEDIA_URL_PREFIX):
+            file_path = media_file_path(self.upload_dir, image_url)
+            if not file_path.exists() or not file_path.is_file():
+                return self.json_error_response(start_response, "not_found", "藏宝阁图片文件不存在。", "404 Not Found")
+            if file_path.stat().st_size > MAX_PLANNING_IMAGE_BYTES:
+                return self.json_error_response(start_response, "image_too_large", "藏宝阁图片超过 5MB。", "413 Content Too Large")
+            start_response(
+                "200 OK",
+                [
+                    ("Content-Type", media_content_type(image_url)),
+                    ("Content-Length", str(file_path.stat().st_size)),
+                    ("Cache-Control", "private, max-age=300"),
+                    ("X-Content-Type-Options", "nosniff"),
+                ],
+            )
+            return file_response_chunks(file_path)
+
+        parsed = urlparse(image_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return self.json_error_response(start_response, "not_found", "当前商品没有可读取的藏宝阁图片。", "404 Not Found")
-        file_path = media_file_path(self.upload_dir, image_url)
-        if not file_path.exists() or not file_path.is_file():
-            return self.json_error_response(start_response, "not_found", "藏宝阁图片文件不存在。", "404 Not Found")
+        request = Request(
+            image_url,
+            headers={"User-Agent": "Cangbaoge-Planning-Image/1.0", "Accept": "image/*"},
+        )
+        try:
+            with urlopen(request, timeout=8) as response:
+                final_url = str(response.geturl() if hasattr(response, "geturl") else image_url)
+                final_parsed = urlparse(final_url)
+                if final_parsed.scheme not in {"http", "https"}:
+                    raise ValueError("图片跳转地址不安全。")
+                body = response.read(MAX_PLANNING_IMAGE_BYTES + 1)
+                response_headers = getattr(response, "headers", None)
+                content_type = (
+                    str(response_headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                    if response_headers is not None
+                    else ""
+                )
+        except Exception as error:
+            return self.json_error_response(
+                start_response,
+                "image_fetch_failed",
+                f"读取藏宝阁外部图片失败：{error}",
+                "502 Bad Gateway",
+            )
+        if not body or len(body) > MAX_PLANNING_IMAGE_BYTES:
+            return self.json_error_response(start_response, "image_too_large", "藏宝阁图片为空或超过 5MB。", "413 Content Too Large")
+        guessed_type = guess_type(final_url)[0] or guess_type(image_url)[0] or ""
+        if not content_type.startswith("image/") and guessed_type.startswith("image/"):
+            content_type = guessed_type
+        if not content_type.startswith("image/"):
+            return self.json_error_response(start_response, "invalid_image", "藏宝阁链接返回的内容不是图片。", "415 Unsupported Media Type")
         start_response(
             "200 OK",
             [
-                ("Content-Type", media_content_type(image_url)),
-                ("Content-Length", str(file_path.stat().st_size)),
+                ("Content-Type", content_type),
+                ("Content-Length", str(len(body))),
                 ("Cache-Control", "private, max-age=300"),
                 ("X-Content-Type-Options", "nosniff"),
             ],
         )
-        return file_response_chunks(file_path)
+        return [body]
 
     def parse_json_body(self, environ) -> dict:
         content_length = int(environ.get("CONTENT_LENGTH") or "0")
@@ -2448,6 +2489,105 @@ class CatalogApplication:
         if not params:
             return "/products"
         return "/products?" + urlencode(params)
+
+    def product_filter_context(self, user: dict, query: dict) -> dict:
+        """Apply the product-list filters once for both the page and Excel exports."""
+        normalized_query = dict(query)
+        keyword = str(query.get("q", "")).strip()
+        supplier_search_enabled = user.get("department") in {"A", "EXECUTIVE"} or is_admin(user)
+        supplier_filter = str(query.get("supplier", "")).strip() if supplier_search_enabled else ""
+        b_dashboard_view = user.get("department") == "B" or is_admin(user)
+        department_filter = str(query.get("department", "")).strip()
+        if not is_admin(user):
+            department_filter = ""
+
+        status_filter = str(query.get("status", "")).strip()
+        marker_filter = str(query.get("marker", "")).strip()
+        if b_dashboard_view and status_filter == "tax_price_modified":
+            status_filter = ""
+            marker_filter = "tax_price_modified"
+
+        allowed_statuses = {
+            "A": {"draft", "pending", "published", "received", "workflow_restart"},
+            "EXECUTIVE": {"draft", "pending", "published", "received", "workflow_restart"},
+            "B": {"pending", "published", "received", "workflow_restart"},
+            "C": {"published", "received"},
+        }.get(user.get("department"), {"draft", "pending", "published", "received", "workflow_restart"})
+        if status_filter not in allowed_statuses:
+            status_filter = ""
+
+        tax_price_filter = "modified" if b_dashboard_view and marker_filter == "tax_price_modified" else ""
+        completion_ready_filter = b_dashboard_view and marker_filter == "completion_ready"
+        if completion_ready_filter:
+            status_filter = ""
+        if not tax_price_filter and not completion_ready_filter:
+            marker_filter = ""
+
+        workflow_restart_filter = status_filter == "workflow_restart" and user.get("department") != "C"
+        lifecycle_filter = str(query.get("lifecycle_status", "")).strip()
+        source_status_filter = (
+            ""
+            if user.get("department") == "C"
+            or tax_price_filter
+            or completion_ready_filter
+            or workflow_restart_filter
+            else status_filter
+        )
+        products = self.visible_products_for_user(
+            db.list_products(
+                self.db_path,
+                "" if user.get("department") == "C" else keyword,
+                department_filter,
+                source_status_filter,
+                lifecycle_filter,
+                supplier_filter,
+                tax_price_filter,
+            ),
+            user,
+        )
+        if user.get("department") == "C":
+            products = self.filter_c_products_by_keyword(products, keyword)
+            if status_filter:
+                products = [
+                    product for product in products
+                    if self.c_effective_status(product, user) == status_filter
+                ]
+        if user.get("department") == "B":
+            products = [product for product in products if product.get("status") != "draft"]
+        if completion_ready_filter:
+            products = [product for product in products if self.product_is_ready_for_b_submission(product)]
+        elif workflow_restart_filter:
+            products = [product for product in products if int(product.get("workflow_restart_required") or 0)]
+        elif user.get("department") != "C" and status_filter in {"published", "received"}:
+            products = [product for product in products if not int(product.get("workflow_restart_required") or 0)]
+
+        normalized_query.update(
+            {
+                "q": keyword,
+                "supplier": supplier_filter,
+                "department": department_filter,
+                "status": status_filter,
+                "marker": marker_filter,
+                "lifecycle_status": lifecycle_filter,
+            }
+        )
+        if is_department_monitor(user):
+            normalized_query["monitor_department"] = str(user.get("monitor_department") or "")
+        return {
+            "products": products,
+            "query": normalized_query,
+            "keyword": keyword,
+            "supplier_search_enabled": supplier_search_enabled,
+            "supplier_filter": supplier_filter,
+            "b_dashboard_view": b_dashboard_view,
+            "department_filter": department_filter,
+            "status_filter": status_filter,
+            "marker_filter": marker_filter,
+            "tax_price_filter": tax_price_filter,
+            "completion_ready_filter": completion_ready_filter,
+            "workflow_restart_filter": workflow_restart_filter,
+            "lifecycle_filter": lifecycle_filter,
+        }
 
     def products_notice_path(self, return_to: str, notice: str) -> str:
         safe_path = self.safe_internal_path(return_to) or "/products"
@@ -8986,72 +9126,23 @@ class CatalogApplication:
     def render_products(self, user, query) -> str:
         brand_name = self.brand_config["brand_name"]
         console_eyebrow = self.brand_config["brand_console_eyebrow"]
-        keyword = query.get("q", "").strip()
-        supplier_search_enabled = user.get("department") in {"A", "EXECUTIVE"} or is_admin(user)
-        supplier_filter = query.get("supplier", "").strip() if supplier_search_enabled else ""
-        b_dashboard_view = user.get("department") == "B" or is_admin(user)
-        department_filter = query.get("department", "").strip()
-        if not is_admin(user):
-            department_filter = ""
-            query = {**query, "department": ""}
-        status_filter = query.get("status", "").strip()
-        marker_filter = query.get("marker", "").strip()
-        # Keep previously shared links working while presenting data markers in
-        # their own filter instead of mixing them with workflow states.
-        if b_dashboard_view and status_filter == "tax_price_modified":
-            status_filter = ""
-            marker_filter = "tax_price_modified"
-            query = {**query, "status": "", "marker": marker_filter}
-        allowed_statuses = {
-            "A": {"draft", "pending", "published", "received", "workflow_restart"},
-            "EXECUTIVE": {"draft", "pending", "published", "received", "workflow_restart"},
-            "B": {"pending", "published", "received", "workflow_restart"},
-            "C": {"published", "received"},
-        }.get(user.get("department"), {"draft", "pending", "published", "received", "workflow_restart"})
-        if status_filter not in allowed_statuses:
-            status_filter = ""
-            query = {**query, "status": ""}
-        tax_price_filter = "modified" if b_dashboard_view and marker_filter == "tax_price_modified" else ""
-        completion_ready_filter = b_dashboard_view and marker_filter == "completion_ready"
-        if completion_ready_filter:
-            status_filter = ""
-            query = {**query, "status": ""}
-        if not tax_price_filter and not completion_ready_filter:
-            marker_filter = ""
-            query = {**query, "marker": ""}
-        workflow_restart_filter = status_filter == "workflow_restart" and user.get("department") != "C"
-        lifecycle_filter = query.get("lifecycle_status", "").strip()
+        filter_context = self.product_filter_context(user, query)
+        query = filter_context["query"]
+        keyword = filter_context["keyword"]
+        supplier_search_enabled = filter_context["supplier_search_enabled"]
+        supplier_filter = filter_context["supplier_filter"]
+        b_dashboard_view = filter_context["b_dashboard_view"]
+        department_filter = filter_context["department_filter"]
+        status_filter = filter_context["status_filter"]
+        marker_filter = filter_context["marker_filter"]
+        tax_price_filter = filter_context["tax_price_filter"]
+        completion_ready_filter = filter_context["completion_ready_filter"]
+        workflow_restart_filter = filter_context["workflow_restart_filter"]
+        lifecycle_filter = filter_context["lifecycle_filter"]
         bulk_enabled = not is_department_monitor(user) and (
             is_admin(user) or user.get("department") in {"A", "B", "C"}
         )
-        source_status_filter = "" if user.get("department") == "C" or tax_price_filter or completion_ready_filter or workflow_restart_filter else status_filter
-        products = self.visible_products_for_user(
-            db.list_products(
-                self.db_path,
-                "" if user.get("department") == "C" else keyword,
-                department_filter,
-                source_status_filter,
-                lifecycle_filter,
-                supplier_filter,
-                tax_price_filter,
-            ),
-            user,
-        )
-        if user.get("department") == "C":
-            products = self.filter_c_products_by_keyword(products, keyword)
-        if user.get("department") == "C" and status_filter:
-            products = [
-                product for product in products
-                if self.c_effective_status(product, user) == status_filter
-            ]
-        if user.get("department") == "B":
-            products = [product for product in products if product.get("status") != "draft"]
-        if completion_ready_filter:
-            products = [product for product in products if self.product_is_ready_for_b_submission(product)]
-        elif workflow_restart_filter:
-            products = [product for product in products if int(product.get("workflow_restart_required") or 0)]
-        elif user.get("department") != "C" and status_filter in {"published", "received"}:
-            products = [product for product in products if not int(product.get("workflow_restart_required") or 0)]
+        products = filter_context["products"]
         total_products = len(products)
         filtered_product_ids = [int(product["id"]) for product in products if product.get("id")]
         page_size = 100
@@ -9072,9 +9163,7 @@ class CatalogApplication:
         return_to_path = self.products_return_path(query)
         filtered_product_ids_value = ",".join(str(product_id) for product_id in filtered_product_ids)
         c_pending_filter_active = user.get("department") == "C" and status_filter == "published"
-        show_select_all_filtered = total_products > page_product_count or (
-            c_pending_filter_active and total_products > 0
-        )
+        show_select_all_filtered = total_products > 0
         select_all_filtered_label = (
             f"选择全部待接收资料（{total_products}）"
             if c_pending_filter_active
@@ -9104,6 +9193,7 @@ class CatalogApplication:
             value = str(query.get(key, "")).strip()
             if value:
                 pagination_params[key] = value
+        export_filter_query = urlencode(pagination_params)
 
         def products_page_href(page_number: int) -> str:
             params = dict(pagination_params)
@@ -9544,6 +9634,7 @@ class CatalogApplication:
               const selectAllFiltered = document.getElementById("select-all-filtered-products");
               const clearSelection = document.getElementById("clear-product-selection");
               const totalProducts = {total_products};
+              const filteredExportQuery = {json.dumps(export_filter_query, ensure_ascii=False)};
               if (!bulkForm) return;
               const rowCheckboxes = () => Array.from(bulkForm.querySelectorAll('input[name="product_ids"]'));
               let lastFocusedCheckbox = null;
@@ -9553,14 +9644,24 @@ class CatalogApplication:
                 if (exportField) {{
                   exportField.value = selectedValue;
                 }}
+                const allFilteredSelected = selectionScope && selectionScope.value === "filtered";
                 document.querySelectorAll("[data-export-selected='1']").forEach((item) => {{
                   const baseHref = item.getAttribute("data-base-href") || "/export.xlsx?mode=selected";
-                  item.setAttribute("href", selectedValue ? `${{baseHref}}&selected=${{encodeURIComponent(selectedValue)}}` : baseHref);
+                  if (allFilteredSelected) {{
+                    const filterSuffix = filteredExportQuery ? `&${{filteredExportQuery}}` : "";
+                    item.setAttribute("href", `${{baseHref}}&selection_scope=filtered${{filterSuffix}}`);
+                  }} else {{
+                    item.setAttribute(
+                      "href",
+                      selectedValue
+                        ? `${{baseHref}}&selection_scope=selected&selected=${{encodeURIComponent(selectedValue)}}`
+                        : baseHref,
+                    );
+                  }}
                 }});
-                const allFilteredSelected = selectionScope && selectionScope.value === "filtered";
                 if (selectionSummary) {{
                   if (allFilteredSelected) {{
-                    selectionSummary.textContent = `已选择全部筛选结果 ${{totalProducts}} 条（用于批量操作）`;
+                    selectionSummary.textContent = `已选择全部筛选结果 ${{totalProducts}} 条（用于批量操作和导出）`;
                   }} else if (selectedItems.length) {{
                     selectionSummary.textContent = `已勾选本页 ${{selectedItems.length}} 条`;
                   }} else {{

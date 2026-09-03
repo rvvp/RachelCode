@@ -3356,6 +3356,78 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(second_body.count('id="select-all-filtered-products"'), 1)
         self.assertIn("supplier=%E5%88%86%E9%A1%B5#products-list", second_body)
 
+    def test_filtered_selection_exports_all_matching_products_across_pages(self):
+        a_user = next(item for item in db.list_users(self.db_path) if item["username"] == "a_editor")
+        with db.get_connection(self.db_path) as connection:
+            for index in range(101):
+                db.create_product(
+                    connection,
+                    {
+                        "product_name": f"跨页导出商品 {index + 1}",
+                        "style_code": f"EXPORT-{index + 1:03d}",
+                        "supplier": "跨页导出供应商有限公司",
+                    },
+                    int(a_user["id"]),
+                    "A",
+                )
+
+        cookie = self.login("a_editor", "demo123")
+        list_response = self.request(
+            "/products?supplier=%E8%B7%A8%E9%A1%B5%E5%AF%BC%E5%87%BA",
+            cookie=cookie,
+        )
+        list_body = list_response["body"].decode("utf-8")
+        self.assertIn("选择全部筛选结果（101）", list_body)
+        self.assertIn('const filteredExportQuery = "supplier=%E8%B7%A8%E9%A1%B5%E5%AF%BC%E5%87%BA";', list_body)
+        self.assertIn("&selection_scope=filtered", list_body)
+        self.assertIn("用于批量操作和导出", list_body)
+
+        filtered_response = self.request(
+            "/export.xlsx?mode=selected&selection_scope=filtered&supplier=%E8%B7%A8%E9%A1%B5%E5%AF%BC%E5%87%BA",
+            cookie=cookie,
+        )
+        self.assertTrue(filtered_response["status"].startswith("200"))
+        filtered_sheet = load_workbook(io.BytesIO(filtered_response["body"])).active
+        self.assertEqual(filtered_sheet.max_row, 102)
+        filtered_headers = [cell.value for cell in filtered_sheet[1]]
+        supplier_column = filtered_headers.index("供应商") + 1
+        self.assertEqual(
+            {filtered_sheet.cell(row_index, supplier_column).value for row_index in range(2, 103)},
+            {"跨页导出供应商有限公司"},
+        )
+
+        selected_response = self.request(
+            "/export.xlsx?mode=selected&selection_scope=selected&selected=1,2",
+            cookie=cookie,
+        )
+        self.assertTrue(selected_response["status"].startswith("200"))
+        selected_sheet = load_workbook(io.BytesIO(selected_response["body"])).active
+        self.assertEqual(selected_sheet.max_row, 3)
+
+    def test_filtered_selection_export_with_images_embeds_every_matching_image(self):
+        with db.get_connection(self.db_path) as connection:
+            connection.execute(
+                "UPDATE products SET supplier = ?, image_url = ? WHERE id = ?",
+                ("图片筛选供应商", "https://example.com/one.png", 1),
+            )
+            connection.execute(
+                "UPDATE products SET supplier = ?, image_url = ? WHERE id = ?",
+                ("图片筛选供应商", "https://example.com/two.png", 2),
+            )
+        cookie = self.login("a_editor", "demo123")
+        image_bytes = self.make_png_bytes()
+        with patch.object(self.app, "fetch_export_image", return_value=image_bytes) as fetch_image:
+            response = self.request(
+                "/export.xlsx?mode=selected&selection_scope=filtered&include_images=1&supplier=%E5%9B%BE%E7%89%87%E7%AD%9B%E9%80%89",
+                cookie=cookie,
+            )
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertIn("catalog-export-with-images.xlsx", dict(response["headers"])["Content-Disposition"])
+        sheet = load_workbook(io.BytesIO(response["body"])).active
+        self.assertEqual(sheet.max_row, 3)
+        self.assertEqual(fetch_image.call_count, 2)
+        self.assertEqual(len(sheet._images), 2)
+
     def test_c_viewer_products_page_does_not_error_when_no_published_products(self):
         with db.get_connection(self.db_path) as connection:
             connection.execute("UPDATE products SET status = 'draft'")
@@ -3410,9 +3482,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.08.30-supplier-negative-tax-v1")
+        self.assertEqual(payload["build_version"], "2026.08.31-filtered-export-v1")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.08.30-supplier-negative-tax-v1")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.08.31-filtered-export-v1")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -3548,6 +3620,9 @@ class CatalogAppTests(unittest.TestCase):
     def test_c_viewer_can_export_only_selected_products(self):
         admin_cookie = self.login("admin_reviewer", "demo123")
         self.make_product_two_a_complete()
+        with db.get_connection(self.db_path) as connection:
+            connection.execute("UPDATE products SET launch_channel = '天猫' WHERE id = 2")
+            connection.commit()
         publish_response = self.request(
             "/products/2/status",
             method="POST",
@@ -3555,6 +3630,18 @@ class CatalogAppTests(unittest.TestCase):
             cookie=admin_cookie,
         )
         self.assertTrue(publish_response["status"].startswith("302"))
+        with db.get_connection(self.db_path) as connection:
+            version = connection.execute(
+                "SELECT product_id, version_no, snapshot_json FROM product_versions WHERE product_id = ? ORDER BY version_no DESC LIMIT 1",
+                (2,),
+            ).fetchone()
+            snapshot = json.loads(version["snapshot_json"])
+            snapshot["launch_channel"] = "天猫"
+            connection.execute(
+                "UPDATE product_versions SET snapshot_json = ? WHERE product_id = ? AND version_no = ?",
+                (json.dumps(snapshot, ensure_ascii=False), version["product_id"], version["version_no"]),
+            )
+            connection.commit()
 
         c_cookie = self.login("c_viewer", "demo123")
         list_response = self.request("/products", cookie=c_cookie)
@@ -3575,6 +3662,14 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(workbook.active.max_row, 2)
         product_name_col = headers.index("商品名称") + 1
         self.assertEqual(workbook.active.cell(2, product_name_col).value, "毛感针织开衫")
+
+        filtered_response = self.request(
+            "/export.xlsx?mode=selected&selection_scope=filtered&status=published",
+            cookie=c_cookie,
+        )
+        self.assertTrue(filtered_response["status"].startswith("200"))
+        filtered_workbook = load_workbook(io.BytesIO(filtered_response["body"]))
+        self.assertEqual(filtered_workbook.active.max_row, 3)
 
     def test_c_viewer_export_selected_requires_checked_items(self):
         c_cookie = self.login("c_viewer", "demo123")
