@@ -6,7 +6,6 @@ import io
 import json
 import secrets
 from http import cookies
-from mimetypes import guess_type
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode
 from urllib.error import HTTPError
@@ -14,8 +13,10 @@ from urllib.request import Request, urlopen
 
 from planning_center import db
 from planning_center.excel import initial_review_workbook_bytes, parse_initial_review_workbook
+from catalog_backend.uploads import detect_image_content_type
 
 SESSIONS: dict[str, int] = {}
+MAX_PLANNING_IMAGE_BYTES = 20 * 1024 * 1024
 
 
 class PlanningApplication:
@@ -391,7 +392,7 @@ class PlanningApplication:
         )
         try:
             with urlopen(request, timeout=10) as response:
-                body = response.read(5 * 1024 * 1024 + 1)
+                body = response.read(MAX_PLANNING_IMAGE_BYTES + 1)
                 response_headers = getattr(response, "headers", None)
                 content_type = (
                     str(response_headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -400,9 +401,9 @@ class PlanningApplication:
                 )
         except Exception as error:
             raise ValueError(f"读取藏宝阁图片失败：{error}")
-        if not body or len(body) > 5 * 1024 * 1024:
-            raise ValueError("藏宝阁图片为空或超过 5MB。")
-        content_type = content_type or guess_type(image_url)[0] or "application/octet-stream"
+        if not body or len(body) > MAX_PLANNING_IMAGE_BYTES:
+            raise ValueError("藏宝阁图片为空或超过 20MB。")
+        content_type = detect_image_content_type(body, content_type, image_url) or "application/octet-stream"
         if not content_type.startswith("image/"):
             raise ValueError("藏宝阁返回的文件不是可支持的图片。")
         start_response(
@@ -1340,12 +1341,18 @@ class PlanningApplication:
             image_title = " ".join(
                 part for part in (str(item.get("style_code") or "").strip(), str(item.get("product_name") or "").strip()) if part
             ) or image_label
+            fallback_image_attr = (
+                f" data-fallback-src='{html.escape(image_url, quote=True)}'"
+                if image_url.lower().startswith(("http://", "https://"))
+                else ""
+            )
             image = (
                 f"<button class='product-image-zoom' type='button' "
                 f"data-image-src='{html.escape(display_image_url, quote=True)}' "
                 f"data-image-title='{html.escape(image_title, quote=True)}' "
                 f"aria-label='查看 {html.escape(image_label, quote=True)} 大图' aria-haspopup='dialog' title='查看大图'>"
-                f"<img src='{html.escape(display_image_url, quote=True)}' alt='{html.escape(image_label, quote=True)}' loading='lazy'>"
+                f"<img class='pricing-source-image' src='{html.escape(display_image_url, quote=True)}' alt='{html.escape(image_label, quote=True)}' loading='lazy' referrerpolicy='no-referrer'"
+                f"{fallback_image_attr}>"
                 f"</button>"
                 if image_url
                 else "<div class='product-image-empty'>暂无图片</div>"
@@ -1621,6 +1628,16 @@ class PlanningApplication:
               imageDialogImage.alt = button.dataset.imageTitle || '款式大图';
               imageDialogTitle.textContent = button.dataset.imageTitle || '款式图片';
               if (!imageDialog.open) imageDialog.showModal();
+            }});
+          }});
+          document.querySelectorAll('.pricing-source-image').forEach((image) => {{
+            image.addEventListener('error', () => {{
+              const fallbackSrc = image.dataset.fallbackSrc || '';
+              if (!fallbackSrc || image.dataset.fallbackTried === '1') return;
+              image.dataset.fallbackTried = '1';
+              image.src = fallbackSrc;
+              const zoomButton = image.closest('.product-image-zoom');
+              if (zoomButton) zoomButton.dataset.imageSrc = fallbackSrc;
             }});
           }});
           imageDialogClose?.addEventListener('click', () => imageDialog?.close());

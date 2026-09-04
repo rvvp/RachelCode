@@ -263,6 +263,38 @@ def media_content_type(media_path: str) -> str:
     return ALLOWED_IMAGE_EXTENSIONS.get(extension, "application/octet-stream")
 
 
+def detect_image_content_type(content: bytes, declared_type: str = "", source: str = "") -> str:
+    """Return a safe image MIME type using the response and file signature.
+
+    Some product-image CDNs return an opaque URL or ``application/octet-stream``
+    even though the payload is a normal image. MIME sniffing is limited to
+    common image signatures so arbitrary HTML or JSON responses are never
+    served as an image by the internal proxy.
+    """
+    normalized_declared = str(declared_type or "").split(";", 1)[0].strip().lower()
+    if normalized_declared.startswith("image/"):
+        return normalized_declared
+    payload = bytes(content or b"")
+    if payload.startswith(b"\xFF\xD8\xFF"):
+        return "image/jpeg"
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if payload.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(payload) >= 12 and payload[:4] == b"RIFF" and payload[8:12] == b"WEBP":
+        return "image/webp"
+    if payload.startswith(b"BM"):
+        return "image/bmp"
+    if len(payload) >= 12 and payload[4:8] == b"ftyp":
+        brand = payload[8:12].lower()
+        if brand in {b"avif", b"avis"}:
+            return "image/avif"
+        if brand in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
+            return "image/heic"
+    guessed_type = guess_type(str(source or ""))[0] or ""
+    return guessed_type if guessed_type.startswith("image/") else ""
+
+
 def generic_content_type(stored_path: str) -> str:
     guessed_type, _ = guess_type(stored_path)
     if guessed_type:

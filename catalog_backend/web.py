@@ -9,7 +9,6 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import cookies
-from mimetypes import guess_type
 from pathlib import Path
 from time import monotonic
 from urllib.parse import parse_qs, quote, urlencode, urlparse
@@ -83,6 +82,7 @@ from catalog_backend.uploads import (
     MAX_IMAGE_BYTES,
     UPLOAD_COPY_CHUNK_BYTES,
     cleanup_expired_local_media_backups,
+    detect_image_content_type,
     delete_generic_upload,
     delete_local_media,
     media_content_type,
@@ -101,7 +101,10 @@ from catalog_backend.uploads import (
 SESSIONS: dict[str, int] = {}
 CATALOG_BUILD_VERSION = "2026.09.04-design-department-v1"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
-MAX_PLANNING_IMAGE_BYTES = 5 * 1024 * 1024
+# Planning previews may contain original hand-shot photos or high-resolution
+# professional images. Keep a bounded proxy response while allowing normal
+# phone-camera files and matching the catalog export image limit.
+MAX_PLANNING_IMAGE_BYTES = 20 * 1024 * 1024
 IMAGE_BACKUP_CLEANUP_INTERVAL_SECONDS = 60 * 60
 LIST_LAYOUT_VIRTUAL_FIELDS: tuple[FieldDef, ...] = ()
 LIST_LAYOUT_VIRTUAL_FIELD_MAP = {}
@@ -1240,10 +1243,8 @@ class CatalogApplication:
                 "502 Bad Gateway",
             )
         if not body or len(body) > MAX_PLANNING_IMAGE_BYTES:
-            return self.json_error_response(start_response, "image_too_large", "藏宝阁图片为空或超过 5MB。", "413 Content Too Large")
-        guessed_type = guess_type(final_url)[0] or guess_type(image_url)[0] or ""
-        if not content_type.startswith("image/") and guessed_type.startswith("image/"):
-            content_type = guessed_type
+            return self.json_error_response(start_response, "image_too_large", "藏宝阁图片为空或超过 20MB。", "413 Content Too Large")
+        content_type = detect_image_content_type(body, content_type, final_url or image_url)
         if not content_type.startswith("image/"):
             return self.json_error_response(start_response, "invalid_image", "藏宝阁链接返回的内容不是图片。", "415 Unsupported Media Type")
         start_response(

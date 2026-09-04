@@ -278,6 +278,42 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(request.full_url, image_url)
         self.assertEqual(request.get_header("Accept"), "image/*")
 
+    def test_internal_planning_image_api_sniffs_opaque_external_jpeg(self):
+        product = next(
+            item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending"
+        )
+        image_url = "https://image-host.test/asset?id=professional-001"
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            connection.execute(
+                "UPDATE products SET image_url = ? WHERE id = ?",
+                (image_url, product["id"]),
+            )
+        app = CatalogApplication(
+            self.catalog_db_path,
+            Path(self.temp.name) / "uploads",
+            planning_api_token="planning-secret",
+        )
+
+        class OpaqueImageResponse(io.BytesIO):
+            headers = {"Content-Type": "application/octet-stream"}
+
+            def geturl(self):
+                return image_url
+
+        with patch(
+            "catalog_backend.web.urlopen",
+            return_value=OpaqueImageResponse(b"\xff\xd8\xffopaque-jpeg"),
+        ):
+            response = self.wsgi_request(
+                app,
+                f"/api/internal/planning/products/{product['id']}/image",
+                authorization="Bearer planning-secret",
+            )
+
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertEqual(response["body"], b"\xff\xd8\xffopaque-jpeg")
+        self.assertEqual(dict(response["headers"])["Content-Type"], "image/jpeg")
+
     def test_planning_revision_publication_updates_same_catalog_product(self):
         app = CatalogApplication(
             self.catalog_db_path,
@@ -716,6 +752,35 @@ class PlanningCenterTests(unittest.TestCase):
         request = mocked_urlopen.call_args.args[0]
         self.assertEqual(request.full_url, "http://catalog.test/api/internal/planning/products/77/image")
         self.assertEqual(request.get_header("Authorization"), "Bearer planning-secret")
+
+    def test_planning_image_proxy_sniffs_opaque_external_jpeg(self):
+        source = {
+            "id": 78,
+            "style_code": "IMG-078",
+            "product_name": "无后缀图片代理测试款",
+            "image_url": "https://image-host.test/asset?id=professional-002",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test", "planning-secret")
+        cookie = self.login_cookie(app, "planner")
+        image_bytes = b"\xff\xd8\xffopaque-jpeg"
+
+        response_headers = {"Content-Type": "application/octet-stream"}
+        image_response = io.BytesIO(image_bytes)
+        image_response.headers = response_headers
+        with patch("planning_center.web.urlopen", return_value=image_response):
+            response = self.wsgi_request(
+                app,
+                "/source-products/78/image?v=1",
+                cookie=cookie,
+            )
+
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertEqual(response["body"], image_bytes)
+        self.assertEqual(dict(response["headers"])["Content-Type"], "image/jpeg")
 
     def test_pricing_formula_rounds_down_to_9_and_snapshots_rules(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋", None, 600, 4)
@@ -2130,6 +2195,9 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("loading='lazy'", workbench)
         self.assertIn("class='product-image-zoom'", workbench)
         self.assertIn("data-image-src='/source-products/31/image?v=1'", workbench)
+        self.assertIn("class='pricing-source-image'", workbench)
+        self.assertIn("data-fallback-src='https://example.com/m031.jpg'", workbench)
+        self.assertIn("referrerpolicy='no-referrer'", workbench)
         self.assertIn("aria-label='查看 M031-黑 大图'", workbench)
         self.assertIn("aria-haspopup='dialog'", workbench)
         self.assertEqual(workbench.count("id='product-image-dialog'"), 1)
@@ -2137,6 +2205,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("imageDialogClose?.addEventListener('click'", workbench)
         self.assertIn("if (event.target === imageDialog) imageDialog.close()", workbench)
         self.assertIn("if (event.key === 'Escape' && imageDialog?.open) imageDialog.close()", workbench)
+        self.assertIn("image.dataset.fallbackTried = '1'", workbench)
         self.assertIn("cursor:zoom-in", workbench)
         self.assertIn(".product-image-dialog::backdrop", workbench)
         self.assertIn("planning-workbench-scroll", workbench)
