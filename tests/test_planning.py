@@ -1458,11 +1458,13 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertFalse(sheet["Q2"].protection.locked)
         self.assertTrue(sheet["N2"].protection.locked)
         self.assertTrue(sheet["R2"].protection.locked)
-        self.assertTrue(sheet.protection.sheet)
-        self.assertFalse(sheet.protection.selectLockedCells)
-        self.assertTrue(sheet.protection.selectUnlockedCells)
+        # Initial-review exports must remain editable in both WPS and
+        # LibreOffice.  The yellow columns identify the only fields imported
+        # back into the system; the gray source columns are informational.
+        self.assertFalse(sheet.protection.sheet)
         self.assertEqual(sheet.sheet_view.selection[0].activeCell, "O2")
         self.assertIn("可修改字段：初审品类、初审上新价、渠道划分", workbook["填写说明"]["C2"].value)
+        self.assertIn("兼容 WPS 和 LibreOffice", workbook["填写说明"]["C2"].value)
         instructions = [
             row[0].value
             for row in workbook["填写说明"].iter_rows(min_row=2, min_col=3, max_col=3)
@@ -1637,7 +1639,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertNotIn("定价初审与复核", workbench)
         self.assertIn("测算上新价", workbench)
         self.assertIn("初审上新价", workbench)
-        self.assertIn("待初审 Excel 仅可修改：初审品类、初审上新价、渠道划分", workbench)
+        self.assertIn("待初审 Excel 请仅修改黄色列：初审品类、初审上新价、渠道划分（兼容 WPS / LibreOffice）", workbench)
         self.assertIn("category-edit-button", workbench)
         self.assertIn(">修改</button>", workbench)
         self.assertIn("class='initial-review-category'", workbench)

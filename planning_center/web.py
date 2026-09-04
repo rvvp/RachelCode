@@ -1166,7 +1166,7 @@ class PlanningApplication:
             f"""
             <div class='pricing-excel-toolbar'>
               <a id='pricing-export-link' class='button compact-button {'disabled' if not exportable_count else ''}' data-export-selected='1' data-base-href='{html.escape("/pricing/export.xlsx" + ("?" + export_query if export_query else ""), quote=True)}' href='{html.escape(export_url, quote=True)}' {'aria-disabled="true" tabindex="-1"' if not exportable_count else ''}>导出筛选资料（{exportable_count}）</a>
-              <span class='review-note'>待初审 Excel 仅可修改：初审品类、初审上新价、渠道划分</span>
+              <span class='review-note'>待初审 Excel 请仅修改黄色列：初审品类、初审上新价、渠道划分（兼容 WPS / LibreOffice）</span>
               {f"<form method='post' action='/pricing/import' enctype='multipart/form-data'><label class='pricing-excel-file'>导入 Excel<input type='file' name='workbook' accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' required></label><button type='submit'>导入并保存初审资料</button></form>" if user.get('role') == 'planner' else "<span class='review-note'>管理员可导出查看，Excel 修改仍由初审人员导入。</span>"}
             </div>"""
             if user.get("role") in {"planner", "admin"}

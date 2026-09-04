@@ -67,7 +67,7 @@ def initial_review_workbook_bytes(
         cell.alignment = Alignment(horizontal="center", vertical="center")
         if header in EDITABLE_HEADERS:
             cell.comment = Comment(
-                "此列允许初审人员修改。请直接编辑黄色单元格；其余列为系统同步资料，只读。",
+                "此列允许初审人员修改。请直接编辑黄色单元格；其余列为系统同步资料，请勿修改。",
                 "商品企划中心",
             )
 
@@ -131,13 +131,14 @@ def initial_review_workbook_bytes(
                 channel_options[index] if index < len(channel_options) else "",
                 (
                     "可修改字段：初审品类、初审上新价、渠道划分。黄色列可编辑；"
+                    "为兼容 WPS 和 LibreOffice，初审表不启用整表保护，灰色资料列请勿修改；"
                     "导入只保存初审资料，不会自动提交复核。"
                     if index == 0
                     else ""
                 ),
             ]
         )
-    option_sheet.append(["", "", "操作提示：请直接编辑主表中的黄色单元格，不要整行粘贴，也不要修改表头。"])
+    option_sheet.append(["", "", "操作提示：请直接编辑主表中的黄色单元格，不要整行粘贴，也不要修改表头和灰色资料列。"])
     option_sheet.append(["", "", "初审上新价必须填写大于 0 的整数；品类和渠道请使用下拉选项。"])
     for cell in option_sheet[1]:
         cell.font = Font(bold=True, color="FFFFFF")
@@ -188,14 +189,15 @@ def initial_review_workbook_bytes(
     worksheet.page_setup.fitToHeight = 0
     worksheet.page_margins = PageMargins(left=0.2, right=0.2, top=0.4, bottom=0.4, header=0.15, footer=0.15)
     worksheet.print_title_rows = "1:1"
-    worksheet.protection.sheet = True
+    # WPS and LibreOffice do not consistently honor openpyxl's combination of
+    # sheet protection and unlocked cells in an XLSX file.  Keep protection for
+    # read-only exports, but leave the initial-review sheet unprotected so the
+    # three yellow input columns are editable in both desktop applications.
+    worksheet.protection.sheet = not bool(editable_rows)
     worksheet.protection.autoFilter = True
     worksheet.protection.sort = True
-    # Keep the protected source columns visible but non-selectable. This makes
-    # the three yellow editable columns the only cells users can interact with
-    # when they open a file in Excel/WPS.
     worksheet.protection.selectLockedCells = not bool(editable_rows)
-    worksheet.protection.selectUnlockedCells = True
+    worksheet.protection.selectUnlockedCells = bool(editable_rows)
     selection = worksheet.sheet_view.selection[0]
     first_editable_cell = f"O{editable_rows[0]}" if editable_rows else "A1"
     selection.activeCell = first_editable_cell
