@@ -671,11 +671,61 @@ def validate_channel_option(db_path: str | Path, channel: str) -> str:
     return str(row["name"])
 
 
+def positive_decimal_value(raw_value) -> Decimal | None:
+    if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+        return None
+    try:
+        value = Decimal(str(raw_value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return value if value.is_finite() and value > 0 else None
+
+
+def source_tax_included_cost_value(item: dict) -> float | None:
+    """Return only the authoritative tax-included catalog cost."""
+    value = positive_decimal_value(item.get("tax_included_price"))
+    if value is None:
+        return None
+    try:
+        normalized = float(value)
+    except OverflowError:
+        return None
+    return normalized if math.isfinite(normalized) and normalized > 0 else None
+
+
+def source_cost_value(item: dict) -> float | None:
+    """Read a persisted source cost or a pricing-record cost.
+
+    Synchronized source rows always contain ``tax_included_price`` and must use
+    that authoritative value. The fallback supports pricing-record dictionaries
+    whose cost is already a frozen snapshot.
+    """
+    if "tax_included_price" in item:
+        return source_tax_included_cost_value(item)
+    for key in ("actual_cost", "cost"):
+        value = positive_decimal_value(item.get(key))
+        if value is None:
+            continue
+        try:
+            normalized = float(value)
+        except OverflowError:
+            continue
+        if math.isfinite(normalized) and normalized > 0:
+            return normalized
+    return None
+
+
+def has_valid_source_cost(item: dict) -> bool:
+    return source_cost_value(item) is not None
+
+
 def planning_source_item_is_eligible(item: dict) -> bool:
     return (
         str(item.get("status") or "").strip() == "pending"
         and str(item.get("lifecycle_status") or "active").strip() == "active"
-        and bool(str(item.get("image_url") or "").strip() or str(item.get("image_gallery_json") or "").strip() not in {"", "[]"})
+        and item.get("submitted_to_merchandise") is True
+        and source_tax_included_cost_value(item) is not None
+        and _source_item_has_image(item)
     )
 
 
@@ -683,23 +733,40 @@ def _source_item_has_image(item: dict) -> bool:
     image_url = str(item.get("image_url") or "").strip()
     if image_url:
         return True
-    gallery = str(item.get("image_gallery_json") or "").strip()
-    return gallery not in {"", "[]"}
+    gallery = item.get("image_gallery_json")
+    if isinstance(gallery, str):
+        try:
+            gallery = json.loads(gallery)
+        except json.JSONDecodeError:
+            return False
+    return bool(isinstance(gallery, list) and any(str(value or "").strip() for value in gallery))
 
 
-def upsert_source_products(db_path: str | Path, items: list[dict], *, require_image: bool = False) -> int:
+def upsert_source_products(
+    db_path: str | Path,
+    items: list[dict],
+    *,
+    require_image: bool = False,
+    require_cost: bool = False,
+) -> int:
     eligible_items = [
         item
         for item in items
         if str(item.get("status") or "").strip() == "pending"
         and str(item.get("lifecycle_status") or "active").strip() == "active"
         and (not require_image or _source_item_has_image(item))
+        and (not require_cost or has_valid_source_cost(item))
     ]
     now = utc_now()
     with get_connection(db_path) as connection:
         category_options = [dict(row) for row in connection.execute("SELECT * FROM category_options WHERE enabled = 1 ORDER BY sort_order, id").fetchall()]
         for item in eligible_items:
             category_suggestion = infer_category(item.get("product_name", ""), category_options)
+            normalized_cost = source_tax_included_cost_value(item)
+            if normalized_cost is None and not require_cost:
+                normalized_cost = source_cost_value({"actual_cost": item.get("actual_cost")})
+            actual_cost = normalized_cost if normalized_cost is not None else item.get("actual_cost")
+            tax_included_price = normalized_cost if normalized_cost is not None else item.get("tax_included_price")
             connection.execute(
                 """
                 INSERT INTO source_products (
@@ -719,8 +786,8 @@ def upsert_source_products(db_path: str | Path, items: list[dict], *, require_im
                 (
                     int(item["id"]), item.get("style_code", ""), item.get("style_color", ""), item.get("color_name", ""),
                     item.get("product_name", ""), item.get("brand_name", ""), item.get("season_year", ""), item.get("supplier", ""),
-                    item.get("supplier_code", ""), item.get("supplier_style_code", ""), category_suggestion, category_suggestion, item.get("actual_cost"),
-                    item.get("tax_included_price"), item.get("image_url", ""), "pending", "active", int(item.get("source_version_no") or 1), int(item.get("image_version_no") or 1),
+                    item.get("supplier_code", ""), item.get("supplier_style_code", ""), category_suggestion, category_suggestion, actual_cost,
+                    tax_included_price, item.get("image_url", ""), "pending", "active", int(item.get("source_version_no") or 1), int(item.get("image_version_no") or 1),
                     item.get("updated_at", ""), item.get("creator_name", ""), now,
                 ),
             )
@@ -779,55 +846,42 @@ def synchronize_source_products(
     *,
     withdrawn_ids: list[int] | tuple[int, ...] | set[int] = (),
     image_updates: list[dict] | tuple[dict, ...] = (),
-    require_image: bool = True,
 ) -> dict:
-    eligible_items = [
-        item
-        for item in items
-        if (
-            planning_source_item_is_eligible(item)
-            if require_image
-            else str(item.get("status") or "").strip() == "pending"
-            and str(item.get("lifecycle_status") or "active").strip() == "active"
-        )
-    ]
-    # Keep already imported legacy rows usable when they predate the image gate;
-    # new rows still require a real image before entering the workbench.
+    eligible_items = [item for item in items if planning_source_item_is_eligible(item)]
+    rejected = len(items) - len(eligible_items)
+    incoming_ids = {int(item.get("id") or 0) for item in items if str(item.get("id") or "").isdigit()}
     strict_ids = {int(item.get("id") or 0) for item in eligible_items}
-    legacy_items = []
-    with get_connection(db_path) as connection:
-        existing_ids = {
-            int(row["id"])
-            for row in connection.execute("SELECT id FROM source_products").fetchall()
-        }
-    for item in items:
-        source_id = int(item.get("id") or 0)
-        if source_id in existing_ids and source_id not in strict_ids:
-            if str(item.get("status") or "").strip() == "pending" and str(item.get("lifecycle_status") or "active").strip() == "active":
-                legacy_items.append(item)
+    rejected_incoming_ids = incoming_ids - strict_ids
     explicit_withdrawn_ids = {int(product_id) for product_id in withdrawn_ids}
-    synced = upsert_source_products(db_path, eligible_items, require_image=require_image)
-    if legacy_items:
-        synced += upsert_source_products(db_path, legacy_items, require_image=False)
+    synced = upsert_source_products(db_path, eligible_items, require_image=True, require_cost=True)
     image_updated = upsert_source_image_updates(db_path, list(image_updates))
     removed = 0
     withdrawn = 0
     with get_connection(db_path) as connection:
         source_rows = connection.execute(
-            "SELECT id, status, lifecycle_status FROM source_products"
+            "SELECT id, status, lifecycle_status, actual_cost, tax_included_price FROM source_products"
         ).fetchall()
         for row in source_rows:
             source_id = int(row["id"])
             locally_ineligible = row["status"] != "pending" or row["lifecycle_status"] != "active"
+            # This row was returned explicitly but failed this service's own
+            # admission check, so it cannot remain in the active workbench.
+            if source_id in rejected_incoming_ids:
+                locally_ineligible = True
             if source_id not in explicit_withdrawn_ids and not locally_ineligible:
                 continue
             latest_record = connection.execute(
                 "SELECT status FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
                 (source_id,),
             ).fetchone()
+            prior_publication = connection.execute(
+                "SELECT 1 FROM pricing_records WHERE source_product_id = ? AND status = 'published' LIMIT 1",
+                (source_id,),
+            ).fetchone()
             if (
                 latest_record
                 and latest_record["status"] in {"suggested", "review_pending", "confirmed", "conflict"}
+                and prior_publication
                 and row["status"] == "pending"
                 and row["lifecycle_status"] == "active"
             ):
@@ -849,6 +903,8 @@ def synchronize_source_products(
             connection.execute("DELETE FROM source_products WHERE id = ?", (source_id,))
             removed += 1
     result = {"synced": synced, "removed": removed, "withdrawn": withdrawn}
+    if rejected:
+        result["rejected"] = rejected
     if image_updated:
         result["image_updated"] = image_updated
     return result

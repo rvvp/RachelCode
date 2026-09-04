@@ -304,7 +304,6 @@ class PlanningApplication:
             items,
             withdrawn_ids=withdrawn_ids,
             image_updates=image_updates,
-            require_image=self.catalog_sync_requires_image(payload),
         )
         return self.redirect(start_response, "/workbench?notice=" + self.q(self.source_sync_message(result)))
 
@@ -316,6 +315,8 @@ class PlanningApplication:
             cleanup.append(f"撤销 {int(result['removed'])} 条未定价资料")
         if result.get("withdrawn"):
             cleanup.append(f"另有 {int(result['withdrawn'])} 条已产生定价记录的资料退出工作台并保留记录")
+        if result.get("rejected"):
+            cleanup.append(f"拦截 {int(result['rejected'])} 条不符合准入条件的资料")
         if cleanup:
             message += "；".join(cleanup) + "。"
         return message
@@ -348,25 +349,27 @@ class PlanningApplication:
         return items, withdrawn_ids
 
     def catalog_sync_details(self, payload: dict | list[dict]) -> tuple[list[dict], list[int], list[dict]]:
-        # List-only payloads are retained for tests and older integrations. Without an
-        # explicit withdrawal list, absence from a response must not remove local data.
-        if isinstance(payload, list):
-            return payload, [], []
         if not isinstance(payload, dict):
-            raise ValueError("藏宝阁返回内容异常。")
+            raise ValueError("藏宝阁同步接口版本过旧，未提供严格准入校验结果，已停止同步。")
+        if payload.get("source") != "cangbaoge":
+            raise ValueError("同步资料来源标识无效，已停止同步。")
+        required_gates = ("workflow_gate", "image_gate", "cost_gate")
+        if any(payload.get(gate) is not True for gate in required_gates):
+            raise ValueError("藏宝阁未完成流程、图片和含税价准入校验，已停止同步。")
+        try:
+            eligibility_gate_version = int(payload.get("eligibility_gate_version") or 0)
+        except (TypeError, ValueError):
+            eligibility_gate_version = 0
+        if eligibility_gate_version < 1:
+            raise ValueError("藏宝阁同步准入协议版本无效，已停止同步。")
         items = payload.get("items") or []
         withdrawn_ids = payload.get("withdrawn_ids") or []
         image_updates = payload.get("image_updates") or []
         if not isinstance(items, list) or not isinstance(withdrawn_ids, list) or not isinstance(image_updates, list):
             raise ValueError("藏宝阁同步资料格式不正确。")
+        if any(not isinstance(item, dict) for item in items + image_updates):
+            raise ValueError("藏宝阁同步资料条目格式不正确。")
         return items, withdrawn_ids, image_updates
-
-    @staticmethod
-    def catalog_sync_requires_image(payload: dict | list[dict]) -> bool:
-        # The catalog API advertises the image gate explicitly.  Older test and
-        # on-premise integrations can continue importing their already shaped
-        # payloads while they are upgraded.
-        return bool(isinstance(payload, dict) and payload.get("image_gate"))
 
     def handle_source_product_image(self, start_response, product_id: int):
         product = db.get_source_product(self.db_path, product_id)
@@ -652,10 +655,27 @@ class PlanningApplication:
         for item in products:
             record = latest_records.get(int(item["id"]))
             workflow_status = str(record.get("status") if record else "waiting")
+            if record and workflow_status in {"suggested", "conflict"}:
+                try:
+                    db.validate_category_option(self.db_path, record.get("category", ""))
+                except ValueError:
+                    # Pricing records may outlive a renamed or removed rule
+                    # option. Keep the active review row usable by rematching
+                    # its source product against the current options.
+                    try:
+                        rematched_category = db.resolve_product_category(self.db_path, item)
+                    except ValueError:
+                        rematched_category = ""
+                    if rematched_category:
+                        record = {**record, "category": rematched_category}
             if requested_status and workflow_status != requested_status:
                 continue
             entries.append((item, record, workflow_status))
         return entries
+
+    @staticmethod
+    def has_valid_source_cost(item: dict) -> bool:
+        return db.has_valid_source_cost(item)
 
     def handle_pricing_batch(self, environ, start_response, user):
         form = self.parse_form_values(environ)
@@ -685,7 +705,14 @@ class PlanningApplication:
         if action == "suggest":
             if selection_scope == "filtered":
                 entries = self.workbench_entries(season, status_filter)
-                products = [item for item, record, workflow_status in entries if workflow_status == "waiting"]
+                # Match the page's disabled-checkbox rule: a filtered batch
+                # only includes waiting products with a positive catalog cost.
+                products = [
+                    item
+                    for item, record, workflow_status in entries
+                    if workflow_status == "waiting"
+                    and self.has_valid_source_cost(item)
+                ]
                 if not products:
                     raise ValueError("当前筛选范围没有待测算资料。")
             else:
@@ -736,6 +763,17 @@ class PlanningApplication:
                 records.append(record)
 
         if action == "submit-review":
+            if selection_scope == "filtered":
+                missing_channels = [
+                    record
+                    for record in records
+                    if not str(record.get("channel") or "").strip()
+                ]
+                if missing_channels:
+                    raise ValueError(
+                        f"当前筛选范围有 {len(missing_channels)} 款尚未填写渠道划分；"
+                        "请先导出 Excel、填写后导入，再执行全部初审提交。"
+                    )
             pending = []
             for record in records:
                 if record["status"] not in {"suggested", "conflict"}:
@@ -748,7 +786,15 @@ class PlanningApplication:
                 price = (price_values or [record.get("launch_price")])[0]
                 category = (category_values or [record.get("category")])[0]
                 channel = (channel_values or [record.get("channel")])[0]
-                validated_category = db.validate_category_option(self.db_path, category)
+                try:
+                    validated_category = db.validate_category_option(self.db_path, category)
+                except ValueError:
+                    if selection_scope != "filtered" or category_values:
+                        raise
+                    source = db.get_source_product(self.db_path, int(record["source_product_id"]))
+                    if not source:
+                        raise LookupError(f"{record['style_code'] or record['product_name']} 的来源商品不存在。")
+                    validated_category = db.resolve_product_category(self.db_path, source)
                 validated_channel = db.validate_channel_option(self.db_path, channel)
                 db.calculate_pricing(
                     self.db_path,
@@ -834,6 +880,37 @@ class PlanningApplication:
         if not self.catalog_api_token:
             raise ValueError("尚未配置藏宝阁内部 Token。")
         source = db.get_source_product(self.db_path, int(record["source_product_id"])) or {}
+        if not source:
+            raise LookupError("回传前找不到对应的藏宝阁来源资料。")
+        if int(source.get("source_version_no") or 0) != int(record.get("source_version_no") or 0):
+            raise ValueError("来源资料版本已变化，请先重新同步藏宝阁后再回传。")
+        source_cost = db.source_cost_value(source)
+        try:
+            record_cost = db.source_cost_value({"actual_cost": record.get("cost")})
+        except (TypeError, ValueError):
+            record_cost = None
+        if source_cost is None or record_cost is None or source_cost != record_cost:
+            raise ValueError("回传前请重新同步并确认藏宝阁含税成本未发生变化。")
+        source_snapshot_fields = {
+            "season_year": "年份季节",
+            "style_code": "款号",
+            "product_name": "商品名称",
+            "supplier": "供应商",
+        }
+        changed_source_fields = [
+            label
+            for key, label in source_snapshot_fields.items()
+            if str(source.get(key) or "").strip() != str(record.get(key) or "").strip()
+        ]
+        if changed_source_fields:
+            raise ValueError(
+                "回传前二次校验失败："
+                + "、".join(changed_source_fields)
+                + "与测算时来源资料不一致，请重新同步后处理。"
+            )
+        category = db.validate_category_option(self.db_path, record.get("category", ""))
+        channel = db.validate_channel_option(self.db_path, record.get("channel", ""))
+        launch_price = db.validated_launch_price(record.get("launch_price"))
         prior_publications = [
             item
             for item in db.list_pricing_records(self.db_path)
@@ -843,9 +920,9 @@ class PlanningApplication:
         payload = {
             "publication_id": record["publication_id"],
             "source_version_no": record["source_version_no"],
-            "category": record["category"],
-            "launch_channel": record.get("channel", ""),
-            "launch_price": record["launch_price"],
+            "category": category,
+            "launch_channel": channel,
+            "launch_price": launch_price,
             "fixed_multiplier": record["fixed_multiplier"],
             "supplier_coefficient": record["supplier_coefficient"],
             "raw_price": record["raw_price"],
@@ -1036,7 +1113,7 @@ class PlanningApplication:
         confirmed = sum(1 for item in records if item.get("status") == "confirmed")
         published = sum(1 for item in records if item.get("status") == "published")
         catalog_sync_action = (
-            "<form method='post' action='/sync'><button class='primary' type='submit'>立即同步藏宝阁</button></form>"
+            "<form method='post' action='/sync'><button class='primary' type='submit'>立即同步藏宝阁</button><small class='sync-condition-note'>同步条件：待商品部填写、已提交商品部、已上传图片、含税价为大于 0 的有效数字</small></form>"
             if user.get("role") == "planner"
             else "<small class='review-note'>同步与回传由商品部初审人员执行</small>"
         )
@@ -1082,7 +1159,6 @@ class PlanningApplication:
                     items,
                     withdrawn_ids=withdrawn_ids,
                     image_updates=image_updates,
-                    require_image=self.catalog_sync_requires_image(payload),
                 )
                 sync_message = self.source_sync_message(result, automatic=True)
             except ValueError as sync_error:
@@ -1113,8 +1189,7 @@ class PlanningApplication:
                 for item, record, workflow_status in filtered_products
                 if record is None
                 and workflow_status == "waiting"
-                and item.get("actual_cost") is not None
-                and float(item.get("actual_cost") or 0) > 0
+                and self.has_valid_source_cost(item)
             ),
             "submit-review": sum(1 for _, record, workflow_status in filtered_products if record and workflow_status in {"suggested", "conflict"}),
             "approve": sum(1 for _, record, workflow_status in filtered_products if record and workflow_status == "review_pending"),
@@ -1126,8 +1201,7 @@ class PlanningApplication:
             for item, record, workflow_status in filtered_products
             if (user.get("role") == "planner" and (record is not None or (
                 workflow_status == "waiting"
-                and item.get("actual_cost") is not None
-                and float(item.get("actual_cost") or 0) > 0
+                and self.has_valid_source_cost(item)
             )))
             or (user.get("role") == "admin" and record is not None)
         )
@@ -1140,7 +1214,7 @@ class PlanningApplication:
         toolbar_message = notice or sync_message or "商品资料已加载，可按条件筛选。"
         seasons = sorted({item.get("season_year", "") for item in db.list_source_products(self.db_path) if item.get("season_year")}, reverse=True)
         catalog_sync_action = (
-            "<form method='post' action='/sync'><button class='primary' type='submit'>同步藏宝阁</button></form>"
+            "<form method='post' action='/sync'><button class='primary' type='submit'>同步藏宝阁</button><small class='sync-condition-note'>同步条件：待商品部填写、已提交商品部、已上传图片、含税价为大于 0 的有效数字</small></form>"
             if user.get("role") == "planner"
             else "<span class='review-note'>同步与回传由商品部初审人员执行</span>"
         )
@@ -1217,7 +1291,7 @@ class PlanningApplication:
         rows = []
         for item, record, workflow_status in page_products:
             cost = item.get("actual_cost")
-            can_price = user.get("role") == "planner" and cost is not None and float(cost or 0) > 0
+            can_price = user.get("role") == "planner" and self.has_valid_source_cost(item)
             source_status_label = {"pending": "已提交商品部", "published": "已完成", "received": "已接收"}.get(item.get("status"), item.get("status") or "未知")
             image_url = str(item.get("image_url") or "").strip()
             display_image_url = f"/source-products/{int(item['id'])}/image?v={int(item.get('image_version_no') or 1)}"
@@ -1627,6 +1701,10 @@ class PlanningApplication:
               }}
               if (event.defaultPrevented) return;
             }}
+            // Cross-page operations use values already saved in the database
+            // (including Excel imports). Unsaved fields on the visible page are
+            // submitted only for explicit page/row selections.
+            if (selectionScope?.value === 'filtered') return;
             if (!['submit-review', 'approve'].includes(action)) return;
             const checkboxName = action === 'submit-review' ? 'submit_review_ids' : 'approve_ids';
             const inputSelector = action === 'submit-review' ? '#initial-price-' : '#pricing-row-';
@@ -2062,4 +2140,5 @@ class PlanningApplication:
         @media(max-width:620px){.pricing-board>.panel-head{flex-direction:column}.pricing-board-tools{align-items:flex-start;flex-direction:column;gap:6px;width:100%}.pricing-pagination-top{width:100%;justify-content:space-between}.pricing-table[data-resizable-columns]{min-width:0}.product-image-dialog{width:calc(100vw - 20px);height:calc(100vh - 20px)}.product-image-dialog-head{padding:11px 10px 10px 14px}.product-image-dialog-canvas{padding:10px}}
         @media(max-width:900px){.workbench-toolbar{align-items:flex-start;flex-wrap:wrap}.workbench-filter{width:100%;margin-left:0}.workbench-filter label{flex:1}.workbench-filter select{width:100%}}
         @media(max-width:620px){.workbench-toolbar-summary{min-width:0;flex-wrap:wrap}.workbench-filter{align-items:stretch;flex-direction:column}.workbench-filter label,.workbench-filter select,.workbench-filter button{width:100%}.pricing-pagination{justify-content:space-between;padding:10px 18px}.pricing-pagination>span:not(.button){text-align:center}.pagination-link{white-space:nowrap}}
+        .sync-condition-note{display:block;margin-top:7px;color:var(--muted);font-size:11px;line-height:1.45;max-width:560px}
         """

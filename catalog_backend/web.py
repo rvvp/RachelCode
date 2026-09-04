@@ -1174,7 +1174,10 @@ class CatalogApplication:
             start_response,
             {
                 "source": "cangbaoge",
+                "workflow_gate": True,
                 "image_gate": True,
+                "cost_gate": True,
+                "eligibility_gate_version": 1,
                 "count": len(products),
                 "items": products,
                 "image_updates": image_updates,

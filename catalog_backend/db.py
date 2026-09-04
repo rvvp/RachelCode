@@ -70,6 +70,32 @@ EMPTY_DATE_MARKERS = {
     "1900/1/1",
 }
 
+# These are transport/audit fields accepted from the planning center. Only
+# category, launch_price and launch_channel are allowed to change a catalog
+# product; source fields such as style_code and tax_included_price are never
+# accepted from the callback.
+PLANNING_PUBLICATION_PAYLOAD_KEYS = frozenset(
+    {
+        "publication_id",
+        "source_version_no",
+        "category",
+        "launch_channel",
+        "launch_price",
+        "fixed_multiplier",
+        "supplier_coefficient",
+        "raw_price",
+        "operator_name",
+        "published_at",
+        "revision",
+    }
+)
+PLANNING_PRODUCT_MUTABLE_FIELD_KEYS = frozenset(
+    {"category", "launch_price", "launch_channel"}
+)
+PLANNING_PRODUCT_PROTECTED_FIELD_KEYS = tuple(
+    field.key for field in PRODUCT_FIELDS if field.key not in PLANNING_PRODUCT_MUTABLE_FIELD_KEYS
+)
+
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -1271,7 +1297,10 @@ def seed_sample_products(connection: sqlite3.Connection) -> None:
             "supplier": "嘉兴尚品针织",
             "cooperation_mode": "",
             "supply_chain_manager": "",
-            "tax_included_price": None,
+            # A catalog item can enter the planning center only after the
+            # follow-up cost is filled in; keep the demo row sync-eligible
+            # once its image is present.
+            "tax_included_price": 188,
             "tag_price": 399,
             "launch_price": 269,
             "launch_channel": "门店首发",
@@ -2780,7 +2809,8 @@ def products_for_c_published_versions(db_path: str | Path, products: list[dict])
 def _planning_source_query() -> str:
     return """
         SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
-               reviewer.display_name AS reviewer_name
+               reviewer.display_name AS reviewer_name,
+               1 AS submitted_to_merchandise
         FROM products p
         JOIN users u ON u.id = p.created_by
         LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
@@ -2794,7 +2824,18 @@ def _planning_source_query() -> str:
               TRIM(COALESCE(p.image_url, '')) != ''
               OR TRIM(COALESCE(p.image_gallery_json, '')) NOT IN ('', '[]')
           )
+          AND typeof(p.tax_included_price) IN ('integer', 'real')
+          AND p.tax_included_price > 0
     """
+
+
+def has_valid_tax_included_price(value) -> bool:
+    """Whether a catalog cost is usable as the planning source cost."""
+    try:
+        normalized = Decimal(str(value).strip())
+    except (InvalidOperation, AttributeError, TypeError, ValueError):
+        return False
+    return normalized.is_finite() and normalized > 0
 
 
 def list_planning_source_products(db_path: str | Path, product_id: int | None = None) -> list[dict]:
@@ -2806,7 +2847,7 @@ def list_planning_source_products(db_path: str | Path, product_id: int | None = 
     query += " ORDER BY p.updated_at DESC, p.id DESC"
     with get_connection(db_path) as connection:
         rows = connection.execute(query, params).fetchall()
-    return [dict(row) for row in rows]
+    return [dict(row) for row in rows if has_valid_tax_included_price(row["tax_included_price"])]
 
 
 def _planning_image_url(product: dict) -> str:
@@ -2851,6 +2892,7 @@ def _planning_product_payload(product: dict) -> dict:
         "updated_at": product.get("updated_at") or "",
         "created_at": product.get("created_at") or "",
         "creator_name": product.get("creator_name") or "",
+        "submitted_to_merchandise": bool(product.get("submitted_to_merchandise")),
     }
 
 
@@ -2866,7 +2908,11 @@ def planning_source_image_payloads(db_path: str | Path, product_ids: list[int] |
     placeholders = ", ".join("?" for _ in ids)
     query = f"""
         SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
-               reviewer.display_name AS reviewer_name
+               reviewer.display_name AS reviewer_name,
+               EXISTS (
+                   SELECT 1 FROM product_logs pl
+                   WHERE pl.product_id = p.id AND pl.action = 'status:pending'
+               ) AS submitted_to_merchandise
         FROM products p
         JOIN users u ON u.id = p.created_by
         LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
@@ -2890,10 +2936,13 @@ def planning_source_image_payloads(db_path: str | Path, product_ids: list[int] |
 
 def planning_withdrawn_source_ids(db_path: str | Path, product_id: int | None = None) -> list[int]:
     query = """
-        SELECT p.id
+        SELECT p.*,
+               EXISTS (
+                   SELECT 1 FROM product_logs pl
+                   WHERE pl.product_id = p.id AND pl.action = 'status:pending'
+               ) AS submitted_to_merchandise
         FROM products p
-        WHERE NOT (p.lifecycle_status = 'active' AND p.status = 'pending')
-          AND EXISTS (
+        WHERE EXISTS (
               SELECT 1 FROM product_logs pl
               WHERE pl.product_id = p.id AND pl.action = 'status:pending'
           )
@@ -2905,7 +2954,19 @@ def planning_withdrawn_source_ids(db_path: str | Path, product_id: int | None = 
     query += " ORDER BY p.id"
     with get_connection(db_path) as connection:
         rows = connection.execute(query, params).fetchall()
-    return [int(row["id"]) for row in rows]
+    withdrawn = []
+    for row in rows:
+        product = dict(row)
+        eligible = (
+            product.get("lifecycle_status") == "active"
+            and product.get("status") == "pending"
+            and bool(product.get("submitted_to_merchandise"))
+            and product_has_image(product)
+            and has_valid_tax_included_price(product.get("tax_included_price"))
+        )
+        if not eligible:
+            withdrawn.append(int(product["id"]))
+    return withdrawn
 
 
 def publish_planning_price(
@@ -2914,6 +2975,12 @@ def publish_planning_price(
     payload: dict,
     actor_user_id: int,
 ) -> dict:
+    unsupported_keys = sorted(set(payload or {}) - PLANNING_PUBLICATION_PAYLOAD_KEYS)
+    if unsupported_keys:
+        raise ValueError(
+            "商品企划回传只允许修改品类、上新价格、上新渠道；不允许回传字段："
+            + "、".join(unsupported_keys)
+        )
     product_row = connection.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
     product = row_to_dict(product_row)
     if not product:
@@ -2922,6 +2989,8 @@ def publish_planning_price(
         raise ValueError("只有正常商品才能接收商品企划回传。")
     if not product_has_image(product):
         raise ValueError("回传前必须先在藏宝阁上传图片。")
+    if not has_valid_tax_included_price(product.get("tax_included_price")):
+        raise ValueError("回传前藏宝阁必须提供有效的含税采购成本。")
     is_initial_publication = product.get("status") == "pending"
     is_revision_publication = product.get("status") in {"published", "received"}
     if not is_initial_publication and not is_revision_publication:
@@ -2973,12 +3042,24 @@ def publish_planning_price(
     ):
         raise ValueError("回传上新价格必须是大于 0 的整数。")
     launch_price = int(launch_price_value)
+    protected_before = {
+        key: normalize_diff_value(product.get(key))
+        for key in PLANNING_PRODUCT_PROTECTED_FIELD_KEYS
+    }
+    protected_before["image_gallery_json"] = normalize_image_gallery(product)
     next_version = current_version + 1
     after = dict(product)
     after["category"] = category
     after["launch_price"] = launch_price
     after["launch_channel"] = launch_channel
     diff_items = build_product_diff(product, after)
+    unexpected_diff_fields = {
+        str(item.get("field_key") or "")
+        for item in diff_items
+        if str(item.get("field_key") or "") not in PLANNING_PRODUCT_MUTABLE_FIELD_KEYS
+    }
+    if unexpected_diff_fields:
+        raise ValueError("回传二次校验失败：检测到企划范围外的字段变更，已取消本次回传。")
     timestamp = utc_now()
     connection.execute(
         """
@@ -2990,6 +3071,15 @@ def publish_planning_price(
         """,
         (category, launch_channel, launch_price, next_version, actor_user_id, timestamp, timestamp, product_id),
     )
+    persisted_row = connection.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+    persisted = row_to_dict(persisted_row) or {}
+    protected_after = {
+        key: normalize_diff_value(persisted.get(key))
+        for key in PLANNING_PRODUCT_PROTECTED_FIELD_KEYS
+    }
+    protected_after["image_gallery_json"] = normalize_image_gallery(persisted)
+    if protected_after != protected_before:
+        raise ValueError("回传二次校验失败：藏宝阁来源字段发生了非预期变化，已取消本次回传。")
     record_product_version(
         connection,
         product_id,
