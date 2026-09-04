@@ -4,6 +4,7 @@ from io import BytesIO
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.formatting.rule import FormulaRule
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -64,6 +65,11 @@ def initial_review_workbook_bytes(
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center")
+        if header in EDITABLE_HEADERS:
+            cell.comment = Comment(
+                "此列允许初审人员修改。请直接编辑黄色单元格；其余列为系统同步资料，只读。",
+                "商品企划中心",
+            )
 
     status_labels = {
         "waiting": "待计算",
@@ -123,15 +129,24 @@ def initial_review_workbook_bytes(
             [
                 category_options[index] if index < len(category_options) else "",
                 channel_options[index] if index < len(channel_options) else "",
-                "黄色列可编辑；导入只保存初审资料，不会自动提交复核。" if index == 0 else "",
+                (
+                    "可修改字段：初审品类、初审上新价、渠道划分。黄色列可编辑；"
+                    "导入只保存初审资料，不会自动提交复核。"
+                    if index == 0
+                    else ""
+                ),
             ]
         )
+    option_sheet.append(["", "", "操作提示：请直接编辑主表中的黄色单元格，不要整行粘贴，也不要修改表头。"])
+    option_sheet.append(["", "", "初审上新价必须填写大于 0 的整数；品类和渠道请使用下拉选项。"])
     for cell in option_sheet[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = header_fill
     option_sheet.column_dimensions["A"].width = 22
     option_sheet.column_dimensions["B"].width = 22
     option_sheet.column_dimensions["C"].width = 56
+    for row in option_sheet.iter_rows(min_row=2, min_col=3, max_col=3):
+        row[0].alignment = Alignment(vertical="top", wrap_text=True)
     option_sheet.freeze_panes = "A2"
 
     category_end = max(2, len(category_options) + 1)
@@ -176,8 +191,15 @@ def initial_review_workbook_bytes(
     worksheet.protection.sheet = True
     worksheet.protection.autoFilter = True
     worksheet.protection.sort = True
-    worksheet.protection.selectLockedCells = True
+    # Keep the protected source columns visible but non-selectable. This makes
+    # the three yellow editable columns the only cells users can interact with
+    # when they open a file in Excel/WPS.
+    worksheet.protection.selectLockedCells = not bool(editable_rows)
     worksheet.protection.selectUnlockedCells = True
+    selection = worksheet.sheet_view.selection[0]
+    first_editable_cell = f"O{editable_rows[0]}" if editable_rows else "A1"
+    selection.activeCell = first_editable_cell
+    selection.sqref = first_editable_cell
 
     workbook.properties.title = f"商品企划中心{worksheet.title}"
     workbook.properties.subject = "上新审核工作台定价资料"
