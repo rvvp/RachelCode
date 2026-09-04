@@ -194,11 +194,23 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
         if "channel" not in pricing_columns:
             connection.execute("ALTER TABLE pricing_records ADD COLUMN channel TEXT NOT NULL DEFAULT ''")
 
-        # Migrate the old shared label without changing pricing history. The
-        # category option and cost-rule group now have distinct meanings.
+        # Migrate the old shared label while preserving record ids and status.
+        # The category option and cost-rule group now have distinct meanings.
         connection.execute(
             "UPDATE category_cost_rules SET category = ? WHERE category = ?",
             (NON_DRESS_PRICING_CATEGORY, LEGACY_CATEGORY_FALLBACK_OPTION),
+        )
+        connection.execute(
+            "UPDATE source_products SET category = ? WHERE category = ?",
+            (CATEGORY_FALLBACK_OPTION, LEGACY_CATEGORY_FALLBACK_OPTION),
+        )
+        connection.execute(
+            "UPDATE source_products SET category_suggestion = ? WHERE category_suggestion = ?",
+            (CATEGORY_FALLBACK_OPTION, LEGACY_CATEGORY_FALLBACK_OPTION),
+        )
+        connection.execute(
+            "UPDATE pricing_records SET category = ? WHERE category = ?",
+            (CATEGORY_FALLBACK_OPTION, LEGACY_CATEGORY_FALLBACK_OPTION),
         )
         legacy_fallback = connection.execute(
             "SELECT id, note FROM category_options WHERE name = ?",

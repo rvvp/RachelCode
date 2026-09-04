@@ -646,6 +646,20 @@ class PlanningCenterTests(unittest.TestCase):
 
     def test_legacy_category_and_cost_rule_labels_are_migrated(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "", None, 600, 4)
+        legacy_product = {
+            "id": 9901,
+            "style_code": "LEGACY-9901",
+            "product_name": "历史兜底分类资料",
+            "season_year": "2026秋",
+            "supplier": "历史供应商",
+            "category": planning_db.CATEGORY_FALLBACK_OPTION,
+            "actual_cost": 150,
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [legacy_product])
+        legacy_record = planning_db.create_pricing_record(self.planning_db_path, legacy_product, "测试企划员")
         with planning_db.get_connection(self.planning_db_path) as connection:
             connection.execute(
                 "UPDATE category_cost_rules SET category = ?",
@@ -666,6 +680,18 @@ class PlanningCenterTests(unittest.TestCase):
                     for name, (keywords, sort_order) in planning_db.LEGACY_DEFAULT_CATEGORY_OPTIONS.items()
                 ],
             )
+            connection.execute(
+                "UPDATE source_products SET category = ?, category_suggestion = ? WHERE id = ?",
+                (
+                    planning_db.LEGACY_CATEGORY_FALLBACK_OPTION,
+                    planning_db.LEGACY_CATEGORY_FALLBACK_OPTION,
+                    legacy_product["id"],
+                ),
+            )
+            connection.execute(
+                "UPDATE pricing_records SET category = ? WHERE id = ?",
+                (planning_db.LEGACY_CATEGORY_FALLBACK_OPTION, legacy_record["id"]),
+            )
 
         planning_db.init_db(self.planning_db_path)
         option_names = [item["name"] for item in planning_db.list_category_options(self.planning_db_path)]
@@ -676,6 +702,8 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertNotIn("外套", option_names)
         self.assertNotIn("半身裙", option_names)
         self.assertNotIn("裤装", option_names)
+        self.assertEqual(planning_db.get_source_product(self.planning_db_path, legacy_product["id"])["category"], "其他")
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, legacy_record["id"])["category"], "其他")
         cost_rules = planning_db.list_category_cost_rules(self.planning_db_path)
         self.assertEqual([item["category"] for item in cost_rules], [planning_db.NON_DRESS_PRICING_CATEGORY])
         fixed, _ = planning_db.resolve_rules(self.planning_db_path, "2026秋", "其他", "供应商 A", 150)
