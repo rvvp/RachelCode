@@ -1187,21 +1187,58 @@ def list_pricing_records(db_path: str | Path, *, season_year: str = "", status: 
     return [dict(row) for row in rows]
 
 
-def list_initial_review_export_rows(db_path: str | Path, *, season_year: str = "") -> list[dict]:
+def list_pricing_export_rows(
+    db_path: str | Path,
+    *,
+    season_year: str = "",
+    status: str = "",
+    record_ids: list[int] | tuple[int, ...] | set[int] = (),
+) -> list[dict]:
+    base_conditions = ["(? = '' OR pr.season_year = ?)"]
+    base_params: list[object] = [season_year, season_year]
+    clean_status = str(status or "").strip()
+    if clean_status:
+        base_conditions.append("pr.status = ?")
+        base_params.append(clean_status)
+    clean_ids = sorted({int(record_id) for record_id in record_ids if str(record_id).isdigit()})
+    id_chunks = [clean_ids[index : index + 800] for index in range(0, len(clean_ids), 800)] or [None]
+    rows: list[object] = []
     with get_connection(db_path) as connection:
-        rows = connection.execute(
-            """
-            SELECT pr.*, sp.style_color, sp.color_name,
-                   sp.source_version_no AS current_source_version_no
-            FROM pricing_records pr
-            JOIN source_products sp ON sp.id = pr.source_product_id
-            WHERE pr.status IN ('suggested', 'conflict')
-              AND (? = '' OR pr.season_year = ?)
-            ORDER BY pr.season_year DESC, pr.created_at DESC, pr.id DESC
-            """,
-            (season_year, season_year),
-        ).fetchall()
+        for id_chunk in id_chunks:
+            conditions = list(base_conditions)
+            params = list(base_params)
+            if id_chunk is not None:
+                placeholders = ", ".join("?" for _ in id_chunk)
+                conditions.append(f"pr.id IN ({placeholders})")
+                params.extend(id_chunk)
+            rows.extend(
+                connection.execute(
+                    f"""
+                    SELECT pr.*, sp.style_color, sp.color_name,
+                           sp.source_version_no AS current_source_version_no
+                    FROM pricing_records pr
+                    JOIN source_products sp ON sp.id = pr.source_product_id
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY pr.season_year DESC, pr.created_at DESC, pr.id DESC
+                    """,
+                    params,
+                ).fetchall()
+            )
+    rows.sort(
+        key=lambda row: (
+            str(row["season_year"] or ""),
+            str(row["created_at"] or ""),
+            int(row["id"]),
+        ),
+        reverse=True,
+    )
     return [dict(row) for row in rows]
+
+
+def list_initial_review_export_rows(db_path: str | Path, *, season_year: str = "") -> list[dict]:
+    """Backward-compatible query for the editable initial-review export."""
+    rows = list_pricing_export_rows(db_path, season_year=season_year)
+    return [row for row in rows if str(row.get("status") or "") in {"suggested", "conflict"}]
 
 
 def get_pricing_record(db_path: str | Path, record_id: int) -> dict | None:

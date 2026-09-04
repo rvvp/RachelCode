@@ -525,15 +525,48 @@ class PlanningApplication:
         return self.redirect(start_response, "/workbench?notice=" + self.q(f"{record['style_code'] or record['product_name']} 已复核通过，可回传藏宝阁。"))
 
     def handle_pricing_export(self, start_response, user, query: dict):
-        self.require_catalog_operator(user)
+        self.require_export_access(user)
         season = str(query.get("season_year") or "").strip()
-        rows = db.list_initial_review_export_rows(self.db_path, season_year=season)
+        status = str(query.get("status") or "").strip()
+        selection_scope = str(query.get("selection_scope") or "filtered").strip()
+        if selection_scope not in {"selected", "filtered"}:
+            raise ValueError("导出选择范围不正确。")
+        selected_ids = self.parse_export_record_ids(query.get("selected", ""))
+        if selection_scope == "selected":
+            if not selected_ids:
+                raise ValueError("请先选择要导出的资料。")
+            rows = db.list_pricing_export_rows(
+                self.db_path,
+                season_year=season,
+                status=status,
+                record_ids=selected_ids,
+            )
+        else:
+            # The workbench may contain several historical revisions for one
+            # source product. Export only the latest row currently visible in
+            # the selected season/status filter.
+            entries = self.workbench_entries(season, status)
+            visible_record_ids = [int(record["id"]) for _, record, _ in entries if record]
+            if len(visible_record_ids) > 5000:
+                raise ValueError("当前筛选范围超过 5000 款，请增加年份季节或定价状态筛选后再导出。")
+            rows = db.list_pricing_export_rows(
+                self.db_path,
+                season_year=season,
+                status=status,
+                record_ids=visible_record_ids,
+            ) if visible_record_ids else []
         if not rows:
-            raise ValueError("当前筛选范围没有已测算且待初审的资料。")
+            raise ValueError("当前筛选范围没有可导出的定价资料。")
         categories = [item["name"] for item in db.list_category_options(self.db_path, enabled_only=True)]
         channels = [item["name"] for item in db.list_channel_options(self.db_path, enabled_only=True)]
-        body = initial_review_workbook_bytes(rows, categories, channels)
-        filename = "planning-initial-review.xlsx"
+        initial_review_export = all(str(row.get("status") or "") in {"suggested", "conflict"} for row in rows)
+        body = initial_review_workbook_bytes(
+            rows,
+            categories,
+            channels,
+            worksheet_title="待初审资料" if initial_review_export else "上新审核资料",
+        )
+        filename = "planning-initial-review.xlsx" if initial_review_export else "planning-pricing-export.xlsx"
         start_response(
             "200 OK",
             [
@@ -544,6 +577,22 @@ class PlanningApplication:
             ],
         )
         return [body]
+
+    def parse_export_record_ids(self, value: str | list[str] | tuple[str, ...]) -> list[int]:
+        raw = value[0] if isinstance(value, (list, tuple)) and value else value
+        ids: list[int] = []
+        for part in str(raw or "").split(","):
+            text = part.strip()
+            if not text:
+                continue
+            if not text.isdigit() or int(text) <= 0:
+                raise ValueError("导出资料中包含无效的定价记录。")
+            record_id = int(text)
+            if record_id not in ids:
+                ids.append(record_id)
+        if len(ids) > 5000:
+            raise ValueError("单次导出最多处理 5000 款。")
+        return ids
 
     def handle_pricing_import(self, environ, start_response, user):
         self.require_catalog_operator(user)
@@ -579,6 +628,31 @@ class PlanningApplication:
             "/workbench?status=suggested&notice=" + self.q(f"已从 Excel 导入并保存 {updated} 款初审资料。"),
         )
 
+    def workbench_entries(self, season_year: str = "", status: str = "") -> list[tuple[dict, dict | None, str]]:
+        """Return the same filtered source/record rows used by the workbench and batch APIs."""
+        season = str(season_year or "").strip()
+        requested_status = str(status or "").strip()
+        products = db.list_source_products(self.db_path, season_year=season)
+        if not requested_status or requested_status == "published":
+            known_product_ids = {int(item["id"]) for item in products}
+            products.extend(
+                item
+                for item in db.list_published_source_products(self.db_path, season_year=season)
+                if int(item["id"]) not in known_product_ids
+            )
+        records = db.list_pricing_records(self.db_path, season_year=season)
+        latest_records: dict[int, dict] = {}
+        for record in records:
+            latest_records.setdefault(int(record["source_product_id"]), record)
+        entries: list[tuple[dict, dict | None, str]] = []
+        for item in products:
+            record = latest_records.get(int(item["id"]))
+            workflow_status = str(record.get("status") if record else "waiting")
+            if requested_status and workflow_status != requested_status:
+                continue
+            entries.append((item, record, workflow_status))
+        return entries
+
     def handle_pricing_batch(self, environ, start_response, user):
         form = self.parse_form_values(environ)
         action = (form.get("batch_action") or [""])[0]
@@ -598,16 +672,16 @@ class PlanningApplication:
         selection_scope = (form.get("selection_scope") or ["selected"])[0]
         if selection_scope not in {"selected", "filtered"}:
             raise ValueError("批量选择范围不正确。")
-        if selection_scope == "filtered" and action != "suggest":
-            raise ValueError("跨页选择全部仅用于批量测算上新价。")
+        season = str((form.get("season_year") or [""])[0]).strip()
+        status_filter = str((form.get("status") or [""])[0]).strip()
         item_ids = [] if selection_scope == "filtered" else self.batch_record_ids(form.get(field_name, []))
         if selection_scope == "selected" and not item_ids:
             raise ValueError("请先勾选要处理的款式。")
 
         if action == "suggest":
             if selection_scope == "filtered":
-                season = str((form.get("season_year") or [""])[0]).strip()
-                products = db.list_waiting_source_products(self.db_path, season_year=season)
+                entries = self.workbench_entries(season, status_filter)
+                products = [item for item, record, workflow_status in entries if workflow_status == "waiting"]
                 if not products:
                     raise ValueError("当前筛选范围没有待测算资料。")
             else:
@@ -635,21 +709,42 @@ class PlanningApplication:
                 "/workbench?status=suggested&notice=" + self.q(f"已批量生成 {len(created)} 款测算上新价。"),
             )
 
-        records = []
-        for record_id in item_ids:
-            record = db.get_pricing_record(self.db_path, record_id)
-            if not record:
-                raise LookupError(f"定价记录 {record_id} 不存在。")
-            records.append(record)
+        if selection_scope == "filtered":
+            entries = self.workbench_entries(season, status_filter)
+            action_statuses = {
+                "submit-review": {"suggested", "conflict"},
+                "approve": {"review_pending"},
+                "publish": {"confirmed"},
+            }
+            allowed_statuses = action_statuses.get(action, set())
+            records = [
+                record
+                for _, record, workflow_status in entries
+                if record and workflow_status in allowed_statuses
+            ]
+            if not records:
+                raise ValueError("当前筛选范围没有可执行该批量操作的资料。")
+        else:
+            records = []
+            for record_id in item_ids:
+                record = db.get_pricing_record(self.db_path, record_id)
+                if not record:
+                    raise LookupError(f"定价记录 {record_id} 不存在。")
+                records.append(record)
 
         if action == "submit-review":
             pending = []
             for record in records:
                 if record["status"] not in {"suggested", "conflict"}:
                     raise ValueError(f"{record['style_code'] or record['product_name']} 不在初审阶段。")
-                price = (form.get(f"launch_price_{record['id']}") or [record.get("launch_price")])[0]
-                category = (form.get(f"category_{record['id']}") or [record.get("category")])[0]
-                channel = (form.get(f"channel_{record['id']}") or [record.get("channel")])[0]
+                price_values = form.get(f"launch_price_{record['id']}") or []
+                category_values = form.get(f"category_{record['id']}") or []
+                channel_values = form.get(f"channel_{record['id']}") or []
+                if selection_scope == "selected" and (not price_values or not category_values or not channel_values):
+                    raise ValueError(f"{record['style_code'] or record['product_name']} 缺少初审价格、品类或渠道，请先在当前页面填写。")
+                price = (price_values or [record.get("launch_price")])[0]
+                category = (category_values or [record.get("category")])[0]
+                channel = (channel_values or [record.get("channel")])[0]
                 validated_category = db.validate_category_option(self.db_path, category)
                 validated_channel = db.validate_channel_option(self.db_path, channel)
                 db.calculate_pricing(
@@ -682,8 +777,12 @@ class PlanningApplication:
             for record in records:
                 if record["status"] != "review_pending":
                     raise ValueError(f"{record['style_code'] or record['product_name']} 不在复核阶段。")
-                submitted_price = (form.get(f"review_price_{record['id']}") or [""])[0]
-                submitted_channel = (form.get(f"review_channel_{record['id']}") or [""])[0]
+                price_values = form.get(f"review_price_{record['id']}") or []
+                channel_values = form.get(f"review_channel_{record['id']}") or []
+                if selection_scope == "selected" and (not price_values or not channel_values):
+                    raise ValueError(f"{record['style_code'] or record['product_name']} 缺少复核上新价或渠道，请先在当前页面填写。")
+                submitted_price = (price_values or [record.get("launch_price")])[0]
+                submitted_channel = (channel_values or [record.get("channel")])[0]
                 clean_channel = db.validate_channel_option(self.db_path, submitted_channel)
                 if (
                     db.validated_launch_price(submitted_price) != db.validated_launch_price(record["launch_price"])
@@ -894,6 +993,10 @@ class PlanningApplication:
         if user.get("role") != "planner":
             raise PermissionError("藏宝阁同步、初审提交和回传由商品部初审人员执行。")
 
+    def require_export_access(self, user: dict) -> None:
+        if user.get("role") not in {"planner", "admin"}:
+            raise PermissionError("只有商品部初审人员或企划管理员可以导出定价资料。")
+
     def optional_id(self, value) -> int | None:
         if value in (None, ""):
             return None
@@ -982,20 +1085,9 @@ class PlanningApplication:
             except ValueError as sync_error:
                 if not error:
                     error = str(sync_error)
-        products = db.list_source_products(self.db_path, season_year=season)
-        if status == "published":
-            known_product_ids = {int(item["id"]) for item in products}
-            products.extend(
-                item
-                for item in db.list_published_source_products(self.db_path, season_year=season)
-                if int(item["id"]) not in known_product_ids
-            )
-        records = db.list_pricing_records(self.db_path, season_year=season)
+        filtered_products = self.workbench_entries(season, status)
         category_options = db.list_category_options(self.db_path, enabled_only=True)
         channel_options = db.list_channel_options(self.db_path, enabled_only=True)
-        latest_records = {}
-        for record in records:
-            latest_records.setdefault(int(record["source_product_id"]), record)
         workflow_labels = {
             "waiting": "待计算",
             "suggested": "待初审",
@@ -1012,21 +1104,29 @@ class PlanningApplication:
             "published": "published",
             "conflict": "conflict",
         }
-        filtered_products = []
-        for item in products:
-            record = latest_records.get(int(item["id"]))
-            workflow_status = record.get("status") if record else "waiting"
-            if status and workflow_status != status:
-                continue
-            filtered_products.append((item, record, workflow_status))
-        waiting_count = sum(1 for _, _, workflow_status in filtered_products if workflow_status == "waiting")
-        initial_review_count = len(
-            [
-                record
-                for record in records
-                if record.get("status") in {"suggested", "conflict"}
-                and (not season or str(record.get("season_year") or "") == season)
-            ]
+        filtered_action_counts = {
+            "suggest": sum(
+                1
+                for item, record, workflow_status in filtered_products
+                if record is None
+                and workflow_status == "waiting"
+                and item.get("actual_cost") is not None
+                and float(item.get("actual_cost") or 0) > 0
+            ),
+            "submit-review": sum(1 for _, record, workflow_status in filtered_products if record and workflow_status in {"suggested", "conflict"}),
+            "approve": sum(1 for _, record, workflow_status in filtered_products if record and workflow_status == "review_pending"),
+            "publish": sum(1 for _, record, workflow_status in filtered_products if record and workflow_status == "confirmed"),
+        }
+        exportable_count = sum(1 for _, record, _ in filtered_products if record)
+        filtered_selectable_count = sum(
+            1
+            for item, record, workflow_status in filtered_products
+            if (user.get("role") == "planner" and (record is not None or (
+                workflow_status == "waiting"
+                and item.get("actual_cost") is not None
+                and float(item.get("actual_cost") or 0) > 0
+            )))
+            or (user.get("role") == "admin" and record is not None)
         )
         page_size = 50
         total_products = len(filtered_products)
@@ -1052,24 +1152,23 @@ class PlanningApplication:
         <form id='pricing-batch-form' class='pricing-batch-toolbar' method='post' action='/pricing/batch'>
           <input id='pricing-selection-scope' type='hidden' name='selection_scope' value='selected'>
           <input type='hidden' name='season_year' value='{html.escape(season, quote=True)}'>
+          <input type='hidden' name='status' value='{html.escape(status, quote=True)}'>
           <label><input id='pricing-select-all' type='checkbox'>勾选本页</label>
-          <button class='compact-button' id='pricing-select-all-waiting' type='button' {' ' if waiting_count else 'disabled'}>选择全部待测算资料（{waiting_count}）</button>
+          <button class='compact-button' id='pricing-select-all-filtered' type='button' {' ' if filtered_selectable_count else 'disabled'}>选择全部筛选资料（{filtered_selectable_count}）</button>
           <button class='compact-button' id='pricing-clear-selection' type='button' hidden>清除选择</button>
           <span id='pricing-selected-count'>已选 0 款</span>
           <div class='pricing-batch-actions'>{batch_buttons}</div>
         </form>"""
-        export_query = urlencode({"season_year": season}) if season else ""
+        export_params = {key: value for key, value in (("season_year", season), ("status", status)) if value}
+        export_query = urlencode(export_params)
         export_url = "/pricing/export.xlsx" + ("?" + export_query if export_query else "")
         excel_toolbar = (
             f"""
             <div class='pricing-excel-toolbar'>
-              <a class='button compact-button {'disabled' if not initial_review_count else ''}' href='{html.escape(export_url, quote=True)}' {'aria-disabled="true" tabindex="-1"' if not initial_review_count else ''}>导出测算结果（{initial_review_count}）</a>
-              <form method='post' action='/pricing/import' enctype='multipart/form-data'>
-                <label class='pricing-excel-file'>导入 Excel<input type='file' name='workbook' accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' required></label>
-                <button type='submit'>导入并保存初审资料</button>
-              </form>
+              <a id='pricing-export-link' class='button compact-button {'disabled' if not exportable_count else ''}' data-export-selected='1' data-base-href='{html.escape("/pricing/export.xlsx" + ("?" + export_query if export_query else ""), quote=True)}' href='{html.escape(export_url, quote=True)}' {'aria-disabled="true" tabindex="-1"' if not exportable_count else ''}>导出筛选资料（{exportable_count}）</a>
+              {f"<form method='post' action='/pricing/import' enctype='multipart/form-data'><label class='pricing-excel-file'>导入 Excel<input type='file' name='workbook' accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' required></label><button type='submit'>导入并保存初审资料</button></form>" if user.get('role') == 'planner' else "<span class='review-note'>管理员可导出查看，Excel 修改仍由初审人员导入。</span>"}
             </div>"""
-            if user.get("role") == "planner"
+            if user.get("role") in {"planner", "admin"}
             else ""
         )
         def select_options(options: list[dict], selected_value: str, placeholder: str) -> str:
@@ -1144,7 +1243,7 @@ class PlanningApplication:
                 category_value = str(item.get("category_suggestion") or item.get("category") or "")
                 if user.get("role") == "planner":
                     selection_cell = (
-                        f"<input class='pricing-batch-checkbox' type='checkbox' name='suggest_ids' value='{item['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(item.get('style_code') or item.get('product_name') or str(item['id']), quote=True)} 批量测算上新价' {' ' if can_price else 'disabled'}>"
+                        f"<input class='pricing-batch-checkbox' type='checkbox' name='suggest_ids' value='{item['id']}' data-export-record-id='' form='pricing-batch-form' aria-label='选择 {html.escape(item.get('style_code') or item.get('product_name') or str(item['id']), quote=True)} 批量测算上新价' {' ' if can_price else 'disabled'}>"
                     )
                     category_cell = f"""
                       <form id='pricing-calc-{item['id']}' class='table-action-form pricing-calc-form' method='post' action='/pricing/suggest'>
@@ -1176,8 +1275,17 @@ class PlanningApplication:
                 price_cell = f"<span class='price calculated-price'>{calculated_price_value}</span><small>当前执行价：{price_value}</small><small>{html.escape(record['publication_id'])}</small>"
                 status_cell = f"<span class='status status-{status_class}'>{html.escape(status_label)}</span>"
                 controls = ""
+                if user.get("role") == "planner":
+                    if record_status in {"suggested", "conflict"}:
+                        selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='submit_review_ids' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 进行批量初审'>"
+                    elif record_status == "confirmed":
+                        selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='publish_ids' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 批量回传藏宝阁'>"
+                    elif record_status in {"review_pending", "published"}:
+                        selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='export_ids' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 导出定价资料'>"
+                elif user.get("role") == "admin":
+                    selection_name = "approve_ids" if record_status == "review_pending" else "export_ids"
+                    selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='{selection_name}' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 导出定价资料'>"
                 if record_status in {"suggested", "conflict"} and user.get("role") == "planner":
-                    selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='submit_review_ids' value='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 进行批量初审'>"
                     category_cell = f"""
                     <div class='category-review-control'>
                       <strong class='category-current' data-category-current='{record['id']}'>{html.escape(record['category'] or '品类待匹配')}</strong>
@@ -1194,7 +1302,7 @@ class PlanningApplication:
                     </form>
                     <small>默认使用测算上新价；如需调整，可直接修改初审上新价。</small>"""
                 elif record_status == "review_pending" and user.get("role") == "admin":
-                    selection_cell = f"<input class='pricing-batch-checkbox review-batch-checkbox' type='checkbox' name='approve_ids' value='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 进行批量复核'>"
+                    selection_cell = f"<input class='pricing-batch-checkbox review-batch-checkbox' type='checkbox' name='approve_ids' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 进行批量复核'>"
                     controls = f"""
                     <div class='review-controls'><span class='review-note'>商品部初审已提交，请进行复核</span>
                       <form class='table-action-form price-review-form review-approval-form' method='post' action='/pricing/{record['id']}/review-save'>
@@ -1205,7 +1313,6 @@ class PlanningApplication:
                       </form>
                     </div>"""
                 elif record_status == "confirmed" and user.get("role") == "planner":
-                    selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='publish_ids' value='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 批量回传藏宝阁'>"
                     controls = f"<form class='table-action-form' method='post' action='/pricing/{record['id']}/publish'><button class='primary' type='submit'>回传藏宝阁</button></form>"
                 elif record_status == "confirmed" and user.get("role") == "admin":
                     controls = "<span class='review-note'>复核已通过，待商品部回传</span>"
@@ -1405,46 +1512,75 @@ class PlanningApplication:
             if (event.key === 'Escape' && imageDialog?.open) imageDialog.close();
           }});
           const selectAll = document.querySelector('#pricing-select-all');
-          const selectAllWaiting = document.querySelector('#pricing-select-all-waiting');
+          const selectAllFiltered = document.querySelector('#pricing-select-all-filtered');
           const clearSelection = document.querySelector('#pricing-clear-selection');
           const selectionScope = document.querySelector('#pricing-selection-scope');
           const selectedCount = document.querySelector('#pricing-selected-count');
           const batchChecks = Array.from(document.querySelectorAll('.pricing-batch-checkbox'));
           const batchButtons = Array.from(document.querySelectorAll("#pricing-batch-form button[name='batch_action']"));
-          const waitingCount = {waiting_count};
+          const exportLink = document.querySelector('#pricing-export-link');
+          const filteredActionCounts = {json.dumps(filtered_action_counts, ensure_ascii=False)};
+          const filteredSelectableCount = {filtered_selectable_count};
+          const exportableCount = {exportable_count};
           const batchFieldByAction = {{'suggest': 'suggest_ids', 'submit-review': 'submit_review_ids', 'approve': 'approve_ids', 'publish': 'publish_ids'}};
           const updateBatchControls = () => {{
             const enabled = batchChecks.filter((checkbox) => !checkbox.disabled);
             const selected = enabled.filter((checkbox) => checkbox.checked);
-            const allWaitingSelected = selectionScope?.value === 'filtered';
-            if (selectedCount) selectedCount.textContent = allWaitingSelected
-              ? `已选择全部待测算资料 ${{waitingCount}} 款`
+            const allFilteredSelected = selectionScope?.value === 'filtered';
+            if (selectedCount) selectedCount.textContent = allFilteredSelected
+              ? `已选择全部筛选资料 ${{filteredSelectableCount}} 款`
               : `已选 ${{selected.length}} 款`;
             if (selectAll) {{
               selectAll.disabled = enabled.length === 0;
-              selectAll.checked = !allWaitingSelected && enabled.length > 0 && selected.length === enabled.length;
-              selectAll.indeterminate = !allWaitingSelected && selected.length > 0 && selected.length < enabled.length;
+              selectAll.checked = !allFilteredSelected && enabled.length > 0 && selected.length === enabled.length;
+              selectAll.indeterminate = !allFilteredSelected && selected.length > 0 && selected.length < enabled.length;
             }}
-            if (selectAllWaiting) selectAllWaiting.hidden = allWaitingSelected;
-            if (clearSelection) clearSelection.hidden = !allWaitingSelected && selected.length === 0;
+            if (selectAllFiltered) selectAllFiltered.hidden = allFilteredSelected;
+            if (clearSelection) clearSelection.hidden = !allFilteredSelected && selected.length === 0;
             batchButtons.forEach((button) => {{
               const fieldName = batchFieldByAction[button.value];
-              const actionCount = allWaitingSelected
-                ? (button.value === 'suggest' ? waitingCount : 0)
+              const actionCount = allFilteredSelected
+                ? Number(filteredActionCounts[button.value] || 0)
                 : selected.filter((checkbox) => checkbox.name === fieldName).length;
               button.disabled = actionCount === 0;
               button.textContent = actionCount > 0 ? `${{button.dataset.label}}（${{actionCount}}）` : button.dataset.label;
             }});
+            const selectedExportIds = selected
+              .map((checkbox) => checkbox.dataset.exportRecordId || '')
+              .filter((recordId) => recordId);
+            if (exportLink) {{
+              const baseHref = exportLink.dataset.baseHref || '/pricing/export.xlsx';
+              const separator = baseHref.includes('?') ? '&' : '?';
+              const canExport = allFilteredSelected ? exportableCount > 0 : selectedExportIds.length > 0;
+              if (canExport) {{
+                const suffix = allFilteredSelected
+                  ? `${{separator}}selection_scope=filtered`
+                  : `${{separator}}selection_scope=selected&selected=${{encodeURIComponent(selectedExportIds.join(','))}}`;
+                exportLink.href = `${{baseHref}}${{suffix}}`;
+                exportLink.classList.remove('disabled');
+                exportLink.removeAttribute('aria-disabled');
+                exportLink.removeAttribute('tabindex');
+                exportLink.textContent = allFilteredSelected
+                  ? `导出筛选资料（${{exportableCount}}）`
+                  : `导出已选资料（${{selectedExportIds.length}}）`;
+              }} else {{
+                exportLink.href = baseHref;
+                exportLink.classList.add('disabled');
+                exportLink.setAttribute('aria-disabled', 'true');
+                exportLink.setAttribute('tabindex', '-1');
+                exportLink.textContent = '导出已选资料（0）';
+              }}
+            }}
           }};
           if (selectAll) selectAll.addEventListener('change', () => {{
             if (selectionScope) selectionScope.value = 'selected';
             batchChecks.forEach((checkbox) => {{ if (!checkbox.disabled) checkbox.checked = selectAll.checked; }});
             updateBatchControls();
           }});
-          selectAllWaiting?.addEventListener('click', () => {{
+          selectAllFiltered?.addEventListener('click', () => {{
             if (selectionScope) selectionScope.value = 'filtered';
             batchChecks.forEach((checkbox) => {{
-              checkbox.checked = !checkbox.disabled && checkbox.name === 'suggest_ids';
+              checkbox.checked = !checkbox.disabled;
             }});
             updateBatchControls();
           }});
@@ -1475,11 +1611,17 @@ class PlanningApplication:
           if (batchForm) batchForm.addEventListener('submit', (event) => {{
             batchForm.querySelectorAll('.batch-row-value').forEach((input) => input.remove());
             const action = event.submitter?.value;
-            if (action === 'suggest' && selectionScope?.value === 'filtered') {{
-              if (!window.confirm(`将为当前筛选范围的全部 ${{waitingCount}} 款待测算资料生成测算上新价，确认继续吗？`)) {{
+            if (selectionScope?.value === 'filtered') {{
+              const actionCount = Number(filteredActionCounts[action] || 0);
+              const actionLabel = event.submitter?.dataset.label || '批量操作';
+              if (!actionCount) {{
+                event.preventDefault();
+                return;
+              }}
+              if (!window.confirm(`将对当前筛选范围中可执行“${{actionLabel}}”的全部 ${{actionCount}} 款资料执行操作，确认继续吗？`)) {{
                 event.preventDefault();
               }}
-              return;
+              if (event.defaultPrevented) return;
             }}
             if (!['submit-review', 'approve'].includes(action)) return;
             const checkboxName = action === 'submit-review' ? 'submit_review_ids' : 'approve_ids';
@@ -1911,7 +2053,7 @@ class PlanningApplication:
         .pricing-table .pricing-image-cell{position:sticky;left:44px;z-index:1;min-width:78px;width:78px;padding-left:10px;padding-right:10px;background:#fff;box-shadow:1px 0 0 var(--line)}.pricing-table thead th:nth-child(2){position:sticky;left:44px;z-index:3;min-width:78px;width:78px;background:#f7f9f7;box-shadow:1px 0 0 var(--line)}.pricing-table tbody tr:hover .pricing-image-cell{background:#fbfcfb}.pricing-table td:nth-child(2){min-width:78px;width:78px}.pricing-table td:nth-child(3){min-width:105px}.pricing-table td:nth-child(4){min-width:88px}.pricing-table td:nth-child(5){min-width:92px}.pricing-table td:nth-child(6){min-width:130px}.pricing-table td:nth-child(7){min-width:110px}.pricing-table td:nth-child(8){min-width:88px}.pricing-table td:nth-child(9){min-width:112px}.pricing-table td:nth-child(10){min-width:170px}.pricing-table td:nth-child(11){min-width:180px}.pricing-table td:nth-child(12){min-width:112px}.pricing-table td:nth-child(13){min-width:135px}.pricing-table td:nth-child(14){min-width:270px}.pricing-table .pricing-workflow-cell{vertical-align:middle}.pricing-table .workflow-status{margin-bottom:8px}.pricing-table .workflow-actions form{margin:0 0 7px}.pricing-table .workflow-actions>form:only-child{margin-bottom:0}.pricing-table .workflow-actions label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap}.pricing-table .workflow-actions input{width:110px;padding:7px 8px}.pricing-table .workflow-actions button{padding:7px 9px;font-size:12px;white-space:nowrap}.pricing-table .workflow-actions small{max-width:245px}
         @media(max-width:620px){.pricing-table .workflow-actions input{width:102px}.pricing-table .workflow-actions button{font-size:11px;padding:6px 8px}}
         .pricing-board-tools{display:flex;align-items:center;gap:12px}.pricing-board-tools .compact-button{background:#fff}.pricing-table[data-resizable-columns]{table-layout:fixed;width:max-content;min-width:0;--select-column-width:44px;--image-column-width:78px}.pricing-table[data-resizable-columns] col{width:auto}.pricing-table[data-resizable-columns] th,.pricing-table[data-resizable-columns] td{width:auto;min-width:0!important;overflow-wrap:anywhere}.pricing-table[data-resizable-columns] .pricing-select-cell{width:var(--select-column-width)}.pricing-table[data-resizable-columns] .pricing-image-cell{left:var(--select-column-width);width:var(--image-column-width)}.pricing-table[data-resizable-columns] thead th:nth-child(2){left:var(--select-column-width);width:var(--image-column-width)}.pricing-table[data-resizable-columns] thead th:not(:first-child):not(:nth-child(2)){position:relative}.pricing-table .rule-summary{display:flex;flex-direction:column;gap:2px;white-space:normal}.pricing-table .rule-expression,.pricing-table .rule-raw-price{display:block;white-space:nowrap}.column-resize-handle{position:absolute;top:0;right:-4px;width:8px;height:100%;cursor:col-resize;touch-action:none;z-index:4}.column-resize-handle:hover,.column-resize-handle:focus-visible,.column-resizing .column-resize-handle{background:var(--accent);opacity:.6;outline:0}.column-resizing{cursor:col-resize!important;user-select:none}.column-resizing *{cursor:col-resize!important;user-select:none}
-        .workbench-toolbar{display:flex;align-items:center;justify-content:space-between;gap:24px;background:#fff;border:1px solid var(--line);padding:12px 18px;margin-bottom:16px}.workbench-toolbar-summary{display:flex;align-items:center;gap:9px;min-width:max-content}.workbench-toolbar-summary strong{font-size:14px;font-weight:600;color:var(--deep)}.toolbar-status-dot{width:8px;height:8px;border-radius:50%;background:#4f8060;box-shadow:0 0 0 3px #edf5ef}.workbench-filter{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;margin-left:auto}.workbench-filter label{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:11px}.workbench-filter select{min-width:145px;padding:7px 9px}.workbench-filter button{padding:7px 12px}.pricing-pagination{display:flex;align-items:center;justify-content:flex-end;gap:12px}.pricing-pagination-bottom{min-height:58px;padding:10px 24px;border-top:1px solid var(--line);background:#f7f9f7}.pricing-pagination-top{min-height:0;padding:0;border:0;background:transparent;gap:7px}.pricing-pagination>span:not(.button){color:var(--muted);font-size:12px;white-space:nowrap}.pagination-link{padding:6px 11px;font-size:12px}.pagination-link.disabled{cursor:not-allowed;opacity:.45;pointer-events:none}
+        .workbench-toolbar{display:flex;align-items:center;justify-content:space-between;gap:24px;background:#fff;border:1px solid var(--line);padding:12px 18px;margin-bottom:16px}.workbench-toolbar-summary{display:flex;align-items:center;gap:9px;min-width:max-content}.workbench-toolbar-summary strong{font-size:14px;font-weight:600;color:var(--deep)}.toolbar-status-dot{width:8px;height:8px;border-radius:50%;background:#4f8060;box-shadow:0 0 0 3px #edf5ef}.workbench-filter{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;margin-left:auto}.workbench-filter label{display:flex;flex-direction:column;gap:3px;color:#202421;font-size:13px;font-weight:700}.workbench-filter select{min-width:145px;padding:7px 9px;color:#202421;font-size:14px;font-weight:600}.workbench-filter button{padding:7px 12px}.pricing-pagination{display:flex;align-items:center;justify-content:flex-end;gap:12px}.pricing-pagination-bottom{min-height:58px;padding:10px 24px;border-top:1px solid var(--line);background:#f7f9f7}.pricing-pagination-top{min-height:0;padding:0;border:0;background:transparent;gap:7px}.pricing-pagination>span:not(.button){color:var(--muted);font-size:12px;white-space:nowrap}.pagination-link{padding:6px 11px;font-size:12px}.pagination-link.disabled{cursor:not-allowed;opacity:.45;pointer-events:none}
         @media(max-width:900px){.pricing-board-tools{flex-wrap:wrap;justify-content:flex-end}.pricing-pagination-top{flex-basis:100%}}
         @media(max-width:620px){.pricing-board>.panel-head{flex-direction:column}.pricing-board-tools{align-items:flex-start;flex-direction:column;gap:6px;width:100%}.pricing-pagination-top{width:100%;justify-content:space-between}.pricing-table[data-resizable-columns]{min-width:0}.product-image-dialog{width:calc(100vw - 20px);height:calc(100vh - 20px)}.product-image-dialog-head{padding:11px 10px 10px 14px}.product-image-dialog-canvas{padding:10px}}
         @media(max-width:900px){.workbench-toolbar{align-items:flex-start;flex-wrap:wrap}.workbench-filter{width:100%;margin-left:0}.workbench-filter label{flex:1}.workbench-filter select{width:100%}}

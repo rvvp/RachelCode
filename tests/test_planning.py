@@ -1223,9 +1223,9 @@ class PlanningCenterTests(unittest.TestCase):
             "/workbench?season_year=2027%E6%98%A5%E5%A4%8F&status=waiting",
             cookie=planner_cookie,
         )["body"].decode("utf-8")
-        self.assertIn("选择全部待测算资料（101）", page)
+        self.assertIn("选择全部筛选资料（101）", page)
         self.assertIn("id='pricing-selection-scope'", page)
-        self.assertIn("const waitingCount = 101;", page)
+        self.assertIn("const filteredActionCounts = {\"suggest\": 101", page)
         self.assertEqual(page.count("name='suggest_ids'"), 50)
 
         response = self.wsgi_request(
@@ -1246,6 +1246,161 @@ class PlanningCenterTests(unittest.TestCase):
         records = planning_db.list_pricing_records(self.planning_db_path, season_year="2027春夏")
         self.assertEqual(len(records), 101)
         self.assertEqual({record["calculated_price"] for record in records}, {399})
+
+    def test_filtered_selection_runs_each_later_stage_across_pages_and_exports_history(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2028春夏", None, 600, 4)
+        products = [
+            {
+                "id": 3200 + index,
+                "style_code": f"FLOW-{index:03d}",
+                "style_color": f"FLOW-{index:03d}-黑",
+                "product_name": f"全流程跨页毛衣 {index}",
+                "season_year": "2028春夏",
+                "supplier": "全流程测试供应商",
+                "category": "毛衣",
+                "actual_cost": 100,
+                "status": "pending",
+                "source_version_no": 1,
+            }
+            for index in range(101)
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        planning_db.create_pricing_records(self.planning_db_path, products, "商品部企划员")
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+
+        suggested_page = self.wsgi_request(
+            app,
+            "/workbench?season_year=2028%E6%98%A5%E5%A4%8F&status=suggested",
+            cookie=planner_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn("选择全部筛选资料（101）", suggested_page)
+        self.assertIn('"submit-review": 101', suggested_page)
+        self.assertEqual(suggested_page.count("name='submit_review_ids'"), 50)
+        suggested_export = self.wsgi_request(
+            app,
+            "/pricing/export.xlsx?season_year=2028%E6%98%A5%E5%A4%8F&status=suggested&selection_scope=filtered",
+            cookie=planner_cookie,
+        )
+        suggested_sheet = load_workbook(io.BytesIO(suggested_export["body"])).active
+        self.assertEqual(suggested_sheet.max_row, 102)
+        self.assertFalse(suggested_sheet["O2"].protection.locked)
+        for row_number in range(2, suggested_sheet.max_row + 1):
+            suggested_sheet.cell(row_number, 17).value = "天猫"
+        edited_workbook = io.BytesIO()
+        suggested_sheet.parent.save(edited_workbook)
+        import_body, import_content_type = self.workbook_multipart(edited_workbook.getvalue())
+        import_response = self.wsgi_request(
+            app,
+            "/pricing/import",
+            method="POST",
+            body=import_body,
+            content_type=import_content_type,
+            cookie=planner_cookie,
+        )
+        self.assertTrue(import_response["status"].startswith("302"))
+        self.assertEqual(
+            {record["channel"] for record in planning_db.list_pricing_records(self.planning_db_path)},
+            {"天猫"},
+        )
+        initial_response = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode(
+                {
+                    "batch_action": "submit-review",
+                    "selection_scope": "filtered",
+                    "season_year": "2028春夏",
+                    "status": "suggested",
+                }
+            ).encode("utf-8"),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(initial_response["status"].startswith("302"))
+        self.assertEqual(
+            sum(record["status"] == "review_pending" for record in planning_db.list_pricing_records(self.planning_db_path)),
+            101,
+        )
+
+        review_page = self.wsgi_request(
+            app,
+            "/workbench?season_year=2028%E6%98%A5%E5%A4%8F&status=review_pending",
+            cookie=admin_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn("选择全部筛选资料（101）", review_page)
+        self.assertIn('"approve": 101', review_page)
+        self.assertEqual(review_page.count("name='approve_ids'"), 50)
+        approval_response = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode(
+                {
+                    "batch_action": "approve",
+                    "selection_scope": "filtered",
+                    "season_year": "2028春夏",
+                    "status": "review_pending",
+                }
+            ).encode("utf-8"),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(approval_response["status"].startswith("302"))
+        self.assertEqual(
+            sum(record["status"] == "confirmed" for record in planning_db.list_pricing_records(self.planning_db_path)),
+            101,
+        )
+
+        confirmed_page = self.wsgi_request(
+            app,
+            "/workbench?season_year=2028%E6%98%A5%E5%A4%8F&status=confirmed",
+            cookie=planner_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn("选择全部筛选资料（101）", confirmed_page)
+        self.assertIn('"publish": 101', confirmed_page)
+        self.assertEqual(confirmed_page.count("name='publish_ids'"), 50)
+        app.catalog_api_token = "planning-secret"
+        publication_result = json.dumps({"status": "published"}).encode("utf-8")
+        with patch("planning_center.web.urlopen", side_effect=lambda *args, **kwargs: io.BytesIO(publication_result)) as mocked_urlopen:
+            publish_response = self.wsgi_request(
+                app,
+                "/pricing/batch",
+                method="POST",
+                body=urlencode(
+                    {
+                        "batch_action": "publish",
+                        "selection_scope": "filtered",
+                        "season_year": "2028春夏",
+                        "status": "confirmed",
+                    }
+                ).encode("utf-8"),
+                cookie=planner_cookie,
+            )
+        self.assertTrue(publish_response["status"].startswith("302"))
+        self.assertEqual(mocked_urlopen.call_count, 101)
+        self.assertEqual(
+            sum(record["status"] == "published" for record in planning_db.list_pricing_records(self.planning_db_path)),
+            101,
+        )
+
+        with patch.object(app, "fetch_catalog_products", return_value=[]):
+            published_page = self.wsgi_request(
+                app,
+                "/workbench?season_year=2028%E6%98%A5%E5%A4%8F&status=published",
+                cookie=planner_cookie,
+            )["body"].decode("utf-8")
+        self.assertIn("选择全部筛选资料（101）", published_page)
+        self.assertEqual(published_page.count("name='export_ids'"), 50)
+        published_export = self.wsgi_request(
+            app,
+            "/pricing/export.xlsx?season_year=2028%E6%98%A5%E5%A4%8F&status=published&selection_scope=filtered",
+            cookie=planner_cookie,
+        )
+        published_sheet = load_workbook(io.BytesIO(published_export["body"])).active
+        self.assertEqual(published_sheet.max_row, 102)
+        self.assertEqual(published_sheet["R2"].value, "已回传")
+        self.assertTrue(published_sheet["O2"].protection.locked)
 
     def test_initial_review_excel_export_and_import_save_drafts_without_advancing(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2027秋冬", None, 600, 4)

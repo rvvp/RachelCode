@@ -47,10 +47,12 @@ def initial_review_workbook_bytes(
     rows: list[dict],
     category_options: list[str],
     channel_options: list[str],
+    editable_statuses: set[str] | frozenset[str] | tuple[str, ...] = ("suggested", "conflict"),
+    worksheet_title: str = "待初审资料",
 ) -> bytes:
     workbook = Workbook()
     worksheet = workbook.active
-    worksheet.title = "待初审资料"
+    worksheet.title = str(worksheet_title or "待初审资料")[:31]
     worksheet.sheet_properties.tabColor = "315447"
 
     header_fill = PatternFill("solid", fgColor="315447")
@@ -64,10 +66,19 @@ def initial_review_workbook_bytes(
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
     status_labels = {
+        "waiting": "待计算",
         "suggested": "待初审",
+        "review_pending": "待复核",
+        "confirmed": "复核通过，待回传",
+        "published": "已回传",
         "conflict": "版本冲突",
     }
+    editable_statuses = {str(status) for status in editable_statuses}
+    editable_rows: list[int] = []
     for row_index, row in enumerate(rows, start=2):
+        row_editable = str(row.get("status") or "") in editable_statuses
+        if row_editable:
+            editable_rows.append(row_index)
         values = (
             int(row["id"]),
             str(row.get("publication_id") or ""),
@@ -91,10 +102,10 @@ def initial_review_workbook_bytes(
         for column_index, value in enumerate(values, start=1):
             cell = worksheet.cell(row_index, column_index, value)
             header = INITIAL_REVIEW_HEADERS[column_index - 1]
-            cell.fill = editable_fill if header in EDITABLE_HEADERS else readonly_fill
+            cell.fill = editable_fill if row_editable and header in EDITABLE_HEADERS else readonly_fill
             cell.border = border
             cell.alignment = Alignment(vertical="center", wrap_text=header in {"商品名称", "供应商"})
-            cell.protection = Protection(locked=header not in EDITABLE_HEADERS)
+            cell.protection = Protection(locked=not row_editable or header not in EDITABLE_HEADERS)
         for column_index in (1, 2, 3, 4, 6, 7):
             worksheet.cell(row_index, column_index).number_format = "@"
         for column_index in (14, 16):
@@ -127,7 +138,7 @@ def initial_review_workbook_bytes(
     channel_end = max(2, len(channel_options) + 1)
     _add_defined_name(workbook, "PlanningCategoryOptions", f"'填写说明'!$A$2:$A${category_end}")
     _add_defined_name(workbook, "PlanningChannelOptions", f"'填写说明'!$B$2:$B${channel_end}")
-    if rows:
+    if rows and editable_rows:
         category_validation = DataValidation(type="list", formula1="=PlanningCategoryOptions", allow_blank=False)
         category_validation.error = "请从规则中已启用的品类选项选择。"
         category_validation.errorTitle = "品类不正确"
@@ -138,8 +149,9 @@ def initial_review_workbook_bytes(
         channel_validation.showErrorMessage = True
         worksheet.add_data_validation(category_validation)
         worksheet.add_data_validation(channel_validation)
-        category_validation.add(f"O2:O{len(rows) + 1}")
-        channel_validation.add(f"Q2:Q{len(rows) + 1}")
+        for row_index in editable_rows:
+            category_validation.add(f"O{row_index}")
+            channel_validation.add(f"Q{row_index}")
 
         invalid_price_fill = PatternFill("solid", fgColor="F7C8C3")
         worksheet.conditional_formatting.add(
@@ -167,8 +179,8 @@ def initial_review_workbook_bytes(
     worksheet.protection.selectLockedCells = True
     worksheet.protection.selectUnlockedCells = True
 
-    workbook.properties.title = "商品企划中心待初审资料"
-    workbook.properties.subject = "上新审核工作台测算结果及初审编辑"
+    workbook.properties.title = f"商品企划中心{worksheet.title}"
+    workbook.properties.subject = "上新审核工作台定价资料"
     buffer = BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()
