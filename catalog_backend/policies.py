@@ -9,14 +9,16 @@ DEPARTMENT_LABELS = {
     "A": "跟单部",
     "B": "商品部",
     "C": "运营部",
+    "DESIGN": "美工部",
     "EXECUTIVE": "总经办",
     "ADMIN": "系统管理员",
 }
 
 EDITOR_DEPARTMENTS = {"A", "B"}
+RELEASED_CATALOG_READ_ONLY_DEPARTMENTS = {"DESIGN"}
 EXECUTIVE_READ_ONLY_DEPARTMENTS = {"EXECUTIVE"}
 ADMIN_DEPARTMENTS = {"ADMIN"}
-MANAGEABLE_DEPARTMENTS = ("A", "B", "C", "EXECUTIVE", "ADMIN")
+MANAGEABLE_DEPARTMENTS = ("A", "B", "C", "DESIGN", "EXECUTIVE", "ADMIN")
 # These fields are completed across the two applications.  The planning center
 # owns the three planning outputs; the catalog remains the source of truth for
 # the image. The completion flag is derived by the system and is never edited.
@@ -184,6 +186,10 @@ def is_executive_read_only(user: dict | None) -> bool:
     return bool(user and user.get("department") in EXECUTIVE_READ_ONLY_DEPARTMENTS)
 
 
+def is_released_catalog_read_only(user: dict | None) -> bool:
+    return bool(user and user.get("department") in RELEASED_CATALOG_READ_ONLY_DEPARTMENTS)
+
+
 def can_manage_users(user: dict | None) -> bool:
     return bool(not is_department_monitor(user) and is_admin(user))
 
@@ -264,6 +270,8 @@ def can_see_product(user: dict | None, product: dict | None) -> bool:
     if is_admin(user):
         return True
     status = product.get("status")
+    if is_released_catalog_read_only(user):
+        return product.get("lifecycle_status") == "active" and status in {"published", "received"}
     if product.get("lifecycle_status") == "archived":
         return user.get("id") == product.get("created_by")
     if user.get("department") == "C":
@@ -384,6 +392,8 @@ def available_lifecycle_actions(user: dict | None, product: dict | None) -> list
 def visible_fields_for_department(department: str | None):
     if department in EDITOR_DEPARTMENTS or department in EXECUTIVE_READ_ONLY_DEPARTMENTS or department in ADMIN_DEPARTMENTS:
         return PRODUCT_FIELDS
+    if department in RELEASED_CATALOG_READ_ONLY_DEPARTMENTS:
+        return C_VISIBLE_FIELDS
     return C_VISIBLE_FIELDS
 
 

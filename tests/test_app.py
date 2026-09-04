@@ -3482,9 +3482,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.08.31-filtered-export-v1")
+        self.assertEqual(payload["build_version"], "2026.09.04-design-department-v1")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.08.31-filtered-export-v1")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.04-design-department-v1")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -3820,7 +3820,7 @@ class CatalogAppTests(unittest.TestCase):
         products_response = self.request("/products", cookie=executive_cookie)
         products_body = products_response["body"].decode("utf-8")
         self.assertTrue(products_response["status"].startswith("200"))
-        self.assertIn("总经办只读模式", products_body)
+        self.assertIn("资料概览", products_body)
         self.assertIn("<strong>executive_viewer</strong>", products_body)
         self.assertIn('<div class="nav-role-note">总经办</div>', products_body)
         self.assertNotIn('href="/products/new"', products_body)
@@ -3854,6 +3854,198 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(
             self.request("/settings/list-layout", method="POST", body=b"", cookie=executive_cookie)["status"].startswith("403")
         )
+
+    def test_design_department_reads_all_released_channels_with_c_fields_and_no_write_or_billing_access(self):
+        admin_cookie = self.login("admin_reviewer", "demo123")
+        users_body = self.request("/users", cookie=admin_cookie)["body"].decode("utf-8")
+        self.assertIn('<option value="DESIGN"', users_body)
+        self.assertIn(">美工部</option>", users_body)
+
+        create_response = self.request(
+            "/users",
+            method="POST",
+            body=urlencode(
+                {
+                    "username": "design_artist",
+                    "department": "DESIGN",
+                    "operating_channel": "tmall",
+                    "billing_platform_codes__tmall": "tmall",
+                    "password": "demo123",
+                    "must_change_password": "",
+                }
+            ).encode("utf-8"),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(create_response["status"].startswith("302"))
+        design_user = next(item for item in db.list_users(self.db_path) if item["username"] == "design_artist")
+        self.assertEqual(design_user["department"], "DESIGN")
+        self.assertEqual(design_user["display_name"], "design_artist")
+        self.assertEqual(design_user["operating_channel"], "")
+        self.assertEqual(json.loads(design_user["billing_platforms_json"]), [])
+
+        db.set_setting(
+            self.db_path,
+            "c_visible_field_keys",
+            "product_name,style_code,image_url,launch_price,launch_channel",
+        )
+        users = {item["department"]: item for item in db.list_users(self.db_path)}
+        with db.get_connection(self.db_path) as connection:
+            released_ids = []
+            for index, (channel, name) in enumerate(
+                (("唯品", "唯品美工资料"), ("同款", "同款美工资料")),
+                start=1,
+            ):
+                product_id = db.create_product(
+                    connection,
+                    self.a_complete_fields_payload(
+                        style_color=f"美工款色-{index}",
+                        style_code=f"DESIGN-{index}",
+                        product_name=name,
+                        launch_price=299 + index,
+                        launch_channel=channel,
+                    ),
+                    users["A"]["id"],
+                    "A",
+                )
+                db.change_product_status(
+                    connection,
+                    product_id,
+                    "pending",
+                    users["A"]["id"],
+                    "开启商品部协作",
+                    "美工部全渠道权限测试。",
+                )
+                db.change_product_status(
+                    connection,
+                    product_id,
+                    "published",
+                    users["B"]["id"],
+                    "确认资料齐全，提交运营部",
+                    "美工部全渠道权限测试。",
+                )
+                released_ids.append(product_id)
+            vip_product_id, same_product_id = released_ids
+            db.update_product(
+                connection,
+                vip_product_id,
+                {"product_name": "唯品尚未重新发布的修订"},
+                users["A"]["id"],
+            )
+
+        design_cookie = self.login("design_artist", "demo123")
+        modules_body = self.request("/modules", cookie=design_cookie)["body"].decode("utf-8")
+        self.assertIn("已提交运营部的全渠道商品资料", modules_body)
+        self.assertIn("进入板块一", modules_body)
+        self.assertNotIn("进入板块二", modules_body)
+        self.assertNotIn("账单与结算", modules_body)
+
+        design_page = self.request("/products", cookie=design_cookie)
+        self.assertTrue(design_page["status"].startswith("200"))
+        design_body = design_page["body"].decode("utf-8")
+        self.assertIn('<div class="nav-role-note">美工部</div>', design_body)
+        self.assertIn("褶皱短袖连衣裙", design_body)
+        self.assertIn("唯品美工资料", design_body)
+        self.assertIn("同款美工资料", design_body)
+        self.assertNotIn("唯品尚未重新发布的修订", design_body)
+        self.assertNotIn("毛感针织开衫", design_body)
+        self.assertIn("<th>上新价格</th>", design_body)
+        self.assertIn("<th>上新渠道</th>", design_body)
+        self.assertNotIn("<th>供应商</th>", design_body)
+        self.assertIn('<select name="channel" aria-label="上新渠道">', design_body)
+        self.assertIn("全部上新渠道", design_body)
+        self.assertIn('name="product_ids"', design_body)
+        self.assertIn("选择全部筛选结果（3）", design_body)
+        self.assertIn("条（用于导出）", design_body)
+        self.assertNotIn("if bulk_enabled else", design_body)
+        self.assertIn("导出勾选资料", design_body)
+        self.assertIn("导出勾选含图片", design_body)
+        self.assertNotIn("批量接收资料", design_body)
+        self.assertNotIn("批量提交运营部", design_body)
+        self.assertNotIn("批量退回跟单部", design_body)
+        self.assertNotIn('href="/products/new"', design_body)
+        self.assertNotIn('href="/import"', design_body)
+        self.assertNotIn('href="/import-images"', design_body)
+        self.assertNotIn('href="/settings/list-layout"', design_body)
+        self.assertNotIn('href="/billing"', design_body)
+
+        vip_query = urlencode({"channel": "唯品"})
+        vip_page_body = self.request(f"/products?{vip_query}", cookie=design_cookie)["body"].decode("utf-8")
+        self.assertIn('<option value="唯品" selected>唯品</option>', vip_page_body)
+        self.assertIn("唯品美工资料", vip_page_body)
+        self.assertNotIn("褶皱短袖连衣裙", vip_page_body)
+        self.assertNotIn("同款美工资料", vip_page_body)
+
+        export_response = self.request(
+            f"/export.xlsx?mode=selected&selection_scope=filtered&{vip_query}",
+            cookie=design_cookie,
+        )
+        self.assertTrue(export_response["status"].startswith("200"))
+        worksheet = load_workbook(io.BytesIO(export_response["body"])).active
+        headers = [cell.value for cell in worksheet[1]]
+        self.assertIn("商品名称", headers)
+        self.assertIn("上新价格", headers)
+        self.assertIn("上新渠道", headers)
+        self.assertNotIn("供应商", headers)
+        self.assertEqual(worksheet.max_row, 2)
+        product_name_column = headers.index("商品名称") + 1
+        self.assertEqual(worksheet.cell(2, product_name_column).value, "唯品美工资料")
+
+        api_payload = json.loads(
+            self.request(f"/api/products?{vip_query}", cookie=design_cookie)["body"].decode("utf-8")
+        )
+        self.assertEqual(api_payload["role"], "DESIGN")
+        self.assertEqual(api_payload["count"], 1)
+        self.assertEqual(api_payload["items"][0]["product_name"], "唯品美工资料")
+        self.assertIn("launch_price", api_payload["items"][0])
+        self.assertNotIn("supplier", api_payload["items"][0])
+
+        c_cookie = self.login("c_viewer", "demo123")
+        c_body = self.request("/products", cookie=c_cookie)["body"].decode("utf-8")
+        self.assertIn("褶皱短袖连衣裙", c_body)
+        self.assertIn("同款美工资料", c_body)
+        self.assertNotIn("唯品美工资料", c_body)
+
+        detail_response = self.request(f"/products/{vip_product_id}", cookie=design_cookie)
+        self.assertTrue(detail_response["status"].startswith("200"))
+        detail_body = detail_response["body"].decode("utf-8")
+        self.assertIn("唯品美工资料", detail_body)
+        self.assertNotIn("唯品尚未重新发布的修订", detail_body)
+        self.assertIn("美工部全渠道只读视图", detail_body)
+        self.assertIn("复制 JSON", detail_body)
+        self.assertNotIn("编辑这条资料", detail_body)
+        self.assertNotIn("接收资料", detail_body)
+        self.assertNotIn("阶段流转", detail_body)
+        self.assertNotIn("查看日志", detail_body)
+        self.assertNotIn("含税价历史", detail_body)
+        self.assertTrue(self.request("/products/2", cookie=design_cookie)["status"].startswith("403"))
+
+        forbidden_requests = (
+            ("/products/new", "GET", b""),
+            (f"/products/{vip_product_id}/edit", "GET", b""),
+            (
+                f"/products/{vip_product_id}/status",
+                "POST",
+                urlencode({"status": "received"}).encode("utf-8"),
+            ),
+            (
+                f"/products/{vip_product_id}/lifecycle",
+                "POST",
+                urlencode({"lifecycle_status": "archived"}).encode("utf-8"),
+            ),
+            ("/products/bulk", "POST", b""),
+            ("/import", "GET", b""),
+            ("/import-images", "GET", b""),
+            ("/settings/list-layout", "GET", b""),
+            ("/settings/list-layout", "POST", b""),
+            ("/logs", "GET", b""),
+            (f"/products/{same_product_id}/logs", "GET", b""),
+            ("/billing", "GET", b""),
+            ("/billing/platform-bills", "GET", b""),
+        )
+        for path, method, body in forbidden_requests:
+            with self.subTest(path=path, method=method):
+                response = self.request(path, method=method, body=body, cookie=design_cookie)
+                self.assertTrue(response["status"].startswith("403"))
 
     def test_default_list_layout_follows_catalog_export_header_order(self):
         a_cookie = self.login("a_editor", "demo123")
@@ -5058,7 +5250,7 @@ class CatalogAppTests(unittest.TestCase):
         admin_cookie = self.login("admin_reviewer", "demo123")
         settings_page = self.request("/settings/c-fields", cookie=admin_cookie)
         settings_body = settings_page["body"].decode("utf-8")
-        self.assertIn("C 部门 API 令牌", settings_body)
+        self.assertIn("商品资料只读 API 令牌", settings_body)
 
         update_response = self.request(
             "/settings/c-fields",

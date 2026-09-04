@@ -65,6 +65,7 @@ from catalog_backend.policies import (
     is_admin,
     is_department_monitor,
     is_executive_read_only,
+    is_released_catalog_read_only,
     lifecycle_label,
     MANAGEABLE_DEPARTMENTS,
     normalize_launch_channel,
@@ -98,7 +99,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.08.31-filtered-export-v1"
+CATALOG_BUILD_VERSION = "2026.09.04-design-department-v1"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_PLANNING_IMAGE_BYTES = 5 * 1024 * 1024
 IMAGE_BACKUP_CLEANUP_INTERVAL_SECONDS = 60 * 60
@@ -636,7 +637,7 @@ class CatalogApplication:
                 self.render_message_page("记录不存在", "没有找到这条商品资料。", user),
                 status="404 Not Found",
             )
-        if user.get("department") == "C":
+        if user.get("department") in {"C", "DESIGN"}:
             visible_products = self.visible_products_for_user([product], user)
             if visible_products:
                 product = visible_products[0]
@@ -1070,7 +1071,7 @@ class CatalogApplication:
         api_user = user or self.api_token_user(environ, query)
         if not api_user:
             payload = json.dumps(
-                {"error": "unauthorized", "message": "请先登录，或使用有效的 C 部门 API 访问令牌。"},
+                {"error": "unauthorized", "message": "请先登录，或使用有效的商品资料只读 API 访问令牌。"},
                 ensure_ascii=False,
             ).encode("utf-8")
             start_response(
@@ -1078,23 +1079,35 @@ class CatalogApplication:
                 [("Content-Type", "application/json; charset=utf-8"), ("Content-Length", str(len(payload)))],
             )
             return [payload]
-        source_status_filter = "" if api_user.get("department") == "C" else query.get("status", "")
+        released_read_only_view = api_user.get("department") in {"C", "DESIGN"}
+        source_status_filter = "" if released_read_only_view else query.get("status", "")
         visible_products = self.visible_products_for_user(
             db.list_products(
                 self.db_path,
-                query="" if api_user.get("department") == "C" else query.get("q", ""),
+                query="" if released_read_only_view else query.get("q", ""),
                 department=query.get("department", ""),
                 status=source_status_filter,
             ),
             api_user,
         )
-        if api_user.get("department") == "C":
+        if released_read_only_view:
             visible_products = self.filter_c_products_by_keyword(visible_products, query.get("q", ""))
-        if api_user.get("department") == "C" and query.get("status", ""):
+        if released_read_only_view and query.get("status", ""):
             visible_products = [
                 product for product in visible_products
-                if self.c_effective_status(product, api_user) == query.get("status", "")
+                if (
+                    self.c_effective_status(product, api_user)
+                    if api_user.get("department") == "C"
+                    else str(product.get("status") or "")
+                ) == query.get("status", "")
             ]
+        if api_user.get("department") == "DESIGN":
+            launch_channel = normalize_launch_channel(query.get("channel", ""))
+            if launch_channel:
+                visible_products = [
+                    product for product in visible_products
+                    if normalize_launch_channel(product.get("launch_channel")) == launch_channel
+                ]
         products = [self.product_payload_for_user(product, api_user) for product in visible_products]
         payload = json.dumps(
             {
@@ -2075,10 +2088,10 @@ class CatalogApplication:
         )
 
     def handle_list_layout_settings_page(self, start_response, user, query):
-        if is_executive_read_only(user):
+        if is_executive_read_only(user) or is_released_catalog_read_only(user):
             return self.html_response(
                 start_response,
-                self.render_message_page("权限不足", "总经办账号可查看和下载资料，但不能修改部门列表字段设置。", user),
+                self.render_message_page("权限不足", "当前只读账号不能修改部门列表字段设置。", user),
                 status="403 Forbidden",
             )
         notice = query.get("notice", "").strip()
@@ -2088,10 +2101,10 @@ class CatalogApplication:
         )
 
     def handle_list_layout_settings_update(self, environ, start_response, user):
-        if is_executive_read_only(user):
+        if is_executive_read_only(user) or is_released_catalog_read_only(user):
             return self.html_response(
                 start_response,
-                self.render_message_page("权限不足", "总经办账号不能修改部门列表字段设置。", user),
+                self.render_message_page("权限不足", "当前只读账号不能修改部门列表字段设置。", user),
                 status="403 Forbidden",
             )
         form, _ = self.parse_form(environ)
@@ -2482,7 +2495,7 @@ class CatalogApplication:
 
     def products_return_path(self, query: dict) -> str:
         params = {}
-        for key in ("q", "supplier", "department", "status", "marker", "lifecycle_status", "page"):
+        for key in ("q", "supplier", "department", "status", "marker", "channel", "lifecycle_status", "page"):
             value = str(query.get(key, "")).strip()
             if value:
                 params[key] = value
@@ -2503,6 +2516,11 @@ class CatalogApplication:
 
         status_filter = str(query.get("status", "")).strip()
         marker_filter = str(query.get("marker", "")).strip()
+        launch_channel_filter = (
+            normalize_launch_channel(query.get("channel", ""))
+            if user.get("department") == "DESIGN"
+            else ""
+        )
         if b_dashboard_view and status_filter == "tax_price_modified":
             status_filter = ""
             marker_filter = "tax_price_modified"
@@ -2512,6 +2530,7 @@ class CatalogApplication:
             "EXECUTIVE": {"draft", "pending", "published", "received", "workflow_restart"},
             "B": {"pending", "published", "received", "workflow_restart"},
             "C": {"published", "received"},
+            "DESIGN": {"published", "received"},
         }.get(user.get("department"), {"draft", "pending", "published", "received", "workflow_restart"})
         if status_filter not in allowed_statuses:
             status_filter = ""
@@ -2527,7 +2546,7 @@ class CatalogApplication:
         lifecycle_filter = str(query.get("lifecycle_status", "")).strip()
         source_status_filter = (
             ""
-            if user.get("department") == "C"
+            if user.get("department") in {"C", "DESIGN"}
             or tax_price_filter
             or completion_ready_filter
             or workflow_restart_filter
@@ -2536,7 +2555,7 @@ class CatalogApplication:
         products = self.visible_products_for_user(
             db.list_products(
                 self.db_path,
-                "" if user.get("department") == "C" else keyword,
+                "" if user.get("department") in {"C", "DESIGN"} else keyword,
                 department_filter,
                 source_status_filter,
                 lifecycle_filter,
@@ -2545,12 +2564,24 @@ class CatalogApplication:
             ),
             user,
         )
-        if user.get("department") == "C":
+        if user.get("department") in {"C", "DESIGN"}:
             products = self.filter_c_products_by_keyword(products, keyword)
+        if user.get("department") == "C":
             if status_filter:
                 products = [
                     product for product in products
                     if self.c_effective_status(product, user) == status_filter
+                ]
+        elif user.get("department") == "DESIGN":
+            if status_filter:
+                products = [
+                    product for product in products
+                    if str(product.get("status") or "") == status_filter
+                ]
+            if launch_channel_filter:
+                products = [
+                    product for product in products
+                    if normalize_launch_channel(product.get("launch_channel")) == launch_channel_filter
                 ]
         if user.get("department") == "B":
             products = [product for product in products if product.get("status") != "draft"]
@@ -2558,7 +2589,7 @@ class CatalogApplication:
             products = [product for product in products if self.product_is_ready_for_b_submission(product)]
         elif workflow_restart_filter:
             products = [product for product in products if int(product.get("workflow_restart_required") or 0)]
-        elif user.get("department") != "C" and status_filter in {"published", "received"}:
+        elif user.get("department") not in {"C", "DESIGN"} and status_filter in {"published", "received"}:
             products = [product for product in products if not int(product.get("workflow_restart_required") or 0)]
 
         normalized_query.update(
@@ -2568,6 +2599,7 @@ class CatalogApplication:
                 "department": department_filter,
                 "status": status_filter,
                 "marker": marker_filter,
+                "channel": launch_channel_filter,
                 "lifecycle_status": lifecycle_filter,
             }
         )
@@ -2583,6 +2615,7 @@ class CatalogApplication:
             "department_filter": department_filter,
             "status_filter": status_filter,
             "marker_filter": marker_filter,
+            "launch_channel_filter": launch_channel_filter,
             "tax_price_filter": tax_price_filter,
             "completion_ready_filter": completion_ready_filter,
             "workflow_restart_filter": workflow_restart_filter,
@@ -2616,9 +2649,10 @@ class CatalogApplication:
         workflow_restart_filter = requested_status == "workflow_restart" and user.get("department") != "C"
         product_status = "" if tax_price_filter or completion_ready_filter or workflow_restart_filter else requested_status
         exact_matches = []
+        released_read_only_view = user.get("department") in {"C", "DESIGN"}
         source_products = db.list_products(
             self.db_path,
-            "" if user.get("department") == "C" else keyword,
+            "" if released_read_only_view else keyword,
             str(query.get("department", "")).strip(),
             product_status,
             str(query.get("lifecycle_status", "")).strip(),
@@ -2626,15 +2660,22 @@ class CatalogApplication:
             tax_price_filter,
         )
         visible_source_products = self.visible_products_for_user(source_products, user)
-        if user.get("department") == "C":
+        if released_read_only_view:
             visible_source_products = self.filter_c_products_by_keyword(visible_source_products, keyword)
+        launch_channel_filter = (
+            normalize_launch_channel(query.get("channel", ""))
+            if user.get("department") == "DESIGN"
+            else ""
+        )
         for product in visible_source_products:
+            if launch_channel_filter and normalize_launch_channel(product.get("launch_channel")) != launch_channel_filter:
+                continue
             if completion_ready_filter and not self.product_is_ready_for_b_submission(product):
                 continue
             if workflow_restart_filter and not int(product.get("workflow_restart_required") or 0):
                 continue
             if (
-                user.get("department") != "C"
+                user.get("department") not in {"C", "DESIGN"}
                 and requested_status in {"published", "received"}
                 and int(product.get("workflow_restart_required") or 0)
             ):
@@ -2911,12 +2952,16 @@ class CatalogApplication:
 
     def list_layout_setting_key(self, user: dict) -> str:
         department = (user.get("department") or "").strip().upper()
+        if department == "DESIGN":
+            department = "C"
         if department not in {"A", "B", "C"}:
             department = "A"
         return f"list_layout_fields_{department}"
 
     def list_layout_customized_setting_key(self, user: dict) -> str:
         department = (user.get("department") or "").strip().upper()
+        if department == "DESIGN":
+            department = "C"
         if department not in {"A", "B", "C"}:
             department = "A"
         return f"list_layout_customized_{department}"
@@ -2964,6 +3009,8 @@ class CatalogApplication:
         available_fields = self.list_layout_available_fields(user)
         available_keys = [field.key for field in available_fields]
         department = (user.get("department") or "").strip().upper()
+        if department == "DESIGN":
+            department = "C"
         if is_executive_read_only(user):
             department = "A"
         default_keys = db.ordered_list_layout_keys(available_keys, department)
@@ -3083,7 +3130,7 @@ class CatalogApplication:
         return {
             "id": 0,
             "username": "c_api_token",
-            "display_name": "C 部门接口令牌",
+            "display_name": "商品资料只读接口令牌",
             "department": "C",
             "operating_channel": "all",
         }
@@ -3095,17 +3142,19 @@ class CatalogApplication:
         return (query.get("access_token") or "").strip()
 
     def visible_fields_for_user(self, user):
-        if user.get("department") == "C":
+        if user.get("department") in {"C", "DESIGN"}:
             return visible_fields_from_keys(self.configured_c_field_keys())
         return visible_fields_for_department(user["department"])
 
     def visible_products_for_user(self, products: list[dict], user: dict) -> list[dict]:
-        if user.get("department") != "C":
+        if user.get("department") not in {"C", "DESIGN"}:
             return [product for product in products if can_see_product(user, product)]
         published_products = db.products_for_c_published_versions(
             self.db_path,
             [product for product in products if product.get("status") in {"published", "received"}],
         )
+        if user.get("department") == "DESIGN":
+            return [product for product in published_products if can_see_product(user, product)]
         if is_department_monitor(user):
             visible_products = [product for product in published_products if can_see_product(user, product)]
             for product in visible_products:
@@ -3128,7 +3177,7 @@ class CatalogApplication:
         clean_keyword = str(keyword or "").strip().casefold()
         if not clean_keyword:
             return products
-        searchable_keys = ("product_name", "style_code", "brand_name")
+        searchable_keys = ("product_name", "style_code", "style_color", "brand_name")
         return [
             product
             for product in products
@@ -3144,10 +3193,10 @@ class CatalogApplication:
         return status
 
     def product_payload_for_user(self, product: dict, user: dict) -> dict:
-        visible_fields = self.visible_fields_for_c_product(product) if user.get("department") == "C" else self.visible_fields_for_user(user)
+        visible_fields = self.visible_fields_for_user(user)
         effective_status = self.c_effective_status(product, user)
         effective_status_label = status_label(effective_status)
-        if user.get("department") != "C" and int(product.get("workflow_restart_required") or 0):
+        if user.get("department") not in {"C", "DESIGN"} and int(product.get("workflow_restart_required") or 0):
             effective_status_label = "待商品部重新提交"
         payload = {
             "id": product.get("id"),
@@ -3482,15 +3531,6 @@ class CatalogApplication:
                   <span class="nav-dropdown-title">板块二</span>
                   <span class="nav-dropdown-note">账单与结算</span>
                 </a>
-                """
-            )
-        else:
-            module_entries.append(
-                """
-                <span class="nav-dropdown-link nav-dropdown-link-disabled">
-                  <span class="nav-dropdown-title">板块二</span>
-                  <span class="nav-dropdown-note">当前账号暂不可访问</span>
-                </span>
                 """
             )
         board_guide = f"""
@@ -9135,6 +9175,7 @@ class CatalogApplication:
         department_filter = filter_context["department_filter"]
         status_filter = filter_context["status_filter"]
         marker_filter = filter_context["marker_filter"]
+        launch_channel_filter = filter_context["launch_channel_filter"]
         tax_price_filter = filter_context["tax_price_filter"]
         completion_ready_filter = filter_context["completion_ready_filter"]
         workflow_restart_filter = filter_context["workflow_restart_filter"]
@@ -9142,6 +9183,7 @@ class CatalogApplication:
         bulk_enabled = not is_department_monitor(user) and (
             is_admin(user) or user.get("department") in {"A", "B", "C"}
         )
+        selection_enabled = bulk_enabled or is_released_catalog_read_only(user)
         products = filter_context["products"]
         total_products = len(products)
         filtered_product_ids = [int(product["id"]) for product in products if product.get("id")]
@@ -9184,12 +9226,12 @@ class CatalogApplication:
               </div>
             </div>
             """
-            if bulk_enabled and page_product_count
+            if selection_enabled and page_product_count
             else ""
         )
 
         pagination_params = {}
-        for key in ("q", "supplier", "department", "status", "marker", "lifecycle_status", "monitor_department"):
+        for key in ("q", "supplier", "department", "status", "marker", "channel", "lifecycle_status", "monitor_department"):
             value = str(query.get(key, "")).strip()
             if value:
                 pagination_params[key] = value
@@ -9331,7 +9373,7 @@ class CatalogApplication:
             if can_view_logs(user):
                 actions.append(f'<a href="/products/{product["id"]}/logs">日志</a>')
             selector_cell = ""
-            if bulk_enabled:
+            if selection_enabled:
                 selector_cell = (
                     f'<td class="table-select-cell"><input type="checkbox" name="product_ids" value="{product["id"]}" style="width:auto;"></td>'
                 )
@@ -9360,9 +9402,9 @@ class CatalogApplication:
                 """
             )
         dynamic_headers = [f"<th>{html.escape(field.label)}</th>" for field in configured_list_fields]
-        selector_header = '<th class="table-select-head"><input type="checkbox" id="toggle-all-products" style="width:auto;"></th>' if bulk_enabled else ""
+        selector_header = '<th class="table-select-head"><input type="checkbox" id="toggle-all-products" style="width:auto;"></th>' if selection_enabled else ""
         table_column_keys = []
-        if bulk_enabled:
+        if selection_enabled:
             table_column_keys.append("__select__")
         table_column_keys.append("__id__")
         table_column_keys.extend(field.key for field in configured_list_fields)
@@ -9376,7 +9418,7 @@ class CatalogApplication:
                 "__actions__",
             ]
         )
-        table_column_count = 7 + len(configured_list_fields) + (1 if bulk_enabled else 0)
+        table_column_count = 7 + len(configured_list_fields) + (1 if selection_enabled else 0)
         new_button = (
             '<a class="pill" href="/products/new">新建资料</a>'
             if can_create_product(user)
@@ -9400,6 +9442,15 @@ class CatalogApplication:
               <div class="stat-card"><span>总接收</span><strong>{c_receipt_stats.get('received', 0)}</strong></div>
               <div class="stat-card"><span>近7天新增</span><strong>{c_receipt_stats.get('recent_created', 0)}</strong></div>
               <div class="stat-card"><span>待运营接收</span><strong>{c_receipt_stats.get('pending', 0)}</strong></div>
+            </div>
+            """
+            insights_grid_class += " products-insights-single"
+        elif is_released_catalog_read_only(user):
+            stats_markup = f"""
+            <div class="stats products-stats-row">
+              <div class="stat-card"><span>资料范围</span><strong>全渠道</strong></div>
+              <div class="stat-card"><span>当前结果</span><strong>{total_products}</strong></div>
+              <div class="stat-card"><span>访问权限</span><strong>只读</strong></div>
             </div>
             """
             insights_grid_class += " products-insights-single"
@@ -9449,6 +9500,8 @@ class CatalogApplication:
                 <option value="received" {"selected" if status_filter == "received" else ""}>已接收</option>
               </select>
             """
+        elif user["department"] == "DESIGN":
+            status_filter_markup = ""
         elif user["department"] in {"A", "EXECUTIVE"}:
             status_filter_markup = f"""
               <select name="status">
@@ -9492,13 +9545,28 @@ class CatalogApplication:
             if b_dashboard_view
             else ""
         )
+        launch_channel_filter_markup = (
+            f"""
+              <select name="channel" aria-label="上新渠道">
+                <option value="">全部上新渠道</option>
+                <option value="天猫" {"selected" if launch_channel_filter == "天猫" else ""}>天猫</option>
+                <option value="唯品" {"selected" if launch_channel_filter == "唯品" else ""}>唯品</option>
+                <option value="同款" {"selected" if launch_channel_filter == "同款" else ""}>同款</option>
+              </select>
+            """
+            if is_released_catalog_read_only(user)
+            else ""
+        )
         if user["department"] == "A":
             filter_controls_markup = status_filter_markup + lifecycle_filter_markup
         elif user["department"] == "C":
             filter_controls_markup = status_filter_markup
+        elif user["department"] == "DESIGN":
+            filter_controls_markup = launch_channel_filter_markup
         else:
             filter_controls_markup = status_filter_markup + lifecycle_filter_markup + marker_filter_markup
         editor_dashboard = user["department"] in {"A", "B", "EXECUTIVE"} or is_admin(user)
+        compact_readonly_dashboard = user["department"] in {"C", "DESIGN"}
         insights_panel = f"""
         <section class="{insights_grid_class}">
           <section class="panel products-stats-panel">
@@ -9509,14 +9577,14 @@ class CatalogApplication:
           {operations_panel}
         </section>
         """
-        insights_after_list = "" if user["department"] == "C" or editor_dashboard else insights_panel
+        insights_after_list = "" if compact_readonly_dashboard or editor_dashboard else insights_panel
         dashboard_open = (
             '<div class="products-c-dashboard"><div class="products-c-overview-stack">'
-            if user["department"] == "C"
+            if compact_readonly_dashboard
             else ('<div class="products-editor-dashboard"><div class="products-editor-overview-stack">' if editor_dashboard else "")
         )
-        overview_close = "</div>" if user["department"] == "C" or editor_dashboard else ""
-        dashboard_close = "</div>" if user["department"] == "C" or editor_dashboard else ""
+        overview_close = "</div>" if compact_readonly_dashboard or editor_dashboard else ""
+        dashboard_close = "</div>" if compact_readonly_dashboard or editor_dashboard else ""
         supplier_filter_markup = (
             f'<input class="products-supplier-field" name="supplier" value="{html.escape(supplier_filter)}" placeholder="供应商名称，支持模糊搜索">'
             if supplier_search_enabled
@@ -9537,7 +9605,7 @@ class CatalogApplication:
             c_note = ""
         layout_settings_button = (
             '<a class="pill" href="/settings/list-layout">列表字段设置</a>'
-            if not is_executive_read_only(user)
+            if not is_executive_read_only(user) and not is_released_catalog_read_only(user)
             else ""
         )
         workflow_rule_note = ""
@@ -9567,14 +9635,14 @@ class CatalogApplication:
             </div>
             {workflow_rule_note}
           </div>
-          {insights_panel if user["department"] == "C" or editor_dashboard else ""}
+          {insights_panel if compact_readonly_dashboard or editor_dashboard else ""}
         </section>
         <section id="products-search-filter" class="panel products-filter-card query-anchor">
           <div class="eyebrow">List Workspace</div>
           <h2>搜索与筛选</h2>
           {notice_block}
           {c_note}
-          <form class="products-filter-form{' products-filter-form-c' if user['department'] == 'C' else ''}" method="get" action="/products#products-list">
+          <form class="products-filter-form{' products-filter-form-c' if compact_readonly_dashboard else ''}" method="get" action="/products#products-list">
               <input class="products-search-field" name="q" value="{html.escape(keyword)}" placeholder="款号、款色">
               {supplier_filter_markup}
               {filter_controls_markup}
@@ -9661,7 +9729,7 @@ class CatalogApplication:
                 }});
                 if (selectionSummary) {{
                   if (allFilteredSelected) {{
-                    selectionSummary.textContent = `已选择全部筛选结果 ${{totalProducts}} 条（用于批量操作和导出）`;
+                    selectionSummary.textContent = `已选择全部筛选结果 ${{totalProducts}} 条（用于{'批量操作和导出' if bulk_enabled else '导出'}）`;
                   }} else if (selectedItems.length) {{
                     selectionSummary.textContent = `已勾选本页 ${{selectedItems.length}} 条`;
                   }} else {{
@@ -9895,13 +9963,19 @@ class CatalogApplication:
               </div>
             </article>
             """
+        product_intro = (
+            "查看已提交运营部的全渠道商品资料，字段范围与运营部同步；支持搜索、详情查看、Excel 导出和只读接口调用。"
+            if is_released_catalog_read_only(user)
+            else "继续处理跟单部、商品部、运营部与美工部之间的商品资料填写、流转、只读调用、字段开放和版本管理。"
+        )
+        home_grid_style = ' style="grid-template-columns:1fr;"' if not billing_entry else ""
         content = f"""
         <div class="modules-home">
-          <div class="detail-grid">
+          <div class="detail-grid"{home_grid_style}>
             <article class="panel">
               <div class="eyebrow">Section 01</div>
               <h2>商品资料后台</h2>
-              <p>继续处理跟单部、商品部、运营部之间的商品资料填写、流转、字段开放、导入导出和版本管理。</p>
+              <p>{html.escape(product_intro)}</p>
               <div class="tools" style="margin-top:18px; margin-bottom:0;">
                 <a class="pill" href="/products">进入板块一</a>
               </div>
@@ -11460,7 +11534,7 @@ class CatalogApplication:
 
     def render_product_detail(self, user, product: dict, notice: str = "") -> str:
         console_eyebrow = self.brand_config["brand_console_eyebrow"]
-        visible_fields = self.visible_fields_for_c_product(product) if user["department"] == "C" else self.visible_fields_for_user(user)
+        visible_fields = self.visible_fields_for_user(user)
         payload = self.product_payload_for_user(product, user)
         copy_summary = self.product_copy_summary(product, user)
         payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -11566,16 +11640,17 @@ class CatalogApplication:
             </section>
             """
         hidden_note = (
-            '<div class="warning">你当前看到的是运营部可访问字段，隐藏字段不会展示在详情页、导出和 API 中。</div>'
-            if user["department"] == "C"
+            '<div class="warning">当前页面使用运营部开放字段范围，隐藏字段不会出现在详情页、导出和 API 中。</div>'
+            if user["department"] in {"C", "DESIGN"}
             else ""
         )
         notice_block = f'<div class="notice">{html.escape(notice)}</div>' if notice else ""
-        workflow_notice = (
-            "状态流转：跟单整理中 -> A/B协作中 -> 待运营接收 -> 已接收"
-            if user["department"] != "C"
-            else "状态为待运营接收表示资料等待你接收；确认后会更新为已接收。"
-        )
+        if user["department"] == "C":
+            workflow_notice = "状态为待运营接收表示资料等待你接收；确认后会更新为已接收。"
+        elif user["department"] == "DESIGN":
+            workflow_notice = "美工部全渠道只读视图，可读取天猫、唯品及同款的已发布资料。"
+        else:
+            workflow_notice = "状态流转：跟单整理中 -> A/B协作中 -> 待运营接收 -> 已接收"
         owner_label = "跟单部发起资料" if product.get("owner_department") == "A" else department_label(product.get("owner_department"))
         revision_badge = self.revision_badge(product)
         completion_flag = payload.get("completion_flag") or ""
@@ -11672,7 +11747,7 @@ class CatalogApplication:
         """
 
     def product_copy_summary(self, product: dict, user: dict) -> str:
-        visible_fields = self.visible_fields_for_c_product(product) if user.get("department") == "C" else self.visible_fields_for_user(user)
+        visible_fields = self.visible_fields_for_user(user)
         visible_keys = {field.key for field in visible_fields}
         gallery_values = self.image_gallery_values(product)
         lines = [
@@ -12626,8 +12701,8 @@ class CatalogApplication:
         <section class="hero">
           <div class="panel">
             <div class="eyebrow">{html.escape(console_eyebrow)}</div>
-            <h1>C 部门字段开放设置</h1>
-            <p class="meta">这里决定运营部在所有已提交运营部资料里能看到哪些字段列，也可以管理给外部系统调用的只读 API 令牌。</p>
+            <h1>运营部 / 美工部字段开放设置</h1>
+            <p class="meta">这里决定运营部与美工部在已提交运营部资料里能看到哪些字段列，也可以管理给外部系统调用的只读 API 令牌。</p>
             <p class="meta">当前已开放 {len(selected)} 个字段。{html.escape(matching_text)}</p>
             {notice_block}
             {error_block}
@@ -12637,7 +12712,7 @@ class CatalogApplication:
             <div class="stats">
               <div class="stat-card"><span>已开放字段</span><strong>{len(selected)}</strong></div>
               <div class="stat-card"><span>字段模板</span><strong>{len(templates)}</strong></div>
-              <div class="stat-card"><span>API 令牌</span><strong>{'已启用' if api_token else '未启用'}</strong></div>
+              <div class="stat-card"><span>只读接口</span><strong>{'已启用' if api_token else '未启用'}</strong></div>
             </div>
           </div>
         </section>
@@ -12662,8 +12737,8 @@ class CatalogApplication:
               </div>
             </section>
             <section class="panel" style="margin-top:18px;">
-              <h2>C 部门 API 令牌</h2>
-              <p class="meta">外部系统可使用 `Authorization: Bearer &lt;token&gt;` 或 `?access_token=&lt;token&gt;` 调用 `/api/products`，返回内容始终按 C 部门开放字段裁剪。</p>
+              <h2>商品资料只读 API 令牌</h2>
+              <p class="meta">详情页制作工具等外部系统可使用 `Authorization: Bearer &lt;token&gt;` 或 `?access_token=&lt;token&gt;` 调用 `/api/products`，返回内容始终按运营部与美工部共用的开放字段裁剪。</p>
               <label class="field field-wide">
                 <span>当前令牌</span>
                 <input value="{html.escape(api_token or '当前未启用 API 令牌')}" readonly>
@@ -12678,8 +12753,8 @@ class CatalogApplication:
               </div>
             </section>
             <section class="panel c-field-access-card" style="margin-top:18px;">
-              <h2>运营部可见字段</h2>
-              <p class="meta">勾选后，运营部将在资料列表、详情、Excel 导出和只读接口中看到对应字段。</p>
+              <h2>运营部 / 美工部可见字段</h2>
+              <p class="meta">勾选后，运营部与美工部将在资料列表、详情、Excel 导出和只读接口中看到对应字段。</p>
               <div class="form-grid c-field-access-grid" style="margin-top:18px;">
                 {''.join(field_checkboxes)}
               </div>
