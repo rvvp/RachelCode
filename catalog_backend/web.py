@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from http import cookies
 from pathlib import Path
 from time import monotonic
-from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from catalog_backend import db
@@ -1195,9 +1195,19 @@ class CatalogApplication:
         if not self.planning_api_authorized(environ):
             return self.json_error_response(start_response, "unauthorized", "需要有效的商品企划内部 Token。", "401 Unauthorized")
         products = db.planning_source_image_payloads(self.db_path, [product_id])
-        if not products:
+        image_url = str(products[0].get("image_url") or "").strip() if products else ""
+        if not image_url:
+            # Planning keeps the source image address so an image can remain
+            # viewable while a catalog row is being archived or reconciled.
+            # Only the authenticated planning service may provide this hint;
+            # normal catalog records always take precedence above.
+            encoded_source = str(environ.get("HTTP_X_PLANNING_IMAGE_SOURCE") or "").strip()
+            try:
+                image_url = unquote(encoded_source) if encoded_source else ""
+            except (UnicodeDecodeError, ValueError):
+                image_url = ""
+        if not image_url:
             return self.json_error_response(start_response, "not_found", "当前商品没有可读取的藏宝阁图片。", "404 Not Found")
-        image_url = str(products[0].get("image_url") or "").strip()
         if image_url.startswith(MEDIA_URL_PREFIX):
             file_path = media_file_path(self.upload_dir, image_url)
             if not file_path.exists() or not file_path.is_file():

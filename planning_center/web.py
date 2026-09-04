@@ -7,7 +7,7 @@ import json
 import secrets
 from http import cookies
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, quote, urlencode
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -388,7 +388,14 @@ class PlanningApplication:
             raise ValueError("尚未配置藏宝阁内部 Token，无法读取商品图片。")
         request = Request(
             f"{self.catalog_api_url}/api/internal/planning/products/{product_id}/image",
-            headers={"Authorization": f"Bearer {self.catalog_api_token}", "Accept": "image/*"},
+            headers={
+                "Authorization": f"Bearer {self.catalog_api_token}",
+                "Accept": "image/*",
+                # The catalog remains authoritative when the product exists.
+                # This hint lets it recover a retained image for a stale source
+                # row whose catalog record is no longer queryable.
+                "X-Planning-Image-Source": quote(image_url, safe=""),
+            },
         )
         try:
             with urlopen(request, timeout=10) as response:

@@ -30,7 +30,7 @@ class PlanningCenterTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def wsgi_request(self, app, path, method="GET", body=b"", content_type="application/x-www-form-urlencoded", cookie="", authorization=""):
+    def wsgi_request(self, app, path, method="GET", body=b"", content_type="application/x-www-form-urlencoded", cookie="", authorization="", planning_image_source=""):
         environ = {}
         setup_testing_defaults(environ)
         if "?" in path:
@@ -40,6 +40,8 @@ class PlanningCenterTests(unittest.TestCase):
             environ["HTTP_COOKIE"] = cookie
         if authorization:
             environ["HTTP_AUTHORIZATION"] = authorization
+        if planning_image_source:
+            environ["HTTP_X_PLANNING_IMAGE_SOURCE"] = planning_image_source
         captured = {}
 
         def start_response(status, headers):
@@ -235,6 +237,35 @@ class PlanningCenterTests(unittest.TestCase):
             app,
             f"/api/internal/planning/products/{product['id']}/image",
             authorization="Bearer planning-secret",
+        )
+
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertEqual(response["body"], image_bytes)
+        self.assertEqual(dict(response["headers"])["Content-Type"], "image/png")
+
+    def test_internal_planning_image_api_uses_authenticated_source_hint_for_stale_product(self):
+        upload_dir = Path(self.temp.name) / "uploads"
+        upload_dir.mkdir()
+        image_bytes = b"\x89PNG\r\n\x1a\nsource-hint-image"
+        (upload_dir / "stale-planning.png").write_bytes(image_bytes)
+        product = next(
+            item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending"
+        )
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            connection.execute(
+                "UPDATE products SET lifecycle_status = 'archived', image_url = '' WHERE id = ?",
+                (product["id"],),
+            )
+        app = CatalogApplication(
+            self.catalog_db_path,
+            upload_dir,
+            planning_api_token="planning-secret",
+        )
+        response = self.wsgi_request(
+            app,
+            f"/api/internal/planning/products/{product['id']}/image",
+            authorization="Bearer planning-secret",
+            planning_image_source="/media/stale-planning.png",
         )
 
         self.assertTrue(response["status"].startswith("200"))
@@ -752,6 +783,7 @@ class PlanningCenterTests(unittest.TestCase):
         request = mocked_urlopen.call_args.args[0]
         self.assertEqual(request.full_url, "http://catalog.test/api/internal/planning/products/77/image")
         self.assertEqual(request.get_header("Authorization"), "Bearer planning-secret")
+        self.assertEqual(request.get_header("X-planning-image-source"), "%2Fmedia%2Fplanning-test.png")
 
     def test_planning_image_proxy_sniffs_opaque_external_jpeg(self):
         source = {
