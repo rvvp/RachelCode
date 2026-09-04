@@ -418,8 +418,12 @@ class PlanningApplication:
         product = db.get_source_product(self.db_path, product_id)
         if not product:
             raise LookupError("同步商品不存在，请先同步藏宝阁。")
-        category = str(form.get("category") or product.get("category_suggestion") or product.get("category") or "").strip()
-        category = db.validate_category_option(self.db_path, category)
+        category = str(form.get("category") or "").strip()
+        category = (
+            db.validate_category_option(self.db_path, category)
+            if category
+            else db.resolve_product_category(self.db_path, product)
+        )
         with db.get_connection(self.db_path) as connection:
             connection.execute("UPDATE source_products SET category = ? WHERE id = ?", (category, product_id))
         product["category"] = category
@@ -697,8 +701,7 @@ class PlanningApplication:
                         raise ValueError(f"{product['style_code'] or product['product_name']} 已有测算记录，无需重复生成。")
                     products.append(product)
             for product in products:
-                category = str(product.get("category_suggestion") or product.get("category") or "").strip()
-                product["category"] = db.validate_category_option(self.db_path, category)
+                product["category"] = db.resolve_product_category(self.db_path, product)
             created = db.create_pricing_records(
                 self.db_path,
                 products,

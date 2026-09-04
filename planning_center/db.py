@@ -567,6 +567,26 @@ def validate_category_option(db_path: str | Path, category: str) -> str:
     return str(row["name"])
 
 
+def resolve_product_category(db_path: str | Path, product: dict) -> str:
+    """Resolve a product category against the currently enabled rule options.
+
+    A product may carry a category suggestion generated before an administrator
+    changed the available options. Re-infer it from the current product name
+    whenever that stored value is no longer enabled, so historical sync data
+    continues to work after category rules are simplified or renamed.
+    """
+    options = list_category_options(db_path, enabled_only=True)
+    enabled_names = {str(option.get("name") or "").strip() for option in options}
+    for value in (product.get("category"), product.get("category_suggestion")):
+        stored_category = str(value or "").strip()
+        if stored_category in enabled_names:
+            return stored_category
+    inferred = infer_category(str(product.get("product_name") or ""), options)
+    if inferred:
+        return validate_category_option(db_path, inferred)
+    raise ValueError("请选择规则中已启用的品类选项。")
+
+
 def validate_channel_option(db_path: str | Path, channel: str) -> str:
     clean_channel = str(channel or "").strip()
     with get_connection(db_path) as connection:

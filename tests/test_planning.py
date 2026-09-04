@@ -1247,6 +1247,39 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(len(records), 101)
         self.assertEqual({record["calculated_price"] for record in records}, {399})
 
+    def test_batch_suggest_reinfers_stale_category_after_rule_options_change(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2027春夏", None, 600, 4)
+        product = {
+            "id": 3099,
+            "style_code": "STALE-CATEGORY-3099",
+            "style_color": "STALE-CATEGORY-3099-黑",
+            "product_name": "历史同步毛衣资料",
+            "season_year": "2027春夏",
+            "supplier": "历史品类供应商",
+            "category": "毛衣",
+            "actual_cost": 100,
+            "status": "pending",
+            "source_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [product])
+        old_option = next(item for item in planning_db.list_category_options(self.planning_db_path) if item["name"] == "毛衣")
+        planning_db.delete_category_option(self.planning_db_path, old_option["id"])
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+
+        response = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode({"batch_action": "suggest", "selection_scope": "selected", "suggest_ids": "3099"}).encode("utf-8"),
+            cookie=planner_cookie,
+        )
+
+        self.assertTrue(response["status"].startswith("302"))
+        record = planning_db.list_pricing_records(self.planning_db_path, season_year="2027春夏")[0]
+        self.assertEqual(record["category"], "其他品类")
+        self.assertEqual(record["calculated_price"], 399)
+
     def test_filtered_selection_runs_each_later_stage_across_pages_and_exports_history(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2028春夏", None, 600, 4)
         products = [
