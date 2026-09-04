@@ -1272,6 +1272,28 @@ def create_pricing_record(db_path: str | Path, product: dict, operator_name: str
     return create_pricing_records(db_path, [product], operator_name)[0]
 
 
+def reopen_confirmed_pricing_record(db_path: str | Path, record_id: int, operator_name: str) -> dict:
+    """Return a pre-publication record to the initial-review stage.
+
+    This is deliberately different from ``start_pricing_revision``: the latter
+    creates a new record for an already published product, while this action
+    keeps the current record and source snapshot intact for a correction before
+    publication.
+    """
+    with get_connection(db_path) as connection:
+        row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+        if not row:
+            raise LookupError("定价记录不存在。")
+        if row["status"] != "confirmed":
+            raise ValueError("只有“复核通过，待回传”的定价记录可以修改。")
+        connection.execute(
+            "UPDATE pricing_records SET status = 'suggested', operator_name = ?, confirmed_at = NULL, error_message = '' WHERE id = ?",
+            (operator_name, record_id),
+        )
+        updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+    return dict(updated)
+
+
 def start_pricing_revision(db_path: str | Path, source_product_id: int, operator_name: str) -> dict:
     """Reopen the same source product for a new planning review cycle."""
     source = get_source_product(db_path, source_product_id)

@@ -130,16 +130,40 @@ def initial_review_workbook_bytes(
                 category_options[index] if index < len(category_options) else "",
                 channel_options[index] if index < len(channel_options) else "",
                 (
-                    "可修改字段：初审品类、初审上新价、渠道划分。黄色列可编辑；"
-                    "为兼容 WPS 和 LibreOffice，初审表不启用整表保护，灰色资料列请勿修改；"
-                    "导入只保存初审资料，不会自动提交复核。"
+                    (
+                        "可修改字段：初审品类、初审上新价、渠道划分。黄色列可编辑；"
+                        "为兼容 WPS 和 LibreOffice，初审表不启用整表保护，灰色资料列请勿修改；"
+                        "导入只保存初审资料，不会自动提交复核。"
+                        if editable_rows
+                        else "当前工作簿为复核通过阶段的只读导出，仅用于人工二次检查；如需修改，请回到工作台点击条目中的“修改”，重新走初审与复核。"
+                    )
                     if index == 0
                     else ""
                 ),
             ]
         )
-    option_sheet.append(["", "", "操作提示：请直接编辑主表中的黄色单元格，不要整行粘贴，也不要修改表头和灰色资料列。"])
-    option_sheet.append(["", "", "初审上新价必须填写大于 0 的整数；品类和渠道请使用下拉选项。"])
+    option_sheet.append(
+        [
+            "",
+            "",
+            (
+                "操作提示：请直接编辑主表中的黄色单元格，不要整行粘贴，也不要修改表头和灰色资料列。"
+                if editable_rows
+                else "操作提示：本工作簿只用于二次检查，禁止修改或导入；发现错误请回到工作台使用“修改”按钮。"
+            ),
+        ]
+    )
+    option_sheet.append(
+        [
+            "",
+            "",
+            (
+                "初审上新价必须填写大于 0 的整数；品类和渠道请使用下拉选项。"
+                if editable_rows
+                else "复核通过阶段不接受 Excel 导入，只有重新完成初审与复核后才能回传藏宝阁。"
+            ),
+        ]
+    )
     for cell in option_sheet[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = header_fill
@@ -227,9 +251,13 @@ def parse_initial_review_workbook(file_obj) -> list[dict]:
         workbook = load_workbook(file_obj, data_only=True, read_only=False)
     except Exception as error:
         raise ValueError(f"无法读取 Excel，请确认文件为有效的 .xlsx 工作簿：{error}") from error
-    if "待初审资料" not in workbook.sheetnames:
+    worksheet_name = next(
+        (name for name in ("待初审资料", "上新审核资料") if name in workbook.sheetnames),
+        None,
+    )
+    if worksheet_name is None:
         raise ValueError("Excel 中缺少“待初审资料”工作表，请使用系统导出的文件。")
-    worksheet = workbook["待初审资料"]
+    worksheet = workbook[worksheet_name]
     headers = tuple(str(worksheet.cell(1, index).value or "").strip() for index in range(1, len(INITIAL_REVIEW_HEADERS) + 1))
     if headers != INITIAL_REVIEW_HEADERS:
         raise ValueError("Excel 表头已被修改，请使用系统导出的原始表头。")

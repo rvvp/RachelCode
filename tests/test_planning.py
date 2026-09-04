@@ -2299,6 +2299,103 @@ class PlanningCenterTests(unittest.TestCase):
         )
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "published")
 
+    def test_confirmed_stage_is_export_only_and_can_reopen_for_new_review(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        product = {
+            "id": 61,
+            "style_code": "PREPUBLISH-061",
+            "style_color": "PREPUBLISH-061-黑",
+            "image_url": "https://example.com/prepublish-061.jpg",
+            "product_name": "回传前修改测试款",
+            "season_year": "2026秋冬",
+            "supplier": "回传前修改供应商",
+            "category": "其他",
+            "actual_cost": 150,
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [product])
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+        record = planning_db.create_pricing_record(self.planning_db_path, product, "商品部企划员")
+        submitted = planning_db.submit_pricing_for_review(
+            self.planning_db_path,
+            record["id"],
+            599,
+            "商品部企划员",
+            "其他",
+            "天猫",
+        )
+        planning_db.approve_pricing_record(
+            self.planning_db_path,
+            submitted["id"],
+            599,
+            "天猫",
+            "企划管理员",
+        )
+
+        with patch.object(app, "fetch_catalog_products", return_value=[]):
+            confirmed_page = self.wsgi_request(
+                app,
+                "/workbench?status=confirmed",
+                cookie=planner_cookie,
+            )["body"].decode("utf-8")
+        self.assertIn(f"action='/pricing/{record['id']}/reopen'", confirmed_page)
+        self.assertIn(f"action='/pricing/{record['id']}/publish'", confirmed_page)
+        self.assertIn("复核通过阶段仅支持导出二次检查", confirmed_page)
+        self.assertNotIn("action='/pricing/import'", confirmed_page)
+
+        exported = self.wsgi_request(
+            app,
+            "/pricing/export.xlsx?status=confirmed&selection_scope=filtered",
+            cookie=planner_cookie,
+        )
+        self.assertTrue(exported["status"].startswith("200"))
+        workbook = load_workbook(io.BytesIO(exported["body"]))
+        sheet = workbook.active
+        self.assertEqual(workbook.sheetnames, ["上新审核资料", "填写说明"])
+        self.assertEqual(sheet["R2"].value, "复核通过，待回传")
+        self.assertTrue(sheet["O2"].protection.locked)
+        self.assertTrue(sheet["P2"].protection.locked)
+        self.assertTrue(sheet["Q2"].protection.locked)
+        self.assertTrue(sheet.protection.sheet)
+
+        # A confirmed workbook cannot be imported, even if a caller bypasses
+        # the hidden UI and posts a valid .xlsx directly.
+        body, content_type = self.workbook_multipart(exported["body"])
+        rejected_import = self.wsgi_request(
+            app,
+            "/pricing/import",
+            method="POST",
+            body=body,
+            content_type=content_type,
+            cookie=planner_cookie,
+        )
+        self.assertTrue(rejected_import["status"].startswith("400"))
+        self.assertIn("只允许导出检查，不能导入 Excel", rejected_import["body"].decode("utf-8"))
+
+        denied_reopen = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/reopen",
+            method="POST",
+            cookie=admin_cookie,
+        )
+        self.assertTrue(denied_reopen["status"].startswith("403"))
+        reopened = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/reopen",
+            method="POST",
+            cookie=planner_cookie,
+        )
+        self.assertTrue(reopened["status"].startswith("302"))
+        self.assertIn("status=suggested", dict(reopened["headers"])["Location"])
+        reopened_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+        self.assertEqual(reopened_record["status"], "suggested")
+        self.assertIsNone(reopened_record["confirmed_at"])
+        self.assertEqual(len(planning_db.list_pricing_records(self.planning_db_path)), 1)
+
     def test_batch_initial_review_approval_and_publication(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
         products = [
