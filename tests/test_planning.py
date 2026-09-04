@@ -253,7 +253,7 @@ class PlanningCenterTests(unittest.TestCase):
         initial = {
             "publication_id": "PC-REVISION-INITIAL",
             "source_version_no": source["current_version_no"],
-            "category": "毛衣",
+            "category": "其他",
             "launch_channel": "唯品",
             "launch_price": 599,
         }
@@ -340,7 +340,7 @@ class PlanningCenterTests(unittest.TestCase):
                 {
                     "publication_id": "PC-CONFIGURED-CHANNEL",
                     "source_version_no": source["current_version_no"],
-                    "category": "毛衣",
+                    "category": "其他",
                     "launch_channel": "直播首发",
                     "launch_price": 599,
                 }
@@ -473,7 +473,7 @@ class PlanningCenterTests(unittest.TestCase):
             "product_name": "修订测试毛衣",
             "season_year": "2026秋冬",
             "supplier": "修订供应商",
-            "category": "毛衣",
+            "category": "其他",
             "actual_cost": 150,
             "image_url": "https://example.com/images/rev-901.jpg",
             "status": "pending",
@@ -543,7 +543,7 @@ class PlanningCenterTests(unittest.TestCase):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋", None, 600, 4)
         product = {
             "id": 7, "style_code": "M001", "product_name": "测试毛衣", "season_year": "2026秋",
-            "supplier": "供应商 A", "category": "毛衣", "actual_cost": 150, "source_version_no": 3,
+            "supplier": "供应商 A", "category": "其他", "actual_cost": 150, "source_version_no": 3,
         }
         record = planning_db.create_pricing_record(self.planning_db_path, product, "测试企划员")
         self.assertEqual(record["raw_price"], 600)
@@ -562,7 +562,7 @@ class PlanningCenterTests(unittest.TestCase):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋", None, 600, 4)
         product = {
             "id": 10, "style_code": "M010", "product_name": "幂等测试", "season_year": "2026秋",
-            "supplier": "供应商 A", "category": "毛衣", "actual_cost": 150, "source_version_no": 1,
+            "supplier": "供应商 A", "category": "其他", "actual_cost": 150, "source_version_no": 1,
         }
         record = planning_db.create_pricing_record(self.planning_db_path, product, "测试企划员")
         updated = planning_db.mark_record_published(
@@ -616,12 +616,70 @@ class PlanningCenterTests(unittest.TestCase):
             fixed, coefficient = planning_db.resolve_rules(
                 self.planning_db_path,
                 "2026秋",
-                "毛衣",
+                "其他",
                 "供应商 A",
                 cost,
             )
             self.assertEqual(fixed, expected)
             self.assertEqual(coefficient, 1)
+
+    def test_every_non_dress_category_uses_the_shared_cost_range_rules(self):
+        planning_db.save_category_option(self.planning_db_path, "上衣", "上衣", 20)
+        planning_db.save_category_option(self.planning_db_path, "裤装", "裤装", 30)
+        planning_db.save_category_cost_rule(self.planning_db_path, "", None, 600, 4)
+        planning_db.save_category_cost_rule(self.planning_db_path, "", 600, None, 3.8)
+
+        for category in ("其他", "上衣", "裤装"):
+            fixed, coefficient = planning_db.resolve_rules(
+                self.planning_db_path,
+                "2026秋",
+                category,
+                "供应商 A",
+                620,
+            )
+            self.assertEqual(fixed, 3.8, category)
+            self.assertEqual(coefficient, 1, category)
+
+        planning_db.save_category_rule(self.planning_db_path, "", "连衣裙", 4.2)
+        fixed, _ = planning_db.resolve_rules(self.planning_db_path, "2026秋", "连衣裙", "供应商 A", 620)
+        self.assertEqual(fixed, 4.2)
+
+    def test_legacy_category_and_cost_rule_labels_are_migrated(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "", None, 600, 4)
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                "UPDATE category_cost_rules SET category = ?",
+                (planning_db.LEGACY_CATEGORY_FALLBACK_OPTION,),
+            )
+            connection.execute(
+                "UPDATE category_options SET name = ?, note = ? WHERE name = ?",
+                (
+                    planning_db.LEGACY_CATEGORY_FALLBACK_OPTION,
+                    "未命中其他关键词时的默认品类；使用成本区间倍率。",
+                    planning_db.CATEGORY_FALLBACK_OPTION,
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO category_options (name, keywords, pricing_group, sort_order, note, updated_at) VALUES (?, ?, 'other', ?, '', ?)",
+                [
+                    (name, keywords, sort_order, planning_db.utc_now())
+                    for name, (keywords, sort_order) in planning_db.LEGACY_DEFAULT_CATEGORY_OPTIONS.items()
+                ],
+            )
+
+        planning_db.init_db(self.planning_db_path)
+        option_names = [item["name"] for item in planning_db.list_category_options(self.planning_db_path)]
+        self.assertIn(planning_db.CATEGORY_FALLBACK_OPTION, option_names)
+        self.assertNotIn(planning_db.LEGACY_CATEGORY_FALLBACK_OPTION, option_names)
+        self.assertNotIn("毛衣", option_names)
+        self.assertNotIn("衬衫", option_names)
+        self.assertNotIn("外套", option_names)
+        self.assertNotIn("半身裙", option_names)
+        self.assertNotIn("裤装", option_names)
+        cost_rules = planning_db.list_category_cost_rules(self.planning_db_path)
+        self.assertEqual([item["category"] for item in cost_rules], [planning_db.NON_DRESS_PRICING_CATEGORY])
+        fixed, _ = planning_db.resolve_rules(self.planning_db_path, "2026秋", "其他", "供应商 A", 150)
+        self.assertEqual(fixed, 4)
 
     def test_other_category_cost_ranges_reject_overlap_and_allow_season_override(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "", None, 600, 4)
@@ -664,7 +722,7 @@ class PlanningCenterTests(unittest.TestCase):
             "调整首档",
             cost_rule["id"],
         )
-        fixed, _ = planning_db.resolve_rules(self.planning_db_path, "2026秋冬", "毛衣", "供应商 A", 620)
+        fixed, _ = planning_db.resolve_rules(self.planning_db_path, "2026秋冬", "其他", "供应商 A", 620)
         self.assertEqual(fixed, 4.1)
 
         planning_db.save_supplier_coefficient(self.planning_db_path, "", "供应商 A", 1.0, "默认")
@@ -688,6 +746,8 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(planning_db.list_supplier_coefficients(self.planning_db_path), [])
 
     def test_rule_page_explains_category_and_cost_logic(self):
+        category_names = [item["name"] for item in planning_db.list_category_options(self.planning_db_path)]
+        self.assertEqual(category_names, ["连衣裙", "其他"])
         app = PlanningApplication(self.planning_db_path, "http://catalog.test")
         login = self.wsgi_request(
             app,
@@ -699,7 +759,7 @@ class PlanningCenterTests(unittest.TestCase):
         response = self.wsgi_request(app, "/rules", cookie=cookie)
         page = response["body"].decode("utf-8")
         self.assertIn("连衣裙固定倍率", page)
-        self.assertIn("其他品类成本区间倍率", page)
+        self.assertIn("非连衣裙品类倍率", page)
         self.assertIn("下限包含，上限不包含", page)
         self.assertIn("可按实际业务新增任意数量的成本区间", page)
         self.assertIn("规则维护账号", page)
@@ -824,7 +884,7 @@ class PlanningCenterTests(unittest.TestCase):
         planning_db.upsert_source_products(self.planning_db_path, products)
         self.assertEqual(planning_db.get_source_product(self.planning_db_path, 61)["category_suggestion"], "西装")
         self.assertEqual(planning_db.get_source_product(self.planning_db_path, 62)["category"], "连衣裙")
-        self.assertEqual(planning_db.get_source_product(self.planning_db_path, 63)["category"], "其他品类")
+        self.assertEqual(planning_db.get_source_product(self.planning_db_path, 63)["category"], "其他")
 
     def test_initial_review_can_change_category_recalculate_and_select_channel(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
@@ -835,7 +895,7 @@ class PlanningCenterTests(unittest.TestCase):
             "product_name": "基础毛衣",
             "season_year": "2026秋冬",
             "supplier": "测试供应商",
-            "category": "毛衣",
+            "category": "其他",
             "actual_cost": 150,
             "status": "pending",
             "lifecycle_status": "active",
@@ -1065,7 +1125,7 @@ class PlanningCenterTests(unittest.TestCase):
         login = self.wsgi_request(app, "/login", method="POST", body=urlencode({"username": "planner", "password": "demo123"}).encode())
         self.assertTrue(login["status"].startswith("302"))
         cookie = dict(login["headers"])["Set-Cookie"].split(";", 1)[0]
-        source = {"id": 9, "style_code": "M009", "product_name": "测试款", "season_year": "2026秋", "supplier": "供应商", "category": "毛衣", "actual_cost": 150, "tax_included_price": 150, "status": "pending", "lifecycle_status": "active", "source_version_no": 1, "updated_at": "", "creator_name": "跟单员"}
+        source = {"id": 9, "style_code": "M009", "product_name": "测试款", "season_year": "2026秋", "supplier": "供应商", "category": "其他", "actual_cost": 150, "tax_included_price": 150, "status": "pending", "lifecycle_status": "active", "source_version_no": 1, "updated_at": "", "creator_name": "跟单员"}
         withdrawn_source = dict(source, id=10, style_code="M010", product_name="误同步的已完成款")
         planning_db.upsert_source_products(self.planning_db_path, [withdrawn_source])
         catalog_payload = {"items": [source], "withdrawn_ids": [10]}
@@ -1090,7 +1150,7 @@ class PlanningCenterTests(unittest.TestCase):
             "product_name": "待商品部填写毛衣",
             "season_year": "2026秋冬",
             "supplier": "同步供应商",
-            "category": "毛衣",
+            "category": "其他",
             "actual_cost": 150,
             "tax_included_price": 150,
             "status": "pending",
@@ -1256,13 +1316,16 @@ class PlanningCenterTests(unittest.TestCase):
             "product_name": "历史同步毛衣资料",
             "season_year": "2027春夏",
             "supplier": "历史品类供应商",
-            "category": "毛衣",
+            "category": "其他",
             "actual_cost": 100,
             "status": "pending",
             "source_version_no": 1,
         }
         planning_db.upsert_source_products(self.planning_db_path, [product])
-        old_option = next(item for item in planning_db.list_category_options(self.planning_db_path) if item["name"] == "毛衣")
+        planning_db.save_category_option(self.planning_db_path, "历史品类", "历史同步毛衣", 80)
+        product["category"] = "历史品类"
+        planning_db.upsert_source_products(self.planning_db_path, [product])
+        old_option = next(item for item in planning_db.list_category_options(self.planning_db_path) if item["name"] == "历史品类")
         planning_db.delete_category_option(self.planning_db_path, old_option["id"])
         app = PlanningApplication(self.planning_db_path, "http://catalog.test")
         planner_cookie = self.login_cookie(app, "planner")
@@ -1277,7 +1340,7 @@ class PlanningCenterTests(unittest.TestCase):
 
         self.assertTrue(response["status"].startswith("302"))
         record = planning_db.list_pricing_records(self.planning_db_path, season_year="2027春夏")[0]
-        self.assertEqual(record["category"], "其他品类")
+        self.assertEqual(record["category"], "其他")
         self.assertEqual(record["calculated_price"], 399)
 
     def test_filtered_selection_runs_each_later_stage_across_pages_and_exports_history(self):
@@ -1290,7 +1353,7 @@ class PlanningCenterTests(unittest.TestCase):
                 "product_name": f"全流程跨页毛衣 {index}",
                 "season_year": "2028春夏",
                 "supplier": "全流程测试供应商",
-                "category": "毛衣",
+                "category": "其他",
                 "actual_cost": 100,
                 "status": "pending",
                 "source_version_no": 1,
@@ -1447,7 +1510,7 @@ class PlanningCenterTests(unittest.TestCase):
                 "product_name": "Excel 测试毛衣",
                 "season_year": "2027秋冬",
                 "supplier": "Excel 测试供应商",
-                "category": "毛衣",
+                "category": "其他",
                 "actual_cost": 150,
                 "status": "pending",
                 "source_version_no": 3,
@@ -1459,7 +1522,7 @@ class PlanningCenterTests(unittest.TestCase):
                 "product_name": "Excel 测试开衫",
                 "season_year": "2027秋冬",
                 "supplier": "Excel 测试供应商",
-                "category": "毛衣",
+                "category": "其他",
                 "actual_cost": 120,
                 "status": "pending",
                 "source_version_no": 1,
@@ -1548,7 +1611,7 @@ class PlanningCenterTests(unittest.TestCase):
                 "product_name": f"版本测试毛衣 {index}",
                 "season_year": "2027春",
                 "supplier": "版本测试供应商",
-                "category": "毛衣",
+            "category": "其他",
                 "actual_cost": 100,
                 "status": "pending",
                 "source_version_no": 1,
@@ -1605,7 +1668,7 @@ class PlanningCenterTests(unittest.TestCase):
             "product_name": "审核测试款",
             "season_year": "2026秋冬",
             "supplier": "供应商审核",
-            "category": "毛衣",
+            "category": "其他",
             "actual_cost": 150,
             "tax_included_price": 150,
             "status": "pending",
@@ -1628,7 +1691,7 @@ class PlanningCenterTests(unittest.TestCase):
             app,
             "/pricing/suggest",
             method="POST",
-            body=urlencode({"product_id": "31", "category": "毛衣"}).encode(),
+            body=urlencode({"product_id": "31", "category": "其他"}).encode(),
             cookie=planner_cookie,
         )
         self.assertTrue(suggest["status"].startswith("302"))
@@ -1704,7 +1767,7 @@ class PlanningCenterTests(unittest.TestCase):
             app,
             f"/pricing/{record['id']}/submit-review",
             method="POST",
-            body=urlencode({"launch_price": "589.5", "category": "毛衣", "channel": "天猫"}).encode(),
+            body=urlencode({"launch_price": "589.5", "category": "其他", "channel": "天猫"}).encode(),
             cookie=planner_cookie,
         )
         self.assertTrue(rejected_fractional["status"].startswith("400"))
@@ -1715,7 +1778,7 @@ class PlanningCenterTests(unittest.TestCase):
             app,
             f"/pricing/{record['id']}/submit-review",
             method="POST",
-            body=urlencode({"launch_price": "2539", "category": "毛衣", "channel": "天猫"}).encode(),
+            body=urlencode({"launch_price": "2539", "category": "其他", "channel": "天猫"}).encode(),
             cookie=planner_cookie,
         )
         self.assertTrue(submitted["status"].startswith("302"))
@@ -1859,7 +1922,7 @@ class PlanningCenterTests(unittest.TestCase):
                 "product_name": f"批量测试款 {product_id}",
                 "season_year": "2026秋冬",
                 "supplier": "批量供应商",
-                "category": "毛衣",
+                "category": "其他",
                 "actual_cost": 150,
                 "status": "pending",
                 "source_version_no": 1,
@@ -1946,8 +2009,8 @@ class PlanningCenterTests(unittest.TestCase):
                     ("submit_review_ids", str(second["id"])),
                     (f"launch_price_{first['id']}", "609"),
                     (f"launch_price_{second['id']}", "619"),
-                    (f"category_{first['id']}", "毛衣"),
-                    (f"category_{second['id']}", "毛衣"),
+                    (f"category_{first['id']}", "其他"),
+                    (f"category_{second['id']}", "其他"),
                     (f"channel_{first['id']}", "天猫"),
                     (f"channel_{second['id']}", "唯品"),
                 ]
@@ -2070,7 +2133,7 @@ class PlanningCenterTests(unittest.TestCase):
             "product_name": "默认测算价",
             "season_year": "2026秋冬",
             "supplier": "供应商",
-            "category": "毛衣",
+            "category": "其他",
             "actual_cost": 150,
             "source_version_no": 1,
         }
@@ -2082,7 +2145,7 @@ class PlanningCenterTests(unittest.TestCase):
             app,
             f"/pricing/{record['id']}/submit-review",
             method="POST",
-            body=urlencode({"category": "毛衣", "channel": "同款"}).encode(),
+            body=urlencode({"category": "其他", "channel": "同款"}).encode(),
             cookie=self.login_cookie(app, "planner"),
         )
         self.assertTrue(response["status"].startswith("302"))

@@ -14,6 +14,21 @@ DEMO_PASSWORD = "demo123"
 PASSWORD_MIN_LENGTH = 8
 UTC = timezone.utc
 
+# Category option names and pricing rule groups are intentionally separate.
+# "其他" is a selectable fallback category; all non-dress categories use the
+# shared cost-range pricing group "非连衣裙品类".
+DRESS_PRICING_CATEGORY = "连衣裙"
+NON_DRESS_PRICING_CATEGORY = "非连衣裙品类"
+CATEGORY_FALLBACK_OPTION = "其他"
+LEGACY_CATEGORY_FALLBACK_OPTION = "其他品类"
+LEGACY_DEFAULT_CATEGORY_OPTIONS = {
+    "毛衣": ("针织衫,毛衣,针织上衣", 20),
+    "衬衫": ("衬衫,衬衣", 30),
+    "外套": ("外套,大衣,风衣,夹克", 40),
+    "半身裙": ("半身裙", 50),
+    "裤装": ("裤装,裤子,长裤,短裤", 60),
+}
+
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -111,7 +126,7 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
             CREATE TABLE IF NOT EXISTS category_cost_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 season_year TEXT NOT NULL DEFAULT '',
-                category TEXT NOT NULL DEFAULT '其他品类',
+                category TEXT NOT NULL DEFAULT '非连衣裙品类',
                 lower_cost REAL,
                 upper_cost REAL,
                 multiplier REAL NOT NULL,
@@ -178,6 +193,45 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
             connection.execute("UPDATE pricing_records SET calculated_price = launch_price WHERE calculated_price IS NULL")
         if "channel" not in pricing_columns:
             connection.execute("ALTER TABLE pricing_records ADD COLUMN channel TEXT NOT NULL DEFAULT ''")
+
+        # Migrate the old shared label without changing pricing history. The
+        # category option and cost-rule group now have distinct meanings.
+        connection.execute(
+            "UPDATE category_cost_rules SET category = ? WHERE category = ?",
+            (NON_DRESS_PRICING_CATEGORY, LEGACY_CATEGORY_FALLBACK_OPTION),
+        )
+        legacy_fallback = connection.execute(
+            "SELECT id, note FROM category_options WHERE name = ?",
+            (LEGACY_CATEGORY_FALLBACK_OPTION,),
+        ).fetchone()
+        current_fallback = connection.execute(
+            "SELECT id FROM category_options WHERE name = ?",
+            (CATEGORY_FALLBACK_OPTION,),
+        ).fetchone()
+        if legacy_fallback:
+            if current_fallback:
+                # Keep the explicitly named fallback and remove the duplicate
+                # legacy option. Historical product/pricing rows are not FK
+                # constrained and remain available for audit.
+                connection.execute("DELETE FROM category_options WHERE id = ?", (int(legacy_fallback["id"]),))
+            else:
+                legacy_note = str(legacy_fallback["note"] or "").strip()
+                migrated_note = (
+                    "未命中其他关键词时的默认分类；定价时使用非连衣裙品类成本区间倍率。"
+                    if not legacy_note or LEGACY_CATEGORY_FALLBACK_OPTION in legacy_note
+                    else legacy_note
+                )
+                connection.execute(
+                    "UPDATE category_options SET name = ?, note = ?, updated_at = ? WHERE id = ?",
+                    (CATEGORY_FALLBACK_OPTION, migrated_note, utc_now(), int(legacy_fallback["id"])),
+                )
+        # Remove only the exact early demo rows. Any category maintained by a
+        # user with different keywords, ordering, or notes is preserved.
+        for name, (keywords, sort_order) in LEGACY_DEFAULT_CATEGORY_OPTIONS.items():
+            connection.execute(
+                "DELETE FROM category_options WHERE name = ? AND keywords = ? AND sort_order = ? AND note = ''",
+                (name, keywords, sort_order),
+            )
         if seed_demo and connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             now = utc_now()
             connection.executemany(
@@ -208,12 +262,7 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
                 "INSERT INTO category_options (name, keywords, pricing_group, sort_order, note, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 [
                     ("连衣裙", "连衣裙,裙装,裙子", "dress", 10, "命中关键词时自动判定；使用连衣裙固定倍率。", now),
-                    ("毛衣", "针织衫,毛衣,针织上衣", "other", 20, "", now),
-                    ("衬衫", "衬衫,衬衣", "other", 30, "", now),
-                    ("外套", "外套,大衣,风衣,夹克", "other", 40, "", now),
-                    ("半身裙", "半身裙", "other", 50, "", now),
-                    ("裤装", "裤装,裤子,长裤,短裤", "other", 60, "", now),
-                    ("其他品类", "", "other", 999, "未命中其他关键词时的默认品类；使用成本区间倍率。", now),
+                    (CATEGORY_FALLBACK_OPTION, "", "other", 999, "未命中当前品类选项关键词时的默认分类；定价时使用非连衣裙品类成本区间倍率。", now),
                 ],
             )
         for row in connection.execute(
@@ -221,6 +270,10 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
             "UNION SELECT DISTINCT TRIM(category) AS name FROM pricing_records WHERE TRIM(category) != ''"
         ).fetchall():
             name = str(row["name"] or "").strip()
+            if name == LEGACY_CATEGORY_FALLBACK_OPTION:
+                name = CATEGORY_FALLBACK_OPTION
+            if name in LEGACY_DEFAULT_CATEGORY_OPTIONS:
+                continue
             if name:
                 connection.execute(
                     "INSERT OR IGNORE INTO category_options (name, keywords, pricing_group, sort_order, note, updated_at) VALUES (?, ?, ?, 500, '', ?)",
@@ -461,6 +514,8 @@ def save_category_option(
         raise ValueError("品类名称不能为空。")
     if len(clean_name) > 40:
         raise ValueError("品类名称不能超过 40 个字符。")
+    if clean_name in {NON_DRESS_PRICING_CATEGORY, LEGACY_CATEGORY_FALLBACK_OPTION}:
+        raise ValueError("“非连衣裙品类”是定价规则组，不是品类选项；未命中时请使用“其他”。")
     clean_keywords = str(keywords or "").strip()
     pricing_group = "dress" if clean_name == "连衣裙" else "other"
     order = _option_sort_order(sort_order)
@@ -488,6 +543,11 @@ def save_category_option(
 
 def delete_category_option(db_path: str | Path, option_id: int) -> None:
     with get_connection(db_path) as connection:
+        option = connection.execute("SELECT name FROM category_options WHERE id = ?", (int(option_id),)).fetchone()
+        if not option:
+            raise LookupError("品类选项不存在。")
+        if str(option["name"] or "").strip() == CATEGORY_FALLBACK_OPTION:
+            raise ValueError("默认品类“其他”不能删除，请保留它作为未命中时的兜底分类。")
         cursor = connection.execute("DELETE FROM category_options WHERE id = ?", (int(option_id),))
         if cursor.rowcount != 1:
             raise LookupError("品类选项不存在。")
@@ -547,8 +607,8 @@ def infer_category(product_name: str, options: list[dict]) -> str:
         if not option.get("enabled", 1):
             continue
         name = str(option.get("name") or "").strip()
-        if name == "其他品类":
-            fallback = name
+        if name in {CATEGORY_FALLBACK_OPTION, LEGACY_CATEGORY_FALLBACK_OPTION}:
+            fallback = CATEGORY_FALLBACK_OPTION
         for keyword in _category_keywords(option.get("keywords", "")):
             if keyword.casefold() in clean_name:
                 matches.append((len(keyword), -int(option.get("sort_order") or 0), name))
@@ -784,7 +844,13 @@ def synchronize_source_products(
 
 def list_category_rules(db_path: str | Path) -> list[dict]:
     with get_connection(db_path) as connection:
-        return [dict(row) for row in connection.execute("SELECT * FROM category_rules WHERE category = '连衣裙' ORDER BY season_year").fetchall()]
+        return [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM category_rules WHERE category = ? ORDER BY season_year",
+                (DRESS_PRICING_CATEGORY,),
+            ).fetchall()
+        ]
 
 
 def list_category_cost_rules(db_path: str | Path) -> list[dict]:
@@ -792,7 +858,8 @@ def list_category_cost_rules(db_path: str | Path) -> list[dict]:
         return [
             dict(row)
             for row in connection.execute(
-                "SELECT * FROM category_cost_rules WHERE category = '其他品类' ORDER BY season_year, lower_cost IS NOT NULL, lower_cost, upper_cost"
+                "SELECT * FROM category_cost_rules WHERE category = ? ORDER BY season_year, lower_cost IS NOT NULL, lower_cost, upper_cost",
+                (NON_DRESS_PRICING_CATEGORY,),
             ).fetchall()
         ]
 
@@ -810,8 +877,8 @@ def save_category_rule(
     note: str = "",
     rule_id: int | None = None,
 ) -> None:
-    if category.strip() != "连衣裙":
-        raise ValueError("固定倍率只适用于“连衣裙”，其他品类请按成本区间配置。")
+    if category.strip() != DRESS_PRICING_CATEGORY:
+        raise ValueError("固定倍率只适用于“连衣裙”，非连衣裙品类请按成本区间配置。")
     if not math.isfinite(float(multiplier)) or multiplier <= 0:
         raise ValueError("连衣裙固定倍率必须大于 0。")
     with get_connection(db_path) as connection:
@@ -819,39 +886,39 @@ def save_category_rule(
         now = utc_now()
         if rule_id is not None:
             target = connection.execute(
-                "SELECT id FROM category_rules WHERE id = ? AND category = '连衣裙'",
-                (int(rule_id),),
+                "SELECT id FROM category_rules WHERE id = ? AND category = ?",
+                (int(rule_id), DRESS_PRICING_CATEGORY),
             ).fetchone()
             if not target:
                 raise LookupError("连衣裙固定倍率规则不存在。")
             duplicate = connection.execute(
-                "SELECT id FROM category_rules WHERE season_year = ? AND category = '连衣裙' AND id != ?",
-                (clean_season, int(rule_id)),
+                "SELECT id FROM category_rules WHERE season_year = ? AND category = ? AND id != ?",
+                (clean_season, DRESS_PRICING_CATEGORY, int(rule_id)),
             ).fetchone()
             if duplicate:
                 raise ValueError("该季节已存在连衣裙固定倍率，请编辑已有规则。")
             connection.execute(
-                "UPDATE category_rules SET season_year = ?, category = ?, multiplier = ?, note = ?, updated_at = ?, enabled = 1 WHERE id = ? AND category = '连衣裙'",
-                (clean_season, category.strip(), float(multiplier), note.strip(), now, int(rule_id)),
+                "UPDATE category_rules SET season_year = ?, category = ?, multiplier = ?, note = ?, updated_at = ?, enabled = 1 WHERE id = ? AND category = ?",
+                (clean_season, DRESS_PRICING_CATEGORY, float(multiplier), note.strip(), now, int(rule_id), DRESS_PRICING_CATEGORY),
             )
             return
         existing = connection.execute(
-            "SELECT id FROM category_rules WHERE season_year = ? AND category = '连衣裙'",
-            (clean_season,),
+            "SELECT id FROM category_rules WHERE season_year = ? AND category = ?",
+            (clean_season, DRESS_PRICING_CATEGORY),
         ).fetchone()
         if existing:
             raise ValueError("该季节已存在连衣裙固定倍率，请点击编辑已有规则。")
         connection.execute(
             "INSERT INTO category_rules (season_year, category, multiplier, note, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (clean_season, category.strip(), float(multiplier), note.strip(), now),
+            (clean_season, DRESS_PRICING_CATEGORY, float(multiplier), note.strip(), now),
         )
 
 
 def delete_category_rule(db_path: str | Path, rule_id: int) -> None:
     with get_connection(db_path) as connection:
         cursor = connection.execute(
-            "DELETE FROM category_rules WHERE id = ? AND category = '连衣裙'",
-            (int(rule_id),),
+            "DELETE FROM category_rules WHERE id = ? AND category = ?",
+            (int(rule_id), DRESS_PRICING_CATEGORY),
         )
         if cursor.rowcount != 1:
             raise LookupError("连衣裙固定倍率规则不存在。")
@@ -895,21 +962,21 @@ def save_category_cost_rule(
     if lower is not None and upper is not None and lower >= upper:
         raise ValueError("成本区间必须满足下限小于上限；上限不包含。")
     if not math.isfinite(float(multiplier)) or multiplier <= 0:
-        raise ValueError("其他品类成本区间倍率必须大于 0。")
+        raise ValueError("非连衣裙品类倍率必须大于 0。")
     clean_season = season_year.strip()
     candidate = {"lower_cost": lower, "upper_cost": upper}
     with get_connection(db_path) as connection:
         existing_rows = [
             dict(row)
             for row in connection.execute(
-                "SELECT * FROM category_cost_rules WHERE season_year = ? AND category = '其他品类' AND enabled = 1 AND (? IS NULL OR id != ?)",
-                (clean_season, rule_id, rule_id),
+                "SELECT * FROM category_cost_rules WHERE season_year = ? AND category = ? AND enabled = 1 AND (? IS NULL OR id != ?)",
+                (clean_season, NON_DRESS_PRICING_CATEGORY, rule_id, rule_id),
             ).fetchall()
         ]
         for row in existing_rows:
             same_range = row.get("lower_cost") == lower and row.get("upper_cost") == upper
             if not same_range and _cost_ranges_overlap(candidate, row):
-                raise ValueError("其他品类的成本区间与已有规则重叠，请调整边界。")
+                raise ValueError("非连衣裙品类的成本区间与已有规则重叠，请调整边界。")
         now = utc_now()
         matching = next(
             (
@@ -923,29 +990,29 @@ def save_category_cost_rule(
             if matching:
                 raise ValueError("该成本区间已存在，请编辑已有规则。")
             target = connection.execute(
-                "SELECT id FROM category_cost_rules WHERE id = ? AND category = '其他品类'",
-                (int(rule_id),),
+                "SELECT id FROM category_cost_rules WHERE id = ? AND category = ?",
+                (int(rule_id), NON_DRESS_PRICING_CATEGORY),
             ).fetchone()
             if not target:
                 raise LookupError("成本区间规则不存在。")
             connection.execute(
-                "UPDATE category_cost_rules SET season_year = ?, lower_cost = ?, upper_cost = ?, multiplier = ?, note = ?, updated_at = ?, enabled = 1 WHERE id = ? AND category = '其他品类'",
-                (clean_season, lower, upper, float(multiplier), note.strip(), now, int(rule_id)),
+                "UPDATE category_cost_rules SET season_year = ?, lower_cost = ?, upper_cost = ?, multiplier = ?, note = ?, updated_at = ?, enabled = 1 WHERE id = ? AND category = ?",
+                (clean_season, lower, upper, float(multiplier), note.strip(), now, int(rule_id), NON_DRESS_PRICING_CATEGORY),
             )
             return
         if matching:
             raise ValueError("该成本区间已存在，请点击编辑已有规则。")
         connection.execute(
-            "INSERT INTO category_cost_rules (season_year, category, lower_cost, upper_cost, multiplier, note, updated_at) VALUES (?, '其他品类', ?, ?, ?, ?, ?)",
-            (clean_season, lower, upper, float(multiplier), note.strip(), now),
+            "INSERT INTO category_cost_rules (season_year, category, lower_cost, upper_cost, multiplier, note, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (clean_season, NON_DRESS_PRICING_CATEGORY, lower, upper, float(multiplier), note.strip(), now),
         )
 
 
 def delete_category_cost_rule(db_path: str | Path, rule_id: int) -> None:
     with get_connection(db_path) as connection:
         cursor = connection.execute(
-            "DELETE FROM category_cost_rules WHERE id = ? AND category = '其他品类'",
-            (int(rule_id),),
+            "DELETE FROM category_cost_rules WHERE id = ? AND category = ?",
+            (int(rule_id), NON_DRESS_PRICING_CATEGORY),
         )
         if cursor.rowcount != 1:
             raise LookupError("成本区间规则不存在。")
@@ -1006,18 +1073,18 @@ def delete_supplier_coefficient(db_path: str | Path, rule_id: int) -> None:
 
 def resolve_rules(db_path: str | Path, season_year: str, category: str, supplier: str, cost: float | None = None) -> tuple[float | None, float]:
     clean_season = season_year.strip()
-    category_type = "连衣裙" if category.strip() == "连衣裙" else "其他品类"
+    category_type = DRESS_PRICING_CATEGORY if category.strip() == DRESS_PRICING_CATEGORY else NON_DRESS_PRICING_CATEGORY
     with get_connection(db_path) as connection:
         category_row = None
-        if category_type == "连衣裙":
+        if category_type == DRESS_PRICING_CATEGORY:
             category_row = connection.execute(
-                "SELECT season_year, multiplier FROM category_rules WHERE category = '连衣裙' AND season_year IN (?, '') AND enabled = 1 ORDER BY CASE WHEN season_year = ? THEN 0 ELSE 1 END LIMIT 1",
-                (clean_season, clean_season),
+                "SELECT season_year, multiplier FROM category_rules WHERE category = ? AND season_year IN (?, '') AND enabled = 1 ORDER BY CASE WHEN season_year = ? THEN 0 ELSE 1 END LIMIT 1",
+                (DRESS_PRICING_CATEGORY, clean_season, clean_season),
             ).fetchone()
         elif cost is not None:
             candidates = connection.execute(
-                "SELECT season_year, lower_cost, upper_cost, multiplier FROM category_cost_rules WHERE category = '其他品类' AND season_year IN (?, '') AND enabled = 1",
-                (clean_season,),
+                "SELECT season_year, lower_cost, upper_cost, multiplier FROM category_cost_rules WHERE category = ? AND season_year IN (?, '') AND enabled = 1",
+                (NON_DRESS_PRICING_CATEGORY, clean_season),
             ).fetchall()
             matching = []
             for row in candidates:
@@ -1058,9 +1125,9 @@ def calculate_pricing(
         raise ValueError("请先选择品类，再生成测算上新价。")
     fixed, coefficient = resolve_rules(db_path, str(season_year or ""), clean_category, str(supplier or ""), float(cost))
     if fixed is None:
-        if clean_category == "连衣裙":
+        if clean_category == DRESS_PRICING_CATEGORY:
             raise ValueError("连衣裙尚未配置固定倍率，请先到规则中配置。")
-        raise ValueError(f"其他品类成本 {float(cost):g} 尚未落入成本区间倍率规则，请先到规则中配置。")
+        raise ValueError(f"非连衣裙品类成本 {float(cost):g} 尚未落入成本区间倍率规则，请先到规则中配置。")
     raw = float(cost) * fixed * coefficient
     return {
         "category": clean_category,
@@ -1075,7 +1142,7 @@ def create_pricing_records(db_path: str | Path, products: list[dict], operator_n
     prepared = []
     for product in products:
         cost = product.get("actual_cost")
-        category = str(product.get("category") or product.get("category_suggestion") or "").strip()
+        category = resolve_product_category(db_path, product)
         calculation = calculate_pricing(
             db_path,
             product.get("season_year", ""),

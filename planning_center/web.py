@@ -956,7 +956,7 @@ class PlanningApplication:
             form.get("note", ""),
             rule_id,
         )
-        message = "其他品类成本区间倍率已修改。" if rule_id else "其他品类成本区间倍率已新增。"
+        message = "非连衣裙品类倍率已修改。" if rule_id else "非连衣裙品类倍率已新增。"
         return self.redirect(start_response, "/rules?notice=" + self.q(message) + "#cost-rules")
 
     def handle_category_cost_rule_delete(self, start_response, user, rule_id: int):
@@ -1763,7 +1763,7 @@ class PlanningApplication:
         supplier_edit = selected(suppliers, "edit_supplier") if can_manage else None
 
         category_option_rows = "".join(
-            f"<tr><td><strong>{html.escape(item['name'])}</strong><small>{'连衣裙固定倍率' if item['pricing_group'] == 'dress' else '其他品类成本区间倍率'}</small></td><td>{html.escape(item['keywords'] or '未配置，作为人工选项')}</td><td>{int(item['sort_order'])}</td><td>{html.escape(item['note'])}</td>"
+            f"<tr><td><strong>{html.escape(item['name'])}</strong><small>{'连衣裙固定倍率' if item['pricing_group'] == 'dress' else '非连衣裙品类倍率'}</small></td><td>{html.escape(item['keywords'] or '未配置，作为人工选项')}</td><td>{int(item['sort_order'])}</td><td>{html.escape(item['note'])}</td>"
             + (
                 f"<td><div class='rule-actions'><a class='button compact-button' href='/rules?edit_category_option={item['id']}#category-options'>编辑</a><form method='post' action='/rules/category-option/{item['id']}/delete' onsubmit=\"return confirm('确定删除这个品类选项吗？');\"><button class='danger-button' type='submit'>删除</button></form></div></td>"
                 if can_manage
@@ -1874,11 +1874,11 @@ class PlanningApplication:
         <section class='page-heading'><div><div class='eyebrow'>RULES & ASSUMPTIONS</div><h1>规则</h1><p>统一维护品类、渠道和定价计算规则。定价规则调整后只影响新生成或初审时重新测算的价格。</p></div></section>
         {self.alert(query.get('notice', ''), 'success') if query.get('notice') else ''}
         <section class='rule-access {access_class}'><div><strong>{'规则维护账号' if can_manage else '规则只读账号'}</strong><span>{access_text}</span></div><small>维护权限：企划管理员</small></section>
-        <section class='rule-logic'><div><span>01</span><strong>商品名判定品类</strong><p>同步时按品类匹配词自动判定，初审人员可以确认或修改。</p></div><div><span>02</span><strong>规则计算</strong><p>连衣裙使用固定倍率，其余品类按照含税成本区间匹配倍率。</p></div><div><span>03</span><strong>渠道划分</strong><p>渠道选项提前维护，由商品部初审人员人工选择。</p></div></section>
-        <section class='panel' id='category-options'><div class='panel-head'><div><div class='eyebrow'>CATEGORY OPTIONS</div><h2>品类选项</h2></div><span class='hint'>用于自动判定与初审选择</span></div>{category_option_form}<p class='range-help'>系统按商品名称匹配关键词，多个关键词可用逗号或换行分隔；同时命中时优先采用更长的关键词。“其他品类”可作为未命中时的默认选项。</p><div class='table-wrap'><table><thead><tr><th>品类</th><th>商品名匹配词</th><th>排序</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{category_option_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置品类选项。</td></tr>'}</tbody></table></div></section>
+        <section class='rule-logic'><div><span>01</span><strong>商品名判定品类</strong><p>同步时按当前启用的品类匹配词自动判定，初审人员可以确认或修改。</p></div><div><span>02</span><strong>规则计算</strong><p>连衣裙使用固定倍率；除连衣裙外的所有品类按照“非连衣裙品类倍率”匹配含税成本区间。</p></div><div><span>03</span><strong>渠道划分</strong><p>渠道选项提前维护，由商品部初审人员人工选择。</p></div></section>
+        <section class='panel' id='category-options'><div class='panel-head'><div><div class='eyebrow'>CATEGORY OPTIONS</div><h2>品类选项</h2></div><span class='hint'>用于自动判定与初审选择</span></div>{category_option_form}<p class='range-help'>系统按商品名称匹配关键词，多个关键词可用逗号或换行分隔；同时命中时优先采用更长的关键词。“其他”是未命中这些品类关键词时的默认分类。</p><div class='table-wrap'><table><thead><tr><th>品类</th><th>商品名匹配词</th><th>排序</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{category_option_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置品类选项。</td></tr>'}</tbody></table></div></section>
         <section class='panel' id='channel-options'><div class='panel-head'><div><div class='eyebrow'>CHANNEL OPTIONS</div><h2>渠道选项</h2></div><span class='hint'>由商品部初审人员人工判断</span></div>{channel_option_form}<div class='table-wrap'><table><thead><tr><th>渠道</th><th>排序</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{channel_option_rows or f'<tr><td colspan="{4 if can_manage else 3}" class="empty">尚未配置渠道选项。</td></tr>'}</tbody></table></div></section>
         <section class='panel' id='dress-rules'><div class='panel-head'><div><div class='eyebrow'>DRESS</div><h2>连衣裙固定倍率</h2></div><span class='hint'>不区分成本金额</span></div>{dress_form}<div class='table-wrap'><table><thead><tr><th>适用季节</th><th>固定倍率</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{dress_rows or f'<tr><td colspan="{4 if can_manage else 3}" class="empty">尚未配置连衣裙固定倍率。</td></tr>'}</tbody></table></div></section>
-        <section class='panel' id='cost-rules'><div class='panel-head'><div><div class='eyebrow'>OTHER CATEGORIES</div><h2>其他品类成本区间倍率</h2></div><span class='hint'>下限包含，上限不包含</span></div>{cost_form}<p class='range-help'>可按实际业务新增任意数量的成本区间，也可随时编辑区间边界和倍率。上限填 600 表示成本小于 600；最后一档可不填上限。同一季节的区间不能重叠。</p><div class='table-wrap'><table><thead><tr><th>适用季节</th><th>含税成本区间</th><th>倍率</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{cost_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置其他品类成本区间；未命中区间时不能生成测算上新价。</td></tr>'}</tbody></table></div></section>
+        <section class='panel' id='cost-rules'><div class='panel-head'><div><div class='eyebrow'>NON-DRESS CATEGORIES</div><h2>非连衣裙品类倍率</h2></div><span class='hint'>除连衣裙外的所有品类；下限包含，上限不包含</span></div>{cost_form}<p class='range-help'>除连衣裙外的所有品类（包括品类选项“其他”）都使用这里的成本区间倍率。可按实际业务新增任意数量的成本区间，也可随时编辑区间边界和倍率。上限填 600 表示成本小于 600；最后一档可不填上限。同一季节的区间不能重叠。</p><div class='table-wrap'><table><thead><tr><th>适用季节</th><th>含税成本区间</th><th>倍率</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{cost_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置非连衣裙品类成本区间；未命中区间时不能生成测算上新价。</td></tr>'}</tbody></table></div></section>
         <section class='panel' id='supplier-rules'><div class='panel-head'><div><div class='eyebrow'>SUPPLIER ADJUSTMENT</div><h2>供应商浮动系数</h2></div><span class='hint'>未配置时为 1.00</span></div>{supplier_form}<div class='table-wrap'><table><thead><tr><th>适用季节</th><th>供应商</th><th>系数</th><th>备注</th>{'<th>操作</th>' if can_manage else ''}</tr></thead><tbody>{supplier_rows or f'<tr><td colspan="{5 if can_manage else 4}" class="empty">尚未配置，系统默认使用 1.00。</td></tr>'}</tbody></table></div></section>
         """
         return self.shell("规则", content, user, "rules")
