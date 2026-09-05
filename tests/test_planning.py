@@ -2445,7 +2445,7 @@ class PlanningCenterTests(unittest.TestCase):
             )["body"].decode("utf-8")
         self.assertIn(f"action='/pricing/{record['id']}/reopen'", confirmed_page)
         self.assertIn(f"action='/pricing/{record['id']}/publish'", confirmed_page)
-        self.assertIn("复核通过阶段仅支持导出二次检查", confirmed_page)
+        self.assertIn("复核通过阶段支持导出可编辑检查副本", confirmed_page)
         self.assertNotIn("action='/pricing/import'", confirmed_page)
 
         exported = self.wsgi_request(
@@ -2458,10 +2458,13 @@ class PlanningCenterTests(unittest.TestCase):
         sheet = workbook.active
         self.assertEqual(workbook.sheetnames, ["上新审核资料", "填写说明"])
         self.assertEqual(sheet["R2"].value, "复核通过，待回传")
-        self.assertTrue(sheet["O2"].protection.locked)
-        self.assertTrue(sheet["P2"].protection.locked)
-        self.assertTrue(sheet["Q2"].protection.locked)
-        self.assertTrue(sheet.protection.sheet)
+        self.assertFalse(sheet["A2"].protection.locked)
+        self.assertFalse(sheet["O2"].protection.locked)
+        self.assertFalse(sheet["P2"].protection.locked)
+        self.assertFalse(sheet["Q2"].protection.locked)
+        self.assertFalse(sheet["R2"].protection.locked)
+        self.assertFalse(sheet.protection.sheet)
+        self.assertIn("可编辑检查副本", workbook["填写说明"]["C2"].value)
 
         # A confirmed workbook cannot be imported, even if a caller bypasses
         # the hidden UI and posts a valid .xlsx directly.

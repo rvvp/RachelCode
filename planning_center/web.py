@@ -591,11 +591,13 @@ class PlanningApplication:
         categories = [item["name"] for item in db.list_category_options(self.db_path, enabled_only=True)]
         channels = [item["name"] for item in db.list_channel_options(self.db_path, enabled_only=True)]
         initial_review_export = all(str(row.get("status") or "") in {"suggested", "conflict"} for row in rows)
+        confirmed_export = all(str(row.get("status") or "") == "confirmed" for row in rows)
         body = initial_review_workbook_bytes(
             rows,
             categories,
             channels,
             worksheet_title="待初审资料" if initial_review_export else "上新审核资料",
+            allow_manual_edit=confirmed_export,
         )
         filename = "planning-initial-review.xlsx" if initial_review_export else "planning-pricing-export.xlsx"
         start_response(
@@ -1276,7 +1278,7 @@ class PlanningApplication:
         export_query = urlencode(export_params)
         export_url = "/pricing/export.xlsx" + ("?" + export_query if export_query else "")
         excel_note = (
-            "复核通过阶段导出为只读资料，仅用于人工二次检查；发现错误请点击条目中的“修改”，重新走初审与复核。"
+            "复核通过阶段导出为可编辑检查副本，仅用于人工匹配和验证，不支持 Excel 导入；发现错误请点击条目中的“修改”，重新走初审与复核。"
             if status == "confirmed"
             else "待初审 Excel 请仅修改黄色列：初审品类、初审上新价、渠道划分（兼容 WPS / LibreOffice）"
         )
@@ -1289,7 +1291,7 @@ class PlanningApplication:
                   "<form method='post' action='/pricing/import' enctype='multipart/form-data'><label class='pricing-excel-file'>导入 Excel<input type='file' name='workbook' accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' required></label><button type='submit'>导入并保存初审资料</button></form>"
                   if user.get('role') == 'planner' and status != 'confirmed'
                   else (
-                      "<span class='review-note'>复核通过阶段仅支持导出二次检查；发现错误请点击条目中的“修改”，重新走初审与复核。</span>"
+                      "<span class='review-note'>复核通过阶段支持导出可编辑检查副本，但不接受 Excel 导入；发现错误请点击条目中的“修改”，重新走初审与复核。</span>"
                       if status == 'confirmed'
                       else "<span class='review-note'>管理员可导出查看，Excel 修改仍由初审人员导入。</span>"
                   )
