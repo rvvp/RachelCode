@@ -98,6 +98,8 @@ class PlanningApplication:
                 return self.handle_reopen(start_response, user, self.path_id(path, "/pricing/", "/reopen"))
             if path.startswith("/pricing/") and path.endswith("/submit-review") and method == "POST":
                 return self.handle_submit_review(environ, start_response, user, self.path_id(path, "/pricing/", "/submit-review"))
+            if path.startswith("/pricing/") and path.endswith("/withdraw-review") and method == "POST":
+                return self.handle_withdraw_review(start_response, user, self.path_id(path, "/pricing/", "/withdraw-review"))
             if path.startswith("/pricing/") and path.endswith("/review-save") and method == "POST":
                 return self.handle_review_save(environ, start_response, user, self.path_id(path, "/pricing/", "/review-save"))
             if path.startswith("/pricing/") and path.endswith("/approve") and method == "POST":
@@ -516,6 +518,20 @@ class PlanningApplication:
             + f"#pricing-row-{int(record['source_product_id'])}",
         )
 
+    def handle_withdraw_review(self, start_response, user, record_id: int):
+        self.require_catalog_operator(user)
+        record = db.withdraw_pricing_from_review(
+            self.db_path,
+            record_id,
+            user.get("display_name", "商品部企划员"),
+        )
+        return self.redirect(
+            start_response,
+            "/workbench?status=suggested&notice="
+            + self.q(f"{record['style_code'] or record['product_name']} 已撤回待复核，可修改后再次提交。")
+            + f"#pricing-row-{int(record['source_product_id'])}",
+        )
+
     def handle_recalculate(self, environ, start_response, user, record_id: int):
         self.require_catalog_operator(user)
         form = self.parse_form(environ)
@@ -592,13 +608,28 @@ class PlanningApplication:
             raise ValueError("当前筛选范围没有可导出的定价资料。")
         categories = [item["name"] for item in db.list_category_options(self.db_path, enabled_only=True)]
         channels = [item["name"] for item in db.list_channel_options(self.db_path, enabled_only=True)]
-        initial_review_export = all(str(row.get("status") or "") in {"suggested", "conflict"} for row in rows)
+        initial_review_export = bool(rows) and all(str(row.get("status") or "") == "suggested" for row in rows)
+        review_export = bool(rows) and all(str(row.get("status") or "") == "review_pending" for row in rows)
         confirmed_export = all(str(row.get("status") or "") == "confirmed" for row in rows)
+        if initial_review_export:
+            editable_statuses = {"suggested"}
+            editable_headers = {"初审品类", "初审上新价", "渠道划分"}
+            worksheet_title = "待初审资料"
+        elif review_export:
+            editable_statuses = {"review_pending"}
+            editable_headers = {"初审上新价", "渠道划分"}
+            worksheet_title = "待复核资料"
+        else:
+            editable_statuses = set()
+            editable_headers = set()
+            worksheet_title = "上新审核资料"
         body = initial_review_workbook_bytes(
             rows,
             categories,
             channels,
-            worksheet_title="待初审资料" if initial_review_export else "上新审核资料",
+            editable_statuses=editable_statuses,
+            editable_headers=editable_headers,
+            worksheet_title=worksheet_title,
             allow_manual_edit=confirmed_export,
         )
         filename = "planning-initial-review.xlsx" if initial_review_export else "planning-pricing-export.xlsx"
@@ -630,7 +661,7 @@ class PlanningApplication:
         return ids
 
     def handle_pricing_import(self, environ, start_response, user):
-        self.require_catalog_operator(user)
+        self.require_excel_import_access(user)
         content_type = str(environ.get("CONTENT_TYPE") or "")
         content_length = int(environ.get("CONTENT_LENGTH") or 0)
         if not content_type.startswith("multipart/form-data"):
@@ -653,29 +684,34 @@ class PlanningApplication:
         if not content or len(content) > 10 * 1024 * 1024:
             raise ValueError("Excel 文件为空或超过 10MB。")
         rows = parse_initial_review_workbook(io.BytesIO(content))
-        importable_rows = []
-        skipped_rows = 0
+        allowed_status = "suggested" if user.get("role") == "planner" else "review_pending"
+        allowed_status_label = "待初审" if allowed_status == "suggested" else "待复核"
         for row in rows:
             record = db.get_pricing_record(self.db_path, int(row.get("record_id") or 0))
             if not record:
                 raise ValueError(f"第 {int(row.get('row_number') or 0)} 行对应的定价记录不存在。")
-            if str(record.get("status") or "") in {"suggested", "conflict"}:
-                importable_rows.append(row)
-            else:
-                skipped_rows += 1
-        if not importable_rows:
-            raise ValueError("当前 Excel 中没有可导入的待初审或版本冲突资料；其他状态只能导出检查，不能通过 Excel 修改。")
-        updated = db.import_initial_review_edits(
-            self.db_path,
-            importable_rows,
-            user.get("display_name", "商品部企划员"),
-        )
-        notice = f"已从 Excel 导入并保存 {updated} 款初审资料。"
-        if skipped_rows:
-            notice += f"另有 {skipped_rows} 款因当前不在待初审或版本冲突状态，已跳过且未修改。"
+            if str(record.get("status") or "") != allowed_status:
+                raise ValueError(
+                    f"当前 Excel 包含不属于{allowed_status_label}权限的资料，不能导入。"
+                    f"{allowed_status_label} Excel 只能全部由对应岗位处理；请按岗位和状态分别导出。"
+                )
+        if allowed_status == "suggested":
+            updated = db.import_initial_review_edits(
+                self.db_path,
+                rows,
+                user.get("display_name", "商品部企划员"),
+            )
+            notice = f"已从 Excel 导入并保存 {updated} 款初审资料。"
+        else:
+            updated = db.import_review_edits(
+                self.db_path,
+                rows,
+                user.get("display_name", "企划管理员"),
+            )
+            notice = f"已从 Excel 导入并保存 {updated} 款复核资料。"
         return self.redirect(
             start_response,
-            "/workbench?status=suggested&notice=" + self.q(notice),
+            "/workbench?status=" + allowed_status + "&notice=" + self.q(notice),
         )
 
     @staticmethod
@@ -1187,6 +1223,10 @@ class PlanningApplication:
         if user.get("role") not in {"planner", "admin"}:
             raise PermissionError("只有商品部初审人员或企划管理员可以导出定价资料。")
 
+    def require_excel_import_access(self, user: dict) -> None:
+        if user.get("role") not in {"planner", "admin"}:
+            raise PermissionError("只有商品部初审人员或企划管理员可以导入定价资料。")
+
     def optional_id(self, value) -> int | None:
         if value in (None, ""):
             return None
@@ -1351,17 +1391,24 @@ class PlanningApplication:
         }
         export_query = urlencode(export_params)
         export_url = "/pricing/export.xlsx" + ("?" + export_query if export_query else "")
+        import_status = "suggested" if user.get("role") == "planner" else "review_pending"
+        can_import_filtered_excel = bool(filtered_products) and all(
+            record is not None and workflow_status == import_status
+            for _, record, workflow_status in filtered_products
+        )
+        import_button_label = "导入并保存初审资料" if import_status == "suggested" else "导入并保存复核资料"
         excel_import_form = (
             "<form id='pricing-import-form' method='post' action='/pricing/import' enctype='multipart/form-data'>"
             "<label class='pricing-excel-file'><span>选择文件</span><input type='file' name='workbook' accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' required></label>"
-            "<button type='submit'>导入并保存初审资料</button></form>"
-            if user.get('role') == 'planner' and filtered_action_counts["submit-review"] > 0
+            f"<button type='submit'>{import_button_label}</button></form>"
+            if user.get("role") in {"planner", "admin"} and can_import_filtered_excel
             else ""
         )
+        excel_toolbar_class = "pricing-excel-toolbar" if excel_import_form else "pricing-excel-toolbar pricing-excel-toolbar-only"
         excel_toolbar = (
             f"""
-            <div class='pricing-excel-toolbar'>
-              <a id='pricing-export-link' class='button compact-button {'disabled' if not exportable_count else ''}' data-export-selected='1' data-base-href='{html.escape("/pricing/export.xlsx" + ("?" + export_query if export_query else ""), quote=True)}' href='{html.escape(export_url, quote=True)}' {'aria-disabled="true" tabindex="-1"' if not exportable_count else ''}>导出Excel（{exportable_count}）</a>
+            <div class='{excel_toolbar_class}'>
+              <a id='pricing-export-link' class='button compact-button {'disabled' if not exportable_count else ''}' data-export-selected='1' data-base-href='{html.escape("/pricing/export.xlsx" + ("?" + export_query if export_query else ""), quote=True)}' href='{html.escape(export_url, quote=True)}' {'aria-disabled="true" tabindex="-1"' if not exportable_count else ''}>导出Excel</a>
               {excel_import_form}
             </div>"""
             if user.get("role") in {"planner", "admin"}
@@ -1398,7 +1445,7 @@ class PlanningApplication:
             ("source-status", "来源状态", ""),
             ("category", "品类", ""),
             ("rule", "规则计算", ""),
-            ("price", "测算上新价", ""),
+            ("price", "上新价", ""),
             ("channel", "渠道划分", ""),
             ("workflow", "流程状态与操作", ""),
         ]
@@ -1484,7 +1531,7 @@ class PlanningApplication:
                 rule_cell = f"<span class='rule-summary'><span class='rule-expression'>{html.escape(rule_expression)}</span><span class='rule-raw-price'>{html.escape(rule_raw_price)}</span></span>{record_error}"
                 channel_label = record.get("channel") or ("待初审选择" if record_status in {"suggested", "conflict"} else "历史记录未划分")
                 channel_cell = f"<strong>{html.escape(channel_label)}</strong>"
-                price_cell = f"<span class='price calculated-price'>{calculated_price_value}</span><small>当前执行价：{price_value}</small><small>{html.escape(record['publication_id'])}</small>"
+                price_cell = f"<span class='price final-price'>{price_value}</span><small class='calculated-price'>测算价{calculated_price_value}</small><small>{html.escape(record['publication_id'])}</small>"
                 status_cell = f"<span class='status status-{status_class}'>{html.escape(status_label)}</span>"
                 controls = ""
                 if user.get("role") == "planner":
@@ -1524,6 +1571,8 @@ class PlanningApplication:
                         <button class='primary review-approve-button' type='submit' formaction='/pricing/{record['id']}/approve'>复核通过</button>
                       </form>
                     </div>"""
+                elif record_status == "review_pending" and user.get("role") == "planner":
+                    controls = f"<form class='table-action-form' method='post' action='/pricing/{record['id']}/withdraw-review' onsubmit=\"return confirm('确认撤回该款式的复核申请吗？撤回后可修改并再次提交。');\"><button type='submit'>撤回</button></form>"
                 elif record_status == "confirmed" and user.get("role") == "planner":
                     controls = f"<div class='prepublish-controls'><form class='table-action-form' method='post' action='/pricing/{record['id']}/reopen'><button type='submit'>修改</button></form><form class='table-action-form' method='post' action='/pricing/{record['id']}/publish'><button class='primary' type='submit'>回传藏宝阁</button></form></div>"
                 elif record_status == "confirmed" and user.get("role") == "admin":
@@ -1826,15 +1875,13 @@ class PlanningApplication:
                 exportLink.classList.remove('disabled');
                 exportLink.removeAttribute('aria-disabled');
                 exportLink.removeAttribute('tabindex');
-                exportLink.textContent = allFilteredSelected
-                  ? `导出Excel（${{exportableCount}}）`
-                  : `导出Excel（${{selectedExportIds.length}}）`;
+                exportLink.textContent = '导出Excel';
               }} else {{
                 exportLink.href = baseHref;
                 exportLink.classList.add('disabled');
                 exportLink.setAttribute('aria-disabled', 'true');
                 exportLink.setAttribute('tabindex', '-1');
-                exportLink.textContent = '导出已选资料（0）';
+                exportLink.textContent = '导出Excel';
               }}
             }}
           }};
@@ -2274,7 +2321,8 @@ class PlanningApplication:
 
     def page(self, title: str, content: str, user: dict | None) -> str:
         body_class = "app-body" if user else "login-body"
-        return f"<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{html.escape(title)}</title><style>{self.css()}</style></head><body class='{body_class}'>{content}</body></html>"
+        price_display_css = ".pricing-table .price-cell .final-price{display:block;font-size:30px;line-height:1.1}.pricing-table .price-cell .calculated-price{display:block;margin-top:5px;font-size:12px;color:var(--muted)}.pricing-excel-toolbar-only>a{grid-column:3}"
+        return f"<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{html.escape(title)}</title><style>{self.css()}</style><style>{price_display_css}</style></head><body class='{body_class}'>{content}</body></html>"
 
     def shell(self, title: str, content: str, user: dict, current: str) -> str:
         nav_items = [("dashboard", "/dashboard", "企划总览"), ("category-planning", "/category-planning", "品类企划"), ("workbench", "/workbench", "上新审核"), ("rules", "/rules", "规则"), ("stats", "/stats", "价格带统计")]

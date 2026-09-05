@@ -1458,7 +1458,7 @@ def import_initial_review_edits(db_path: str | Path, rows: list[dict], operator_
             ).fetchone()
             if not source_row:
                 raise ValueError(f"第 {row_number} 行对应的来源商品不存在。")
-            if record["status"] not in {"suggested", "conflict"}:
+            if record["status"] != "suggested":
                 raise ValueError(f"第 {row_number} 行已不在待初审阶段，请重新导出最新资料。")
             if (
                 str(item.get("publication_id") or "") != str(record["publication_id"])
@@ -1510,6 +1510,63 @@ def import_initial_review_edits(db_path: str | Path, rows: list[dict], operator_
             connection.execute(
                 "UPDATE source_products SET category = ? WHERE id = ?",
                 (category, int(record["source_product_id"])),
+            )
+    return len(prepared)
+
+
+def import_review_edits(db_path: str | Path, rows: list[dict], operator_name: str) -> int:
+    """Validate and atomically save review-stage price/channel edits."""
+    if not rows:
+        raise ValueError("Excel 中没有可导入的复核资料。")
+    prepared: list[tuple[int, int, str, int]] = []
+    seen_ids: set[int] = set()
+    with get_connection(db_path) as connection:
+        active_channels = {
+            str(row["name"])
+            for row in connection.execute("SELECT name FROM channel_options WHERE enabled = 1").fetchall()
+        }
+        for item in rows:
+            row_number = int(item.get("row_number") or 0)
+            record_id = int(item.get("record_id") or 0)
+            if record_id in seen_ids:
+                raise ValueError(f"第 {row_number} 行的定价记录ID重复。")
+            seen_ids.add(record_id)
+            record_row = connection.execute(
+                "SELECT * FROM pricing_records WHERE id = ?",
+                (record_id,),
+            ).fetchone()
+            if not record_row:
+                raise ValueError(f"第 {row_number} 行对应的定价记录不存在。")
+            record = dict(record_row)
+            source_row = connection.execute(
+                "SELECT source_version_no FROM source_products WHERE id = ?",
+                (int(record["source_product_id"]),),
+            ).fetchone()
+            if not source_row:
+                raise ValueError(f"第 {row_number} 行对应的来源商品不存在。")
+            if record["status"] != "review_pending":
+                raise ValueError(f"第 {row_number} 行已不在待复核阶段，请重新导出最新资料。")
+            if (
+                str(item.get("publication_id") or "") != str(record["publication_id"])
+                or int(item.get("source_product_id") or 0) != int(record["source_product_id"])
+            ):
+                raise ValueError(f"第 {row_number} 行的企划记录号或来源商品ID不匹配。")
+            imported_version = int(item.get("source_version_no") or 0)
+            if (
+                imported_version != int(record["source_version_no"])
+                or imported_version != int(source_row["source_version_no"])
+            ):
+                raise ValueError(f"第 {row_number} 行来源版本已变化，请重新导出最新资料。")
+            channel = str(item.get("channel") or "").strip()
+            if channel not in active_channels:
+                raise ValueError(f"第 {row_number} 行请选择规则中已启用的渠道选项。")
+            price = validated_launch_price(item.get("launch_price"))
+            prepared.append((price, channel, int(record["id"]), int(record["source_product_id"])))
+
+        for price, channel, record_id, _source_product_id in prepared:
+            connection.execute(
+                "UPDATE pricing_records SET launch_price = ?, channel = ?, operator_name = ?, error_message = '' WHERE id = ?",
+                (price, channel, operator_name, record_id),
             )
     return len(prepared)
 
@@ -1617,6 +1674,27 @@ def submit_pricing_for_review(
             ),
         )
         connection.execute("UPDATE source_products SET category = ? WHERE id = ?", (clean_category, row["source_product_id"]))
+        updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+    return dict(updated)
+
+
+def withdraw_pricing_from_review(db_path: str | Path, record_id: int, operator_name: str) -> dict:
+    """Return a pending review record to the initial-review stage.
+
+    The status check is performed inside the same transaction as the update so
+    a planner cannot withdraw a record after an administrator has already
+    approved it.
+    """
+    with get_connection(db_path) as connection:
+        row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+        if not row:
+            raise LookupError("定价记录不存在。")
+        if row["status"] != "review_pending":
+            raise ValueError("只有待复核的定价记录可以撤回；企划管理员复核后不能撤回。")
+        connection.execute(
+            "UPDATE pricing_records SET status = 'suggested', operator_name = ?, confirmed_at = NULL, error_message = '' WHERE id = ?",
+            (operator_name, record_id),
+        )
         updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
     return dict(updated)
 

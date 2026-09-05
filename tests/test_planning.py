@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from urllib.parse import unquote_plus, urlencode
+from urllib.parse import unquote, urlencode
 from wsgiref.util import setup_testing_defaults
 from zipfile import ZipFile
 
@@ -1569,6 +1569,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertLess(page_one.index("<div class='pricing-selection-toolbar'>"), page_one.index("class='table-wrap pricing-table-wrap'"))
         self.assertIn("<button class='primary' type='submit'>筛选</button>", page_one)
         self.assertIn("导出Excel", page_one)
+        self.assertNotIn("导出Excel（", page_one)
         self.assertNotIn("id='pricing-import-form'", page_one)
         self.assertNotIn("导入并保存初审资料", page_one)
         self.assertNotIn("待初审 Excel 请仅修改黄色列", page_one)
@@ -2058,7 +2059,7 @@ class PlanningCenterTests(unittest.TestCase):
         with ZipFile(io.BytesIO(export_response["body"])) as archive:
             self.assertNotIn(b"<sheetProtection", archive.read("xl/worksheets/sheet1.xml"))
         self.assertEqual(sheet.sheet_view.selection[0].activeCell, "O2")
-        self.assertIn("可修改字段：初审品类、初审上新价、渠道划分", workbook["填写说明"]["C2"].value)
+        self.assertIn("可修改字段：品类、上新价、渠道划分", workbook["填写说明"]["C2"].value)
         self.assertIn("兼容 WPS 和 LibreOffice", workbook["填写说明"]["C2"].value)
         instructions = [
             row[0].value
@@ -2100,6 +2101,124 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(records["XLSX-001"]["status"], "suggested")
         self.assertEqual(records["XLSX-002"]["channel"], "唯品")
         self.assertEqual(records["XLSX-002"]["status"], "suggested")
+
+    def test_review_excel_export_and_import_is_editable_for_admin_only(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2027秋冬", None, 600, 4)
+        product = {
+            "id": 4151,
+            "style_code": "XLSX-REVIEW-001",
+            "style_color": "XLSX-REVIEW-001-黑",
+            "product_name": "Excel 复核测试款",
+            "season_year": "2027秋冬",
+            "supplier": "Excel 复核测试供应商",
+            "category": "其他",
+            "actual_cost": 150,
+            "status": "pending",
+            "source_version_no": 2,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [product])
+        record = planning_db.create_pricing_record(self.planning_db_path, product, "商品部企划员")
+        submitted = planning_db.submit_pricing_for_review(
+            self.planning_db_path,
+            record["id"],
+            609,
+            "商品部企划员",
+            "其他",
+            "天猫",
+        )
+        mixed_product = {**product, "id": 4152, "style_code": "XLSX-REVIEW-002", "style_color": "XLSX-REVIEW-002-白"}
+        planning_db.upsert_source_products(self.planning_db_path, [mixed_product])
+        planning_db.create_pricing_record(self.planning_db_path, mixed_product, "商品部企划员")
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+        planner_cookie = self.login_cookie(app, "planner")
+
+        admin_page = self.wsgi_request(
+            app,
+            "/workbench?season_year=2027%E7%A7%8B%E5%86%AC&status=review_pending",
+            cookie=admin_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn("id='pricing-import-form'", admin_page)
+        self.assertIn("导入并保存复核资料", admin_page)
+        self.assertNotIn("导入并保存初审资料", admin_page)
+
+        planner_page = self.wsgi_request(
+            app,
+            "/workbench?season_year=2027%E7%A7%8B%E5%86%AC&status=review_pending",
+            cookie=planner_cookie,
+        )["body"].decode("utf-8")
+        self.assertNotIn("id='pricing-import-form'", planner_page)
+
+        mixed_admin_page = self.wsgi_request(
+            app,
+            "/workbench?search=XLSX-REVIEW-001%2CXLSX-REVIEW-002",
+            cookie=admin_cookie,
+        )["body"].decode("utf-8")
+        self.assertNotIn("id='pricing-import-form'", mixed_admin_page)
+
+        exported = self.wsgi_request(
+            app,
+            "/pricing/export.xlsx?season_year=2027%E7%A7%8B%E5%86%AC&status=review_pending&selection_scope=filtered",
+            cookie=admin_cookie,
+        )
+        self.assertTrue(exported["status"].startswith("200"))
+        workbook = load_workbook(io.BytesIO(exported["body"]))
+        self.assertEqual(workbook.sheetnames, ["待复核资料", "填写说明"])
+        sheet = workbook["待复核资料"]
+        self.assertEqual(sheet.max_row, 2)
+        self.assertFalse(sheet["O2"].protection.locked)
+        self.assertFalse(sheet["P2"].protection.locked)
+        self.assertFalse(sheet["Q2"].protection.locked)
+        self.assertFalse(sheet.protection.sheet)
+        self.assertIn("可修改字段：上新价、渠道划分", workbook["填写说明"]["C2"].value)
+        self.assertIn("导入只保存复核资料，不会自动通过复核", workbook["填写说明"]["C2"].value)
+        for worksheet in workbook.worksheets:
+            for row in worksheet.iter_rows():
+                self.assertTrue(all(not cell.protection.locked for cell in row))
+            self.assertFalse(worksheet.protection.sheet)
+        with ZipFile(io.BytesIO(exported["body"])) as archive:
+            self.assertNotIn(b"<sheetProtection", archive.read("xl/worksheets/sheet1.xml"))
+            self.assertNotIn(b"<sheetProtection", archive.read("xl/worksheets/sheet2.xml"))
+
+        sheet["F2"] = "不可修改款号"
+        sheet["J2"] = 999
+        sheet["O2"] = "连衣裙"
+        sheet["P2"] = 619
+        sheet["Q2"] = "唯品"
+        edited = io.BytesIO()
+        workbook.save(edited)
+        body, content_type = self.workbook_multipart(edited.getvalue(), filename="review.xlsx")
+        imported = self.wsgi_request(
+            app,
+            "/pricing/import",
+            method="POST",
+            body=body,
+            content_type=content_type,
+            cookie=admin_cookie,
+        )
+        self.assertTrue(imported["status"].startswith("302"))
+        self.assertIn("status=review_pending", dict(imported["headers"])["Location"])
+        updated = planning_db.get_pricing_record(self.planning_db_path, submitted["id"])
+        self.assertEqual(updated["style_code"], "XLSX-REVIEW-001")
+        self.assertEqual(updated["cost"], 150)
+        self.assertEqual(updated["category"], "其他")
+        self.assertEqual(updated["launch_price"], 619)
+        self.assertEqual(updated["channel"], "唯品")
+        self.assertEqual(updated["status"], "review_pending")
+
+        # A planner cannot use the review-stage workbook, even when the
+        # workbook itself is a valid, fully editable xlsx file.
+        body, content_type = self.workbook_multipart(edited.getvalue(), filename="review-for-planner.xlsx")
+        rejected = self.wsgi_request(
+            app,
+            "/pricing/import",
+            method="POST",
+            body=body,
+            content_type=content_type,
+            cookie=planner_cookie,
+        )
+        self.assertTrue(rejected["status"].startswith("400"))
+        self.assertIn("不属于待初审权限", rejected["body"].decode("utf-8"))
 
     def test_initial_review_excel_import_rejects_stale_source_version_atomically(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2027春", None, 600, 4)
@@ -2240,7 +2359,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("data-column-key='category'>品类", workbench)
         self.assertIn("data-column-key='rule'>规则计算", workbench)
         self.assertIn("<span class='rule-expression'>4 × 1</span><span class='rule-raw-price'>= 600.0 原始</span>", workbench)
-        self.assertIn("data-column-key='price'>测算上新价", workbench)
+        self.assertIn("data-column-key='price'>上新价", workbench)
         self.assertIn("data-column-key='channel'>渠道划分", workbench)
         self.assertIn("data-column-key='workflow'>流程状态与操作", workbench)
         self.assertNotIn("<th>定价状态</th>", workbench)
@@ -2249,6 +2368,8 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("初审与复核", workbench)
         self.assertNotIn("定价初审与复核", workbench)
         self.assertIn("测算上新价", workbench)
+        self.assertIn("class='price final-price'>599</span><small class='calculated-price'>测算价599</small>", workbench)
+        self.assertIn(".pricing-table .price-cell .final-price", workbench)
         self.assertIn("初审上新价", workbench)
         self.assertNotIn("待初审 Excel 请仅修改黄色列", workbench)
         self.assertIn("category-edit-button", workbench)
@@ -2344,6 +2465,7 @@ class PlanningCenterTests(unittest.TestCase):
         )
         self.assertTrue(rejected_review_fractional["status"].startswith("400"))
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "review_pending")
+
         rejected_unsaved_review = self.wsgi_request(
             app,
             f"/pricing/{record['id']}/approve",
@@ -2436,6 +2558,102 @@ class PlanningCenterTests(unittest.TestCase):
         )
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "published")
 
+    def test_planner_can_withdraw_pending_review_before_admin_approval(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        product = {
+            "id": 35,
+            "style_code": "WITHDRAW-035",
+            "style_color": "WITHDRAW-035-黑",
+            "product_name": "撤回测试款",
+            "season_year": "2026秋冬",
+            "supplier": "撤回测试供应商",
+            "category": "其他",
+            "actual_cost": 150,
+            "tax_included_price": 150,
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [product])
+        record = planning_db.create_pricing_record(self.planning_db_path, product, "商品部企划员")
+        planning_db.submit_pricing_for_review(
+            self.planning_db_path,
+            record["id"],
+            599,
+            "商品部企划员",
+            "其他",
+            "天猫",
+        )
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+
+        planner_page = self.wsgi_request(
+            app,
+            "/workbench?status=review_pending",
+            cookie=planner_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn(f"action='/pricing/{record['id']}/withdraw-review'", planner_page)
+        self.assertIn("确认撤回该款式的复核申请吗？撤回后可修改并再次提交。", planner_page)
+        self.assertIn(">撤回</button>", planner_page)
+        admin_page = self.wsgi_request(
+            app,
+            "/workbench?status=review_pending",
+            cookie=admin_cookie,
+        )["body"].decode("utf-8")
+        self.assertNotIn(f"action='/pricing/{record['id']}/withdraw-review'", admin_page)
+
+        denied = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/withdraw-review",
+            method="POST",
+            cookie=admin_cookie,
+        )
+        self.assertTrue(denied["status"].startswith("403"))
+
+        withdrawn = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/withdraw-review",
+            method="POST",
+            cookie=planner_cookie,
+        )
+        self.assertTrue(withdrawn["status"].startswith("302"))
+        self.assertIn("status=suggested", dict(withdrawn["headers"])["Location"])
+        self.assertIn("可修改后再次提交", unquote(dict(withdrawn["headers"])["Location"]))
+        withdrawn_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+        self.assertEqual(withdrawn_record["status"], "suggested")
+        self.assertEqual(withdrawn_record["launch_price"], 599)
+        self.assertEqual(withdrawn_record["channel"], "天猫")
+
+        resubmitted = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/submit-review",
+            method="POST",
+            body=urlencode({"launch_price": "609", "category": "其他", "channel": "唯品"}).encode(),
+            cookie=planner_cookie,
+        )
+        self.assertTrue(resubmitted["status"].startswith("302"))
+        resubmitted_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+        self.assertEqual(resubmitted_record["status"], "review_pending")
+        self.assertEqual(resubmitted_record["launch_price"], 609)
+        self.assertEqual(resubmitted_record["channel"], "唯品")
+
+        planning_db.approve_pricing_record(
+            self.planning_db_path,
+            record["id"],
+            609,
+            "唯品",
+            "企划管理员",
+        )
+        rejected_after_approval = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/withdraw-review",
+            method="POST",
+            cookie=planner_cookie,
+        )
+        self.assertTrue(rejected_after_approval["status"].startswith("400"))
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "confirmed")
+
     def test_confirmed_stage_is_export_only_and_can_reopen_for_new_review(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
         product = {
@@ -2483,6 +2701,10 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn(f"action='/pricing/{record['id']}/publish'", confirmed_page)
         self.assertNotIn("复核通过阶段支持导出可编辑检查副本", confirmed_page)
         self.assertNotIn("action='/pricing/import'", confirmed_page)
+        self.assertIn("pricing-excel-toolbar-only", confirmed_page)
+        self.assertIn(".pricing-excel-toolbar-only>a{grid-column:3}", confirmed_page)
+        self.assertNotIn("导出已选资料", confirmed_page)
+        self.assertNotIn("导出Excel（", confirmed_page)
 
         exported = self.wsgi_request(
             app,
@@ -2514,7 +2736,7 @@ class PlanningCenterTests(unittest.TestCase):
             cookie=planner_cookie,
         )
         self.assertTrue(rejected_import["status"].startswith("400"))
-        self.assertIn("没有可导入的待初审或版本冲突资料", rejected_import["body"].decode("utf-8"))
+        self.assertIn("不属于待初审权限", rejected_import["body"].decode("utf-8"))
 
         denied_reopen = self.wsgi_request(
             app,
@@ -2536,7 +2758,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIsNone(reopened_record["confirmed_at"])
         self.assertEqual(len(planning_db.list_pricing_records(self.planning_db_path)), 1)
 
-    def test_mixed_status_search_export_is_editable_and_imports_only_initial_review_rows(self):
+    def test_mixed_status_search_export_is_editable_but_import_is_rejected_atomically(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
         products = [
             {
@@ -2580,7 +2802,7 @@ class PlanningCenterTests(unittest.TestCase):
             f"/workbench?{search_query}",
             cookie=planner_cookie,
         )["body"].decode("utf-8")
-        self.assertIn("id='pricing-import-form'", search_page)
+        self.assertNotIn("id='pricing-import-form'", search_page)
 
         exported = self.wsgi_request(
             app,
@@ -2622,14 +2844,15 @@ class PlanningCenterTests(unittest.TestCase):
             content_type=content_type,
             cookie=planner_cookie,
         )
-        self.assertTrue(imported["status"].startswith("302"))
-        self.assertIn("另有 1 款", unquote_plus(dict(imported["headers"])["Location"]))
+        self.assertTrue(imported["status"].startswith("400"))
+        self.assertIn("不属于待初审权限", imported["body"].decode("utf-8"))
         updated_suggested = planning_db.get_pricing_record(self.planning_db_path, suggested["id"])
         unchanged_confirmed = planning_db.get_pricing_record(self.planning_db_path, confirmed["id"])
         self.assertEqual(updated_suggested["style_code"], "MIX-62")
         self.assertEqual(updated_suggested["cost"], 150)
-        self.assertEqual(updated_suggested["launch_price"], 499)
-        self.assertEqual(updated_suggested["channel"], "唯品")
+        self.assertEqual(updated_suggested["category"], "其他")
+        self.assertEqual(updated_suggested["launch_price"], 599)
+        self.assertEqual(updated_suggested["channel"], "")
         self.assertEqual(unchanged_confirmed["category"], "其他")
         self.assertEqual(unchanged_confirmed["launch_price"], 599)
         self.assertEqual(unchanged_confirmed["channel"], "天猫")

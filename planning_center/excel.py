@@ -48,9 +48,10 @@ def initial_review_workbook_bytes(
     rows: list[dict],
     category_options: list[str],
     channel_options: list[str],
-    editable_statuses: set[str] | frozenset[str] | tuple[str, ...] = ("suggested", "conflict"),
+    editable_statuses: set[str] | frozenset[str] | tuple[str, ...] = ("suggested",),
     worksheet_title: str = "待初审资料",
     allow_manual_edit: bool = False,
+    editable_headers: set[str] | frozenset[str] | tuple[str, ...] = tuple(EDITABLE_HEADERS),
 ) -> bytes:
     workbook = Workbook()
     worksheet = workbook.active
@@ -65,6 +66,24 @@ def initial_review_workbook_bytes(
         and rows
         and all(str(row.get("status") or "") == "confirmed" for row in rows)
     )
+    editable_headers = {str(header) for header in editable_headers}
+    editable_header_labels = {
+        "初审品类": "品类",
+        "初审上新价": "上新价",
+        "渠道划分": "渠道划分",
+    }
+    editable_label_text = "、".join(
+        editable_header_labels[header]
+        for header in ("初审品类", "初审上新价", "渠道划分")
+        if header in editable_headers
+    )
+    import_stage_label = (
+        "初审"
+        if "初审品类" in editable_headers
+        else "复核"
+        if {"初审上新价", "渠道划分"}.intersection(editable_headers)
+        else ""
+    )
 
     header_fill = PatternFill("solid", fgColor="315447")
     readonly_fill = PatternFill("solid", fgColor="EEF1EE")
@@ -76,9 +95,9 @@ def initial_review_workbook_bytes(
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.protection = Protection(locked=False)
-        if header in EDITABLE_HEADERS and not manual_editable:
+        if header in editable_headers and not manual_editable:
             cell.comment = Comment(
-                "此列允许初审人员修改。请直接编辑黄色单元格；其余列为系统同步资料，请勿修改。",
+                "此列允许当前流程岗位修改。请直接编辑黄色单元格；其余列为系统同步资料，请勿修改。",
                 "商品企划中心",
             )
 
@@ -122,7 +141,7 @@ def initial_review_workbook_bytes(
             if manual_editable:
                 cell.fill = PatternFill(fill_type=None)
             else:
-                cell.fill = editable_fill if row_editable and header in EDITABLE_HEADERS else readonly_fill
+                cell.fill = editable_fill if row_editable and header in editable_headers else readonly_fill
             cell.border = border
             cell.alignment = Alignment(vertical="center", wrap_text=header in {"商品名称", "供应商"})
             # Every export is an ordinary editable workbook for manual
@@ -152,9 +171,12 @@ def initial_review_workbook_bytes(
                         "修改不会回写商品企划中心，也不能通过本工作簿回传藏宝阁。发现错误请回到工作台点击条目中的“修改”，重新走初审与复核。"
                         if manual_editable
                         else (
-                            "可修改字段：初审品类、初审上新价、渠道划分。黄色列可编辑；"
-                            "为兼容 WPS 和 LibreOffice，初审表不启用整表保护，灰色资料列请勿修改；"
-                            "导入只保存初审资料，不会自动提交复核。"
+                            f"可修改字段：{editable_label_text or '无'}。黄色列可编辑；"
+                            "为兼容 WPS 和 LibreOffice，审核表不启用整表保护，灰色资料列请勿修改；"
+                            + (
+                                f"导入只保存{import_stage_label}资料，不会自动"
+                                + ("通过复核。" if import_stage_label == "复核" else "提交复核。")
+                            )
                             if editable_rows
                             else (
                                 "当前工作簿可自由编辑，用于人工匹配和验证；修改不会写回商品企划中心。"
@@ -208,13 +230,14 @@ def initial_review_workbook_bytes(
     for row in option_sheet.iter_rows():
         for cell in row:
             cell.protection = Protection(locked=False)
+    option_sheet.protection.sheet = False
     option_sheet.freeze_panes = "A2"
 
     category_end = max(2, len(category_options) + 1)
     channel_end = max(2, len(channel_options) + 1)
     _add_defined_name(workbook, "PlanningCategoryOptions", f"'填写说明'!$A$2:$A${category_end}")
     _add_defined_name(workbook, "PlanningChannelOptions", f"'填写说明'!$B$2:$B${channel_end}")
-    if rows and editable_rows:
+    if rows and editable_rows and editable_headers.intersection(EDITABLE_HEADERS):
         category_validation = DataValidation(type="list", formula1="=PlanningCategoryOptions", allow_blank=False)
         category_validation.error = "请从规则中已启用的品类选项选择。"
         category_validation.errorTitle = "品类不正确"
@@ -223,17 +246,21 @@ def initial_review_workbook_bytes(
         channel_validation.error = "请从规则中已启用的渠道选项选择。"
         channel_validation.errorTitle = "渠道不正确"
         channel_validation.showErrorMessage = True
-        worksheet.add_data_validation(category_validation)
-        worksheet.add_data_validation(channel_validation)
-        for row_index in editable_rows:
-            category_validation.add(f"O{row_index}")
-            channel_validation.add(f"Q{row_index}")
+        if "初审品类" in editable_headers:
+            worksheet.add_data_validation(category_validation)
+            for row_index in editable_rows:
+                category_validation.add(f"O{row_index}")
+        if "渠道划分" in editable_headers:
+            worksheet.add_data_validation(channel_validation)
+            for row_index in editable_rows:
+                channel_validation.add(f"Q{row_index}")
 
-        invalid_price_fill = PatternFill("solid", fgColor="F7C8C3")
-        worksheet.conditional_formatting.add(
-            f"P2:P{len(rows) + 1}",
-            FormulaRule(formula=["OR(P2<1,P2<>INT(P2))"], fill=invalid_price_fill),
-        )
+        if "初审上新价" in editable_headers:
+            invalid_price_fill = PatternFill("solid", fgColor="F7C8C3")
+            worksheet.conditional_formatting.add(
+                f"P2:P{len(rows) + 1}",
+                FormulaRule(formula=["OR(P2<1,P2<>INT(P2))"], fill=invalid_price_fill),
+            )
 
     widths = (13, 30, 13, 11, 14, 16, 18, 28, 24, 13, 12, 14, 14, 14, 18, 16, 18, 15)
     for column_index, width in enumerate(widths, start=1):
@@ -258,9 +285,19 @@ def initial_review_workbook_bytes(
     worksheet.protection.selectLockedCells = False
     worksheet.protection.selectUnlockedCells = True
     selection = worksheet.sheet_view.selection[0]
-    first_editable_cell = f"O{editable_rows[0]}" if editable_rows else "A1"
+    first_editable_column = "O" if "初审品类" in editable_headers else "P" if "初审上新价" in editable_headers else "Q" if "渠道划分" in editable_headers else "A"
+    first_editable_cell = f"{first_editable_column}{editable_rows[0]}" if editable_rows else "A1"
     selection.activeCell = first_editable_cell
     selection.sqref = first_editable_cell
+
+    # Final safety net: every exported worksheet and every used cell must be
+    # a normal editable workbook in WPS/Excel. Import permissions are enforced
+    # by the server-side workflow status, never by workbook protection.
+    for exported_sheet in workbook.worksheets:
+        exported_sheet.protection.sheet = False
+        for row in exported_sheet.iter_rows():
+            for cell in row:
+                cell.protection = Protection(locked=False)
 
     workbook.properties.title = f"商品企划中心{worksheet.title}"
     workbook.properties.subject = "上新审核工作台定价资料"
@@ -287,17 +324,17 @@ def parse_initial_review_workbook(file_obj) -> list[dict]:
     except Exception as error:
         raise ValueError(f"无法读取 Excel，请确认文件为有效的 .xlsx 工作簿：{error}") from error
     worksheet_name = next(
-        (name for name in ("待初审资料", "上新审核资料") if name in workbook.sheetnames),
+        (name for name in ("待初审资料", "待复核资料", "上新审核资料") if name in workbook.sheetnames),
         None,
     )
     if worksheet_name is None:
-        raise ValueError("Excel 中缺少“待初审资料”工作表，请使用系统导出的文件。")
+        raise ValueError("Excel 中缺少“待初审资料”或“待复核资料”工作表，请使用系统导出的文件。")
     worksheet = workbook[worksheet_name]
     headers = tuple(str(worksheet.cell(1, index).value or "").strip() for index in range(1, len(INITIAL_REVIEW_HEADERS) + 1))
     if headers != INITIAL_REVIEW_HEADERS:
         raise ValueError("Excel 表头已被修改，请使用系统导出的原始表头。")
     if worksheet.max_row - 1 > MAX_IMPORT_ROWS:
-        raise ValueError(f"单次最多导入 {MAX_IMPORT_ROWS} 条初审资料。")
+        raise ValueError(f"单次最多导入 {MAX_IMPORT_ROWS} 条审核资料。")
 
     parsed: list[dict] = []
     seen_record_ids: set[int] = set()
@@ -322,5 +359,5 @@ def parse_initial_review_workbook(file_obj) -> list[dict]:
             }
         )
     if not parsed:
-        raise ValueError("Excel 中没有可导入的初审资料。")
+        raise ValueError("Excel 中没有可导入的审核资料。")
     return parsed
