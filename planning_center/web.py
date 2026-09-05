@@ -4,6 +4,7 @@ import cgi
 import html
 import io
 import json
+import re
 import secrets
 from http import cookies
 from pathlib import Path
@@ -559,6 +560,7 @@ class PlanningApplication:
         self.require_export_access(user)
         season = str(query.get("season_year") or "").strip()
         status = str(query.get("status") or "").strip()
+        search = str(query.get("search") or "").strip()
         selection_scope = str(query.get("selection_scope") or "filtered").strip()
         if selection_scope not in {"selected", "filtered"}:
             raise ValueError("导出选择范围不正确。")
@@ -576,7 +578,7 @@ class PlanningApplication:
             # The workbench may contain several historical revisions for one
             # source product. Export only the latest row currently visible in
             # the selected season/status filter.
-            entries = self.workbench_entries(season, status)
+            entries = self.workbench_entries(season, status, search)
             visible_record_ids = [int(record["id"]) for _, record, _ in entries if record]
             if len(visible_record_ids) > 5000:
                 raise ValueError("当前筛选范围超过 5000 款，请增加年份季节或定价状态筛选后再导出。")
@@ -673,10 +675,34 @@ class PlanningApplication:
             "/workbench?status=suggested&notice=" + self.q(f"已从 Excel 导入并保存 {updated} 款初审资料。"),
         )
 
-    def workbench_entries(self, season_year: str = "", status: str = "") -> list[tuple[dict, dict | None, str]]:
+    @staticmethod
+    def workbench_search_terms(value: str) -> tuple[str, ...]:
+        return tuple(
+            term.casefold()
+            for term in re.split(r"[\s,，、;；]+", str(value or "").strip())
+            if term.strip()
+        )
+
+    @classmethod
+    def workbench_item_matches_search(cls, item: dict, search_terms: tuple[str, ...]) -> bool:
+        if not search_terms:
+            return True
+        searchable = " ".join(
+            str(item.get(field) or "").casefold()
+            for field in ("style_code", "style_color", "color_name")
+        )
+        return any(term in searchable for term in search_terms)
+
+    def workbench_entries(
+        self,
+        season_year: str = "",
+        status: str = "",
+        search: str = "",
+    ) -> list[tuple[dict, dict | None, str]]:
         """Return the same filtered source/record rows used by the workbench and batch APIs."""
         season = str(season_year or "").strip()
         requested_status = str(status or "").strip()
+        search_terms = self.workbench_search_terms(search)
         products = db.list_source_products(self.db_path, season_year=season)
         if not requested_status or requested_status == "published":
             known_product_ids = {int(item["id"]) for item in products}
@@ -691,6 +717,8 @@ class PlanningApplication:
             latest_records.setdefault(int(record["source_product_id"]), record)
         entries: list[tuple[dict, dict | None, str]] = []
         for item in products:
+            if not self.workbench_item_matches_search(item, search_terms):
+                continue
             record = latest_records.get(int(item["id"]))
             workflow_status = str(record.get("status") if record else "waiting")
             if record and workflow_status in {"suggested", "conflict"}:
@@ -736,13 +764,14 @@ class PlanningApplication:
             raise ValueError("批量选择范围不正确。")
         season = str((form.get("season_year") or [""])[0]).strip()
         status_filter = str((form.get("status") or [""])[0]).strip()
+        search_filter = str((form.get("search") or [""])[0]).strip()
         item_ids = [] if selection_scope == "filtered" else self.batch_record_ids(form.get(field_name, []))
         if selection_scope == "selected" and not item_ids:
             raise ValueError("请先勾选要处理的款式。")
 
         if action == "suggest":
             if selection_scope == "filtered":
-                entries = self.workbench_entries(season, status_filter)
+                entries = self.workbench_entries(season, status_filter, search_filter)
                 # Match the page's disabled-checkbox rule: a filtered batch
                 # only includes waiting products with a positive catalog cost.
                 products = [
@@ -774,11 +803,21 @@ class PlanningApplication:
             )
             return self.redirect(
                 start_response,
-                "/workbench?status=suggested&notice=" + self.q(f"已批量生成 {len(created)} 款测算上新价。"),
+                "/workbench?" + urlencode(
+                    {
+                        key: value
+                        for key, value in (
+                            ("status", "suggested"),
+                            ("search", search_filter),
+                            ("notice", f"已批量生成 {len(created)} 款测算上新价。"),
+                        )
+                        if value
+                    }
+                ),
             )
 
         if selection_scope == "filtered":
-            entries = self.workbench_entries(season, status_filter)
+            entries = self.workbench_entries(season, status_filter, search_filter)
             action_statuses = {
                 "submit-review": {"suggested", "conflict"},
                 "approve": {"review_pending"},
@@ -858,7 +897,21 @@ class PlanningApplication:
                     category,
                     channel,
                 )
-            return self.redirect(start_response, "/workbench?status=review_pending&notice=" + self.q(f"已批量提交 {len(pending)} 款上新定价进入复核。"))
+            return self.redirect(
+                start_response,
+                "/workbench?"
+                + urlencode(
+                    {
+                        key: value
+                        for key, value in (
+                            ("status", "review_pending"),
+                            ("search", search_filter),
+                            ("notice", f"已批量提交 {len(pending)} 款上新定价进入复核。"),
+                        )
+                        if value
+                    }
+                ),
+            )
 
         if action == "approve":
             for record in records:
@@ -884,7 +937,21 @@ class PlanningApplication:
                     record["channel"],
                     user.get("display_name", "企划管理员"),
                 )
-            return self.redirect(start_response, "/workbench?status=confirmed&notice=" + self.q(f"已批量复核通过 {len(records)} 款上新定价。"))
+            return self.redirect(
+                start_response,
+                "/workbench?"
+                + urlencode(
+                    {
+                        key: value
+                        for key, value in (
+                            ("status", "confirmed"),
+                            ("search", search_filter),
+                            ("notice", f"已批量复核通过 {len(records)} 款上新定价。"),
+                        )
+                        if value
+                    }
+                ),
+            )
 
         for record in records:
             if record["status"] not in {"confirmed", "conflict"}:
@@ -898,6 +965,8 @@ class PlanningApplication:
             else:
                 failed.append(updated)
         query = {"notice": f"已批量回传 {len(published)} 款上新定价。"}
+        if search_filter:
+            query["search"] = search_filter
         if failed:
             query["error"] = f"有 {len(failed)} 款回传失败，请查看版本冲突状态后重新处理。"
         return self.redirect(start_response, "/workbench?" + urlencode(query))
@@ -1184,6 +1253,7 @@ class PlanningApplication:
         sync_message = ""
         season = query.get("season_year", "")
         status = query.get("status", "")
+        search = str(query.get("search") or "").strip()
         try:
             requested_page = max(1, int(query.get("page") or 1))
         except ValueError:
@@ -1202,7 +1272,7 @@ class PlanningApplication:
             except ValueError as sync_error:
                 if not error:
                     error = str(sync_error)
-        filtered_products = self.workbench_entries(season, status)
+        filtered_products = self.workbench_entries(season, status, search)
         category_options = db.list_category_options(self.db_path, enabled_only=True)
         channel_options = db.list_channel_options(self.db_path, enabled_only=True)
         workflow_labels = {
@@ -1249,7 +1319,7 @@ class PlanningApplication:
         current_page = min(requested_page, total_pages)
         page_start = (current_page - 1) * page_size
         page_products = filtered_products[page_start : page_start + page_size]
-        toolbar_message = notice or sync_message or "商品资料已加载，可按条件筛选。"
+        toolbar_message = notice or sync_message
         seasons = sorted({item.get("season_year", "") for item in db.list_source_products(self.db_path) if item.get("season_year")}, reverse=True)
         catalog_sync_action = (
             "<form method='post' action='/sync'><button class='primary' type='submit'>同步藏宝阁</button><small class='sync-condition-note'>同步条件：待商品部填写、已提交商品部、已上传图片、含税价为大于 0 的有效数字</small></form>"
@@ -1268,13 +1338,18 @@ class PlanningApplication:
           <input id='pricing-selection-scope' type='hidden' name='selection_scope' value='selected'>
           <input type='hidden' name='season_year' value='{html.escape(season, quote=True)}'>
           <input type='hidden' name='status' value='{html.escape(status, quote=True)}'>
+          <input type='hidden' name='search' value='{html.escape(search, quote=True)}'>
           <label><input id='pricing-select-all' type='checkbox'>勾选本页</label>
           <button class='compact-button' id='pricing-select-all-filtered' type='button' {' ' if filtered_selectable_count else 'disabled'}>选择全部筛选资料（{filtered_selectable_count}）</button>
           <button class='compact-button' id='pricing-clear-selection' type='button' hidden>清除选择</button>
           <span id='pricing-selected-count'>已选 0 款</span>
           <div class='pricing-batch-actions'>{batch_buttons}</div>
         </form>"""
-        export_params = {key: value for key, value in (("season_year", season), ("status", status)) if value}
+        export_params = {
+            key: value
+            for key, value in (("season_year", season), ("status", status), ("search", search))
+            if value
+        }
         export_query = urlencode(export_params)
         export_url = "/pricing/export.xlsx" + ("?" + export_query if export_query else "")
         excel_note = (
@@ -1483,6 +1558,8 @@ class PlanningApplication:
                 params["season_year"] = season
             if status:
                 params["status"] = status
+            if search:
+                params["search"] = search
             if target_page > 1:
                 params["page"] = target_page
             return "/workbench" + ("?" + urlencode(params) if params else "")
@@ -1509,12 +1586,41 @@ class PlanningApplication:
           <span>每页 50 款 · 第 {current_page} / {total_pages} 页 · 共 {total_products} 款</span>
           {next_page}
         </nav>"""
+        clear_search_params = {
+            key: value
+            for key, value in (("season_year", season), ("status", status))
+            if value
+        }
+        clear_search_href = "/workbench" + (
+            "?" + urlencode(clear_search_params) if clear_search_params else ""
+        )
+        clear_search_link = (
+            f"<a class='button compact-button' href='{html.escape(clear_search_href, quote=True)}'>清除搜索</a>"
+            if search
+            else ""
+        )
+        toolbar_note = (
+            f"<small class='workbench-toolbar-note'>{html.escape(toolbar_message)}</small>"
+            if toolbar_message
+            else ""
+        )
+        search_form = f"""
+          <form class='workbench-search' method='get' action='/workbench'>
+            <label><span>搜索款号 / 款色</span><input type='search' name='search' value='{html.escape(search, quote=True)}' placeholder='可输入多个，逗号、空格或换行分隔' autocomplete='off'></label>
+            <input type='hidden' name='season_year' value='{html.escape(season, quote=True)}'>
+            <input type='hidden' name='status' value='{html.escape(status, quote=True)}'>
+            <button class='primary' type='submit'>搜索</button>
+            {clear_search_link}
+          </form>
+          {toolbar_note}
+        """
+        filter_search_hidden = f"<input type='hidden' name='search' value='{html.escape(search, quote=True)}'>"
         content = f"""
         <section class='page-heading'><div><div class='eyebrow'>NEW ARRIVAL PRICING</div><h1>上新审核工作台</h1><p>所有款色集中在一张定价资料与审核卡片中，按条目完成规则匹配、初审、复核和回传。</p></div>{catalog_sync_action}</section>
         {self.alert(error, 'error') if error else ''}
         <section class='workbench-toolbar'>
-          <div class='workbench-toolbar-summary'><span class='toolbar-status-dot' aria-hidden='true'></span><strong>{html.escape(toolbar_message)}</strong></div>
-          <form class='workbench-filter' method='get' action='/workbench'><label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待初审</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待复核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>复核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button type='submit'>筛选</button></form>
+          <div class='workbench-search-wrap'>{search_form}</div>
+          <form class='workbench-filter' method='get' action='/workbench'>{filter_search_hidden}<label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待初审</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待复核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>复核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button type='submit'>筛选</button></form>
         </section>
         <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>初审与复核</h2><p class='hint'>来源资料、测算结果和流程操作在同一行展示，每页最多 50 款。</p></div><div class='pricing-board-tools'><button id='pricing-reset-columns' class='compact-button' type='button' title='恢复默认列宽'>恢复默认列宽</button><span class='count'>本页 {len(page_products)} 款</span>{pagination_top}</div></div>{batch_toolbar}{excel_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table' data-resizable-columns='pricing-v1'>{pricing_colgroup}<thead><tr>{pricing_header}</tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="14" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div>{pagination_bottom}</section>
         <dialog id='product-image-dialog' class='product-image-dialog' aria-labelledby='product-image-dialog-title'>
@@ -2203,9 +2309,10 @@ class PlanningApplication:
         @media(max-width:620px){.pricing-table .workflow-actions input{width:102px}.pricing-table .workflow-actions button{font-size:11px;padding:6px 8px}}
         .pricing-board-tools{display:flex;align-items:center;gap:12px}.pricing-board-tools .compact-button{background:#fff}.pricing-table[data-resizable-columns]{table-layout:fixed;width:max-content;min-width:0;--select-column-width:44px;--image-column-width:78px}.pricing-table[data-resizable-columns] col{width:auto}.pricing-table[data-resizable-columns] th,.pricing-table[data-resizable-columns] td{width:auto;min-width:0!important;overflow-wrap:anywhere}.pricing-table[data-resizable-columns] .pricing-select-cell{width:var(--select-column-width)}.pricing-table[data-resizable-columns] .pricing-image-cell{left:var(--select-column-width);width:var(--image-column-width)}.pricing-table[data-resizable-columns] thead th:nth-child(2){left:var(--select-column-width);width:var(--image-column-width)}.pricing-table[data-resizable-columns] thead th:not(:first-child):not(:nth-child(2)){position:relative}.pricing-table .rule-summary{display:flex;flex-direction:column;gap:2px;white-space:normal}.pricing-table .rule-expression,.pricing-table .rule-raw-price{display:block;white-space:nowrap}.column-resize-handle{position:absolute;top:0;right:-4px;width:8px;height:100%;cursor:col-resize;touch-action:none;z-index:4}.column-resize-handle:hover,.column-resize-handle:focus-visible,.column-resizing .column-resize-handle{background:var(--accent);opacity:.6;outline:0}.column-resizing{cursor:col-resize!important;user-select:none}.column-resizing *{cursor:col-resize!important;user-select:none}
         .workbench-toolbar{display:flex;align-items:center;justify-content:space-between;gap:24px;background:#fff;border:1px solid var(--line);padding:12px 18px;margin-bottom:16px}.workbench-toolbar-summary{display:flex;align-items:center;gap:9px;min-width:max-content}.workbench-toolbar-summary strong{font-size:14px;font-weight:600;color:var(--deep)}.toolbar-status-dot{width:8px;height:8px;border-radius:50%;background:#4f8060;box-shadow:0 0 0 3px #edf5ef}.workbench-filter{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;margin-left:auto}.workbench-filter label{display:flex;flex-direction:column;gap:3px;color:#202421;font-size:13px;font-weight:700}.workbench-filter select{min-width:145px;padding:7px 9px;color:#202421;font-size:14px;font-weight:600}.workbench-filter button{padding:7px 12px}.pricing-pagination{display:flex;align-items:center;justify-content:flex-end;gap:12px}.pricing-pagination-bottom{min-height:58px;padding:10px 24px;border-top:1px solid var(--line);background:#f7f9f7}.pricing-pagination-top{min-height:0;padding:0;border:0;background:transparent;gap:7px}.pricing-pagination>span:not(.button){color:var(--muted);font-size:12px;white-space:nowrap}.pagination-link{padding:6px 11px;font-size:12px}.pagination-link.disabled{cursor:not-allowed;opacity:.45;pointer-events:none}
-        @media(max-width:900px){.pricing-board-tools{flex-wrap:wrap;justify-content:flex-end}.pricing-pagination-top{flex-basis:100%}}
+        .workbench-search-wrap{display:flex;flex:1;min-width:0;flex-direction:column;gap:4px}.workbench-search{display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap}.workbench-search label{display:flex;flex:1;min-width:230px;flex-direction:column;gap:3px;color:#202421;font-size:13px;font-weight:700}.workbench-search input{width:100%;min-width:280px;padding:7px 9px;color:#202421;font-size:14px}.workbench-search button,.workbench-search .button{padding:7px 12px;white-space:nowrap}.workbench-toolbar-note{color:var(--muted);font-size:12px;line-height:1.4}
+        @media(max-width:900px){.pricing-board-tools{flex-wrap:wrap;justify-content:flex-end}.pricing-pagination-top{flex-basis:100%}.workbench-search-wrap{width:100%}.workbench-search{width:100%}.workbench-search label{min-width:0}.workbench-search input{min-width:0}}
         @media(max-width:620px){.pricing-board>.panel-head{flex-direction:column}.pricing-board-tools{align-items:flex-start;flex-direction:column;gap:6px;width:100%}.pricing-pagination-top{width:100%;justify-content:space-between}.pricing-table[data-resizable-columns]{min-width:0}.product-image-dialog{width:calc(100vw - 20px);height:calc(100vh - 20px)}.product-image-dialog-head{padding:11px 10px 10px 14px}.product-image-dialog-canvas{padding:10px}}
         @media(max-width:900px){.workbench-toolbar{align-items:flex-start;flex-wrap:wrap}.workbench-filter{width:100%;margin-left:0}.workbench-filter label{flex:1}.workbench-filter select{width:100%}}
-        @media(max-width:620px){.workbench-toolbar-summary{min-width:0;flex-wrap:wrap}.workbench-filter{align-items:stretch;flex-direction:column}.workbench-filter label,.workbench-filter select,.workbench-filter button{width:100%}.pricing-pagination{justify-content:space-between;padding:10px 18px}.pricing-pagination>span:not(.button){text-align:center}.pagination-link{white-space:nowrap}}
+        @media(max-width:620px){.workbench-toolbar-summary{min-width:0;flex-wrap:wrap}.workbench-search{align-items:stretch;flex-direction:column}.workbench-search label,.workbench-search input,.workbench-search button,.workbench-search .button{width:100%}.workbench-filter{align-items:stretch;flex-direction:column}.workbench-filter label,.workbench-filter select,.workbench-filter button{width:100%}.pricing-pagination{justify-content:space-between;padding:10px 18px}.pricing-pagination>span:not(.button){text-align:center}.pagination-link{white-space:nowrap}}
         .sync-condition-note{display:block;margin-top:7px;color:var(--muted);font-size:11px;line-height:1.45;max-width:560px}
         """

@@ -1551,15 +1551,29 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(page_one.count("id='pricing-row-"), 50)
         self.assertEqual(page_one.count("name='suggest_ids'"), 50)
         self.assertNotIn("当前结果", page_one)
-        self.assertIn("商品资料已加载，可按条件筛选。", page_one)
+        self.assertNotIn("商品资料已加载，可按条件筛选。", page_one)
+        self.assertNotIn("<div class='workbench-toolbar-summary'>", page_one)
+        self.assertIn("class='workbench-search'", page_one)
         self.assertIn("每页 50 款 · 第 1 / 2 页 · 共 51 款", page_one)
         self.assertEqual(page_one.count("aria-label='列表顶部分页'"), 1)
         self.assertEqual(page_one.count("aria-label='列表底部分页'"), 1)
         self.assertIn("<span>第 1 / 2 页</span>", page_one)
         self.assertLess(page_one.index("aria-label='列表顶部分页'"), page_one.index("<form id='pricing-batch-form'"))
         self.assertIn("href='/workbench?season_year=2026%E7%A7%8B%E5%86%AC&amp;status=waiting&amp;page=2'", page_one)
-        self.assertLess(page_one.index("workbench-toolbar-summary"), page_one.index("workbench-filter"))
+        self.assertLess(page_one.index("<form class='workbench-search'"), page_one.index("<form class='workbench-filter'"))
         self.assertNotIn("<section class='filter-bar'>", page_one)
+
+        search_page = self.wsgi_request(
+            app,
+            "/workbench?season_year=2026%E7%A7%8B%E5%86%AC&status=waiting&search=PAGE-1001%2CPAGE-1051",
+            cookie=planner_cookie,
+        )["body"].decode("utf-8")
+        self.assertEqual(search_page.count("id='pricing-row-"), 2)
+        self.assertIn("value='PAGE-1001,PAGE-1051'", search_page)
+        self.assertIn("PAGE-1001-黑", search_page)
+        self.assertIn("PAGE-1051-黑", search_page)
+        self.assertNotIn("id='pricing-row-1002'", search_page)
+        self.assertIn("每页 50 款 · 第 1 / 1 页 · 共 2 款", search_page)
 
         page_two = self.wsgi_request(
             app,
