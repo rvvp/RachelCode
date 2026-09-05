@@ -75,6 +75,7 @@ def initial_review_workbook_bytes(
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.protection = Protection(locked=False)
         if header in EDITABLE_HEADERS and not manual_editable:
             cell.comment = Comment(
                 "此列允许初审人员修改。请直接编辑黄色单元格；其余列为系统同步资料，请勿修改。",
@@ -124,11 +125,10 @@ def initial_review_workbook_bytes(
                 cell.fill = editable_fill if row_editable and header in EDITABLE_HEADERS else readonly_fill
             cell.border = border
             cell.alignment = Alignment(vertical="center", wrap_text=header in {"商品名称", "供应商"})
-            cell.protection = Protection(
-                locked=False
-                if manual_editable
-                else not row_editable or header not in EDITABLE_HEADERS
-            )
+            # Every export is an ordinary editable workbook for manual
+            # matching. Import permissions are enforced by the server using
+            # the live workflow status, never by spreadsheet protection.
+            cell.protection = Protection(locked=False)
         for column_index in (1, 2, 3, 4, 6, 7):
             worksheet.cell(row_index, column_index).number_format = "@"
         for column_index in (14, 16):
@@ -156,7 +156,10 @@ def initial_review_workbook_bytes(
                             "为兼容 WPS 和 LibreOffice，初审表不启用整表保护，灰色资料列请勿修改；"
                             "导入只保存初审资料，不会自动提交复核。"
                             if editable_rows
-                            else "当前工作簿为系统资料导出，仅用于查看；如需修改，请回到工作台按流程操作。"
+                            else (
+                                "当前工作簿可自由编辑，用于人工匹配和验证；修改不会写回商品企划中心。"
+                                "需要修改系统资料时，请回到工作台按流程操作。"
+                            )
                         )
                     )
                     if index == 0
@@ -174,7 +177,7 @@ def initial_review_workbook_bytes(
                 else (
                     "操作提示：请直接编辑主表中的黄色单元格，不要整行粘贴，也不要修改表头和灰色资料列。"
                     if editable_rows
-                    else "操作提示：本工作簿仅用于查看；发现错误请回到工作台使用“修改”按钮。"
+                    else "操作提示：本工作簿可自由编辑用于人工检查，但不接受 Excel 导入。"
                 )
             ),
         ]
@@ -202,6 +205,9 @@ def initial_review_workbook_bytes(
     option_sheet.column_dimensions["C"].width = 56
     for row in option_sheet.iter_rows(min_row=2, min_col=3, max_col=3):
         row[0].alignment = Alignment(vertical="top", wrap_text=True)
+    for row in option_sheet.iter_rows():
+        for cell in row:
+            cell.protection = Protection(locked=False)
     option_sheet.freeze_panes = "A2"
 
     category_end = max(2, len(category_options) + 1)
@@ -243,16 +249,14 @@ def initial_review_workbook_bytes(
     worksheet.page_setup.fitToHeight = 0
     worksheet.page_margins = PageMargins(left=0.2, right=0.2, top=0.4, bottom=0.4, header=0.15, footer=0.15)
     worksheet.print_title_rows = "1:1"
-    # WPS and LibreOffice do not consistently honor openpyxl's combination of
-    # sheet protection and unlocked cells. Initial-review workbooks and the
-    # confirmed inspection copy remain unprotected; unrelated read-only
-    # exports keep their original sheet protection.
-    workbook_is_editable = manual_editable or bool(editable_rows)
-    worksheet.protection.sheet = not workbook_is_editable
+    # WPS and LibreOffice handle protected worksheets inconsistently. All
+    # exports are local inspection copies, so keep every worksheet fully
+    # unprotected; server-side validation remains the authority for imports.
+    worksheet.protection.sheet = False
     worksheet.protection.autoFilter = True
     worksheet.protection.sort = True
-    worksheet.protection.selectLockedCells = not workbook_is_editable
-    worksheet.protection.selectUnlockedCells = workbook_is_editable
+    worksheet.protection.selectLockedCells = False
+    worksheet.protection.selectUnlockedCells = True
     selection = worksheet.sheet_view.selection[0]
     first_editable_cell = f"O{editable_rows[0]}" if editable_rows else "A1"
     selection.activeCell = first_editable_cell

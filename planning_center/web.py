@@ -653,26 +653,29 @@ class PlanningApplication:
         if not content or len(content) > 10 * 1024 * 1024:
             raise ValueError("Excel 文件为空或超过 10MB。")
         rows = parse_initial_review_workbook(io.BytesIO(content))
-        # The confirmed stage is intentionally export-only. A correction must
-        # go through the explicit row-level “修改” action and a fresh review.
-        confirmed_rows = [
-            row
-            for row in rows
-            if (
-                (record := db.get_pricing_record(self.db_path, int(row.get("record_id") or 0)))
-                and str(record.get("status") or "") == "confirmed"
-            )
-        ]
-        if confirmed_rows:
-            raise ValueError("“复核通过，待回传”阶段只允许导出检查，不能导入 Excel；如需修改请先点击“修改”。")
+        importable_rows = []
+        skipped_rows = 0
+        for row in rows:
+            record = db.get_pricing_record(self.db_path, int(row.get("record_id") or 0))
+            if not record:
+                raise ValueError(f"第 {int(row.get('row_number') or 0)} 行对应的定价记录不存在。")
+            if str(record.get("status") or "") in {"suggested", "conflict"}:
+                importable_rows.append(row)
+            else:
+                skipped_rows += 1
+        if not importable_rows:
+            raise ValueError("当前 Excel 中没有可导入的待初审或版本冲突资料；其他状态只能导出检查，不能通过 Excel 修改。")
         updated = db.import_initial_review_edits(
             self.db_path,
-            rows,
+            importable_rows,
             user.get("display_name", "商品部企划员"),
         )
+        notice = f"已从 Excel 导入并保存 {updated} 款初审资料。"
+        if skipped_rows:
+            notice += f"另有 {skipped_rows} 款因当前不在待初审或版本冲突状态，已跳过且未修改。"
         return self.redirect(
             start_response,
-            "/workbench?status=suggested&notice=" + self.q(f"已从 Excel 导入并保存 {updated} 款初审资料。"),
+            "/workbench?status=suggested&notice=" + self.q(notice),
         )
 
     @staticmethod
@@ -1352,7 +1355,7 @@ class PlanningApplication:
             "<form id='pricing-import-form' method='post' action='/pricing/import' enctype='multipart/form-data'>"
             "<label class='pricing-excel-file'><span>选择文件</span><input type='file' name='workbook' accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' required></label>"
             "<button type='submit'>导入并保存初审资料</button></form>"
-            if user.get('role') == 'planner' and status != 'confirmed'
+            if user.get('role') == 'planner' and filtered_action_counts["submit-review"] > 0
             else ""
         )
         excel_toolbar = (
@@ -1639,7 +1642,7 @@ class PlanningApplication:
           <div class='workbench-search-wrap'>{search_form}</div>
           <form class='workbench-filter' method='get' action='/workbench'>{filter_search_hidden}<label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待初审</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待复核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>复核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button class='primary' type='submit'>筛选</button></form>
         </section>
-        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>初审与复核</h2><p class='hint'>来源资料、测算结果和流程操作在同一行展示，每页最多 50 款。</p></div><div class='pricing-board-tools'><button id='pricing-reset-columns' class='compact-button' type='button' title='恢复默认列宽'>恢复默认列宽</button><span class='count'>本页 {len(page_products)} 款</span>{batch_toolbar}</div></div>{pagination_top}{selection_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table' data-resizable-columns='pricing-v1'>{pricing_colgroup}<thead><tr>{pricing_header}</tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="14" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div>{pagination_bottom}</section>
+        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>初审与复核</h2><p class='hint'>来源资料、测算结果和流程操作在同一行展示，每页最多 50 款。</p></div><div class='pricing-board-tools'>{batch_toolbar}</div></div>{pagination_top}{selection_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table' data-resizable-columns='pricing-v1'>{pricing_colgroup}<thead><tr>{pricing_header}</tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="14" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div>{pagination_bottom}</section>
         <dialog id='product-image-dialog' class='product-image-dialog' aria-labelledby='product-image-dialog-title'>
           <div class='product-image-dialog-frame'>
             <div class='product-image-dialog-head'><div><span>STYLE IMAGE</span><strong id='product-image-dialog-title'>款式图片</strong></div><button class='product-image-dialog-close' type='button' aria-label='关闭大图' title='关闭'>&times;</button></div>
@@ -1702,11 +1705,6 @@ class PlanningApplication:
           if (pricingTable) {{
             const widths = readColumnWidths();
             resizeHeaders.forEach((header) => applyColumnWidth(header, widths[header.dataset.columnKey]));
-            const resetButton = document.querySelector('#pricing-reset-columns');
-            resetButton?.addEventListener('click', () => {{
-              try {{ localStorage.removeItem(resizeStorageKey); }} catch (error) {{}}
-              resizeHeaders.forEach((header) => applyColumnWidth(header, defaultColumnWidths[header.dataset.columnKey]));
-            }});
             let resizeState = null;
             const stopResize = () => {{
               if (!resizeState) return;
@@ -2324,7 +2322,7 @@ class PlanningApplication:
         @media(max-width:620px){.rule-form.option-rule-form{grid-template-columns:1fr}.rule-form.option-rule-form .form-actions{grid-column:auto}.pricing-board>.panel-head{padding:18px 18px 0;align-items:flex-start}.pricing-batch-toolbar{align-items:flex-start;flex-wrap:wrap;padding:10px 18px}.pricing-batch-actions{width:100%;justify-content:flex-start;margin-left:0;overflow-x:auto}.pricing-excel-toolbar,.pricing-excel-toolbar>form{align-items:stretch;flex-direction:column}.pricing-excel-toolbar{padding:10px 18px}.pricing-excel-toolbar>a,.pricing-excel-toolbar button{width:100%}.pricing-excel-file{align-items:stretch;flex-direction:column}.pricing-excel-file input{width:100%}.pricing-table{min-width:1690px}.pricing-table th,.pricing-table td{padding:10px 9px}.pricing-table .pricing-action-cell input{width:102px}.pricing-table .pricing-action-cell button{font-size:11px;padding:6px 8px}}
         .pricing-table .pricing-image-cell{position:sticky;left:44px;z-index:1;min-width:78px;width:78px;padding-left:10px;padding-right:10px;background:#fff;box-shadow:1px 0 0 var(--line)}.pricing-table thead th:nth-child(2){position:sticky;left:44px;z-index:3;min-width:78px;width:78px;background:#f7f9f7;box-shadow:1px 0 0 var(--line)}.pricing-table tbody tr:hover .pricing-image-cell{background:#fbfcfb}.pricing-table td:nth-child(2){min-width:78px;width:78px}.pricing-table td:nth-child(3){min-width:105px}.pricing-table td:nth-child(4){min-width:88px}.pricing-table td:nth-child(5){min-width:92px}.pricing-table td:nth-child(6){min-width:130px}.pricing-table td:nth-child(7){min-width:110px}.pricing-table td:nth-child(8){min-width:88px}.pricing-table td:nth-child(9){min-width:112px}.pricing-table td:nth-child(10){min-width:170px}.pricing-table td:nth-child(11){min-width:180px}.pricing-table td:nth-child(12){min-width:112px}.pricing-table td:nth-child(13){min-width:135px}.pricing-table td:nth-child(14){min-width:270px}.pricing-table .pricing-workflow-cell{vertical-align:middle}.pricing-table .workflow-status{margin-bottom:8px}.pricing-table .workflow-actions form{margin:0 0 7px}.pricing-table .workflow-actions>form:only-child{margin-bottom:0}.pricing-table .workflow-actions label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap}.pricing-table .workflow-actions input{width:110px;padding:7px 8px}.pricing-table .workflow-actions button{padding:7px 9px;font-size:12px;white-space:nowrap}.pricing-table .workflow-actions small{max-width:245px}
         @media(max-width:620px){.pricing-table .workflow-actions input{width:102px}.pricing-table .workflow-actions button{font-size:11px;padding:6px 8px}}
-        .pricing-board-tools{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap;min-width:0;padding:8px 10px;border:1px solid var(--line);background:#f7f9f7}.pricing-board-tools .compact-button{background:#fff}.pricing-table[data-resizable-columns]{table-layout:fixed;width:max-content;min-width:0;--select-column-width:44px;--image-column-width:78px}.pricing-table[data-resizable-columns] col{width:auto}.pricing-table[data-resizable-columns] th,.pricing-table[data-resizable-columns] td{width:auto;min-width:0!important;overflow-wrap:anywhere}.pricing-table[data-resizable-columns] .pricing-select-cell{width:var(--select-column-width)}.pricing-table[data-resizable-columns] .pricing-image-cell{left:var(--select-column-width);width:var(--image-column-width)}.pricing-table[data-resizable-columns] thead th:nth-child(2){left:var(--select-column-width);width:var(--image-column-width)}.pricing-table[data-resizable-columns] thead th:not(:first-child):not(:nth-child(2)){position:relative}.pricing-table .rule-summary{display:flex;flex-direction:column;gap:2px;white-space:normal}.pricing-table .rule-expression,.pricing-table .rule-raw-price{display:block;white-space:nowrap}.column-resize-handle{position:absolute;top:0;right:-4px;width:8px;height:100%;cursor:col-resize;touch-action:none;z-index:4}.column-resize-handle:hover,.column-resize-handle:focus-visible,.column-resizing .column-resize-handle{background:var(--accent);opacity:.6;outline:0}.column-resizing{cursor:col-resize!important;user-select:none}.column-resizing *{cursor:col-resize!important;user-select:none}
+        .pricing-board-tools{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap;min-width:0;padding:0;border:0;background:transparent}.pricing-board-tools .compact-button{background:#fff}.pricing-table[data-resizable-columns]{table-layout:fixed;width:max-content;min-width:0;--select-column-width:44px;--image-column-width:78px}.pricing-table[data-resizable-columns] col{width:auto}.pricing-table[data-resizable-columns] th,.pricing-table[data-resizable-columns] td{width:auto;min-width:0!important;overflow-wrap:anywhere}.pricing-table[data-resizable-columns] .pricing-select-cell{width:var(--select-column-width)}.pricing-table[data-resizable-columns] .pricing-image-cell{left:var(--select-column-width);width:var(--image-column-width)}.pricing-table[data-resizable-columns] thead th:nth-child(2){left:var(--select-column-width);width:var(--image-column-width)}.pricing-table[data-resizable-columns] thead th:not(:first-child):not(:nth-child(2)){position:relative}.pricing-table .rule-summary{display:flex;flex-direction:column;gap:2px;white-space:normal}.pricing-table .rule-expression,.pricing-table .rule-raw-price{display:block;white-space:nowrap}.column-resize-handle{position:absolute;top:0;right:-4px;width:8px;height:100%;cursor:col-resize;touch-action:none;z-index:4}.column-resize-handle:hover,.column-resize-handle:focus-visible,.column-resizing .column-resize-handle{background:var(--accent);opacity:.6;outline:0}.column-resizing{cursor:col-resize!important;user-select:none}.column-resizing *{cursor:col-resize!important;user-select:none}
         .workbench-toolbar{display:flex;align-items:center;justify-content:space-between;gap:24px;background:#fff;border:1px solid var(--line);padding:12px 18px;margin-bottom:16px}.workbench-toolbar-summary{display:flex;align-items:center;gap:9px;min-width:max-content}.workbench-toolbar-summary strong{font-size:14px;font-weight:600;color:var(--deep)}.toolbar-status-dot{width:8px;height:8px;border-radius:50%;background:#4f8060;box-shadow:0 0 0 3px #edf5ef}.workbench-filter{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;margin-left:auto}.workbench-filter label{display:flex;flex-direction:column;gap:3px;color:#202421;font-size:13px;font-weight:700}.workbench-filter select{min-width:145px;padding:7px 9px;color:#202421;font-size:14px;font-weight:600}.workbench-filter button{padding:7px 12px}.pricing-pagination{display:flex;align-items:center;justify-content:flex-end;gap:12px}.pricing-pagination-bottom{min-height:58px;padding:10px 24px;border-top:1px solid var(--line);background:#f7f9f7}.pricing-pagination-top{width:100%;min-height:58px;padding:10px 24px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:#f7f9f7;justify-content:center;gap:7px}.pricing-pagination>span:not(.button){color:var(--muted);font-size:12px;white-space:nowrap}.pagination-link{padding:6px 11px;font-size:12px}.pagination-link.disabled{cursor:not-allowed;opacity:.45;pointer-events:none}
         .workbench-search-wrap{display:flex;flex:0 1 460px;max-width:50%;min-width:0;flex-direction:column;gap:4px}.workbench-search{display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap}.workbench-search label{display:flex;flex:1;min-width:230px;flex-direction:column;gap:3px;color:#202421;font-size:13px;font-weight:700}.workbench-search input{width:100%;min-width:280px;padding:7px 9px;color:#202421;font-size:14px}.workbench-search button,.workbench-search .button{padding:7px 12px;white-space:nowrap}.workbench-toolbar-note{color:var(--muted);font-size:12px;line-height:1.4}
         @media(max-width:900px){.pricing-board-tools{flex-wrap:wrap;justify-content:flex-end}.pricing-pagination-top{flex-basis:100%}.workbench-search-wrap{width:100%;max-width:none}.workbench-search{width:100%}.workbench-search label{min-width:0}.workbench-search input{min-width:0}.catalog-sync-form{align-items:flex-start;width:100%}.catalog-sync-form .sync-condition-note{text-align:left}}
