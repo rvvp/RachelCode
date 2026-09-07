@@ -2353,6 +2353,20 @@ def update_product(connection: sqlite3.Connection, product_id: int, raw_values: 
                 PRODUCT_FIELD_MAP[key].label for key in sorted(forbidden_changes) if key in PRODUCT_FIELD_MAP
             )
             raise PermissionError(f"当前账号不能修改这些字段：{changed_labels}。")
+        blocked_restart_changes = requested_changes & WORKFLOW_RESTART_FIELD_KEYS
+        if (
+            actor_department == "A"
+            and actor_user_id == before_product.get("created_by")
+            and before_product.get("lifecycle_status") == "active"
+            and before_product.get("status") in {"published", "received"}
+            and blocked_restart_changes
+        ):
+            changed_labels = "、".join(
+                PRODUCT_FIELD_MAP[key].label for key in sorted(blocked_restart_changes) if key in PRODUCT_FIELD_MAP
+            )
+            raise PermissionError(
+                f"当前资料已进入运营流程，不能直接修改{changed_labels}。请先使用“召回到 A/B 协作”，再进行修改。"
+            )
     merged_values = dict(before_product)
     for field_key in allowed_field_keys:
         if field_key in raw_values:

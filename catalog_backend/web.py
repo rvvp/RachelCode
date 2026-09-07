@@ -49,6 +49,8 @@ from catalog_backend.policies import (
     can_edit_product,
     can_import_product_excel,
     can_import_product_images,
+    can_delete_product,
+    can_recall_product,
     c_user_can_manage_platform_bill,
     can_manage_supplier_settlements,
     can_manage_users,
@@ -100,7 +102,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.09.07-multi-product-search-v1"
+CATALOG_BUILD_VERSION = "2026.09.07-a-lifecycle-v1"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -376,6 +378,8 @@ class CatalogApplication:
                 if method == "GET":
                     return self.handle_list_layout_settings_page(start_response, user, query)
                 return self.handle_list_layout_settings_update(environ, start_response, user)
+            if path == "/rules" and method == "GET":
+                return self.html_response(start_response, self.render_rules_page(user))
             if path.startswith(MEDIA_URL_PREFIX) and method == "GET":
                 return self.handle_media(start_response, user, path)
 
@@ -626,8 +630,22 @@ class CatalogApplication:
                 ),
                 status="400 Bad Request",
             )
-        with db.get_connection(self.db_path) as connection:
-            db.update_product(connection, product_id, form, user["id"])
+        try:
+            with db.get_connection(self.db_path) as connection:
+                db.update_product(connection, product_id, form, user["id"])
+        except PermissionError as error:
+            merged = {**product, **form}
+            return self.html_response(
+                start_response,
+                self.render_product_form(
+                    user,
+                    f"/products/{product_id}/edit",
+                    f"编辑资料 #{product_id}",
+                    merged,
+                    [str(error)],
+                ),
+                status="403 Forbidden",
+            )
         return self.redirect(
             start_response,
             f"/products/{product_id}?notice=" + self.urlencode_message("商品资料已更新。"),
@@ -671,18 +689,31 @@ class CatalogApplication:
             return self.handle_b_stage_import(start_response, user, products)
         created = 0
         updated = 0
+        blocked: list[str] = []
         for product in products:
-            action, _ = db.save_or_update_owned_product(
-                self.db_path,
-                product,
-                user["id"],
-                user["department"],
-            )
+            try:
+                action, _ = db.save_or_update_owned_product(
+                    self.db_path,
+                    product,
+                    user["id"],
+                    user["department"],
+                )
+            except PermissionError as error:
+                row_label = str(
+                    product.get("style_code") or product.get("style_color") or product.get("product_name") or "未命名资料"
+                ).strip()
+                blocked.append(f"{row_label}：{error}")
+                continue
             if action == "created":
                 created += 1
             else:
                 updated += 1
         report = f"导入完成：新增 {created} 条，更新 {updated} 条。"
+        if blocked:
+            preview = "；".join(blocked[:3])
+            if len(blocked) > 3:
+                preview = f"{preview}；另有 {len(blocked) - 3} 条未更新"
+            report = f"{report} 以下资料未更新，请先召回到 A/B 协作：{preview}"
         return self.html_response(start_response, self.render_import_page(user, report=report))
 
     def handle_b_stage_import(self, start_response, user, products: list[dict]):
@@ -1488,6 +1519,15 @@ class CatalogApplication:
             return self.redirect(
                 start_response,
                 f"{return_to}{separator}notice=" + self.urlencode_message("资料已删除。"),
+            )
+        return_to = self.safe_internal_path(form.get("return_to"))
+        if return_to:
+            return self.redirect(
+                start_response,
+                self.products_notice_path(
+                    return_to,
+                    f"资料生命周期已更新为{lifecycle_label(target_status)}。",
+                ),
             )
         return self.redirect(
             start_response,
@@ -3371,6 +3411,8 @@ class CatalogApplication:
 
     def status_transition_validation_error(self, product: dict, target_status: str) -> str:
         if target_status == "pending":
+            if product.get("status") in {"published", "received"}:
+                return ""
             missing_keys = [
                 field_key
                 for field_key in COLLABORATION_START_FIELD_KEYS
@@ -3590,6 +3632,7 @@ class CatalogApplication:
         if is_admin(user):
             action_links.append('<li class="nav-chip"><a href="/users">账号管理</a></li>')
             action_links.append('<li class="nav-chip"><a href="/settings/c-fields">字段开放</a></li>')
+        action_links.append('<li class="nav-chip"><a href="/rules">规则说明</a></li>')
         if can_view_logs(user):
             action_links.append('<li class="nav-chip"><a href="/logs">日志中心</a></li>')
         if not is_department_monitor(user):
@@ -4495,6 +4538,14 @@ class CatalogApplication:
       overflow: visible;
       box-shadow: inset 0 -1px 0 rgba(94, 67, 40, 0.08);
     }}
+    .catalog-table thead th:last-child {{
+      right: 0;
+      z-index: 5;
+      background: rgba(247, 241, 233, 0.99);
+      box-shadow:
+        inset 0 -1px 0 rgba(94, 67, 40, 0.08),
+        -12px 0 18px -18px rgba(67, 43, 25, 0.72);
+    }}
     .catalog-table tbody tr {{
       transition: background 160ms ease;
     }}
@@ -4520,6 +4571,19 @@ class CatalogApplication:
     .catalog-table .table-updated-cell,
     .catalog-table .table-actions-cell {{
       white-space: nowrap;
+    }}
+    .catalog-table .table-actions-cell {{
+      position: sticky;
+      right: 0;
+      z-index: 2;
+      background: rgba(255, 255, 255, 0.99);
+      box-shadow: -12px 0 18px -18px rgba(67, 43, 25, 0.72);
+    }}
+    .catalog-table tbody tr:nth-child(even) .table-actions-cell {{
+      background: rgba(250, 246, 240, 0.99);
+    }}
+    .catalog-table tbody tr:hover .table-actions-cell {{
+      background: rgba(255, 248, 238, 0.99);
     }}
     .catalog-table .table-id-link {{
       display: inline-flex;
@@ -4609,6 +4673,133 @@ class CatalogApplication:
     }}
     .catalog-table .table-action-links .table-action-danger:hover {{
       background: rgba(255, 234, 226, 0.98);
+    }}
+    .catalog-table .table-action-links .table-action-recall {{
+      color: #8a4b22;
+      border-color: rgba(138, 75, 34, 0.22);
+      background: rgba(251, 239, 222, 0.96);
+    }}
+    .catalog-table .table-action-links .table-action-recall:hover {{
+      background: rgba(246, 225, 198, 0.98);
+    }}
+    .rule-status-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }}
+    .rule-status-grid .stat-card {{
+      min-height: 118px;
+      justify-content: flex-start;
+    }}
+    .rule-status-grid small {{
+      display: block;
+      margin-top: 6px;
+      color: var(--muted);
+      line-height: 1.55;
+    }}
+    .rules-panel {{
+      display: grid;
+      gap: 28px;
+    }}
+    .rule-section + .rule-section {{
+      padding-top: 26px;
+      border-top: 1px solid var(--line);
+    }}
+    .rule-section h2 {{
+      margin: 5px 0 14px;
+    }}
+    .rules-table-wrap {{
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(255,255,255,0.52);
+    }}
+    .rules-table {{
+      width: 100%;
+      min-width: 720px;
+      border-collapse: collapse;
+    }}
+    .rules-table th,
+    .rules-table td {{
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      line-height: 1.6;
+    }}
+    .rules-table thead th {{
+      color: var(--muted);
+      background: rgba(247,241,233,0.82);
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .rules-table tbody tr:last-child th,
+    .rules-table tbody tr:last-child td {{
+      border-bottom: 0;
+    }}
+    .rules-table tbody th {{
+      width: 150px;
+      color: var(--accent-deep);
+      font-weight: 700;
+    }}
+    .rule-callouts {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    .rule-callout {{
+      display: grid;
+      gap: 7px;
+      align-content: start;
+      min-height: 112px;
+      padding: 16px;
+      border: 1px solid rgba(188,108,37,0.16);
+      border-radius: 16px;
+      background: rgba(255,249,240,0.64);
+    }}
+    .rule-callout strong {{
+      color: var(--accent-strong);
+    }}
+    .rule-callout span,
+    .rule-lead,
+    .rule-section > p {{
+      color: var(--muted);
+      line-height: 1.7;
+    }}
+    .trigger-field-list {{
+      margin: 12px 0 16px;
+      padding: 14px 16px;
+      border-left: 3px solid var(--accent);
+      background: rgba(188,108,37,0.08);
+      color: var(--accent-deep);
+      line-height: 1.8;
+      font-weight: 700;
+    }}
+    .catalog-table .table-action-links .table-action-lifecycle {{
+      color: #80602e;
+      border-color: rgba(128, 96, 46, 0.2);
+      background: rgba(250, 244, 224, 0.96);
+    }}
+    .catalog-table .table-action-links .table-action-lifecycle:hover {{
+      background: rgba(244, 234, 199, 0.98);
+    }}
+    .catalog-table .table-action-links .table-action-restore {{
+      color: #2f6f55;
+      border-color: rgba(47, 111, 85, 0.2);
+      background: rgba(230, 244, 235, 0.96);
+    }}
+    .catalog-table .table-action-links .table-action-restore:hover {{
+      background: rgba(214, 237, 222, 0.98);
+    }}
+    .catalog-table .table-action-links .table-action-disabled,
+    .catalog-table .table-action-links .table-action-disabled:hover {{
+      color: rgba(120, 109, 98, 0.62);
+      border-color: rgba(91, 58, 29, 0.08);
+      background: rgba(245, 242, 238, 0.9);
+      cursor: not-allowed;
+      filter: none;
+      transform: none;
     }}
     .catalog-table .table-action-links .table-action-receive {{
       color: var(--success);
@@ -7475,6 +7666,10 @@ class CatalogApplication:
       .supplier-bill-import-action-pair {{
         grid-column: 1;
       }}
+      .rule-status-grid,
+      .rule-callouts {{
+        grid-template-columns: 1fr;
+      }}
       .brand-dashboard-toolbar {{
         align-items: flex-start;
       }}
@@ -9400,7 +9595,36 @@ class CatalogApplication:
                     f'name="status" value="received" '
                     f'formaction="/products/{product["id"]}/status" formmethod="post">接收</button>'
                 )
+            status_actions = dict(available_status_actions(user, product))
+            if (
+                can_recall_product(user, product)
+                and product.get("status") in {"published", "received"}
+                and "pending" in status_actions
+            ):
+                actions.append(
+                    f'<button class="table-action-recall" type="submit" '
+                    f'name="status" value="pending" '
+                    f'formaction="/products/{product["id"]}/status" formmethod="post" '
+                    f'title="召回后可修改重要字段或删除资料">召回</button>'
+                )
             lifecycle_actions = dict(available_lifecycle_actions(user, product))
+            for lifecycle_target in lifecycle_actions:
+                if lifecycle_target == "archived":
+                    action_label = "归档" if product.get("lifecycle_status") == "active" else "恢复为归档"
+                    action_class = "table-action-lifecycle"
+                    action_title = "归档后可在全部类型中选择已归档查看"
+                elif lifecycle_target == "active":
+                    action_label = "恢复" if product.get("lifecycle_status") == "archived" else "恢复为正常"
+                    action_class = "table-action-restore"
+                    action_title = "恢复为正常资料"
+                else:
+                    continue
+                actions.append(
+                    f'<button class="{action_class}" type="submit" '
+                    f'name="lifecycle_status" value="{html.escape(lifecycle_target)}" '
+                    f'formaction="/products/{product["id"]}/lifecycle" formmethod="post" '
+                    f'title="{html.escape(action_title, quote=True)}">{action_label}</button>'
+                )
             if "deleted" in lifecycle_actions:
                 product_name = str(product.get("product_name") or "").strip()
                 style_code = str(product.get("style_code") or "").strip()
@@ -9413,6 +9637,21 @@ class CatalogApplication:
                     f'formaction="/products/{product["id"]}/lifecycle" formmethod="post" '
                     f'data-delete-button="1" '
                     f'data-product-label="{html.escape(action_context, quote=True)}">删除</button>'
+                )
+            elif (
+                user.get("department") == "A"
+                and product.get("lifecycle_status") == "active"
+                and not can_delete_product(user, product)
+            ):
+                delete_title = (
+                    "资料已进入运营流程，请先召回到 A/B 协作后再删除"
+                    if can_recall_product(user, product)
+                    else "仅资料发起人可以删除该条目"
+                )
+                actions.append(
+                    '<button class="table-action-disabled" type="button" disabled '
+                    f'title="{html.escape(delete_title, quote=True)}" '
+                    f'aria-label="删除不可用：{html.escape(delete_title, quote=True)}">删除</button>'
                 )
             if can_view_logs(user):
                 actions.append(f'<a href="/products/{product["id"]}/logs">日志</a>')
@@ -12055,6 +12294,83 @@ class CatalogApplication:
         """
         return self.page("修改密码 - 商品资料后台", content, user, back_href="/modules")
 
+    def render_rules_page(self, user) -> str:
+        trigger_labels = "、".join(
+            field.label for field in PRODUCT_FIELDS if field.key in WORKFLOW_RESTART_FIELD_KEYS
+        )
+        content = f"""
+        <section class="hero">
+          <div class="panel">
+            <div class="eyebrow">Workspace Rules</div>
+            <h1>规则说明</h1>
+            <p>这里集中说明商品资料后台的工作流、字段权限和资料进入运营流程后的修改规则。页面与接口均以这些规则为准。</p>
+          </div>
+          <div class="panel">
+            <div class="eyebrow">Current Workflow</div>
+            <h2>四个流程状态</h2>
+            <div class="rule-status-grid">
+              <div class="stat-card"><span>状态 1</span><strong>跟单整理中</strong><small>A 跟单部录入和整理主体资料。</small></div>
+              <div class="stat-card"><span>状态 2</span><strong>A/B 协作中</strong><small>A、B 可按字段权限并行完善资料。</small></div>
+              <div class="stat-card"><span>状态 3</span><strong>待运营接收</strong><small>B 判断资料齐全后提交给 C 运营部。</small></div>
+              <div class="stat-card"><span>状态 4</span><strong>已接收</strong><small>C 运营账号确认接收当前运营版本。</small></div>
+            </div>
+          </div>
+        </section>
+        <section class="panel rules-panel">
+          <div class="rule-section">
+            <div class="eyebrow">Roles</div>
+            <h2>各部门操作范围</h2>
+            <div class="rules-table-wrap">
+              <table class="rules-table">
+                <thead><tr><th>角色</th><th>可操作内容</th><th>不可操作内容</th></tr></thead>
+                <tbody>
+                  <tr><th>A 跟单部</th><td>维护自己发起资料的 A 阶段字段；在早期状态开启 B 协作。</td><td>不能修改商品部或企划中心负责字段；运营阶段不能直接修改触发字段。</td></tr>
+                  <tr><th>B 商品部</th><td>在 A/B 协作中推进商品资料；当前藏宝阁内直接维护图片，资料完成后提交运营部。</td><td>不能删除、归档或召回；不能修改 A 阶段字段。品类、上新价格、上新渠道由商品企划中心维护并回传。</td></tr>
+                  <tr><th>C 运营部</th><td>查看本账号渠道及同款资料；对当前运营版本执行接收。</td><td>不能修改资料、删除、归档或召回。</td></tr>
+                  <tr><th>总经办 / 美工部</th><td>按各自只读范围查看资料。</td><td>不能上传、修改、删除、归档或召回。</td></tr>
+                  <tr><th>管理员</th><td>可查看并监控各部门，维护账号和系统规则，执行必要的流程及生命周期管理。</td><td>管理员操作会写入日志，正式业务仍建议由对应部门完成。</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="rule-section">
+            <div class="eyebrow">Lifecycle</div>
+            <h2>删除、归档与召回</h2>
+            <div class="rule-callouts">
+              <div class="rule-callout"><strong>删除</strong><span>A 原始发起人仅可在“跟单整理中”或“A/B 协作中”删除自己发起的正常资料。进入运营阶段后，必须先召回。</span></div>
+              <div class="rule-callout"><strong>归档</strong><span>仅 A 原始发起人和管理员有权限。A 只能对“已接收”的自己发起资料归档；管理员可按管理权限归档。</span></div>
+              <div class="rule-callout"><strong>召回</strong><span>仅 A 原始发起人和管理员可对“待运营接收”或“已接收”资料执行“召回到 A/B 协作”。召回会清除当前运营接收标记，保留历史版本和操作日志。</span></div>
+            </div>
+          </div>
+          <div class="rule-section">
+            <div class="eyebrow">Revision Policy</div>
+            <h2>运营阶段修改规则</h2>
+            <p class="rule-lead">资料进入“待运营接收”或“已接收”后，以下字段视为流程触发字段：</p>
+            <div class="trigger-field-list">{html.escape(trigger_labels)}</div>
+            <div class="rules-table-wrap rule-revision-table-wrap">
+              <table class="rules-table rule-revision-table">
+                <thead><tr><th>操作账号</th><th>可修改内容</th><th>处理规则</th></tr></thead>
+                <tbody>
+                  <tr><th>A 跟单部</th><td>可修改 A 阶段负责字段。上方列出的字段属于触发字段。</td><td>处于“待运营接收”或“已接收”时，修改触发字段前必须先使用“召回到 A/B 协作”；非触发字段可直接修改并生成新版本。</td></tr>
+                  <tr><th>B 商品部</th><td>当前藏宝阁只开放图片维护。</td><td>图片采用独立图片版本更新，不触发召回，也不要求运营重新接收。B 没有召回权限。</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="rule-callouts">
+              <div class="rule-callout"><strong>重要字段</strong><span>A 修改前请先使用“召回到 A/B 协作”；未召回时系统会拒绝保存或导入，避免运营继续使用不完整版本。</span></div>
+              <div class="rule-callout"><strong>非触发字段</strong><span>A 修改非触发字段会生成新版本并更新资料，不会要求 C 重新接收。B 当前直接可修改的是图片，图片按独立图片版本更新，不触发业务流程重走。</span></div>
+              <div class="rule-callout"><strong>企划回传</strong><span>商品企划中心回传品类、上新价格或上新渠道等变更时，系统会标记“待商品部重新提交”；B 确认后才生成新的运营版本，C 再接收新版本。</span></div>
+            </div>
+          </div>
+          <div class="rule-section">
+            <div class="eyebrow">Audit Trail</div>
+            <h2>版本与记录</h2>
+            <p>每次资料修改、状态流转、召回、删除和归档都会写入操作日志。资料版本页用于回溯修改前后的版本；含税价另有独立历史记录，便于查询最初价格和后续调整。</p>
+          </div>
+        </section>
+        """
+        return self.page("规则说明 - 商品资料后台", content, user, back_href="/modules")
+
     def render_message_page(self, title: str, message: str, user=None) -> str:
         content = f"""
         <section class="panel" style="max-width:820px; margin:0 auto;">
@@ -12891,6 +13207,8 @@ class CatalogApplication:
 
     def status_note_label(self, user, product: dict, target_status: str) -> str:
         if target_status == "pending":
+            if product.get("status") in {"published", "received"}:
+                return "召回说明（选填）"
             return "交接说明（选填）"
         if target_status == "published":
             return "完成说明（选填）"
@@ -12900,6 +13218,8 @@ class CatalogApplication:
 
     def status_note_placeholder(self, user, product: dict, target_status: str) -> str:
         if target_status == "pending":
+            if product.get("status") in {"published", "received"}:
+                return "例如：材质发生调整，召回后重新核对 A/B 协作资料。"
             return "例如：款式识别信息已补齐，可以开始图片和上新准备工作。"
         if target_status == "published":
             return "例如：已确认当前资料齐全，可以提交运营部接收。"
@@ -12920,7 +13240,10 @@ class CatalogApplication:
     def status_change_details(self, user, product: dict, target_status: str, review_note: str = "") -> str:
         actor = department_label(user.get("department"))
         if target_status == "pending":
-            if user.get("department") == "A":
+            if product.get("status") in {"published", "received"}:
+                details = f"{actor} 召回资料，重新进入 A/B 协作阶段，可在召回后修改资料并重新确认流转。"
+                note_prefix = "召回说明"
+            elif user.get("department") == "A":
                 details = f"{actor} 已补齐款式识别字段并开启商品部协作，A/B 可按各自字段权限并行完善资料。"
                 note_prefix = "交接说明"
             else:

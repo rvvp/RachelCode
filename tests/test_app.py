@@ -410,6 +410,14 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(initial_stats["recent_tax_price_changes"], 0)
 
         a_cookie = self.login("a_editor", "demo123")
+        recall_response = self.request(
+            "/products/1/status",
+            method="POST",
+            body=urlencode({"status": "pending"}).encode("utf-8"),
+            cookie=a_cookie,
+        )
+        self.assertTrue(recall_response["status"].startswith("302"))
+        self.assertEqual(db.get_product(self.db_path, 1)["status"], "pending")
         update_response = self.request(
             "/products/1/edit",
             method="POST",
@@ -3538,9 +3546,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.07-multi-product-search-v1")
+        self.assertEqual(payload["build_version"], "2026.09.07-a-lifecycle-v1")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.07-multi-product-search-v1")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.07-a-lifecycle-v1")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -6095,8 +6103,13 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("0+", headers["Location"])
         self.assertIn("1+", headers["Location"])
 
-    def test_editor_can_archive_own_product_and_admin_can_restore_deleted_product(self):
+    def test_a_can_archive_received_product_restore_it_and_admin_can_restore_deleted_product(self):
+        with db.get_connection(self.db_path) as connection:
+            connection.execute("UPDATE products SET status = 'received' WHERE id = 1")
         editor_cookie = self.login("a_editor", "demo123")
+        received_list_body = self.request("/products", cookie=editor_cookie)["body"].decode("utf-8")
+        self.assertIn('name="lifecycle_status" value="archived"', received_list_body)
+        self.assertIn(">归档</button>", received_list_body)
         archive_response = self.request(
             "/products/1/lifecycle",
             method="POST",
@@ -6110,9 +6123,26 @@ class CatalogAppTests(unittest.TestCase):
         logs = db.get_product_logs(self.db_path, 1)
         self.assertTrue(any(item["action"] == "lifecycle:archived" for item in logs))
 
+        archived_list_response = self.request("/products?lifecycle_status=archived", cookie=editor_cookie)
+        archived_list_body = archived_list_response["body"].decode("utf-8")
+        self.assertIn('name="lifecycle_status" value="active"', archived_list_body)
+        self.assertIn(">恢复</button>", archived_list_body)
+        self.assertNotIn('data-delete-button="1"', archived_list_body)
+
         c_cookie = self.login("c_viewer", "demo123")
         forbidden_response = self.request("/products/1", cookie=c_cookie)
         self.assertTrue(forbidden_response["status"].startswith("403"))
+
+        restore_response = self.request(
+            "/products/1/lifecycle",
+            method="POST",
+            body=urlencode({"lifecycle_status": "active", "return_to": "/products?lifecycle_status=archived"}).encode("utf-8"),
+            cookie=editor_cookie,
+        )
+        self.assertTrue(restore_response["status"].startswith("302"))
+        self.assertIn("lifecycle_status=archived", dict(restore_response["headers"])["Location"])
+        restored_by_a = db.get_product(self.db_path, 1)
+        self.assertEqual(restored_by_a["lifecycle_status"], "active")
 
         admin_cookie = self.login("admin_reviewer", "demo123")
         delete_response = self.request(
@@ -6134,6 +6164,19 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(restore_response["status"].startswith("302"))
         restored_product = db.get_product(self.db_path, 1)
         self.assertEqual(restored_product["lifecycle_status"], "active")
+
+    def test_a_cannot_archive_until_c_has_received_the_product(self):
+        editor_cookie = self.login("a_editor", "demo123")
+        list_body = self.request("/products", cookie=editor_cookie)["body"].decode("utf-8")
+        self.assertNotIn('name="lifecycle_status" value="archived"', list_body)
+        response = self.request(
+            "/products/1/lifecycle",
+            method="POST",
+            body=urlencode({"lifecycle_status": "archived"}).encode("utf-8"),
+            cookie=editor_cookie,
+        )
+        self.assertTrue(response["status"].startswith("403"))
+        self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "active")
 
     def test_delete_lifecycle_requires_confirmation(self):
         admin_cookie = self.login("admin_reviewer", "demo123")
@@ -6165,6 +6208,8 @@ class CatalogAppTests(unittest.TestCase):
         a_list_response = self.request("/products", cookie=a_cookie)
         a_list_body = a_list_response["body"].decode("utf-8")
         self.assertLess(a_list_body.index('data-delete-button="1"'), a_list_body.index('/products/1/logs'))
+        self.assertIn(".catalog-table thead th:last-child {", a_list_body)
+        self.assertIn(".catalog-table .table-actions-cell {", a_list_body)
         delete_response = self.request(
             "/products/2/lifecycle",
             method="POST",
@@ -6173,6 +6218,27 @@ class CatalogAppTests(unittest.TestCase):
         )
         self.assertTrue(delete_response["status"].startswith("302"))
         self.assertEqual(db.get_product(self.db_path, 2)["lifecycle_status"], "deleted")
+
+        db.create_user(
+            self.db_path,
+            "a_other_editor",
+            "另一位跟单员",
+            "A",
+            "demo123",
+            must_change_password=False,
+        )
+        other_a_cookie = self.login("a_other_editor", "demo123")
+        other_a_body = self.request("/products", cookie=other_a_cookie)["body"].decode("utf-8")
+        self.assertNotIn('data-delete-button="1"', other_a_body)
+        self.assertIn("仅资料发起人可以删除该条目", other_a_body)
+        forbidden_a_delete = self.request(
+            "/products/1/lifecycle",
+            method="POST",
+            body=urlencode({"lifecycle_status": "deleted", "confirm_text": "DELETE"}).encode("utf-8"),
+            cookie=other_a_cookie,
+        )
+        self.assertTrue(forbidden_a_delete["status"].startswith("403"))
+        self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "active")
 
     def test_a_can_start_collaboration_early_and_a_b_updates_merge_by_field(self):
         users = {user["department"]: user for user in db.list_users(self.db_path)}
@@ -6213,12 +6279,12 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(updated["image_url"], "https://example.com/collaboration.jpg")
         self.assertIn("资料尚未完成", self.app.status_transition_validation_error(updated, "published"))
 
-    def test_post_publication_trigger_fields_preserve_c_version_until_b_resubmits(self):
+    def test_post_publication_trigger_fields_require_a_recall_before_editing(self):
         users = {user["department"]: user for user in db.list_users(self.db_path)}
         source = next(product for product in db.list_products(self.db_path) if product["status"] == "published")
         original_name = source["product_name"]
-        original_release = int(source["c_release_no"])
         with db.get_connection(self.db_path) as connection:
+            original_release = int(source["c_release_no"])
             self.assertTrue(
                 db.record_c_product_receipt(connection, source["id"], users["C"]["id"], original_release)
             )
@@ -6241,80 +6307,141 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(non_trigger["c_published_version_no"], non_trigger["current_version_no"])
 
         with db.get_connection(self.db_path) as connection:
-            db.update_product(
-                connection,
-                source["id"],
-                {"product_name": original_name + "修订"},
-                users["A"]["id"],
-            )
-        triggered = db.get_product(self.db_path, source["id"])
-        self.assertEqual(triggered["workflow_restart_required"], 1)
-        self.assertIn("product_name", json.loads(triggered["workflow_restart_fields_json"]))
-        c_formal = db.products_for_c_published_versions(self.db_path, [triggered])[0]
-        self.assertEqual(c_formal["product_name"], original_name)
-        self.assertIn("published", dict(available_status_actions(users["B"], triggered)))
-        c_visible = self.app.visible_products_for_user([triggered], users["C"])
-        self.assertEqual(len(c_visible), 1)
-        self.assertEqual(c_visible[0]["product_name"], original_name)
-        c_cookie = self.login("c_viewer", "demo123")
-        old_name_response = self.request(
-            "/api/products?" + urlencode({"q": original_name}),
-            cookie=c_cookie,
-        )
-        self.assertEqual(json.loads(old_name_response["body"])["count"], 1)
-        work_name_response = self.request(
-            "/api/products?" + urlencode({"q": original_name + "修订"}),
-            cookie=c_cookie,
-        )
-        self.assertEqual(json.loads(work_name_response["body"])["count"], 0)
+            with self.assertRaisesRegex(PermissionError, "请先使用“召回到 A/B 协作”"):
+                db.update_product(
+                    connection,
+                    source["id"],
+                    {"product_name": original_name + "修订"},
+                    users["A"]["id"],
+                )
+        blocked = db.get_product(self.db_path, source["id"])
+        self.assertEqual(blocked["status"], "received")
+        self.assertEqual(blocked["product_name"], original_name)
+        self.assertEqual(blocked["workflow_restart_required"], 0)
 
-        other_c_id = db.create_user(
-            self.db_path,
-            "c_unreceived_revision_test",
-            "未接收运营",
-            "C",
-            "demo123",
-            must_change_password=False,
-            operating_channel="tmall",
-            billing_platform_codes=["tmall"],
+        a_cookie = self.login("a_editor", "demo123")
+        list_body = self.request("/products", cookie=a_cookie)["body"].decode("utf-8")
+        self.assertIn('name="status" value="pending"', list_body)
+        self.assertIn(">召回</button>", list_body)
+        self.assertIn('title="资料已进入运营流程，请先召回到 A/B 协作后再删除"', list_body)
+        recall_response = self.request(
+            f"/products/{source['id']}/status",
+            method="POST",
+            body=urlencode({"status": "pending", "review_note": "需要调整材质和商品名称"}).encode("utf-8"),
+            cookie=a_cookie,
         )
-        other_c = next(user for user in db.list_users(self.db_path) if user["id"] == other_c_id)
-        self.assertEqual(self.app.visible_products_for_user([triggered], other_c), [])
+        self.assertTrue(recall_response["status"].startswith("302"))
+        recalled = db.get_product(self.db_path, source["id"])
+        self.assertEqual(recalled["status"], "pending")
+        self.assertIsNone(recalled["received_at"])
+        self.assertIn('data-delete-button="1"', self.request("/products", cookie=a_cookie)["body"].decode("utf-8"))
 
         with db.get_connection(self.db_path) as connection:
             db.update_product(
                 connection,
                 source["id"],
-                {"product_name": original_name},
+                {"product_name": f"运营修订资料-{source['id']}"},
                 users["A"]["id"],
             )
-        reverted = db.get_product(self.db_path, source["id"])
-        self.assertEqual(reverted["workflow_restart_required"], 0)
-        self.assertEqual(reverted["c_published_version_no"], reverted["current_version_no"])
+        recalled_update = db.get_product(self.db_path, source["id"])
+        self.assertEqual(recalled_update["status"], "pending")
+        revised_name = f"运营修订资料-{source['id']}"
+        self.assertEqual(recalled_update["product_name"], revised_name)
+        self.assertEqual(recalled_update["workflow_restart_required"], 0)
+        self.assertIn("published", dict(available_status_actions(users["B"], recalled_update)))
 
         with db.get_connection(self.db_path) as connection:
-            db.update_product(
-                connection,
-                source["id"],
-                {"product_name": original_name + "最终修订"},
-                users["A"]["id"],
-            )
-            before_resubmit = db.get_product(self.db_path, source["id"])
             db.change_product_status(
                 connection,
                 source["id"],
                 "published",
                 users["B"]["id"],
-                "重新提交给运营部",
-                "专项测试",
+                "确认资料齐全，提交运营部",
+                "召回后重新提交",
             )
         republished = db.get_product(self.db_path, source["id"])
         self.assertEqual(republished["workflow_restart_required"], 0)
-        self.assertEqual(republished["c_release_no"], int(before_resubmit["c_release_no"]) + 1)
-        self.assertEqual(
-            db.products_for_c_published_versions(self.db_path, [republished])[0]["product_name"],
-            original_name + "最终修订",
+        self.assertEqual(republished["c_release_no"], original_release + 1)
+        c_formal = db.products_for_c_published_versions(self.db_path, [republished])[0]
+        self.assertEqual(c_formal["product_name"], revised_name)
+        c_cookie = self.login("c_viewer", "demo123")
+        old_name_response = self.request(
+            "/api/products?" + urlencode({"q": original_name}),
+            cookie=c_cookie,
         )
+        self.assertEqual(json.loads(old_name_response["body"])["count"], 0)
+        work_name_response = self.request(
+            "/api/products?" + urlencode({"q": revised_name}),
+            cookie=c_cookie,
+        )
+        self.assertEqual(json.loads(work_name_response["body"])["count"], 1)
+
+    def test_a_must_recall_released_product_before_deleting(self):
+        with db.get_connection(self.db_path) as connection:
+            connection.execute("UPDATE products SET status = 'received' WHERE id = 1")
+        a_cookie = self.login("a_editor", "demo123")
+        direct_delete = self.request(
+            "/products/1/lifecycle",
+            method="POST",
+            body=urlencode({"lifecycle_status": "deleted", "confirm_text": "DELETE"}).encode("utf-8"),
+            cookie=a_cookie,
+        )
+        self.assertTrue(direct_delete["status"].startswith("403"))
+        self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "active")
+
+        recall_response = self.request(
+            "/products/1/status",
+            method="POST",
+            body=urlencode({"status": "pending"}).encode("utf-8"),
+            cookie=a_cookie,
+        )
+        self.assertTrue(recall_response["status"].startswith("302"))
+        delete_response = self.request(
+            "/products/1/lifecycle",
+            method="POST",
+            body=urlencode({"lifecycle_status": "deleted", "confirm_text": "DELETE"}).encode("utf-8"),
+            cookie=a_cookie,
+        )
+        self.assertTrue(delete_response["status"].startswith("302"))
+        self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "deleted")
+
+    def test_only_a_and_admin_can_recall_and_rules_are_visible(self):
+        with db.get_connection(self.db_path) as connection:
+            connection.execute("UPDATE products SET status = 'published' WHERE id = 1")
+        b_cookie = self.login("b_editor", "demo123")
+        b_body = self.request("/products", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertNotIn(">召回</button>", b_body)
+        b_response = self.request(
+            "/products/1/status",
+            method="POST",
+            body=urlencode({"status": "pending"}).encode("utf-8"),
+            cookie=b_cookie,
+        )
+        self.assertTrue(b_response["status"].startswith("403"))
+
+        c_cookie = self.login("c_viewer", "demo123")
+        c_response = self.request(
+            "/products/1/lifecycle",
+            method="POST",
+            body=urlencode({"lifecycle_status": "deleted", "confirm_text": "DELETE"}).encode("utf-8"),
+            cookie=c_cookie,
+        )
+        self.assertTrue(c_response["status"].startswith("403"))
+
+        a_cookie = self.login("a_editor", "demo123")
+        rules_body = self.request("/rules", cookie=a_cookie)["body"].decode("utf-8")
+        self.assertIn('href="/rules"', self.request("/products", cookie=a_cookie)["body"].decode("utf-8"))
+        self.assertIn("规则说明", rules_body)
+        self.assertIn("材质", rules_body)
+        self.assertIn("请先使用“召回到 A/B 协作”", rules_body)
+        self.assertIn("含税价", rules_body)
+        for username in ("a_editor", "b_editor", "c_viewer", "admin_reviewer"):
+            account_cookie = self.login(username, "demo123")
+            account_rules = self.request("/rules", cookie=account_cookie)
+            self.assertTrue(account_rules["status"].startswith("200"), username)
+            account_rules_body = account_rules["body"].decode("utf-8")
+            self.assertIn('href="/rules"', account_rules_body)
+            self.assertIn("规则说明", account_rules_body)
 
     def test_admin_restore_uses_same_post_publication_restart_rule(self):
         users = {user["department"]: user for user in db.list_users(self.db_path)}

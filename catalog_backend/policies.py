@@ -314,6 +314,8 @@ def available_status_actions(user: dict | None, product: dict | None) -> list[tu
         actions = []
         if status == "draft":
             actions.append(("pending", "开启商品部协作"))
+        elif status in {"published", "received"} and can_recall_product(user, product):
+            actions.append(("pending", "召回到 A/B 协作"))
         return actions
     if user.get("department") == "B":
         actions = []
@@ -334,12 +336,12 @@ def available_status_actions(user: dict | None, product: dict | None) -> list[tu
         if status == "pending":
             actions.append(("published", "管理员代为提交运营部"))
             actions.append(("draft", "管理员退回跟单部"))
-        if status == "published":
+        if status == "published" and can_recall_product(user, product):
             actions.append(("draft", "管理员转回跟单部修改"))
-            actions.append(("pending", "管理员转回 A/B 协作"))
-        if status == "received":
+            actions.append(("pending", "管理员召回到 A/B 协作"))
+        if status == "received" and can_recall_product(user, product):
             actions.append(("draft", "管理员转回跟单部修改"))
-            actions.append(("pending", "管理员转回 A/B 协作"))
+            actions.append(("pending", "管理员召回到 A/B 协作"))
         if status == "draft":
             actions.append(("pending", "管理员开启商品部协作"))
         return actions
@@ -355,11 +357,21 @@ def lifecycle_label(status: str | None) -> str:
 
 
 def can_manage_lifecycle(user: dict | None, product: dict | None) -> bool:
-    return bool(user and product and not is_department_monitor(user) and (can_edit_product(user, product) or is_admin(user)))
+    if not user or not product or is_department_monitor(user):
+        return False
+    return bool(
+        is_admin(user)
+        or can_archive_product(user, product)
+        or can_restore_product(user, product)
+        or (
+            product.get("lifecycle_status") == "active"
+            and can_delete_product(user, product)
+        )
+    )
 
 
 def can_delete_product(user: dict | None, product: dict | None) -> bool:
-    """Only the originating A user (or an administrator) can delete a record."""
+    """Only A may delete its own early-stage records; administrators retain full control."""
     if not user or not product or is_department_monitor(user):
         return False
     if is_admin(user):
@@ -367,21 +379,69 @@ def can_delete_product(user: dict | None, product: dict | None) -> bool:
     return bool(
         user.get("department") == "A"
         and user.get("id") == product.get("created_by")
+        and product.get("lifecycle_status") == "active"
+        and product.get("status") in {"draft", "pending"}
+    )
+
+
+def can_recall_product(user: dict | None, product: dict | None) -> bool:
+    """Only the source A user or an administrator can recall released records."""
+    if not user or not product or is_department_monitor(user):
+        return False
+    if product.get("lifecycle_status") != "active" or product.get("status") not in {"published", "received"}:
+        return False
+    return bool(
+        is_admin(user)
+        or (
+            user.get("department") == "A"
+            and user.get("id") == product.get("created_by")
+        )
+    )
+
+
+def can_archive_product(user: dict | None, product: dict | None) -> bool:
+    """A may archive only their own records after C has received them."""
+    if not user or not product or is_department_monitor(user):
+        return False
+    if is_admin(user):
+        return product.get("lifecycle_status") == "active"
+    return bool(
+        user.get("department") == "A"
+        and user.get("id") == product.get("created_by")
+        and product.get("lifecycle_status") == "active"
+        and product.get("status") == "received"
+    )
+
+
+def can_restore_product(user: dict | None, product: dict | None) -> bool:
+    """A may restore their own archived records; deleted records remain admin-only."""
+    if not user or not product or is_department_monitor(user):
+        return False
+    if is_admin(user):
+        return product.get("lifecycle_status") in {"archived", "deleted"}
+    return bool(
+        user.get("department") == "A"
+        and user.get("id") == product.get("created_by")
+        and product.get("lifecycle_status") == "archived"
     )
 
 
 def available_lifecycle_actions(user: dict | None, product: dict | None) -> list[tuple[str, str]]:
-    if not can_manage_lifecycle(user, product):
+    if not user or not product or is_department_monitor(user):
         return []
     lifecycle = product.get("lifecycle_status") or "active"
     if lifecycle == "active":
-        actions = [("archived", "归档资料")]
+        actions = []
+        if can_archive_product(user, product):
+            actions.append(("archived", "归档资料"))
         if can_delete_product(user, product):
             actions.append(("deleted", "删除资料"))
         return actions
     if lifecycle == "archived":
-        actions = [("active", "恢复为正常")]
-        if can_delete_product(user, product):
+        actions = []
+        if can_restore_product(user, product):
+            actions.append(("active", "恢复为正常"))
+        if is_admin(user) and can_delete_product(user, product):
             actions.append(("deleted", "删除资料"))
         return actions
     if lifecycle == "deleted" and is_admin(user):
