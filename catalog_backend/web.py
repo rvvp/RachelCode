@@ -4579,6 +4579,9 @@ class CatalogApplication:
       background: rgba(255, 255, 255, 0.99);
       box-shadow: -12px 0 18px -18px rgba(67, 43, 25, 0.72);
     }}
+    .catalog-table tbody .table-actions-cell:has(.table-action-menu[open]) {{
+      z-index: 8;
+    }}
     .catalog-table tbody tr:nth-child(even) .table-actions-cell {{
       background: rgba(250, 246, 240, 0.99);
     }}
@@ -4666,6 +4669,60 @@ class CatalogApplication:
       background: rgba(255,247,236,0.96);
       text-decoration: none;
     }}
+    .catalog-table .table-action-menu {{
+      position: relative;
+      display: inline-block;
+      vertical-align: middle;
+      z-index: 4;
+    }}
+    .catalog-table .table-action-menu summary {{
+      list-style: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      min-height: 26px;
+      padding: 3px 7px;
+      border-radius: 12px;
+      border: 1px solid rgba(91, 58, 29, 0.1);
+      background: rgba(255,255,255,0.86);
+      color: var(--accent-deep);
+      font-weight: 600;
+      cursor: pointer;
+      user-select: none;
+      font-size: 12px;
+    }}
+    .catalog-table .table-action-menu summary::-webkit-details-marker {{
+      display: none;
+    }}
+    .catalog-table .table-action-menu summary::after {{
+      content: "▾";
+      color: var(--muted);
+      font-size: 10px;
+    }}
+    .catalog-table .table-action-menu[open] summary,
+    .catalog-table .table-action-menu summary:hover {{
+      background: rgba(255,247,236,0.96);
+    }}
+    .catalog-table .table-action-menu-panel {{
+      position: absolute;
+      top: calc(100% + 6px);
+      right: 0;
+      z-index: 20;
+      display: grid;
+      gap: 4px;
+      min-width: 88px;
+      padding: 6px;
+      border: 1px solid rgba(94, 67, 40, 0.14);
+      border-radius: 12px;
+      background: rgba(255, 251, 245, 0.98);
+      box-shadow: 0 12px 24px rgba(67, 43, 25, 0.16);
+    }}
+    .catalog-table .table-action-menu-panel button {{
+      width: 100%;
+      justify-content: flex-start;
+      white-space: nowrap;
+    }}
     .catalog-table .table-action-links .table-action-danger {{
       color: #a63f1a;
       border-color: rgba(166, 63, 26, 0.18);
@@ -4682,21 +4739,18 @@ class CatalogApplication:
     .catalog-table .table-action-links .table-action-recall:hover {{
       background: rgba(246, 225, 198, 0.98);
     }}
-    .rule-status-grid {{
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-      margin-top: 16px;
+    .rules-page-heading {{
+      margin: 0 0 18px;
+      padding: 0 4px;
     }}
-    .rule-status-grid .stat-card {{
-      min-height: 118px;
-      justify-content: flex-start;
+    .rules-page-heading h1 {{
+      margin: 0;
     }}
-    .rule-status-grid small {{
-      display: block;
-      margin-top: 6px;
+    .rules-page-heading p {{
+      max-width: 980px;
+      margin: 10px 0 0;
       color: var(--muted);
-      line-height: 1.55;
+      line-height: 1.7;
     }}
     .rules-panel {{
       display: grid;
@@ -5731,6 +5785,13 @@ class CatalogApplication:
       gap: 12px;
       flex-wrap: wrap;
     }}
+    .products-list-control-actions {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      width: 100%;
+    }}
     .products-list-control-meta > .products-selection-summary {{
       order: 2;
       margin-left: auto;
@@ -5781,6 +5842,23 @@ class CatalogApplication:
       box-shadow: none;
       font-size: 13px;
       white-space: nowrap;
+    }}
+    .products-bulk-archive-button {{
+      flex: 0 0 auto;
+      min-height: 34px;
+      padding: 7px 14px;
+      border: 1px solid rgba(128, 96, 46, 0.18);
+      border-radius: 11px;
+      background: rgba(250, 244, 224, 0.78);
+      color: #80602e;
+      box-shadow: none;
+      font-size: 13px;
+      white-space: nowrap;
+    }}
+    .products-bulk-archive-button:hover {{
+      background: rgba(244, 234, 199, 0.92);
+      filter: none;
+      transform: none;
     }}
     .pagination-page-current {{
       background: var(--accent);
@@ -7666,7 +7744,6 @@ class CatalogApplication:
       .supplier-bill-import-action-pair {{
         grid-column: 1;
       }}
-      .rule-status-grid,
       .rule-callouts {{
         grid-template-columns: 1fr;
       }}
@@ -9468,6 +9545,7 @@ class CatalogApplication:
             if selection_enabled and page_product_count
             else ""
         )
+        bulk_archive_markup = self.render_bulk_archive_tool(user)
 
         pagination_params = {}
         for key in ("q", "supplier", "department", "status", "marker", "channel", "lifecycle_status", "monitor_department"):
@@ -9529,9 +9607,10 @@ class CatalogApplication:
         <nav class="products-list-control-bar" id="products-list-control-bar" aria-label="资料列表顶部分页">
           {f'<div class="products-list-page-row">{pagination_links_markup}</div>' if total_pages > 1 else ''}
           <div class="products-list-control-meta">
-            {selection_toolbar_markup}
-            <span class="products-selection-summary" id="products-selection-summary">当前未勾选，本页共 {page_product_count} 条</span>
-            {pagination_summary_markup}
+            <div class="products-list-control-actions">
+              {selection_toolbar_markup}
+              {bulk_archive_markup}
+            </div>
           </div>
         </nav>
         """
@@ -9596,12 +9675,13 @@ class CatalogApplication:
                     f'formaction="/products/{product["id"]}/status" formmethod="post">接收</button>'
                 )
             status_actions = dict(available_status_actions(user, product))
+            recall_action_markup = ""
             if (
                 can_recall_product(user, product)
                 and product.get("status") in {"published", "received"}
                 and "pending" in status_actions
             ):
-                actions.append(
+                recall_action_markup = (
                     f'<button class="table-action-recall" type="submit" '
                     f'name="status" value="pending" '
                     f'formaction="/products/{product["id"]}/status" formmethod="post" '
@@ -9610,6 +9690,8 @@ class CatalogApplication:
             lifecycle_actions = dict(available_lifecycle_actions(user, product))
             for lifecycle_target in lifecycle_actions:
                 if lifecycle_target == "archived":
+                    if product.get("lifecycle_status") == "active":
+                        continue
                     action_label = "归档" if product.get("lifecycle_status") == "active" else "恢复为归档"
                     action_class = "table-action-lifecycle"
                     action_title = "归档后可在全部类型中选择已归档查看"
@@ -9625,13 +9707,14 @@ class CatalogApplication:
                     f'formaction="/products/{product["id"]}/lifecycle" formmethod="post" '
                     f'title="{html.escape(action_title, quote=True)}">{action_label}</button>'
                 )
+            delete_action_markup = ""
             if "deleted" in lifecycle_actions:
                 product_name = str(product.get("product_name") or "").strip()
                 style_code = str(product.get("style_code") or "").strip()
                 action_context = " / ".join(value for value in (product_name, style_code) if value)
                 if not action_context:
                     action_context = f"资料 #{product['id']}"
-                actions.append(
+                delete_action_markup = (
                     f'<button class="table-action-danger" type="submit" '
                     f'name="lifecycle_status" value="deleted" '
                     f'formaction="/products/{product["id"]}/lifecycle" formmethod="post" '
@@ -9648,10 +9731,20 @@ class CatalogApplication:
                     if can_recall_product(user, product)
                     else "仅资料发起人可以删除该条目"
                 )
-                actions.append(
+                delete_action_markup = (
                     '<button class="table-action-disabled" type="button" disabled '
                     f'title="{html.escape(delete_title, quote=True)}" '
                     f'aria-label="删除不可用：{html.escape(delete_title, quote=True)}">删除</button>'
+                )
+            lifecycle_menu_items = [
+                markup for markup in (delete_action_markup, recall_action_markup) if markup
+            ]
+            if lifecycle_menu_items:
+                actions.append(
+                    '<details class="table-action-menu">'
+                    '<summary title="删除或召回">更多</summary>'
+                    f'<div class="table-action-menu-panel">{"".join(lifecycle_menu_items)}</div>'
+                    '</details>'
                 )
             if can_view_logs(user):
                 actions.append(f'<a href="/products/{product["id"]}/logs">日志</a>')
@@ -11640,10 +11733,18 @@ class CatalogApplication:
           <div class="list-intro-actions">
             <div class="tools">
               <button type="submit" name="bulk_action" value="publish_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交运营部</button>
-              <button type="submit" name="bulk_action" value="archive_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量归档</button>
             </div>
           </div>
         """
+
+    def render_bulk_archive_tool(self, user) -> str:
+        if not is_admin(user) or is_department_monitor(user):
+            return ""
+        return (
+            '<button type="submit" name="bulk_action" value="archive_selected" '
+            'form="products-bulk-form" formmethod="post" formaction="/products/bulk" '
+            'class="ghost-button products-bulk-archive-button">批量归档</button>'
+        )
 
     def render_product_form(self, user, action: str, title: str, values: dict, errors: list[str] | None = None) -> str:
         console_eyebrow = self.brand_config["brand_console_eyebrow"]
@@ -12299,23 +12400,10 @@ class CatalogApplication:
             field.label for field in PRODUCT_FIELDS if field.key in WORKFLOW_RESTART_FIELD_KEYS
         )
         content = f"""
-        <section class="hero">
-          <div class="panel">
-            <div class="eyebrow">Workspace Rules</div>
-            <h1>规则说明</h1>
-            <p>这里集中说明商品资料后台的工作流、字段权限和资料进入运营流程后的修改规则。页面与接口均以这些规则为准。</p>
-          </div>
-          <div class="panel">
-            <div class="eyebrow">Current Workflow</div>
-            <h2>四个流程状态</h2>
-            <div class="rule-status-grid">
-              <div class="stat-card"><span>状态 1</span><strong>跟单整理中</strong><small>A 跟单部录入和整理主体资料。</small></div>
-              <div class="stat-card"><span>状态 2</span><strong>A/B 协作中</strong><small>A、B 可按字段权限并行完善资料。</small></div>
-              <div class="stat-card"><span>状态 3</span><strong>待运营接收</strong><small>B 判断资料齐全后提交给 C 运营部。</small></div>
-              <div class="stat-card"><span>状态 4</span><strong>已接收</strong><small>C 运营账号确认接收当前运营版本。</small></div>
-            </div>
-          </div>
-        </section>
+        <header class="rules-page-heading">
+          <h1>规则说明</h1>
+          <p>这里集中说明商品资料后台的工作流、字段权限和资料进入运营流程后的修改规则。页面与接口均以这些规则为准。</p>
+        </header>
         <section class="panel rules-panel">
           <div class="rule-section">
             <div class="eyebrow">Roles</div>

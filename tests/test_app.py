@@ -5787,6 +5787,7 @@ class CatalogAppTests(unittest.TestCase):
         list_response = self.request("/products", cookie=admin_cookie)
         list_body = list_response["body"].decode("utf-8")
         self.assertIn("批量操作", list_body)
+        self.assertIn("products-bulk-archive-button", list_body)
         self.assertIn('name="product_ids"', list_body)
 
         publish_response = self.request(
@@ -6108,8 +6109,13 @@ class CatalogAppTests(unittest.TestCase):
             connection.execute("UPDATE products SET status = 'received' WHERE id = 1")
         editor_cookie = self.login("a_editor", "demo123")
         received_list_body = self.request("/products", cookie=editor_cookie)["body"].decode("utf-8")
-        self.assertIn('name="lifecycle_status" value="archived"', received_list_body)
-        self.assertIn(">归档</button>", received_list_body)
+        self.assertNotIn('name="lifecycle_status" value="archived"', received_list_body)
+        self.assertIn('class="table-action-menu"', received_list_body)
+        self.assertIn(">召回</button>", received_list_body)
+        self.assertLess(
+            received_list_body.index('class="table-action-danger"'),
+            received_list_body.index('class="table-action-recall"'),
+        )
         archive_response = self.request(
             "/products/1/lifecycle",
             method="POST",
@@ -6432,6 +6438,9 @@ class CatalogAppTests(unittest.TestCase):
         rules_body = self.request("/rules", cookie=a_cookie)["body"].decode("utf-8")
         self.assertIn('href="/rules"', self.request("/products", cookie=a_cookie)["body"].decode("utf-8"))
         self.assertIn("规则说明", rules_body)
+        self.assertIn('class="rules-page-heading"', rules_body)
+        self.assertNotIn("四个流程状态", rules_body)
+        self.assertNotIn('class="hero"', rules_body)
         self.assertIn("材质", rules_body)
         self.assertIn("请先使用“召回到 A/B 协作”", rules_body)
         self.assertIn("含税价", rules_body)
