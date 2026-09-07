@@ -5,6 +5,7 @@ import html
 import io
 import json
 import math
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -99,7 +100,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.09.04-design-department-v1"
+CATALOG_BUILD_VERSION = "2026.09.07-multi-product-search-v1"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -2569,7 +2570,7 @@ class CatalogApplication:
         products = self.visible_products_for_user(
             db.list_products(
                 self.db_path,
-                "" if user.get("department") in {"C", "DESIGN"} else keyword,
+                "",
                 department_filter,
                 source_status_filter,
                 lifecycle_filter,
@@ -2578,8 +2579,7 @@ class CatalogApplication:
             ),
             user,
         )
-        if user.get("department") in {"C", "DESIGN"}:
-            products = self.filter_c_products_by_keyword(products, keyword)
+        products = self.filter_products_by_catalog_identifiers(products, keyword)
         if user.get("department") == "C":
             if status_filter:
                 products = [
@@ -2647,7 +2647,8 @@ class CatalogApplication:
 
     def style_code_detail_redirect_target(self, user, query: dict) -> str:
         keyword = str(query.get("q", "")).strip()
-        if not keyword:
+        search_terms = self.catalog_identifier_search_terms(keyword)
+        if len(search_terms) != 1:
             return ""
         supplier = ""
         if user.get("department") in {"A", "EXECUTIVE"} or is_admin(user):
@@ -2666,7 +2667,7 @@ class CatalogApplication:
         released_read_only_view = user.get("department") in {"C", "DESIGN"}
         source_products = db.list_products(
             self.db_path,
-            "" if released_read_only_view else keyword,
+            "",
             str(query.get("department", "")).strip(),
             product_status,
             str(query.get("lifecycle_status", "")).strip(),
@@ -2674,8 +2675,10 @@ class CatalogApplication:
             tax_price_filter,
         )
         visible_source_products = self.visible_products_for_user(source_products, user)
-        if released_read_only_view:
-            visible_source_products = self.filter_c_products_by_keyword(visible_source_products, keyword)
+        visible_source_products = self.filter_products_by_catalog_identifiers(
+            visible_source_products,
+            keyword,
+        )
         launch_channel_filter = (
             normalize_launch_channel(query.get("channel", ""))
             if user.get("department") == "DESIGN"
@@ -2695,7 +2698,7 @@ class CatalogApplication:
             ):
                 continue
             style_code = str(product.get("style_code") or "").strip()
-            if style_code.casefold() != keyword.casefold():
+            if style_code.casefold() != search_terms[0]:
                 continue
             exact_matches.append(product)
         if len(exact_matches) != 1:
@@ -3186,6 +3189,30 @@ class CatalogApplication:
             product["c_received"] = c_received
             visible_products.append(product)
         return visible_products
+
+    @staticmethod
+    def catalog_identifier_search_terms(value: str) -> tuple[str, ...]:
+        return tuple(
+            term.casefold()
+            for term in re.split(r"[\s,，、;；]+", str(value or "").strip())
+            if term.strip()
+        )
+
+    @classmethod
+    def filter_products_by_catalog_identifiers(cls, products: list[dict], keyword: str) -> list[dict]:
+        search_terms = cls.catalog_identifier_search_terms(keyword)
+        if not search_terms:
+            return products
+        searchable_keys = ("style_code", "style_color", "color_name")
+        return [
+            product
+            for product in products
+            if any(
+                term in str(product.get(field_key) or "").casefold()
+                for term in search_terms
+                for field_key in searchable_keys
+            )
+        ]
 
     def filter_c_products_by_keyword(self, products: list[dict], keyword: str) -> list[dict]:
         clean_keyword = str(keyword or "").strip().casefold()
@@ -5429,6 +5456,9 @@ class CatalogApplication:
     .products-filter-form .products-search-field,
     .products-filter-form .products-supplier-field {{
       min-width: 0;
+    }}
+    .products-filter-form .products-search-field {{
+      font-size: 14px;
     }}
     .products-filter-form .products-filter-submit {{
       grid-column: 1 / -1;
@@ -9657,7 +9687,7 @@ class CatalogApplication:
           {notice_block}
           {c_note}
           <form class="products-filter-form{' products-filter-form-c' if compact_readonly_dashboard else ''}" method="get" action="/products#products-list">
-              <input class="products-search-field" name="q" value="{html.escape(keyword)}" placeholder="款号、款色">
+              <input class="products-search-field" type="search" name="q" value="{html.escape(keyword)}" placeholder="可输入多个，逗号、空格或换行分隔" aria-label="搜索款号或款色" autocomplete="off">
               {supplier_filter_markup}
               {filter_controls_markup}
               <button class="products-filter-submit" type="submit">搜索筛选</button>

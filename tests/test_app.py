@@ -3305,6 +3305,62 @@ class CatalogAppTests(unittest.TestCase):
         b_body = self.request("/products", cookie=b_cookie)["body"].decode("utf-8")
         self.assertNotIn('name="supplier"', b_body)
 
+    def test_products_search_supports_single_and_multiple_style_identifiers(self):
+        cookie = self.login("a_editor", "demo123")
+        page_body = self.request("/products", cookie=cookie)["body"].decode("utf-8")
+        self.assertIn('type="search" name="q"', page_body)
+        self.assertIn('placeholder="可输入多个，逗号、空格或换行分隔"', page_body)
+        self.assertIn('aria-label="搜索款号或款色"', page_body)
+
+        exact_response = self.request(
+            "/products?" + urlencode({"q": "NH-2601"}),
+            cookie=cookie,
+        )
+        self.assertTrue(exact_response["status"].startswith("302"))
+        self.assertTrue(dict(exact_response["headers"])["Location"].startswith("/products/1?"))
+
+        for separator in (",", "，", "、", ";", "；", " ", "\n"):
+            response = self.request(
+                "/products?" + urlencode({"q": f"NH-2601{separator}SP-8420"}),
+                cookie=cookie,
+            )
+            body = response["body"].decode("utf-8")
+            self.assertTrue(response["status"].startswith("200"))
+            self.assertIn('<a class="table-id-link" href="/products/1">#1</a>', body)
+            self.assertIn('<a class="table-id-link" href="/products/2">#2</a>', body)
+            self.assertIn("共 2 条，第 1 / 1 页，每页 100 条", body)
+
+        style_color_response = self.request(
+            "/products?" + urlencode({"q": "短袖连衣裙-蓝"}),
+            cookie=cookie,
+        )
+        style_color_body = style_color_response["body"].decode("utf-8")
+        self.assertTrue(style_color_response["status"].startswith("200"))
+        self.assertIn('<a class="table-id-link" href="/products/1">#1</a>', style_color_body)
+        self.assertNotIn('<a class="table-id-link" href="/products/2">#2</a>', style_color_body)
+
+        export_response = self.request(
+            "/export.xlsx?" + urlencode(
+                {
+                    "mode": "selected",
+                    "selection_scope": "filtered",
+                    "q": "NH-2601,SP-8420",
+                }
+            ),
+            cookie=cookie,
+        )
+        self.assertTrue(export_response["status"].startswith("200"))
+        export_sheet = load_workbook(io.BytesIO(export_response["body"]), data_only=True).active
+        headers = [cell.value for cell in export_sheet[1]]
+        style_code_column = headers.index("款号") + 1
+        self.assertEqual(
+            {
+                export_sheet.cell(row_index, style_code_column).value
+                for row_index in range(2, export_sheet.max_row + 1)
+            },
+            {"NH-2601", "SP-8420"},
+        )
+
     def test_products_list_paginates_100_rows_and_preserves_supplier_filter(self):
         a_user = next(item for item in db.list_users(self.db_path) if item["username"] == "a_editor")
         with db.get_connection(self.db_path) as connection:
@@ -3482,9 +3538,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.04-design-department-v1")
+        self.assertEqual(payload["build_version"], "2026.09.07-multi-product-search-v1")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.04-design-department-v1")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.07-multi-product-search-v1")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
