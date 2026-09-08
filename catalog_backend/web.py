@@ -102,7 +102,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.09.08-department-recall-v2"
+CATALOG_BUILD_VERSION = "2026.09.08-archive-toolbar-v1"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -5790,9 +5790,9 @@ class CatalogApplication:
       flex-wrap: wrap;
     }}
     .products-list-control-actions {{
-      display: flex;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
       align-items: center;
-      justify-content: space-between;
       gap: 12px;
       width: 100%;
     }}
@@ -5814,9 +5814,9 @@ class CatalogApplication:
     .products-selection-toolbar {{
       display: flex;
       align-items: center;
-      justify-content: space-between;
+      justify-content: flex-start;
       gap: 12px;
-      flex-wrap: wrap;
+      min-width: 0;
       margin: 0;
       padding: 0;
       border: 0;
@@ -5834,9 +5834,10 @@ class CatalogApplication:
     .products-selection-actions {{
       display: flex;
       align-items: center;
-      justify-content: flex-end;
+      justify-content: flex-start;
       gap: 8px;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
+      min-width: 0;
     }}
     .products-selection-actions button {{
       width: auto;
@@ -5848,19 +5849,22 @@ class CatalogApplication:
       white-space: nowrap;
     }}
     .products-bulk-archive-button {{
-      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: auto;
       min-height: 34px;
       padding: 7px 14px;
-      border: 1px solid rgba(128, 96, 46, 0.18);
+      border: 1px solid rgba(181, 106, 45, 0.14);
       border-radius: 11px;
-      background: rgba(250, 244, 224, 0.78);
-      color: #80602e;
+      background: linear-gradient(180deg, rgba(181,106,45,0.1), rgba(181,106,45,0.06));
+      color: var(--accent-strong);
       box-shadow: none;
       font-size: 13px;
       white-space: nowrap;
     }}
     .products-bulk-archive-button:hover {{
-      background: rgba(244, 234, 199, 0.92);
+      background: linear-gradient(180deg, rgba(181,106,45,0.1), rgba(181,106,45,0.06));
       filter: none;
       transform: none;
     }}
