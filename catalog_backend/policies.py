@@ -52,6 +52,7 @@ WORKFLOW_RESTART_FIELD_KEYS = frozenset(
 C_OPERATING_CHANNELS = {
     "tmall": "天猫类",
     "vip": "唯品类",
+    "all": "全渠道",
 }
 BILLING_PLATFORM_OPTIONS = (
     ("tmall", "天猫"),
@@ -109,10 +110,10 @@ def c_user_can_see_launch_channel(user: dict | None, launch_channel) -> bool:
         return False
     operating_channel = str(user.get("operating_channel") or "").strip()
     normalized_channel = normalize_launch_channel(launch_channel)
-    if operating_channel not in C_OPERATING_CHANNELS or not normalized_channel:
-        if operating_channel == "all":
-            return True
+    if not normalized_channel or operating_channel not in C_OPERATING_CHANNELS:
         return False
+    if operating_channel == "all":
+        return normalized_channel in LAUNCH_CHANNEL_OPTIONS
     if normalized_channel == "同款":
         return True
     return (normalized_channel == "天猫" and operating_channel == "tmall") or (
@@ -123,11 +124,22 @@ def c_user_can_see_launch_channel(user: dict | None, launch_channel) -> bool:
 def c_visible_launch_channels(user: dict | None) -> tuple[str, ...]:
     if not user or user.get("department") != "C":
         return ()
+    if user.get("operating_channel") == "all":
+        return LAUNCH_CHANNEL_OPTIONS
     if user.get("operating_channel") == "tmall":
         return ("天猫", "同款")
     if user.get("operating_channel") == "vip":
         return ("唯品", "同款")
     return ()
+
+
+def c_receipt_counts_toward_product_status(user: dict | None) -> bool:
+    """Only channel-specific operating accounts advance the shared workflow status."""
+    return bool(
+        user
+        and user.get("department") == "C"
+        and user.get("operating_channel") in {"tmall", "vip"}
+    )
 
 
 def normalize_billing_platform_codes(value) -> tuple[str, ...]:

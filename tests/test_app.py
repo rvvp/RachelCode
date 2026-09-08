@@ -3185,6 +3185,8 @@ class CatalogAppTests(unittest.TestCase):
 
     def test_admin_must_assign_operating_channel_for_c_account(self):
         cookie = self.login("admin_reviewer", "demo123")
+        users_page = self.request("/users", cookie=cookie)["body"].decode("utf-8")
+        self.assertIn('<option value="all" >全渠道（天猫/唯品/同款）</option>', users_page)
         incomplete_response = self.request(
             "/users",
             method="POST",
@@ -3199,7 +3201,7 @@ class CatalogAppTests(unittest.TestCase):
             cookie=cookie,
         )
         self.assertTrue(incomplete_response["status"].startswith("400"))
-        self.assertIn("必须选择天猫类或唯品类", incomplete_response["body"].decode("utf-8"))
+        self.assertIn("必须选择天猫类、唯品类或全渠道", incomplete_response["body"].decode("utf-8"))
 
         create_response = self.request(
             "/users",
@@ -3220,6 +3222,239 @@ class CatalogAppTests(unittest.TestCase):
         created_user = next(item for item in db.list_users(self.db_path) if item["username"] == "tmall_operator")
         self.assertEqual(created_user["operating_channel"], "tmall")
         self.assertEqual(json.loads(created_user["billing_platforms_json"]), ["tmall"])
+
+        all_channel_response = self.request(
+            "/users",
+            method="POST",
+            body=urlencode(
+                {
+                    "username": "all_channel_operator",
+                    "display_name": "全渠道运营",
+                    "department": "C",
+                    "operating_channel": "all",
+                    "billing_platform_codes__jd": "jd",
+                    "password": "demo123",
+                }
+            ).encode("utf-8"),
+            cookie=cookie,
+        )
+        self.assertTrue(all_channel_response["status"].startswith("302"))
+        all_channel_user = next(
+            item for item in db.list_users(self.db_path) if item["username"] == "all_channel_operator"
+        )
+        self.assertEqual(all_channel_user["operating_channel"], "all")
+        self.assertEqual(json.loads(all_channel_user["billing_platforms_json"]), ["jd"])
+
+        managed_users_page = self.request("/users", cookie=cookie)["body"].decode("utf-8")
+        self.assertIn("all_channel_operator", managed_users_page)
+        self.assertIn("全渠道", managed_users_page)
+        edit_page = self.request(f"/users/{all_channel_user['id']}/edit", cookie=cookie)["body"].decode("utf-8")
+        self.assertIn('<option value="all" selected>全渠道（天猫/唯品/同款）</option>', edit_page)
+
+        all_channel_cookie = self.login("all_channel_operator", "demo123")
+        billing_page = self.request(
+            "/billing/platform-bills?month=2026-06&platform=jd",
+            cookie=all_channel_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn('<option value="jd" selected', billing_page)
+        self.assertNotIn('<option value="tmall"', billing_page)
+        self.assertNotIn('<option value="vip"', billing_page)
+
+    def test_all_channel_c_account_reads_exports_and_receives_all_product_channels(self):
+        all_channel_user_id = db.create_user(
+            self.db_path,
+            "all_channel_c",
+            "全渠道运营",
+            "C",
+            "demo123",
+            must_change_password=False,
+            operating_channel="all",
+            billing_platform_codes=("jd",),
+        )
+        vip_cookie = self.create_c_operator("vip_channel_c", "唯品运营", "vip")
+        users = {item["username"]: item for item in db.list_users(self.db_path)}
+        a_user = users["a_editor"]
+        b_user = users["b_editor"]
+        with db.get_connection(self.db_path) as connection:
+            connection.execute("UPDATE products SET lifecycle_status = 'archived'")
+            product_ids = []
+            for index, channel in enumerate(("天猫", "唯品", "同款"), start=1):
+                product_id = db.create_product(
+                    connection,
+                    self.a_complete_fields_payload(
+                        style_color=f"全渠道款色-{index}",
+                        style_code=f"ALL-CHANNEL-{index}",
+                        product_name=f"全渠道测试-{channel}",
+                        launch_price="299",
+                        launch_channel=channel,
+                    ),
+                    a_user["id"],
+                    "A",
+                )
+                db.change_product_status(
+                    connection,
+                    product_id,
+                    "pending",
+                    a_user["id"],
+                    "开启商品部协作",
+                    "全渠道测试。",
+                )
+                db.change_product_status(
+                    connection,
+                    product_id,
+                    "published",
+                    b_user["id"],
+                    "确认资料齐全，提交运营部",
+                    "全渠道测试。",
+                )
+                product_ids.append(product_id)
+            connection.execute(
+                "UPDATE products SET launch_channel = ? WHERE id = ?",
+                ("天猫/京东/抖音", product_ids[0]),
+            )
+            unsupported_product_id = db.create_product(
+                connection,
+                self.a_complete_fields_payload(
+                    style_color="全渠道款色-其他",
+                    style_code="ALL-CHANNEL-OTHER",
+                    product_name="全渠道测试-其他渠道",
+                    launch_price="299",
+                    launch_channel="门店首发",
+                ),
+                a_user["id"],
+                "A",
+            )
+            db.change_product_status(
+                connection,
+                unsupported_product_id,
+                "pending",
+                a_user["id"],
+                "开启商品部协作",
+                "全渠道边界测试。",
+            )
+            db.change_product_status(
+                connection,
+                unsupported_product_id,
+                "published",
+                b_user["id"],
+                "确认资料齐全，提交运营部",
+                "全渠道边界测试。",
+            )
+
+        all_channel_cookie = self.login("all_channel_c", "demo123")
+        list_body = self.request("/products", cookie=all_channel_cookie)["body"].decode("utf-8")
+        for channel in ("天猫", "唯品", "同款"):
+            self.assertIn(f"全渠道测试-{channel}", list_body)
+        self.assertNotIn("全渠道测试-其他渠道", list_body)
+
+        tmall_body = self.request("/products", cookie=self.login("c_viewer", "demo123"))["body"].decode("utf-8")
+        self.assertIn("全渠道测试-天猫", tmall_body)
+        self.assertIn("全渠道测试-同款", tmall_body)
+        self.assertNotIn("全渠道测试-唯品", tmall_body)
+        vip_body = self.request("/products", cookie=vip_cookie)["body"].decode("utf-8")
+        self.assertIn("全渠道测试-唯品", vip_body)
+        self.assertIn("全渠道测试-同款", vip_body)
+        self.assertNotIn("全渠道测试-天猫", vip_body)
+
+        api_response = self.request("/api/products", cookie=all_channel_cookie)
+        api_payload = json.loads(api_response["body"].decode("utf-8"))
+        self.assertEqual(api_payload["count"], 3)
+        self.assertEqual(
+            {item["product_name"] for item in api_payload["items"]},
+            {"全渠道测试-天猫", "全渠道测试-唯品", "全渠道测试-同款"},
+        )
+        self.assertEqual(
+            db.c_user_receipt_stats(self.db_path, users["all_channel_c"]),
+            {"total": 3, "received": 0, "pending": 3, "recent_created": 3},
+        )
+
+        single_receive_response = self.request(
+            f"/products/{product_ids[0]}/status",
+            method="POST",
+            body=urlencode({"status": "received"}).encode("utf-8"),
+            cookie=all_channel_cookie,
+        )
+        self.assertTrue(single_receive_response["status"].startswith("302"))
+        self.assertIn(
+            "已记录当前账号接收，资料全局状态保持不变",
+            unquote_plus(dict(single_receive_response["headers"])["Location"]),
+        )
+        first_product = db.get_product(self.db_path, product_ids[0])
+        self.assertEqual(first_product["status"], "published")
+        self.assertTrue(
+            db.c_product_received_by_user(
+                self.db_path,
+                product_ids[0],
+                all_channel_user_id,
+                first_product["c_release_no"],
+            )
+        )
+        init_db(self.db_path)
+        self.assertEqual(db.get_product(self.db_path, product_ids[0])["status"], "published")
+
+        receive_response = self.request(
+            "/products/bulk",
+            method="POST",
+            body=urlencode(
+                {
+                    "selection_scope": "filtered",
+                    "filtered_product_ids": ",".join(str(product_id) for product_id in product_ids[1:]),
+                    "bulk_action": "receive_selected",
+                    "return_to": "/products?status=published",
+                }
+            ).encode("utf-8"),
+            cookie=all_channel_cookie,
+        )
+        self.assertTrue(receive_response["status"].startswith("302"))
+        self.assertIn("成功 2 条", unquote_plus(dict(receive_response["headers"])["Location"]))
+        self.assertIn(
+            "资料全局状态保持不变",
+            unquote_plus(dict(receive_response["headers"])["Location"]),
+        )
+        for product_id in product_ids:
+            product = db.get_product(self.db_path, product_id)
+            self.assertEqual(product["status"], "published")
+            self.assertTrue(
+                db.c_product_received_by_user(
+                    self.db_path,
+                    product_id,
+                    all_channel_user_id,
+                    product["c_release_no"],
+                )
+            )
+        self.assertEqual(
+            db.c_user_receipt_stats(self.db_path, users["all_channel_c"]),
+            {"total": 3, "received": 3, "pending": 0, "recent_created": 3},
+        )
+
+        pending_body = self.request("/products?status=published", cookie=all_channel_cookie)["body"].decode("utf-8")
+        self.assertNotIn("全渠道测试-", pending_body)
+        received_body = self.request("/products?status=received", cookie=all_channel_cookie)["body"].decode("utf-8")
+        for channel in ("天猫", "唯品", "同款"):
+            self.assertIn(f"全渠道测试-{channel}", received_body)
+
+        tmall_receive_response = self.request(
+            f"/products/{product_ids[2]}/status",
+            method="POST",
+            body=urlencode({"status": "received"}).encode("utf-8"),
+            cookie=self.login("c_viewer", "demo123"),
+        )
+        self.assertTrue(tmall_receive_response["status"].startswith("302"))
+        self.assertEqual(db.get_product(self.db_path, product_ids[2])["status"], "received")
+        self.assertEqual(db.get_product(self.db_path, product_ids[0])["status"], "published")
+        self.assertEqual(db.get_product(self.db_path, product_ids[1])["status"], "published")
+
+        export_response = self.request("/export.xlsx", cookie=all_channel_cookie)
+        self.assertTrue(export_response["status"].startswith("200"))
+        worksheet = load_workbook(io.BytesIO(export_response["body"]), data_only=True).active
+        exported_values = {
+            str(cell.value)
+            for row in worksheet.iter_rows()
+            for cell in row
+            if cell.value is not None
+        }
+        for channel in ("天猫", "唯品", "同款"):
+            self.assertIn(f"全渠道测试-{channel}", exported_values)
 
     def test_c_account_separates_product_channel_from_multi_platform_bill_permissions(self):
         admin_cookie = self.login("admin_reviewer", "demo123")
@@ -3546,9 +3781,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.08-archive-toolbar-v1")
+        self.assertEqual(payload["build_version"], "2026.09.08-all-channel-receipt-v2")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.08-archive-toolbar-v1")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.08-all-channel-receipt-v2")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -6113,6 +6348,11 @@ class CatalogAppTests(unittest.TestCase):
         received_list_body = self.request("/products", cookie=editor_cookie)["body"].decode("utf-8")
         self.assertNotIn('name="lifecycle_status" value="archived"', received_list_body)
         self.assertIn('class="table-action-menu"', received_list_body)
+        self.assertIn(
+            'document.querySelectorAll("details.nav-menu, details.export-menu, details.table-action-menu")',
+            received_list_body,
+        )
+        self.assertIn(".catalog-table .table-action-menu-panel::before {", received_list_body)
         self.assertIn(">召回</button>", received_list_body)
         self.assertLess(
             received_list_body.index('class="table-action-danger"'),
@@ -6527,6 +6767,8 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("材质", rules_body)
         self.assertIn("请先使用“召回到 A/B 协作”", rules_body)
         self.assertIn("含税价", rules_body)
+        self.assertIn("“同款”任一渠道接收即显示“已接收”", rules_body)
+        self.assertIn("全渠道账号可记录个人接收，但不参与全局状态判断", rules_body)
         for username in ("a_editor", "b_editor", "c_viewer", "admin_reviewer"):
             account_cookie = self.login(username, "demo123")
             account_rules = self.request("/rules", cookie=account_cookie)

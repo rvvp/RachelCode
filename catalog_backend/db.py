@@ -351,8 +351,11 @@ def init_db(
                     (
                         SELECT receipt.recipient_user_id
                         FROM product_c_receipts receipt
+                        JOIN users receipt_user ON receipt_user.id = receipt.recipient_user_id
                         WHERE receipt.product_id = products.id
                           AND receipt.release_no = products.c_release_no
+                          AND receipt_user.department = 'C'
+                          AND receipt_user.operating_channel IN ('tmall', 'vip')
                         ORDER BY receipt.received_at ASC
                         LIMIT 1
                     )
@@ -362,8 +365,11 @@ def init_db(
                     (
                         SELECT receipt.received_at
                         FROM product_c_receipts receipt
+                        JOIN users receipt_user ON receipt_user.id = receipt.recipient_user_id
                         WHERE receipt.product_id = products.id
                           AND receipt.release_no = products.c_release_no
+                          AND receipt_user.department = 'C'
+                          AND receipt_user.operating_channel IN ('tmall', 'vip')
                         ORDER BY receipt.received_at ASC
                         LIMIT 1
                     )
@@ -373,8 +379,11 @@ def init_db(
               AND EXISTS (
                   SELECT 1
                   FROM product_c_receipts receipt
+                  JOIN users receipt_user ON receipt_user.id = receipt.recipient_user_id
                   WHERE receipt.product_id = products.id
                     AND receipt.release_no = products.c_release_no
+                    AND receipt_user.department = 'C'
+                    AND receipt_user.operating_channel IN ('tmall', 'vip')
               )
             """
         )
@@ -1702,7 +1711,11 @@ def create_user(
     clean_department = department.strip()
     clean_operating_channel = operating_channel.strip() if clean_department == "C" else ""
     if billing_platform_codes is None and clean_department == "C":
-        billing_platform_codes = (clean_operating_channel,)
+        billing_platform_codes = (
+            (clean_operating_channel,)
+            if clean_operating_channel in {"tmall", "vip"}
+            else ()
+        )
     billing_platforms_json = json.dumps(
         list(normalize_billing_platform_codes(billing_platform_codes if clean_department == "C" else ())),
         ensure_ascii=False,
@@ -1738,7 +1751,11 @@ def update_user_profile(
     clean_department = department.strip()
     clean_operating_channel = operating_channel.strip() if clean_department == "C" else ""
     if billing_platform_codes is None and clean_department == "C":
-        billing_platform_codes = (clean_operating_channel,)
+        billing_platform_codes = (
+            (clean_operating_channel,)
+            if clean_operating_channel in {"tmall", "vip"}
+            else ()
+        )
     billing_platforms_json = json.dumps(
         list(normalize_billing_platform_codes(billing_platform_codes if clean_department == "C" else ())),
         ensure_ascii=False,
@@ -3711,7 +3728,7 @@ def c_user_receipt_stats(db_path: str | Path, user: dict) -> dict[str, int]:
     recent_created = 0
     total = 0
     for product in products:
-        if product.get("launch_channel") not in visible_channels:
+        if normalize_launch_channel(product.get("launch_channel")) not in visible_channels:
             continue
         release_no = int(product.get("c_release_no") or 0)
         is_received = release_no in receipt_releases.get(int(product["id"]), set())

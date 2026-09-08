@@ -51,6 +51,7 @@ from catalog_backend.policies import (
     can_import_product_images,
     can_delete_product,
     can_recall_product,
+    c_receipt_counts_toward_product_status,
     c_user_can_manage_platform_bill,
     can_manage_supplier_settlements,
     can_manage_users,
@@ -102,7 +103,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.09.08-archive-toolbar-v1"
+CATALOG_BUILD_VERSION = "2026.09.08-all-channel-receipt-v2"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -1420,28 +1421,16 @@ class CatalogApplication:
                     status="403 Forbidden",
                 )
             with db.get_connection(self.db_path) as connection:
-                recorded = db.record_c_product_receipt(connection, product_id, user["id"], release_no)
-                if recorded:
-                    details = self.status_change_details(user, product, "received", review_note)
-                    if product.get("status") != "received":
-                        db.change_product_status(
-                            connection,
-                            product_id,
-                            "received",
-                            user["id"],
-                            "接收资料",
-                            details,
-                        )
-                    else:
-                        db.log_product_action(
-                            connection,
-                            product_id,
-                            user["id"],
-                            "c:received",
-                            "接收资料",
-                            details,
-                        )
-            notice = "资料已接收。" if recorded else "该资料当前版本已接收，无需重复操作。"
+                recorded = self.record_c_receipt(
+                    connection,
+                    product,
+                    user,
+                    review_note=review_note,
+                )
+            if recorded and user.get("operating_channel") == "all":
+                notice = "已记录当前账号接收，资料全局状态保持不变。"
+            else:
+                notice = "资料已接收。" if recorded else "该资料当前版本已接收，无需重复操作。"
             return self.redirect(
                 start_response,
                 f"/products/{product_id}?notice=" + self.urlencode_message(notice),
@@ -1762,26 +1751,7 @@ class CatalogApplication:
                         skipped += 1
                         self.append_bulk_skip_reason(skip_reasons, product, "当前资料不是待运营接收状态。")
                         continue
-                    if db.record_c_product_receipt(connection, product_id, user["id"], int(product.get("c_release_no") or 0)):
-                        details = self.status_change_details(user, product, "received")
-                        if product.get("status") != "received":
-                            db.change_product_status(
-                                connection,
-                                product_id,
-                                "received",
-                                user["id"],
-                                "接收资料",
-                                details,
-                            )
-                        else:
-                            db.log_product_action(
-                                connection,
-                                product_id,
-                                user["id"],
-                                "c:received",
-                                "接收资料",
-                                details,
-                            )
+                    if self.record_c_receipt(connection, product, user):
                         updated += 1
                     else:
                         skipped += 1
@@ -1860,6 +1830,12 @@ class CatalogApplication:
         else:
             action_label = "批量操作"
         notice = f"{action_label}完成：成功 {updated} 条，跳过 {skipped} 条。"
+        if (
+            action == "receive_selected"
+            and user.get("department") == "C"
+            and user.get("operating_channel") == "all"
+        ):
+            notice = f"{notice} 已记录当前账号接收，资料全局状态保持不变。"
         if skip_reasons:
             notice = f"{notice} 主要原因：{'；'.join(skip_reasons)}"
         return self.redirect(start_response, self.products_notice_path(form.get("return_to", ""), notice))
@@ -2493,7 +2469,7 @@ class CatalogApplication:
         if form.get("department", "").strip() not in MANAGEABLE_DEPARTMENTS:
             errors.append("角色或部门不合法。")
         if form.get("department", "").strip() == "C" and form.get("operating_channel", "").strip() not in C_OPERATING_CHANNELS:
-            errors.append("运营部账号必须选择天猫类或唯品类运营归属。")
+            errors.append("运营部账号必须选择天猫类、唯品类或全渠道归属。")
         if form.get("department", "").strip() == "C":
             raw_billing_codes = self.collect_checkbox_values(form, "billing_platform_codes")
             billing_codes = normalize_billing_platform_codes(raw_billing_codes)
@@ -4721,6 +4697,14 @@ class CatalogApplication:
       border-radius: 12px;
       background: rgba(255, 251, 245, 0.98);
       box-shadow: 0 12px 24px rgba(67, 43, 25, 0.16);
+    }}
+    .catalog-table .table-action-menu-panel::before {{
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 100%;
+      height: 6px;
     }}
     .catalog-table .table-action-menu-panel button {{
       width: 100%;
@@ -7935,7 +7919,7 @@ class CatalogApplication:
   </div>
   <script>
     {monitor_script}
-    document.querySelectorAll("details.nav-menu, details.export-menu").forEach(function(menu) {{
+    document.querySelectorAll("details.nav-menu, details.export-menu, details.table-action-menu").forEach(function(menu) {{
       let closeTimer = null;
       const cancelPendingClose = function() {{
         if (closeTimer !== null) {{
@@ -7961,7 +7945,7 @@ class CatalogApplication:
       }});
       menu.addEventListener("toggle", function() {{
         if (menu.open) {{
-          document.querySelectorAll("details.nav-menu[open], details.export-menu[open]").forEach(function(otherMenu) {{
+          document.querySelectorAll("details.nav-menu[open], details.export-menu[open], details.table-action-menu[open]").forEach(function(otherMenu) {{
             if (otherMenu !== menu) {{
               otherMenu.open = false;
             }}
@@ -9655,7 +9639,9 @@ class CatalogApplication:
             if is_department_monitor(user):
                 c_note = '<div class="warning">管理员正在查看运营部汇总视图：已合并天猫、唯品及同款资料，仅用于查看接收进度。</div>'
             elif user.get("operating_channel") not in C_OPERATING_CHANNELS:
-                c_note = '<div class="warning">当前运营账号尚未设置运营归属，暂不显示商品资料。请由管理员在账号管理中设置为天猫类或唯品类。</div>'
+                c_note = '<div class="warning">当前运营账号尚未设置运营归属，暂不显示商品资料。请由管理员在账号管理中设置为天猫类、唯品类或全渠道。</div>'
+            elif user.get("operating_channel") == "all":
+                c_note = '<div class="warning">当前账号归属全渠道：可查看并记录接收天猫、唯品和同款资料，但不参与全局“已接收”状态判断；账单权限仍以账号管理中的账单属性为准。</div>'
             else:
                 c_note = (
                     f'<div class="warning">当前账号归属{html.escape(operating_channel_label(user.get("operating_channel")))}：只能查看本归属渠道及同款资料，页面、Excel 导出和 JSON 接口均不会返回其他渠道内容。</div>'
@@ -12430,7 +12416,7 @@ class CatalogApplication:
                 <tbody>
                   <tr><th>A 跟单部</th><td>维护自己发起资料的 A 阶段字段；在早期状态开启 B 协作；跟单部任一账号可归档及恢复已归档资料。</td><td>不能修改商品部或企划中心负责字段；运营阶段不能直接修改触发字段；只能删除或召回自己发起的资料。</td></tr>
                   <tr><th>B 商品部</th><td>在 A/B 协作中推进商品资料；当前藏宝阁内直接维护图片，资料完成后提交运营部。发现商品部或企划字段有误时，可从运营阶段召回。</td><td>不能删除或归档；不能修改 A 阶段字段。品类、上新价格、上新渠道由商品企划中心维护并回传。</td></tr>
-                  <tr><th>C 运营部</th><td>查看本账号渠道及同款资料；对当前运营版本执行接收。</td><td>不能修改资料、删除、归档或召回。</td></tr>
+                  <tr><th>C 运营部</th><td>按账号渠道属性查看并接收资料；天猫类或唯品类账号接收后即更新全局状态，“同款”任一渠道接收即显示“已接收”。全渠道账号可记录个人接收，但不参与全局状态判断；账单属性仍独立授权。</td><td>不能修改资料、删除、归档或召回。</td></tr>
                   <tr><th>总经办 / 美工部</th><td>按各自只读范围查看资料。</td><td>不能上传、修改、删除、归档或召回。</td></tr>
                   <tr><th>管理员</th><td>可查看并监控各部门，维护账号和系统规则，执行必要的流程及生命周期管理。</td><td>管理员操作会写入日志，正式业务仍建议由对应部门完成。</td></tr>
                 </tbody>
@@ -12538,7 +12524,7 @@ class CatalogApplication:
             for code in MANAGEABLE_DEPARTMENTS
         )
         operating_channel_options = "".join(
-            f'<option value="{code}" {"selected" if form_values.get("operating_channel") == code else ""}>{html.escape(label)}</option>'
+            f'<option value="{code}" {"selected" if form_values.get("operating_channel") == code else ""}>{html.escape("全渠道（天猫/唯品/同款）" if code == "all" else label)}</option>'
             for code, label in C_OPERATING_CHANNELS.items()
         )
         selected_billing_platforms = set(self.billing_platform_codes_for_user_form(form_values))
@@ -12628,7 +12614,7 @@ class CatalogApplication:
             for code in MANAGEABLE_DEPARTMENTS
         )
         operating_channel_options = "".join(
-            f'<option value="{code}" {"selected" if managed_user.get("operating_channel") == code else ""}>{html.escape(label)}</option>'
+            f'<option value="{code}" {"selected" if managed_user.get("operating_channel") == code else ""}>{html.escape("全渠道（天猫/唯品/同款）" if code == "all" else label)}</option>'
             for code, label in C_OPERATING_CHANNELS.items()
         )
         selected_billing_platforms = set(self.billing_platform_codes_for_user_form(managed_user))
@@ -13309,6 +13295,46 @@ class CatalogApplication:
         """
         return self.page("列表字段设置 - 商品资料后台", content, user, current_page="products", back_href="/products")
 
+    def record_c_receipt(
+        self,
+        connection,
+        product: dict,
+        user: dict,
+        review_note: str = "",
+    ) -> bool:
+        release_no = int(product.get("c_release_no") or 0)
+        recorded = db.record_c_product_receipt(
+            connection,
+            int(product["id"]),
+            int(user["id"]),
+            release_no,
+        )
+        if not recorded:
+            return False
+        details = self.status_change_details(user, product, "received", review_note)
+        if (
+            product.get("status") != "received"
+            and c_receipt_counts_toward_product_status(user)
+        ):
+            db.change_product_status(
+                connection,
+                int(product["id"]),
+                "received",
+                int(user["id"]),
+                "接收资料",
+                details,
+            )
+        else:
+            db.log_product_action(
+                connection,
+                int(product["id"]),
+                int(user["id"]),
+                "c:received",
+                "接收资料",
+                details,
+            )
+        return True
+
     def status_note_label(self, user, product: dict, target_status: str) -> str:
         if target_status == "pending":
             if product.get("status") in {"published", "received"}:
@@ -13363,7 +13389,10 @@ class CatalogApplication:
                 details = f"{actor} 将资料提交为待运营接收。"
                 note_prefix = "处理说明"
         elif target_status == "received":
-            details = f"{actor} 已确认接收商品部完成并开放的资料。"
+            if user.get("operating_channel") == "all":
+                details = f"{actor}全渠道账号已记录个人接收，本次操作不参与资料全局状态判断。"
+            else:
+                details = f"{actor} 已确认接收商品部完成并开放的资料。"
             note_prefix = "接收说明"
         else:
             details = f"{actor} 将资料退回跟单部主体填写阶段。"
