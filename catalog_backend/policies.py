@@ -273,7 +273,7 @@ def can_see_product(user: dict | None, product: dict | None) -> bool:
     if is_released_catalog_read_only(user):
         return product.get("lifecycle_status") == "active" and status in {"published", "received"}
     if product.get("lifecycle_status") == "archived":
-        return user.get("id") == product.get("created_by")
+        return user.get("department") == "A"
     if user.get("department") == "C":
         return status in {"published", "received"} and c_user_can_see_launch_channel(user, product.get("launch_channel"))
     return True
@@ -322,6 +322,8 @@ def available_status_actions(user: dict | None, product: dict | None) -> list[tu
         if status == "pending":
             actions.append(("published", "确认资料齐全，提交运营部"))
             actions.append(("draft", "退回跟单部补充"))
+        if status in {"published", "received"} and can_recall_product(user, product):
+            actions.append(("pending", "召回到 A/B 协作"))
         if status in {"published", "received"} and int(product.get("workflow_restart_required") or 0):
             actions.append(("published", "重新提交给运营部"))
         return actions
@@ -385,13 +387,14 @@ def can_delete_product(user: dict | None, product: dict | None) -> bool:
 
 
 def can_recall_product(user: dict | None, product: dict | None) -> bool:
-    """Only the source A user or an administrator can recall released records."""
+    """The source A user, B team, or an administrator may recall released records."""
     if not user or not product or is_department_monitor(user):
         return False
     if product.get("lifecycle_status") != "active" or product.get("status") not in {"published", "received"}:
         return False
     return bool(
         is_admin(user)
+        or user.get("department") == "B"
         or (
             user.get("department") == "A"
             and user.get("id") == product.get("created_by")
@@ -400,28 +403,26 @@ def can_recall_product(user: dict | None, product: dict | None) -> bool:
 
 
 def can_archive_product(user: dict | None, product: dict | None) -> bool:
-    """A may archive only their own records after C has received them."""
+    """Any A user may archive records after C has received them."""
     if not user or not product or is_department_monitor(user):
         return False
     if is_admin(user):
         return product.get("lifecycle_status") == "active"
     return bool(
         user.get("department") == "A"
-        and user.get("id") == product.get("created_by")
         and product.get("lifecycle_status") == "active"
         and product.get("status") == "received"
     )
 
 
 def can_restore_product(user: dict | None, product: dict | None) -> bool:
-    """A may restore their own archived records; deleted records remain admin-only."""
+    """Any A user may restore archived records; deleted records remain admin-only."""
     if not user or not product or is_department_monitor(user):
         return False
     if is_admin(user):
         return product.get("lifecycle_status") in {"archived", "deleted"}
     return bool(
         user.get("department") == "A"
-        and user.get("id") == product.get("created_by")
         and product.get("lifecycle_status") == "archived"
     )
 

@@ -102,7 +102,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.09.07-a-lifecycle-v1"
+CATALOG_BUILD_VERSION = "2026.09.08-department-recall-v2"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -1828,7 +1828,11 @@ class CatalogApplication:
                     allowed = dict(available_lifecycle_actions(user, product))
                     if "archived" not in allowed:
                         skipped += 1
-                        self.append_bulk_skip_reason(skip_reasons, product, "当前状态不能批量归档。")
+                        archive_skip_reason = "当前状态不能批量归档。"
+                        if user.get("department") == "A":
+                            if product.get("status") != "received":
+                                archive_skip_reason = "资料须在已接收状态才能归档。"
+                        self.append_bulk_skip_reason(skip_reasons, product, archive_skip_reason)
                         continue
                     db.change_product_lifecycle(
                         connection,
@@ -1836,7 +1840,7 @@ class CatalogApplication:
                         "archived",
                         user["id"],
                         allowed["archived"],
-                        "系统管理员批量归档资料。",
+                        f"{department_label(user.get('department'))}批量归档资料。",
                     )
                     updated += 1
                     continue
@@ -9676,17 +9680,21 @@ class CatalogApplication:
                 )
             status_actions = dict(available_status_actions(user, product))
             recall_action_markup = ""
-            if (
-                can_recall_product(user, product)
-                and product.get("status") in {"published", "received"}
-                and "pending" in status_actions
-            ):
-                recall_action_markup = (
-                    f'<button class="table-action-recall" type="submit" '
-                    f'name="status" value="pending" '
-                    f'formaction="/products/{product["id"]}/status" formmethod="post" '
-                    f'title="召回后可修改重要字段或删除资料">召回</button>'
-                )
+            if product.get("lifecycle_status") == "active" and product.get("status") in {"published", "received"}:
+                if can_recall_product(user, product) and "pending" in status_actions:
+                    recall_action_markup = (
+                        f'<button class="table-action-recall" type="submit" '
+                        f'name="status" value="pending" '
+                        f'formaction="/products/{product["id"]}/status" formmethod="post" '
+                        f'title="召回后可修改重要字段或删除资料">召回</button>'
+                    )
+                elif user.get("department") == "A":
+                    recall_title = "仅资料原发起人可以召回该条目"
+                    recall_action_markup = (
+                        '<button class="table-action-disabled" type="button" disabled '
+                        f'title="{html.escape(recall_title, quote=True)}" '
+                        f'aria-label="召回不可用：{html.escape(recall_title, quote=True)}">召回</button>'
+                    )
             lifecycle_actions = dict(available_lifecycle_actions(user, product))
             for lifecycle_target in lifecycle_actions:
                 if lifecycle_target == "archived":
@@ -9729,7 +9737,7 @@ class CatalogApplication:
                 delete_title = (
                     "资料已进入运营流程，请先召回到 A/B 协作后再删除"
                     if can_recall_product(user, product)
-                    else "仅资料发起人可以删除该条目"
+                    else "仅资料原发起人可以删除该条目"
                 )
                 delete_action_markup = (
                     '<button class="table-action-disabled" type="button" disabled '
@@ -9740,12 +9748,15 @@ class CatalogApplication:
                 markup for markup in (delete_action_markup, recall_action_markup) if markup
             ]
             if lifecycle_menu_items:
-                actions.append(
-                    '<details class="table-action-menu">'
-                    '<summary title="删除或召回">更多</summary>'
-                    f'<div class="table-action-menu-panel">{"".join(lifecycle_menu_items)}</div>'
-                    '</details>'
-                )
+                if user.get("department") == "B" and recall_action_markup and not delete_action_markup:
+                    actions.append(recall_action_markup)
+                else:
+                    actions.append(
+                        '<details class="table-action-menu">'
+                        '<summary title="删除或召回">删除</summary>'
+                        f'<div class="table-action-menu-panel">{"".join(lifecycle_menu_items)}</div>'
+                        '</details>'
+                    )
             if can_view_logs(user):
                 actions.append(f'<a href="/products/{product["id"]}/logs">日志</a>')
             selector_cell = ""
@@ -11738,12 +11749,13 @@ class CatalogApplication:
         """
 
     def render_bulk_archive_tool(self, user) -> str:
-        if not is_admin(user) or is_department_monitor(user):
+        if is_department_monitor(user) or (not is_admin(user) and user.get("department") != "A"):
             return ""
         return (
             '<button type="submit" name="bulk_action" value="archive_selected" '
             'form="products-bulk-form" formmethod="post" formaction="/products/bulk" '
-            'class="ghost-button products-bulk-archive-button">批量归档</button>'
+            'class="ghost-button products-bulk-archive-button" '
+            'title="可归档跟单部任一账号发起且已接收的资料；不符合条件的条目会自动跳过">批量归档</button>'
         )
 
     def render_product_form(self, user, action: str, title: str, values: dict, errors: list[str] | None = None) -> str:
@@ -12412,8 +12424,8 @@ class CatalogApplication:
               <table class="rules-table">
                 <thead><tr><th>角色</th><th>可操作内容</th><th>不可操作内容</th></tr></thead>
                 <tbody>
-                  <tr><th>A 跟单部</th><td>维护自己发起资料的 A 阶段字段；在早期状态开启 B 协作。</td><td>不能修改商品部或企划中心负责字段；运营阶段不能直接修改触发字段。</td></tr>
-                  <tr><th>B 商品部</th><td>在 A/B 协作中推进商品资料；当前藏宝阁内直接维护图片，资料完成后提交运营部。</td><td>不能删除、归档或召回；不能修改 A 阶段字段。品类、上新价格、上新渠道由商品企划中心维护并回传。</td></tr>
+                  <tr><th>A 跟单部</th><td>维护自己发起资料的 A 阶段字段；在早期状态开启 B 协作；跟单部任一账号可归档及恢复已归档资料。</td><td>不能修改商品部或企划中心负责字段；运营阶段不能直接修改触发字段；只能删除或召回自己发起的资料。</td></tr>
+                  <tr><th>B 商品部</th><td>在 A/B 协作中推进商品资料；当前藏宝阁内直接维护图片，资料完成后提交运营部。发现商品部或企划字段有误时，可从运营阶段召回。</td><td>不能删除或归档；不能修改 A 阶段字段。品类、上新价格、上新渠道由商品企划中心维护并回传。</td></tr>
                   <tr><th>C 运营部</th><td>查看本账号渠道及同款资料；对当前运营版本执行接收。</td><td>不能修改资料、删除、归档或召回。</td></tr>
                   <tr><th>总经办 / 美工部</th><td>按各自只读范围查看资料。</td><td>不能上传、修改、删除、归档或召回。</td></tr>
                   <tr><th>管理员</th><td>可查看并监控各部门，维护账号和系统规则，执行必要的流程及生命周期管理。</td><td>管理员操作会写入日志，正式业务仍建议由对应部门完成。</td></tr>
@@ -12425,9 +12437,9 @@ class CatalogApplication:
             <div class="eyebrow">Lifecycle</div>
             <h2>删除、归档与召回</h2>
             <div class="rule-callouts">
-              <div class="rule-callout"><strong>删除</strong><span>A 原始发起人仅可在“跟单整理中”或“A/B 协作中”删除自己发起的正常资料。进入运营阶段后，必须先召回。</span></div>
-              <div class="rule-callout"><strong>归档</strong><span>仅 A 原始发起人和管理员有权限。A 只能对“已接收”的自己发起资料归档；管理员可按管理权限归档。</span></div>
-              <div class="rule-callout"><strong>召回</strong><span>仅 A 原始发起人和管理员可对“待运营接收”或“已接收”资料执行“召回到 A/B 协作”。召回会清除当前运营接收标记，保留历史版本和操作日志。</span></div>
+              <div class="rule-callout"><strong>删除</strong><span>A 原始发起人仅可在“跟单整理中”或“A/B 协作中”删除自己发起的正常资料。进入运营阶段后，必须先召回；已删除资料仅管理员可恢复。</span></div>
+              <div class="rule-callout"><strong>归档</strong><span>A 跟单部任一账号可批量归档“已接收”资料，也可在“已归档”筛选中恢复；管理员可按管理权限归档或恢复。</span></div>
+              <div class="rule-callout"><strong>召回</strong><span>A 原始发起人、B 商品部和管理员可对“待运营接收”或“已接收”资料执行“召回到 A/B 协作”。A 同部门非发起人仅能查看禁用入口。召回会清除当前运营接收标记，保留历史版本和操作日志。</span></div>
             </div>
           </div>
           <div class="rule-section">
@@ -12440,7 +12452,7 @@ class CatalogApplication:
                 <thead><tr><th>操作账号</th><th>可修改内容</th><th>处理规则</th></tr></thead>
                 <tbody>
                   <tr><th>A 跟单部</th><td>可修改 A 阶段负责字段。上方列出的字段属于触发字段。</td><td>处于“待运营接收”或“已接收”时，修改触发字段前必须先使用“召回到 A/B 协作”；非触发字段可直接修改并生成新版本。</td></tr>
-                  <tr><th>B 商品部</th><td>当前藏宝阁只开放图片维护。</td><td>图片采用独立图片版本更新，不触发召回，也不要求运营重新接收。B 没有召回权限。</td></tr>
+                  <tr><th>B 商品部</th><td>当前藏宝阁直接开放图片维护；品类、上新价格和上新渠道由商品企划中心维护。</td><td>图片采用独立图片版本更新，不自动触发召回。发现商品部或企划字段有误时，B 可主动召回到 A/B 协作，修正后重新提交运营部。</td></tr>
                 </tbody>
               </table>
             </div>

@@ -3546,9 +3546,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.07-a-lifecycle-v1")
+        self.assertEqual(payload["build_version"], "2026.09.08-department-recall-v2")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.07-a-lifecycle-v1")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.08-department-recall-v2")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -6079,6 +6079,8 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("毛感针织开衫（已更新）", c_list_body)
 
     def test_bulk_actions_skip_ineligible_products_and_forbid_non_admin(self):
+        with db.get_connection(self.db_path) as connection:
+            connection.execute("UPDATE products SET status = 'received' WHERE id = 1")
         editor_cookie = self.login("a_editor", "demo123")
         forbidden_response = self.request(
             "/products/bulk",
@@ -6161,6 +6163,15 @@ class CatalogAppTests(unittest.TestCase):
         deleted_product = db.get_product(self.db_path, 1)
         self.assertEqual(deleted_product["lifecycle_status"], "deleted")
 
+        forbidden_a_restore = self.request(
+            "/products/1/lifecycle",
+            method="POST",
+            body=urlencode({"lifecycle_status": "active"}).encode("utf-8"),
+            cookie=editor_cookie,
+        )
+        self.assertTrue(forbidden_a_restore["status"].startswith("403"))
+        self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "deleted")
+
         restore_response = self.request(
             "/products/1/lifecycle",
             method="POST",
@@ -6174,6 +6185,7 @@ class CatalogAppTests(unittest.TestCase):
     def test_a_cannot_archive_until_c_has_received_the_product(self):
         editor_cookie = self.login("a_editor", "demo123")
         list_body = self.request("/products", cookie=editor_cookie)["body"].decode("utf-8")
+        self.assertIn("products-bulk-archive-button", list_body)
         self.assertNotIn('name="lifecycle_status" value="archived"', list_body)
         response = self.request(
             "/products/1/lifecycle",
@@ -6236,7 +6248,7 @@ class CatalogAppTests(unittest.TestCase):
         other_a_cookie = self.login("a_other_editor", "demo123")
         other_a_body = self.request("/products", cookie=other_a_cookie)["body"].decode("utf-8")
         self.assertNotIn('data-delete-button="1"', other_a_body)
-        self.assertIn("仅资料发起人可以删除该条目", other_a_body)
+        self.assertIn("仅资料原发起人可以删除该条目", other_a_body)
         forbidden_a_delete = self.request(
             "/products/1/lifecycle",
             method="POST",
@@ -6245,6 +6257,60 @@ class CatalogAppTests(unittest.TestCase):
         )
         self.assertTrue(forbidden_a_delete["status"].startswith("403"))
         self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "active")
+
+    def test_a_non_creator_can_archive_and_restore_but_cannot_delete_or_recall(self):
+        with db.get_connection(self.db_path) as connection:
+            connection.execute("UPDATE products SET status = 'received' WHERE id = 1")
+        db.create_user(
+            self.db_path,
+            "a_colleague",
+            "另一位跟单员",
+            "A",
+            "demo123",
+            must_change_password=False,
+        )
+        colleague_cookie = self.login("a_colleague", "demo123")
+        list_body = self.request("/products", cookie=colleague_cookie)["body"].decode("utf-8")
+        self.assertIn("products-bulk-archive-button", list_body)
+        self.assertIn("仅资料原发起人可以删除该条目", list_body)
+        self.assertIn("仅资料原发起人可以召回该条目", list_body)
+        self.assertIn('<summary title="删除或召回">删除</summary>', list_body)
+        self.assertNotIn('data-delete-button="1"', list_body)
+
+        archive_response = self.request(
+            "/products/bulk",
+            method="POST",
+            body=urlencode([("product_ids", "1"), ("bulk_action", "archive_selected")]).encode("utf-8"),
+            cookie=colleague_cookie,
+        )
+        self.assertTrue(archive_response["status"].startswith("302"))
+        archive_notice = unquote_plus(dict(archive_response["headers"])["Location"])
+        self.assertIn("成功 1 条", archive_notice)
+        self.assertIn("跳过 0 条", archive_notice)
+        self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "archived")
+
+        archived_body = self.request(
+            "/products?lifecycle_status=archived",
+            cookie=colleague_cookie,
+        )["body"].decode("utf-8")
+        self.assertIn('name="lifecycle_status" value="active"', archived_body)
+        restore_response = self.request(
+            "/products/1/lifecycle",
+            method="POST",
+            body=urlencode({"lifecycle_status": "active"}).encode("utf-8"),
+            cookie=colleague_cookie,
+        )
+        self.assertTrue(restore_response["status"].startswith("302"))
+        self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "active")
+
+        recall_response = self.request(
+            "/products/1/status",
+            method="POST",
+            body=urlencode({"status": "pending"}).encode("utf-8"),
+            cookie=colleague_cookie,
+        )
+        self.assertTrue(recall_response["status"].startswith("403"))
+        self.assertEqual(db.get_product(self.db_path, 1)["status"], "received")
 
     def test_a_can_start_collaboration_early_and_a_b_updates_merge_by_field(self):
         users = {user["department"]: user for user in db.list_users(self.db_path)}
@@ -6411,19 +6477,32 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(delete_response["status"].startswith("302"))
         self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "deleted")
 
-    def test_only_a_and_admin_can_recall_and_rules_are_visible(self):
+    def test_b_can_recall_without_delete_or_archive_and_rules_are_visible(self):
         with db.get_connection(self.db_path) as connection:
             connection.execute("UPDATE products SET status = 'published' WHERE id = 1")
         b_cookie = self.login("b_editor", "demo123")
         b_body = self.request("/products", cookie=b_cookie)["body"].decode("utf-8")
-        self.assertNotIn(">召回</button>", b_body)
+        self.assertIn(">召回</button>", b_body)
+        self.assertNotIn('<summary title="删除或召回">更多</summary>', b_body)
+        self.assertNotIn('data-delete-button="1"', b_body)
+        self.assertNotIn('name="bulk_action" value="archive_selected"', b_body)
         b_response = self.request(
             "/products/1/status",
             method="POST",
             body=urlencode({"status": "pending"}).encode("utf-8"),
             cookie=b_cookie,
         )
-        self.assertTrue(b_response["status"].startswith("403"))
+        self.assertTrue(b_response["status"].startswith("302"))
+        self.assertEqual(db.get_product(self.db_path, 1)["status"], "pending")
+
+        b_delete_response = self.request(
+            "/products/1/lifecycle",
+            method="POST",
+            body=urlencode({"lifecycle_status": "deleted", "confirm_text": "DELETE"}).encode("utf-8"),
+            cookie=b_cookie,
+        )
+        self.assertTrue(b_delete_response["status"].startswith("403"))
+        self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "active")
 
         c_cookie = self.login("c_viewer", "demo123")
         c_response = self.request(
