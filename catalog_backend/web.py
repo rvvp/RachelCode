@@ -5795,6 +5795,12 @@ class CatalogApplication:
     .products-filter-form-c {{
       grid-template-columns: repeat(3, minmax(0, 1fr));
     }}
+    .products-filter-form-a {{
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+    }}
+    .products-filter-form-a .products-filter-submit {{
+      width: calc((100% - 40px) / 5);
+    }}
     .products-filter-form-c .products-filter-submit {{
       grid-column: auto;
       justify-self: stretch;
@@ -5838,8 +5844,11 @@ class CatalogApplication:
       flex-wrap: wrap;
     }}
     .products-list-control-bar {{
-      display: grid;
-      gap: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
       margin: 0 0 14px;
       padding: 10px 12px;
       border: 1px solid rgba(94, 67, 40, 0.1);
@@ -5850,21 +5859,25 @@ class CatalogApplication:
       display: flex;
       align-items: center;
       justify-content: center;
+      flex: 1 1 520px;
+      min-width: 0;
       min-height: 36px;
     }}
     .products-list-control-meta {{
       display: flex;
       align-items: center;
-      justify-content: space-between;
+      justify-content: flex-end;
       gap: 12px;
+      flex: 1 1 auto;
       flex-wrap: wrap;
     }}
     .products-list-control-actions {{
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      display: flex;
       align-items: center;
+      justify-content: flex-end;
       gap: 12px;
-      width: 100%;
+      width: auto;
+      min-width: 0;
     }}
     .products-list-control-meta > .products-selection-summary {{
       order: 2;
@@ -10112,7 +10125,7 @@ class CatalogApplication:
           <h2>搜索与筛选</h2>
           {notice_block}
           {c_note}
-          <form class="products-filter-form{' products-filter-form-c' if compact_readonly_dashboard else ''}" method="get" action="/products#products-list">
+          <form class="products-filter-form{' products-filter-form-c' if compact_readonly_dashboard else (' products-filter-form-a' if user['department'] == 'A' else '')}" method="get" action="/products#products-list">
               <input class="products-search-field" type="search" name="q" value="{html.escape(keyword)}" placeholder="可输入多个，逗号、空格或换行分隔" aria-label="搜索款号或款色" autocomplete="off">
               {supplier_filter_markup}
               {filter_controls_markup}

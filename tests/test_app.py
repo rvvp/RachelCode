@@ -569,9 +569,11 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn(">已完成</option>", a_form)
         self.assertEqual(select_markup(a_form, "status").count("<option"), 6)
         self.assertLess(a_form.index('name="status"'), a_form.index('name="lifecycle_status"'))
+        self.assertIn('class="products-filter-form products-filter-form-a"', a_form)
 
         b_form = filter_form(self.request("/products", cookie=self.login("b_editor", "demo123"))["body"].decode("utf-8"))
         self.assertNotIn("products-filter-form-c", b_form)
+        self.assertNotIn("products-filter-form-a", b_form)
         self.assertNotIn('class="filter-department-context"', b_form)
         self.assertNotIn('<select name="department">', b_form)
         self.assertIn('value="pending"', b_form)
@@ -623,6 +625,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("SP-8420", a_body)
         self.assertNotIn("NH-2601", a_body)
         self.assertIn("season_year=2026%E7%A7%8B", a_body)
+        self.assertIn(".products-filter-form-a {\n      grid-template-columns: repeat(5, minmax(0, 1fr));", a_body)
+        self.assertIn(".products-list-control-bar {\n      display: flex;", a_body)
+        self.assertIn('class="products-list-control-actions"', a_body)
 
         b_body = self.request(
             "/products?season_year=2026%E7%A7%8B",
