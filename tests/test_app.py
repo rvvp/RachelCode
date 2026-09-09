@@ -296,6 +296,19 @@ class CatalogAppTests(unittest.TestCase):
         image.save(output, format="PNG")
         return output.getvalue()
 
+    def make_catalog_import_workbook_bytes(self, product: dict, **overrides) -> bytes:
+        from catalog_backend.fields import PRODUCT_FIELDS
+
+        values = {field.key: product.get(field.key, "") for field in PRODUCT_FIELDS}
+        values.update(overrides)
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append([field.excel_header for field in PRODUCT_FIELDS])
+        worksheet.append([values[field.key] for field in PRODUCT_FIELDS])
+        output = io.BytesIO()
+        workbook.save(output)
+        return output.getvalue()
+
     def test_a_and_b_editors_show_workflow_specific_catalog_summaries(self):
         a_cookie = self.login("a_editor", "demo123")
         a_response = self.request("/products", cookie=a_cookie)
@@ -595,6 +608,33 @@ class CatalogAppTests(unittest.TestCase):
             self.assertIn(f">{label}</option>", admin_status)
         self.assertEqual(admin_status.count("<option"), 6)
         self.assertEqual(select_markup(admin_form, "marker").count("<option"), 3)
+
+    def test_a_editor_can_filter_products_by_season_year(self):
+        a_cookie = self.login("a_editor", "demo123")
+        a_body = self.request(
+            "/products?season_year=2026%E7%A7%8B",
+            cookie=a_cookie,
+        )["body"].decode("utf-8")
+
+        self.assertIn(
+            'name="season_year" value="2026秋"',
+            a_body,
+        )
+        self.assertIn("SP-8420", a_body)
+        self.assertNotIn("NH-2601", a_body)
+        self.assertIn("season_year=2026%E7%A7%8B", a_body)
+
+        b_body = self.request(
+            "/products?season_year=2026%E7%A7%8B",
+            cookie=self.login("b_editor", "demo123"),
+        )["body"].decode("utf-8")
+        self.assertNotIn('name="season_year"', b_body)
+        self.assertNotIn("season_year=2026%E7%A7%8B", b_body)
+
+        self.assertEqual(
+            [product["style_code"] for product in db.list_products(self.db_path, season_year="2026")],
+            ["SP-8420", "NH-2601"],
+        )
 
     def test_workflow_status_filters_are_mutually_exclusive_and_b_hides_drafts(self):
         users = {user["department"]: user for user in db.list_users(self.db_path)}
@@ -3781,9 +3821,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.09-bulk-delete-v4")
+        self.assertEqual(payload["build_version"], "2026.09.09-field-permissions-v1")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.09-bulk-delete-v4")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.09-field-permissions-v1")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -4680,15 +4720,15 @@ class CatalogAppTests(unittest.TestCase):
         headers = [
             "检测报告", "发货仓库", "品牌\n名称", "年份季节", "图片", "款色", "款号", "颜色\n名称",
             "商品名称", "品类", "是否有配饰", "供应商", "吊牌价", "上新价格", "上新渠道", "尺码段", "F", "S", "M",
-            "L", "XL", "2XL", "3XL", "合计", "材质", "成分", "洗涤方式", "洗涤方式 （英文）",
+            "L", "XL", "2XL", "3XL", "合计", "材质", "成分(英文)", "洗涤方式", "洗涤方式 （英文）",
             "安全技术类别", "执行标准", "尺寸表",
         ]
         sheet.append(headers)
         sheet.append([
             "已归档", "杭州一仓", "North Harbor", "2026夏", "https://example.com/images/nh-2601.jpg",
             "短袖连衣裙-蓝", "NH-2601", "海盐蓝", "褶皱短袖连衣裙", "连衣裙", "无", "杭州云锦供应链",
-            499, 359, "直播首发", "S-XL", "", 20, 28, 18, 10, "", "", 76, "梭织",
-            "面料 85%棉 15%锦纶", "建议冷水轻柔机洗", "Machine wash cold, gentle cycle", "B类",
+            499, 329, "天猫", "S-XL", "", 20, 28, 18, 10, "", "", 76, "梭织",
+            "SHELL: 85% COTTON 15% NYLON", "建议冷水轻柔机洗", "Machine wash cold, gentle cycle", "B类",
             "GB/T 2660", "S: 肩宽37 / 胸围92 / 衣长112",
         ])
         buffer = io.BytesIO()
@@ -4703,6 +4743,142 @@ class CatalogAppTests(unittest.TestCase):
         )
         body = response["body"].decode("utf-8")
         self.assertIn("新增 0 条，更新 1 条", body)
+        updated = db.get_product(self.db_path, 1)
+        self.assertEqual(updated["image_url"], "https://example.com/images/nh-2601.jpg")
+        self.assertEqual(updated["launch_price"], 329)
+        self.assertEqual(updated["launch_channel"], "天猫")
+
+    def test_a_excel_import_rejects_planning_field_changes(self):
+        cookie = self.login("a_editor", "demo123")
+        before = db.get_product(self.db_path, 1)
+        workbook_bytes = self.make_catalog_import_workbook_bytes(
+            before,
+            category="上衣",
+            launch_price=150,
+            launch_channel="唯品",
+        )
+        response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart("workbook", "planning-fields.xlsx", workbook_bytes),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(response["status"].startswith("200"))
+        body = response["body"].decode("utf-8")
+        self.assertIn("新增 0 条，更新 0 条", body)
+        self.assertIn("当前账号不能通过 Excel 导入或修改这些商品部字段", body)
+        self.assertIn("上新价格", body)
+        self.assertIn("上新渠道", body)
+        self.assertIn("品类", body)
+        after = db.get_product(self.db_path, 1)
+        self.assertEqual(after["launch_price"], before["launch_price"])
+        self.assertEqual(after["launch_channel"], before["launch_channel"])
+
+    def test_b_excel_import_only_updates_image_and_rejects_mixed_rows(self):
+        cookie = self.login("b_editor", "demo123")
+        before = db.get_product(self.db_path, 1)
+        forbidden_workbook = self.make_catalog_import_workbook_bytes(
+            before,
+            image_url="https://example.com/images/b-image-that-must-not-save.jpg",
+            category="上衣",
+            launch_price=150,
+            launch_channel="唯品",
+        )
+        forbidden_response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart("workbook", "mixed-fields.xlsx", forbidden_workbook),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(forbidden_response["status"].startswith("200"))
+        forbidden_body = forbidden_response["body"].decode("utf-8")
+        self.assertIn("检测到 1 条越权修改，整行未导入", forbidden_body)
+        self.assertIn("只能导入图片", forbidden_body)
+        self.assertIn("品类", forbidden_body)
+        self.assertIn("上新价格", forbidden_body)
+        self.assertIn("上新渠道", forbidden_body)
+        unchanged = db.get_product(self.db_path, 1)
+        self.assertEqual(unchanged["image_url"], before["image_url"])
+        self.assertEqual(unchanged["launch_price"], before["launch_price"])
+        self.assertEqual(unchanged["launch_channel"], before["launch_channel"])
+
+        image_workbook = self.make_catalog_import_workbook_bytes(
+            before,
+            image_url="https://example.com/images/b-image-only.jpg",
+        )
+        image_response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart("workbook", "image-only.xlsx", image_workbook),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(image_response["status"].startswith("200"))
+        self.assertIn("已回填 1 条商品部资料", image_response["body"].decode("utf-8"))
+        updated = db.get_product(self.db_path, 1)
+        self.assertEqual(updated["image_url"], "https://example.com/images/b-image-only.jpg")
+        self.assertEqual(updated["launch_price"], before["launch_price"])
+        self.assertEqual(updated["launch_channel"], before["launch_channel"])
+
+    def test_b_single_edit_rejects_forged_non_image_fields(self):
+        cookie = self.login("b_editor", "demo123")
+        before = db.get_product(self.db_path, 1)
+        response = self.request(
+            "/products/1/edit",
+            method="POST",
+            body=urlencode(
+                {
+                    "image_url": before["image_url"],
+                    "category": "上衣",
+                    "launch_price": "150",
+                    "launch_channel": "唯品",
+                }
+            ).encode("utf-8"),
+            cookie=cookie,
+        )
+        self.assertTrue(response["status"].startswith("403"))
+        body = response["body"].decode("utf-8")
+        self.assertIn("当前账号不能修改这些字段", body)
+        self.assertIn("品类", body)
+        self.assertIn("上新价格", body)
+        self.assertIn("上新渠道", body)
+        after = db.get_product(self.db_path, 1)
+        self.assertEqual(after["category"], before["category"])
+        self.assertEqual(after["launch_price"], before["launch_price"])
+        self.assertEqual(after["launch_channel"], before["launch_channel"])
+
+    def test_a_single_edit_rejects_forged_b_fields(self):
+        cookie = self.login("a_editor", "demo123")
+        before = db.get_product(self.db_path, 1)
+        response = self.request(
+            "/products/1/edit",
+            method="POST",
+            body=urlencode(
+                {
+                    "product_name": before["product_name"],
+                    "style_code": before["style_code"],
+                    "image_url": "https://example.com/images/a-forged-image.jpg",
+                    "launch_price": "150",
+                    "launch_channel": "唯品",
+                    "category": "上衣",
+                }
+            ).encode("utf-8"),
+            cookie=cookie,
+        )
+        self.assertTrue(response["status"].startswith("403"))
+        body = response["body"].decode("utf-8")
+        self.assertIn("当前账号不能修改这些字段", body)
+        self.assertIn("图片", body)
+        self.assertIn("上新价格", body)
+        self.assertIn("上新渠道", body)
+        self.assertIn("品类", body)
+        after = db.get_product(self.db_path, 1)
+        self.assertEqual(after["image_url"], before["image_url"])
+        self.assertEqual(after["launch_price"], before["launch_price"])
+        self.assertEqual(after["launch_channel"], before["launch_channel"])
+        self.assertEqual(after["category"], before["category"])
 
     def test_product_form_hides_size_chart_and_shows_launch_channel(self):
         cookie = self.login("a_editor", "demo123")
@@ -4727,6 +4903,12 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn('name="brand_name"', body)
         self.assertNotIn('name="tax_included_price"', body)
         self.assertNotIn('name="size_chart"', body)
+
+        import_response = self.request("/import", cookie=cookie)
+        import_body = import_response["body"].decode("utf-8")
+        self.assertIn("仅图片字段", import_body)
+        self.assertNotIn("仅商品部字段", import_body)
+        self.assertIn("其他字段不会被导入修改", import_body)
 
     def test_a_can_update_tax_price_and_trace_initial_and_current_values(self):
         a_cookie = self.login("a_editor", "demo123")
@@ -5773,7 +5955,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn("launch_price", a_item)
         self.assertNotIn("launch_price", b_item)
 
-    def test_b_stage_update_logs_field_level_diff(self):
+    def test_b_stage_edit_only_logs_image_field_level_diff(self):
         with db.get_connection(self.db_path) as connection:
             db.change_product_status(
                 connection,
@@ -5784,7 +5966,7 @@ class CatalogAppTests(unittest.TestCase):
                 "测试：A 已提交给 B。",
             )
         cookie = self.login("b_editor", "demo123")
-        update_response = self.request(
+        forbidden_response = self.request(
             "/products/1/edit",
             method="POST",
             body=urlencode(
@@ -5798,23 +5980,33 @@ class CatalogAppTests(unittest.TestCase):
             ).encode("utf-8"),
             cookie=cookie,
         )
+        self.assertTrue(forbidden_response["status"].startswith("403"))
+        self.assertIn("当前账号不能修改这些字段", forbidden_response["body"].decode("utf-8"))
+
+        update_response = self.request(
+            "/products/1/edit",
+            method="POST",
+            body=urlencode(
+                {"image_url": "https://example.com/images/b-stage-image.jpg"}
+            ).encode("utf-8"),
+            cookie=cookie,
+        )
         self.assertTrue(update_response["status"].startswith("302"))
 
         logs = db.get_product_logs(self.db_path, 1)
         update_log = next(item for item in logs if item["action"] == "update")
         diff_items = update_log["diff_items"]
-        self.assertTrue(any(item["field_key"] == "launch_price" for item in diff_items))
-        self.assertTrue(any(item["field_key"] == "launch_channel" for item in diff_items))
-        self.assertLessEqual(len(diff_items), 3)
+        self.assertTrue(any(item["field_key"] == "image_url" for item in diff_items))
+        self.assertEqual(len(diff_items), 1)
 
         logs_response = self.request("/products/1/logs", cookie=cookie)
         logs_body = logs_response["body"].decode("utf-8")
-        self.assertIn("本次共修改 2 项，仅摘要展示 2 项", logs_body)
-        self.assertIn("上新价格", logs_body)
+        self.assertIn("本次共修改 1 项，仅摘要展示 1 项", logs_body)
+        self.assertIn("图片", logs_body)
 
         versions = db.list_product_versions(self.db_path, 1)
-        self.assertEqual(versions[0]["version_no"], 2)
-        self.assertEqual(versions[0]["change_count"], 2)
+        self.assertEqual(versions[0]["version_no"], 1)
+        self.assertEqual(versions[0]["change_count"], 0)
 
     def test_admin_can_view_versions_and_restore_old_version(self):
         with db.get_connection(self.db_path) as connection:
@@ -5833,10 +6025,8 @@ class CatalogAppTests(unittest.TestCase):
                     "brand_name": "North Harbor",
                     "product_name": "褶皱短袖连衣裙改版",
                     "style_code": "NH-2601",
-                    "launch_price": "399",
-                    "launch_channel": "直播首发",
                 },
-                2,
+                1,
             )
 
         admin_cookie = self.login("admin_reviewer", "demo123")
@@ -6612,9 +6802,11 @@ class CatalogAppTests(unittest.TestCase):
         list_body = self.request("/products", cookie=colleague_cookie)["body"].decode("utf-8")
         self.assertIn("products-bulk-archive-button", list_body)
         self.assertIn("grid-template-columns: minmax(0, 1fr) auto;", list_body)
+        self.assertIn(".products-bulk-delete-button,", list_body)
         self.assertIn(".products-bulk-archive-button {", list_body)
         self.assertIn("width: auto;", list_body)
-        self.assertIn("background: linear-gradient(180deg, rgba(181,106,45,0.1), rgba(181,106,45,0.06));", list_body)
+        self.assertIn('class="ghost-button products-bulk-delete-button"', list_body)
+        self.assertIn('class="ghost-button products-bulk-archive-button"', list_body)
         self.assertIn("仅资料原发起人可以删除该条目", list_body)
         self.assertIn("仅资料原发起人可以召回该条目", list_body)
         self.assertIn('<summary title="删除或召回">删除</summary>', list_body)

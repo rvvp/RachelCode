@@ -35,6 +35,7 @@ from catalog_backend.excel import (
 )
 from catalog_backend.fields import CATALOG_EXPORT_FIELD_ORDER, FIELDS_BY_GROUP, FieldDef, PRODUCT_FIELDS, PRODUCT_FIELD_MAP
 from catalog_backend.policies import (
+    B_CATALOG_EDITABLE_FIELD_KEYS,
     B_STAGE_FIELD_KEYS,
     BILLING_PLATFORM_OPTIONS,
     COLLABORATION_START_FIELD_KEYS,
@@ -103,7 +104,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.09.09-bulk-delete-v4"
+CATALOG_BUILD_VERSION = "2026.09.09-field-permissions-v1"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -609,13 +610,35 @@ class CatalogApplication:
                 ),
             )
         form, files = self.parse_form(environ)
+        editable_keys = self.editable_field_keys_for_request(user, product)
+        submitted_field_changes = db.imported_field_changes(
+            product,
+            form,
+            set(PRODUCT_FIELD_MAP) - editable_keys,
+        )
+        if submitted_field_changes:
+            labels = "、".join(
+                PRODUCT_FIELD_MAP[key].label
+                for key in sorted(submitted_field_changes)
+                if key in PRODUCT_FIELD_MAP
+            )
+            return self.html_response(
+                start_response,
+                self.render_product_form(
+                    user,
+                    f"/products/{product_id}/edit",
+                    f"编辑资料 #{product_id}",
+                    product,
+                    [f"当前账号不能修改这些字段：{labels}。请回到有权限的部门或商品企划中心处理。"],
+                ),
+                status="403 Forbidden",
+            )
         self.apply_image_upload(
             form,
             files,
             existing_image_url=product.get("image_url"),
             existing_image_gallery=product.get("image_gallery_json"),
         )
-        editable_keys = self.editable_field_keys_for_request(user, product)
         form = self.normalized_form_for_stage(user, product, form)
         errors = self.validate_product_form(form, editable_keys=editable_keys)
         if errors:
@@ -714,7 +737,7 @@ class CatalogApplication:
             preview = "；".join(blocked[:3])
             if len(blocked) > 3:
                 preview = f"{preview}；另有 {len(blocked) - 3} 条未更新"
-            report = f"{report} 以下资料未更新，请先召回到 A/B 协作：{preview}"
+            report = f"{report} 以下资料未更新：{preview}"
         return self.html_response(start_response, self.render_import_page(user, report=report))
 
     def handle_b_stage_import(self, start_response, user, products: list[dict]):
@@ -722,17 +745,10 @@ class CatalogApplication:
         unmatched: list[str] = []
         ambiguous: list[str] = []
         skipped: list[str] = []
-        invalid_channels: list[str] = []
+        unauthorized: list[tuple[str, set[str]]] = []
         with db.get_connection(self.db_path) as connection:
             for row in products:
                 row_label = str(row.get("style_code") or row.get("product_name") or "未命名资料").strip()
-                raw_launch_channel = row.get("launch_channel")
-                if raw_launch_channel not in (None, ""):
-                    normalized_launch_channel = normalize_launch_channel(raw_launch_channel)
-                    if not normalized_launch_channel:
-                        invalid_channels.append(row_label)
-                        continue
-                    row["launch_channel"] = normalized_launch_channel
                 candidates = db.find_matching_products_for_import(
                     connection,
                     row.get("style_code"),
@@ -748,6 +764,19 @@ class CatalogApplication:
                     ambiguous.append(row_label)
                     continue
                 product = editable_candidates[0]
+                imported_field_keys = {
+                    field.key
+                    for field in PRODUCT_FIELDS
+                    if field.key in row
+                }
+                protected_import_changes = db.imported_field_changes(
+                    product,
+                    row,
+                    imported_field_keys - B_CATALOG_EDITABLE_FIELD_KEYS - {"completion_flag"},
+                )
+                if protected_import_changes:
+                    unauthorized.append((row_label, protected_import_changes))
+                    continue
                 updated_payload = {field.key: product.get(field.key) for field in PRODUCT_FIELDS}
                 changed = False
                 # The completion marker is derived from the full record. B-stage
@@ -772,9 +801,23 @@ class CatalogApplication:
         if ambiguous:
             detail_parts.append(f"重复匹配 {len(ambiguous)} 条")
         if skipped:
-            detail_parts.append(f"未填写商品部字段而跳过 {len(skipped)} 条")
-        if invalid_channels:
-            detail_parts.append(f"上新渠道不合法 {len(invalid_channels)} 条（仅支持天猫、唯品、同款）")
+            detail_parts.append(f"未填写图片而跳过 {len(skipped)} 条")
+        if unauthorized:
+            unauthorized_labels = {
+                "category": "品类",
+                "launch_price": "上新价格",
+                "launch_channel": "上新渠道",
+            }
+            unauthorized_preview = "；".join(
+                f"{row_label}（{'、'.join(unauthorized_labels.get(key, PRODUCT_FIELD_MAP[key].label) for key in sorted(field_keys))}）"
+                for row_label, field_keys in unauthorized[:3]
+            )
+            if len(unauthorized) > 3:
+                unauthorized_preview = f"{unauthorized_preview}；另有 {len(unauthorized) - 3} 条"
+            detail_parts.append(
+                f"检测到 {len(unauthorized)} 条越权修改，整行未导入：{unauthorized_preview}。"
+                "商品部在藏宝阁只能导入图片，品类、上新价格和上新渠道请回到商品企划中心修改。"
+            )
         if detail_parts:
             report = f"{report} 另外：{'，'.join(detail_parts)}。"
         return self.html_response(start_response, self.render_import_page(user, report=report))
@@ -2560,7 +2603,7 @@ class CatalogApplication:
 
     def products_return_path(self, query: dict) -> str:
         params = {}
-        for key in ("q", "supplier", "department", "status", "marker", "channel", "lifecycle_status", "page"):
+        for key in ("q", "supplier", "department", "status", "marker", "channel", "lifecycle_status", "season_year", "page"):
             value = str(query.get(key, "")).strip()
             if value:
                 params[key] = value
@@ -2574,6 +2617,8 @@ class CatalogApplication:
         keyword = str(query.get("q", "")).strip()
         supplier_search_enabled = user.get("department") in {"A", "EXECUTIVE"} or is_admin(user)
         supplier_filter = str(query.get("supplier", "")).strip() if supplier_search_enabled else ""
+        season_year_search_enabled = user.get("department") == "A"
+        season_year_filter = str(query.get("season_year", "")).strip() if season_year_search_enabled else ""
         b_dashboard_view = user.get("department") == "B" or is_admin(user)
         department_filter = str(query.get("department", "")).strip()
         if not is_admin(user):
@@ -2626,6 +2671,7 @@ class CatalogApplication:
                 lifecycle_filter,
                 supplier_filter,
                 tax_price_filter,
+                season_year_filter,
             ),
             user,
         )
@@ -2665,6 +2711,7 @@ class CatalogApplication:
                 "marker": marker_filter,
                 "channel": launch_channel_filter,
                 "lifecycle_status": lifecycle_filter,
+                "season_year": season_year_filter,
             }
         )
         if is_department_monitor(user):
@@ -2675,6 +2722,8 @@ class CatalogApplication:
             "keyword": keyword,
             "supplier_search_enabled": supplier_search_enabled,
             "supplier_filter": supplier_filter,
+            "season_year_search_enabled": season_year_search_enabled,
+            "season_year_filter": season_year_filter,
             "b_dashboard_view": b_dashboard_view,
             "department_filter": department_filter,
             "status_filter": status_filter,
@@ -2710,6 +2759,11 @@ class CatalogApplication:
             requested_status = ""
             requested_marker = "tax_price_modified"
         tax_price_filter = "modified" if requested_marker == "tax_price_modified" and marker_filter_allowed else ""
+        season_year_filter = (
+            str(query.get("season_year", "")).strip()
+            if user.get("department") == "A"
+            else ""
+        )
         completion_ready_filter = requested_marker == "completion_ready" and marker_filter_allowed
         workflow_restart_filter = requested_status == "workflow_restart" and user.get("department") != "C"
         product_status = "" if tax_price_filter or completion_ready_filter or workflow_restart_filter else requested_status
@@ -2723,6 +2777,7 @@ class CatalogApplication:
             str(query.get("lifecycle_status", "")).strip(),
             supplier,
             tax_price_filter,
+            season_year_filter,
         )
         visible_source_products = self.visible_products_for_user(source_products, user)
         visible_source_products = self.filter_products_by_catalog_identifiers(
@@ -5717,7 +5772,8 @@ class CatalogApplication:
       gap: 10px;
     }}
     .products-filter-form .products-search-field,
-    .products-filter-form .products-supplier-field {{
+    .products-filter-form .products-supplier-field,
+    .products-filter-form .products-season-year-field {{
       min-width: 0;
     }}
     .products-filter-form .products-search-field {{
@@ -5862,6 +5918,7 @@ class CatalogApplication:
       font-size: 13px;
       white-space: nowrap;
     }}
+    .products-bulk-delete-button,
     .products-bulk-archive-button {{
       display: inline-flex;
       align-items: center;
@@ -5869,10 +5926,7 @@ class CatalogApplication:
       width: auto;
       min-height: 34px;
       padding: 7px 14px;
-      border: 1px solid rgba(181, 106, 45, 0.14);
       border-radius: 11px;
-      background: linear-gradient(180deg, rgba(181,106,45,0.1), rgba(181,106,45,0.06));
-      color: var(--accent-strong);
       box-shadow: none;
       font-size: 13px;
       white-space: nowrap;
@@ -5883,31 +5937,6 @@ class CatalogApplication:
       justify-content: flex-end;
       gap: 8px;
       flex-wrap: nowrap;
-    }}
-    .products-bulk-delete-button {{
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: auto;
-      min-height: 34px;
-      padding: 7px 14px;
-      border: 1px solid rgba(166, 63, 26, 0.18);
-      border-radius: 11px;
-      background: rgba(255, 250, 247, 0.88);
-      color: #a63f1a;
-      box-shadow: none;
-      font-size: 13px;
-      white-space: nowrap;
-    }}
-    .products-bulk-delete-button:hover {{
-      background: rgba(255, 245, 241, 0.96);
-      filter: none;
-      transform: none;
-    }}
-    .products-bulk-archive-button:hover {{
-      background: linear-gradient(180deg, rgba(181,106,45,0.1), rgba(181,106,45,0.06));
-      filter: none;
-      transform: none;
     }}
     .pagination-page-current {{
       background: var(--accent);
@@ -9536,6 +9565,8 @@ class CatalogApplication:
         keyword = filter_context["keyword"]
         supplier_search_enabled = filter_context["supplier_search_enabled"]
         supplier_filter = filter_context["supplier_filter"]
+        season_year_search_enabled = filter_context["season_year_search_enabled"]
+        season_year_filter = filter_context["season_year_filter"]
         b_dashboard_view = filter_context["b_dashboard_view"]
         department_filter = filter_context["department_filter"]
         status_filter = filter_context["status_filter"]
@@ -9597,7 +9628,7 @@ class CatalogApplication:
         bulk_lifecycle_markup = self.render_bulk_lifecycle_tools(user)
 
         pagination_params = {}
-        for key in ("q", "supplier", "department", "status", "marker", "channel", "lifecycle_status", "monitor_department"):
+        for key in ("q", "supplier", "department", "status", "marker", "channel", "lifecycle_status", "season_year", "monitor_department"):
             value = str(query.get(key, "")).strip()
             if value:
                 pagination_params[key] = value
@@ -9991,8 +10022,13 @@ class CatalogApplication:
             if is_released_catalog_read_only(user)
             else ""
         )
+        season_year_filter_markup = (
+            f'<input class="products-season-year-field" type="search" name="season_year" value="{html.escape(season_year_filter)}" placeholder="年份季节，例如 2026秋" aria-label="搜索年份季节" autocomplete="off">'
+            if season_year_search_enabled
+            else ""
+        )
         if user["department"] == "A":
-            filter_controls_markup = status_filter_markup + lifecycle_filter_markup
+            filter_controls_markup = season_year_filter_markup + status_filter_markup + lifecycle_filter_markup
         elif user["department"] == "C":
             filter_controls_markup = status_filter_markup
         elif user["department"] == "DESIGN":
@@ -12253,12 +12289,12 @@ class CatalogApplication:
             stat_one = "匹配方式"
             stat_one_value = "既有资料精确匹配"
             stat_two = "更新范围"
-            stat_two_value = "仅商品部字段"
+            stat_two_value = "仅图片字段"
             stat_three = "后续动作"
             stat_three_value = "批量流转到运营部"
             section_title = "导入商品部补充文件"
             button_text = "开始导入商品部 Excel"
-            hint_text = "导入后请回到资料列表，勾选对应条目，再使用“批量提交运营部”继续流转。空白的商品部字段不会覆盖原值。"
+            hint_text = "导入后请回到资料列表，勾选对应条目，再使用“批量提交运营部”继续流转。未填写图片的行会跳过，其他字段不会被导入修改。"
         else:
             page_title = "从参考模板导入 Excel"
             intro_text = "导入时会读取第一张工作表，并按模板第一行表头识别字段。若发现与你本人已录入的同款号、同颜色、同商品名记录，则更新；否则新增。"
@@ -12388,7 +12424,7 @@ class CatalogApplication:
             <div class="stats">
               <div class="stat-card"><span>方式一</span><strong>文件名对款色</strong></div>
               <div class="stat-card"><span>方式二</span><strong>Excel 对图片</strong></div>
-              <div class="stat-card"><span>更新范围</span><strong>商品部可编辑资料</strong></div>
+              <div class="stat-card"><span>更新范围</span><strong>仅图片字段</strong></div>
               <div class="stat-card"><span>图片策略</span><strong>覆盖，旧图保留2天</strong></div>
             </div>
           </div>

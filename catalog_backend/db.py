@@ -12,6 +12,8 @@ from pathlib import Path
 from catalog_backend.fields import CATALOG_EXPORT_FIELD_ORDER, PRODUCT_FIELDS, PRODUCT_FIELD_MAP
 from catalog_backend.policies import (
     A_STAGE_FIELD_KEYS,
+    B_CATALOG_EDITABLE_FIELD_KEYS,
+    B_CATALOG_PROTECTED_FIELD_KEYS,
     B_PLANNING_MANAGED_FIELD_KEYS,
     B_STAGE_FIELD_KEYS,
     WORKFLOW_RESTART_FIELD_KEYS,
@@ -2004,6 +2006,21 @@ def normalize_product_data(raw_values: dict) -> dict:
     return normalized
 
 
+def imported_field_changes(existing: dict, raw_values: dict, field_keys, *, ignore_empty: bool = True) -> set[str]:
+    """Return imported fields that would change storage, ignoring blank cells."""
+    before = normalize_product_data(existing)
+    after = normalize_product_data({**existing, **raw_values})
+    changed = set()
+    for field_key in field_keys:
+        if field_key not in raw_values:
+            continue
+        if ignore_empty and not has_meaningful_value(raw_values.get(field_key)):
+            continue
+        if before.get(field_key) != after.get(field_key):
+            changed.add(field_key)
+    return changed
+
+
 def normalize_image_gallery(raw_values: dict) -> str:
     raw_gallery = raw_values.get("image_gallery_json")
     if isinstance(raw_gallery, str):
@@ -2344,7 +2361,7 @@ def update_product(connection: sqlite3.Connection, product_id: int, raw_values: 
         elif actor_department == "A":
             allowed_field_keys = set(A_STAGE_FIELD_KEYS)
         elif actor_department == "B":
-            allowed_field_keys = {"image_url"}
+            allowed_field_keys = set(B_CATALOG_EDITABLE_FIELD_KEYS)
         else:
             allowed_field_keys = set()
         requested_changes = {
@@ -3384,6 +3401,21 @@ def save_or_update_owned_product(
             raw_values.get("color_name"),
             raw_values.get("product_name"),
         )
+        protected_import_changes = imported_field_changes(
+            existing or {},
+            raw_values,
+            B_CATALOG_PROTECTED_FIELD_KEYS,
+        )
+        if protected_import_changes:
+            labels = "、".join(
+                PRODUCT_FIELD_MAP[key].label
+                for key in sorted(protected_import_changes)
+                if key in PRODUCT_FIELD_MAP
+            )
+            raise PermissionError(
+                f"当前账号不能通过 Excel 导入或修改这些商品部字段：{labels}。"
+                "品类、上新价格和上新渠道只能由商品企划中心维护并回传。"
+            )
         sanitized_values = dict(raw_values)
         for field in PRODUCT_FIELDS:
             if field.key in B_STAGE_FIELD_KEYS:
@@ -3450,9 +3482,11 @@ def list_products(
     lifecycle_status: str = "",
     supplier: str = "",
     tax_price_changed: str = "",
+    season_year: str = "",
 ) -> list[dict]:
     like_query = f"%{query.strip()}%"
     supplier_query = f"%{supplier.strip()}%"
+    season_year_query = f"%{season_year.strip()}%"
     tax_price_filter = "modified" if str(tax_price_changed or "").strip() == "modified" else ""
     with get_connection(db_path) as connection:
         rows = connection.execute(
@@ -3472,6 +3506,7 @@ def list_products(
             AND (? = '' OR p.status = ?)
             AND (? = '' OR p.lifecycle_status = ?)
             AND (? = '' OR COALESCE(p.supplier, '') LIKE ?)
+            AND (? = '' OR COALESCE(p.season_year, '') LIKE ?)
             AND (
                 ? = ''
                 OR EXISTS (
@@ -3511,6 +3546,8 @@ def list_products(
                 lifecycle_status.strip(),
                 supplier.strip(),
                 supplier_query,
+                season_year.strip(),
+                season_year_query,
                 tax_price_filter,
                 tax_price_filter,
             ),
