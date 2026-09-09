@@ -2204,16 +2204,40 @@ class PlanningApplication:
         return f"{float(lower):g} ≤ 成本 < {float(upper):g}"
 
     def render_stats(self, user: dict, query: dict) -> str:
-        season = query.get("season_year", "")
-        category = query.get("category", "")
+        requested_season = query.get("season_year")
+        category = str(query.get("category", "") or "").strip()
+        # Statistics only include confirmed/published records. Use the newest
+        # season represented by that dataset on first entry, while retaining
+        # an explicit empty value as the user's intentional "all seasons"
+        # selection.
+        all_pricing_records = db.list_pricing_records(self.db_path)
+        statistic_records = [
+            record
+            for record in all_pricing_records
+            if str(record.get("status") or "") in {"confirmed", "published"}
+            and str(record.get("season_year") or "").strip()
+        ]
+        seasons = sorted({str(record["season_year"]).strip() for record in statistic_records}, reverse=True)
+        season = seasons[0] if requested_season is None and seasons else str(requested_season or "").strip()
         stats = db.pricing_stats(self.db_path, season, category)
-        records = db.list_pricing_records(self.db_path, season_year=season)
         total = sum(item["count"] for item in stats)
-        seasons = sorted({item.get("season_year", "") for item in records if item.get("season_year")}, reverse=True)
+        category_options = [
+            str(item["name"])
+            for item in db.list_category_options(self.db_path, enabled_only=True)
+            if str(item.get("name") or "").strip()
+        ]
+        category_options = list(dict.fromkeys(category_options))
+        category_select_options = [
+            f"<option value='' {'selected' if not category else ''}>全部品类</option>"
+        ]
+        category_select_options.extend(
+            f"<option value='{html.escape(option, quote=True)}' {'selected' if option == category else ''}>{html.escape(option)}</option>"
+            for option in category_options
+        )
         bars = ''.join(f"<div class='band-row'><div class='band-label'><span>{html.escape(item['label'])}</span><strong>{item['count']} 款 · {item['share']:.1f}%</strong></div><div class='bar'><i style='width:{min(100, item['share'])}%'></i></div></div>" for item in stats)
         content = f"""
         <section class='page-heading'><div><div class='eyebrow'>PRICE ARCHITECTURE</div><h1>价格带统计</h1><p>统计口径为已确认或已发布的款式数，未定价商品不计入占比。</p></div></section>
-        <section class='filter-bar'><form method='get' action='/stats'><label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>品类<input name='category' value='{html.escape(category)}' placeholder='全部品类'></label><button type='submit'>刷新统计</button></form></section>
+        <section class='filter-bar'><form method='get' action='/stats'><label>年份季节<select name='season_year'><option value='' {'selected' if not season else ''}>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>品类<select name='category'>{''.join(category_select_options)}</select></label><button type='submit'>刷新统计</button></form></section>
         <section class='metrics'><div><span>统计款式</span><strong>{total}</strong><small>已确认 / 已发布</small></div><div><span>最低价格带</span><strong>{stats[0]['count'] if stats else 0}</strong><small>300 及以下</small></div><div><span>最高价格带</span><strong>{stats[-1]['count'] if stats else 0}</strong><small>1201 以上</small></div></section>
         <section class='panel'><div class='panel-head'><div><div class='eyebrow'>CURRENT MIX</div><h2>价格带分布</h2></div></div>{bars or '<p class="empty">暂无已确认定价。</p>'}</section>
         """

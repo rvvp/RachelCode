@@ -3155,6 +3155,79 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("SKU 数", category_html)
         self.assertIn("第二阶段", category_html)
 
+    def test_stats_defaults_to_latest_season_and_uses_rule_category_options(self):
+        planning_db.save_category_option(self.planning_db_path, "针织上衣", "针织上衣", 20)
+        planning_db.save_category_option(self.planning_db_path, "半身裙", "半身裙", 30)
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026春夏", None, 600, 4)
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 600, 4)
+        products = [
+            {
+                "id": 5101,
+                "style_code": "STATS-SS-001",
+                "style_color": "STATS-SS-001-黑",
+                "product_name": "半身裙春夏款",
+                "season_year": "2026春夏",
+                "supplier": "统计供应商",
+                "category": "半身裙",
+                "actual_cost": 100,
+                "status": "pending",
+                "source_version_no": 1,
+            },
+            {
+                "id": 5102,
+                "style_code": "STATS-AW-001",
+                "style_color": "STATS-AW-001-黑",
+                "product_name": "针织上衣秋冬款",
+                "season_year": "2026秋冬",
+                "supplier": "统计供应商",
+                "category": "针织上衣",
+                "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 1,
+            },
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        for product in products:
+            record = planning_db.create_pricing_record(self.planning_db_path, product, "商品部企划员")
+            planning_db.submit_pricing_for_review(
+                self.planning_db_path,
+                record["id"],
+                record["calculated_price"],
+                "商品部企划员",
+                product["category"],
+                "天猫",
+            )
+            planning_db.approve_pricing_record(
+                self.planning_db_path,
+                record["id"],
+                record["calculated_price"],
+                "天猫",
+                "企划管理员",
+            )
+
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planner")
+        default_page = self.wsgi_request(app, "/stats", cookie=cookie)
+        default_html = default_page["body"].decode("utf-8")
+        self.assertTrue(default_page["status"].startswith("200"))
+        self.assertIn("<option value='2026秋冬' selected>2026秋冬</option>", default_html)
+        self.assertNotIn("<option value='2026春夏' selected>", default_html)
+        self.assertIn("<option value='' selected>全部品类</option>", default_html)
+        self.assertIn("<option value='针织上衣' ", default_html)
+        self.assertIn("<option value='半身裙' ", default_html)
+        self.assertNotIn("name='category' value=", default_html)
+        self.assertIn("统计款式</span><strong>1</strong>", default_html)
+
+        all_seasons_page = self.wsgi_request(app, "/stats?season_year=", cookie=cookie)
+        all_seasons_html = all_seasons_page["body"].decode("utf-8")
+        self.assertIn("<option value='' selected>全部季节</option>", all_seasons_html)
+        self.assertIn("统计款式</span><strong>2</strong>", all_seasons_html)
+
+        category_page = self.wsgi_request(app, "/stats?season_year=2026%E7%A7%8B%E5%86%AC&category=%E9%92%88%E7%BB%87%E4%B8%8A%E8%A1%A3", cookie=cookie)
+        category_html = category_page["body"].decode("utf-8")
+        self.assertIn("<option value='针织上衣' selected>", category_html)
+        self.assertIn("统计款式</span><strong>1</strong>", category_html)
+
 
 if __name__ == "__main__":
     unittest.main()
