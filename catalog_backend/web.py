@@ -103,7 +103,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.09.08-all-channel-receipt-v2"
+CATALOG_BUILD_VERSION = "2026.09.09-bulk-delete-v4"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -1683,6 +1683,12 @@ class CatalogApplication:
                 start_response,
                 self.products_notice_path(form.get("return_to", ""), "请先勾选至少一条资料。"),
             )
+        if action == "delete_selected" and str(form.get("confirm_text", "")).strip() != "DELETE":
+            return self.html_response(
+                start_response,
+                self.render_message_page("需要确认", "批量删除资料前请输入 DELETE 进行确认。", user),
+                status="400 Bad Request",
+            )
         updated = 0
         skipped = 0
         skip_reasons: list[str] = []
@@ -1794,6 +1800,28 @@ class CatalogApplication:
                     )
                     updated += 1
                     continue
+                if action == "delete_selected":
+                    allowed = dict(available_lifecycle_actions(user, product))
+                    if "deleted" not in allowed:
+                        skipped += 1
+                        delete_skip_reason = "当前资料不能批量删除。"
+                        if user.get("department") == "A":
+                            if int(product.get("created_by") or 0) != int(user.get("id") or 0):
+                                delete_skip_reason = "仅资料原始发起人可以删除该条目。"
+                            elif product.get("status") in {"published", "received"}:
+                                delete_skip_reason = "资料已进入运营流程，请先召回到 A/B 协作后再删除。"
+                        self.append_bulk_skip_reason(skip_reasons, product, delete_skip_reason)
+                        continue
+                    db.change_product_lifecycle(
+                        connection,
+                        product_id,
+                        "deleted",
+                        user["id"],
+                        allowed["deleted"],
+                        f"{department_label(user.get('department'))}批量删除资料。",
+                    )
+                    updated += 1
+                    continue
                 if action == "archive_selected":
                     allowed = dict(available_lifecycle_actions(user, product))
                     if "archived" not in allowed:
@@ -1825,6 +1853,8 @@ class CatalogApplication:
             action_label = "批量退回跟单部"
         elif action == "publish_selected":
             action_label = "批量提交运营部"
+        elif action == "delete_selected":
+            action_label = "批量删除"
         elif action == "archive_selected":
             action_label = "批量归档"
         else:
@@ -5847,6 +5877,33 @@ class CatalogApplication:
       font-size: 13px;
       white-space: nowrap;
     }}
+    .products-bulk-lifecycle-actions {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: nowrap;
+    }}
+    .products-bulk-delete-button {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: auto;
+      min-height: 34px;
+      padding: 7px 14px;
+      border: 1px solid rgba(166, 63, 26, 0.18);
+      border-radius: 11px;
+      background: rgba(255, 250, 247, 0.88);
+      color: #a63f1a;
+      box-shadow: none;
+      font-size: 13px;
+      white-space: nowrap;
+    }}
+    .products-bulk-delete-button:hover {{
+      background: rgba(255, 245, 241, 0.96);
+      filter: none;
+      transform: none;
+    }}
     .products-bulk-archive-button:hover {{
       background: linear-gradient(180deg, rgba(181,106,45,0.1), rgba(181,106,45,0.06));
       filter: none;
@@ -9537,7 +9594,7 @@ class CatalogApplication:
             if selection_enabled and page_product_count
             else ""
         )
-        bulk_archive_markup = self.render_bulk_archive_tool(user)
+        bulk_lifecycle_markup = self.render_bulk_lifecycle_tools(user)
 
         pagination_params = {}
         for key in ("q", "supplier", "department", "status", "marker", "channel", "lifecycle_status", "monitor_department"):
@@ -9601,7 +9658,7 @@ class CatalogApplication:
           <div class="products-list-control-meta">
             <div class="products-list-control-actions">
               {selection_toolbar_markup}
-              {bulk_archive_markup}
+              {bulk_lifecycle_markup}
             </div>
           </div>
         </nav>
@@ -10198,6 +10255,7 @@ class CatalogApplication:
               bulkForm.addEventListener("submit", (event) => {{
                 const submitter = event.submitter;
                 if (!(submitter instanceof HTMLButtonElement) || submitter.name !== "bulk_action") return;
+                if (submitter.dataset.deleteButton === "1") return;
                 if (!selectionScope || selectionScope.value !== "filtered") return;
                 const actionLabel = (submitter.textContent || "批量操作").trim();
                 if (!window.confirm(`将对当前筛选结果的全部 ${{totalProducts}} 条资料执行“${{actionLabel}}”。系统会逐条校验，不符合条件的资料将自动跳过。确认继续吗？`)) {{
@@ -10211,11 +10269,20 @@ class CatalogApplication:
               const bulkForm = document.getElementById("products-bulk-form");
               const confirmField = document.getElementById("list-delete-confirm-text");
               if (!bulkForm || !confirmField) return;
-              bulkForm.querySelectorAll("[data-delete-button='1']").forEach((button) => {{
+              document.querySelectorAll("[data-delete-button='1']").forEach((button) => {{
                 button.addEventListener("click", (event) => {{
                   confirmField.value = "";
+                  const isBulkDelete = button.dataset.bulkDeleteButton === "1";
+                  if (isBulkDelete) {{
+                    const selectionScope = document.getElementById("products-selection-scope");
+                    const hasCheckedRows = bulkForm.querySelector("input[name='product_ids']:checked") !== null;
+                    if ((!selectionScope || selectionScope.value !== "filtered") && !hasCheckedRows) return;
+                  }}
                   const productLabel = button.getAttribute("data-product-label") || "当前资料";
-                  const typedText = window.prompt(`删除后该条资料会从普通列表隐藏，管理员仍可恢复。\\n请输入 DELETE 确认删除：${{productLabel}}`, "");
+                  const promptMessage = isBulkDelete
+                    ? "批量删除后，符合权限和流程条件的资料会从普通列表隐藏，管理员仍可恢复。\\n请输入 DELETE 确认批量删除："
+                    : `删除后该条资料会从普通列表隐藏，管理员仍可恢复。\\n请输入 DELETE 确认删除：${{productLabel}}`;
+                  const typedText = window.prompt(promptMessage, "");
                   if (typedText === null) {{
                     event.preventDefault();
                     return;
@@ -11738,15 +11805,22 @@ class CatalogApplication:
           </div>
         """
 
-    def render_bulk_archive_tool(self, user) -> str:
+    def render_bulk_lifecycle_tools(self, user) -> str:
         if is_department_monitor(user) or (not is_admin(user) and user.get("department") != "A"):
             return ""
-        return (
-            '<button type="submit" name="bulk_action" value="archive_selected" '
-            'form="products-bulk-form" formmethod="post" formaction="/products/bulk" '
-            'class="ghost-button products-bulk-archive-button" '
-            'title="可归档跟单部任一账号发起且已接收的资料；不符合条件的条目会自动跳过">批量归档</button>'
-        )
+        return """
+          <div class="products-bulk-lifecycle-actions">
+            <button type="submit" name="bulk_action" value="delete_selected"
+              form="products-bulk-form" formmethod="post" formaction="/products/bulk"
+              class="ghost-button products-bulk-delete-button"
+              data-delete-button="1" data-bulk-delete-button="1"
+              title="仅删除有权限且仍在跟单整理中或 A/B 协作中的资料；其他条目会自动跳过">批量删除</button>
+            <button type="submit" name="bulk_action" value="archive_selected"
+              form="products-bulk-form" formmethod="post" formaction="/products/bulk"
+              class="ghost-button products-bulk-archive-button"
+              title="可归档跟单部任一账号发起且已接收的资料；不符合条件的条目会自动跳过">批量归档</button>
+          </div>
+        """
 
     def render_product_form(self, user, action: str, title: str, values: dict, errors: list[str] | None = None) -> str:
         console_eyebrow = self.brand_config["brand_console_eyebrow"]
@@ -12416,7 +12490,7 @@ class CatalogApplication:
                 <tbody>
                   <tr><th>A 跟单部</th><td>维护自己发起资料的 A 阶段字段；在早期状态开启 B 协作；跟单部任一账号可归档及恢复已归档资料。</td><td>不能修改商品部或企划中心负责字段；运营阶段不能直接修改触发字段；只能删除或召回自己发起的资料。</td></tr>
                   <tr><th>B 商品部</th><td>在 A/B 协作中推进商品资料；当前藏宝阁内直接维护图片，资料完成后提交运营部。发现商品部或企划字段有误时，可从运营阶段召回。</td><td>不能删除或归档；不能修改 A 阶段字段。品类、上新价格、上新渠道由商品企划中心维护并回传。</td></tr>
-                  <tr><th>C 运营部</th><td>按账号渠道属性查看并接收资料；天猫类或唯品类账号接收后即更新全局状态，“同款”任一渠道接收即显示“已接收”。全渠道账号可记录个人接收，但不参与全局状态判断；账单属性仍独立授权。</td><td>不能修改资料、删除、归档或召回。</td></tr>
+                  <tr><th>C 运营部</th><td>按账号渠道属性查看并接收资料。天猫类或唯品类中任意一个账号接收所属渠道资料后，全局状态即更新为“已接收”，不需等待同类别其他账号逐一接收；“同款”由任意天猫类或唯品类账号接收后，即显示“已接收”。全渠道账号可记录个人接收，但不参与全局状态判断；账单属性仍独立授权。</td><td>不能修改资料、删除、归档或召回。</td></tr>
                   <tr><th>总经办 / 美工部</th><td>按各自只读范围查看资料。</td><td>不能上传、修改、删除、归档或召回。</td></tr>
                   <tr><th>管理员</th><td>可查看并监控各部门，维护账号和系统规则，执行必要的流程及生命周期管理。</td><td>管理员操作会写入日志，正式业务仍建议由对应部门完成。</td></tr>
                 </tbody>
@@ -12427,7 +12501,7 @@ class CatalogApplication:
             <div class="eyebrow">Lifecycle</div>
             <h2>删除、归档与召回</h2>
             <div class="rule-callouts">
-              <div class="rule-callout"><strong>删除</strong><span>A 原始发起人仅可在“跟单整理中”或“A/B 协作中”删除自己发起的正常资料。进入运营阶段后，必须先召回；已删除资料仅管理员可恢复。</span></div>
+              <div class="rule-callout"><strong>删除</strong><span>A 原始发起人仅可在“跟单整理中”或“A/B 协作中”删除自己发起的正常资料，可勾选多条后使用“批量删除”。系统会逐条校验权限，不符合条件的条目自动跳过。进入运营阶段后，必须先召回；已删除资料仅管理员可恢复。</span></div>
               <div class="rule-callout"><strong>归档</strong><span>A 跟单部任一账号可批量归档“已接收”资料，也可在“已归档”筛选中恢复；管理员可按管理权限归档或恢复。</span></div>
               <div class="rule-callout"><strong>召回</strong><span>A 原始发起人、B 商品部和管理员可对“待运营接收”或“已接收”资料执行“召回到 A/B 协作”。A 同部门非发起人仅能查看禁用入口。召回会清除当前运营接收标记，保留历史版本和操作日志。</span></div>
             </div>

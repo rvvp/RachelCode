@@ -3781,9 +3781,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.08-all-channel-receipt-v2")
+        self.assertEqual(payload["build_version"], "2026.09.09-bulk-delete-v4")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.08-all-channel-receipt-v2")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.09-bulk-delete-v4")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -6375,7 +6375,8 @@ class CatalogAppTests(unittest.TestCase):
         archived_list_body = archived_list_response["body"].decode("utf-8")
         self.assertIn('name="lifecycle_status" value="active"', archived_list_body)
         self.assertIn(">恢复</button>", archived_list_body)
-        self.assertNotIn('data-delete-button="1"', archived_list_body)
+        self.assertIn('data-bulk-delete-button="1"', archived_list_body)
+        self.assertNotIn('class="table-action-danger"', archived_list_body)
 
         c_cookie = self.login("c_viewer", "demo123")
         forbidden_response = self.request("/products/1", cookie=c_cookie)
@@ -6465,7 +6466,7 @@ class CatalogAppTests(unittest.TestCase):
         a_cookie = self.login("a_editor", "demo123")
         a_list_response = self.request("/products", cookie=a_cookie)
         a_list_body = a_list_response["body"].decode("utf-8")
-        self.assertLess(a_list_body.index('data-delete-button="1"'), a_list_body.index('/products/1/logs'))
+        self.assertLess(a_list_body.index('class="table-action-danger"'), a_list_body.index('/products/1/logs'))
         self.assertIn(".catalog-table thead th:last-child {", a_list_body)
         self.assertIn(".catalog-table .table-actions-cell {", a_list_body)
         delete_response = self.request(
@@ -6487,7 +6488,8 @@ class CatalogAppTests(unittest.TestCase):
         )
         other_a_cookie = self.login("a_other_editor", "demo123")
         other_a_body = self.request("/products", cookie=other_a_cookie)["body"].decode("utf-8")
-        self.assertNotIn('data-delete-button="1"', other_a_body)
+        self.assertIn('data-bulk-delete-button="1"', other_a_body)
+        self.assertNotIn('class="table-action-danger"', other_a_body)
         self.assertIn("仅资料原发起人可以删除该条目", other_a_body)
         forbidden_a_delete = self.request(
             "/products/1/lifecycle",
@@ -6497,6 +6499,103 @@ class CatalogAppTests(unittest.TestCase):
         )
         self.assertTrue(forbidden_a_delete["status"].startswith("403"))
         self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "active")
+
+    def test_a_creator_can_bulk_delete_early_records_and_ineligible_records_are_skipped(self):
+        users = {item["username"]: item for item in db.list_users(self.db_path)}
+        a_user = users["a_editor"]
+        other_a_id = db.create_user(
+            self.db_path,
+            "a_bulk_delete_other",
+            "其他跟单员",
+            "A",
+            "demo123",
+            must_change_password=False,
+        )
+        with db.get_connection(self.db_path) as connection:
+            own_draft_id = db.create_product(
+                connection,
+                {"style_code": "BULK-DELETE-001", "product_name": "批量删除草稿"},
+                a_user["id"],
+                "A",
+            )
+            own_pending_id = db.create_product(
+                connection,
+                {"style_code": "BULK-DELETE-002", "product_name": "批量删除协作资料"},
+                a_user["id"],
+                "A",
+            )
+            db.change_product_status(
+                connection,
+                own_pending_id,
+                "pending",
+                a_user["id"],
+                "开启商品部协作",
+                "批量删除测试。",
+            )
+            other_draft_id = db.create_product(
+                connection,
+                {"style_code": "BULK-DELETE-003", "product_name": "其他发起人资料"},
+                other_a_id,
+                "A",
+            )
+
+        a_cookie = self.login("a_editor", "demo123")
+        list_body = self.request("/products", cookie=a_cookie)["body"].decode("utf-8")
+        self.assertIn('class="products-bulk-lifecycle-actions"', list_body)
+        self.assertIn('name="bulk_action" value="delete_selected"', list_body)
+        self.assertIn('data-bulk-delete-button="1"', list_body)
+        self.assertLess(
+            list_body.index('value="delete_selected"'),
+            list_body.index('value="archive_selected"'),
+        )
+        self.assertIn('document.querySelectorAll("[data-delete-button=\'1\']")', list_body)
+
+        b_body = self.request("/products", cookie=self.login("b_editor", "demo123"))["body"].decode("utf-8")
+        self.assertNotIn('value="delete_selected"', b_body)
+
+        missing_confirmation = self.request(
+            "/products/bulk",
+            method="POST",
+            body=urlencode(
+                [("product_ids", str(own_draft_id)), ("bulk_action", "delete_selected")]
+            ).encode("utf-8"),
+            cookie=a_cookie,
+        )
+        self.assertTrue(missing_confirmation["status"].startswith("400"))
+        self.assertIn("DELETE", missing_confirmation["body"].decode("utf-8"))
+        self.assertEqual(db.get_product(self.db_path, own_draft_id)["lifecycle_status"], "active")
+
+        delete_response = self.request(
+            "/products/bulk",
+            method="POST",
+            body=urlencode(
+                [
+                    ("product_ids", str(own_draft_id)),
+                    ("product_ids", str(own_pending_id)),
+                    ("product_ids", str(other_draft_id)),
+                    ("product_ids", "1"),
+                    ("bulk_action", "delete_selected"),
+                    ("confirm_text", "DELETE"),
+                    ("return_to", "/products"),
+                ]
+            ).encode("utf-8"),
+            cookie=a_cookie,
+        )
+        self.assertTrue(delete_response["status"].startswith("302"))
+        notice = unquote_plus(dict(delete_response["headers"])["Location"])
+        self.assertIn("批量删除完成：成功 2 条，跳过 2 条", notice)
+        self.assertIn("仅资料原始发起人可以删除该条目", notice)
+        self.assertIn("请先召回到 A/B 协作后再删除", notice)
+        self.assertEqual(db.get_product(self.db_path, own_draft_id)["lifecycle_status"], "deleted")
+        self.assertEqual(db.get_product(self.db_path, own_pending_id)["lifecycle_status"], "deleted")
+        self.assertEqual(db.get_product(self.db_path, other_draft_id)["lifecycle_status"], "active")
+        self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "active")
+        self.assertTrue(
+            any(
+                item["action"] == "lifecycle:deleted" and "批量删除" in item["details"]
+                for item in db.get_product_logs(self.db_path, own_draft_id)
+            )
+        )
 
     def test_a_non_creator_can_archive_and_restore_but_cannot_delete_or_recall(self):
         with db.get_connection(self.db_path) as connection:
@@ -6519,7 +6618,8 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("仅资料原发起人可以删除该条目", list_body)
         self.assertIn("仅资料原发起人可以召回该条目", list_body)
         self.assertIn('<summary title="删除或召回">删除</summary>', list_body)
-        self.assertNotIn('data-delete-button="1"', list_body)
+        self.assertIn('data-bulk-delete-button="1"', list_body)
+        self.assertNotIn('class="table-action-danger"', list_body)
 
         archive_response = self.request(
             "/products/bulk",
@@ -6767,7 +6867,11 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("材质", rules_body)
         self.assertIn("请先使用“召回到 A/B 协作”", rules_body)
         self.assertIn("含税价", rules_body)
-        self.assertIn("“同款”任一渠道接收即显示“已接收”", rules_body)
+        self.assertIn("可勾选多条后使用“批量删除”", rules_body)
+        self.assertIn("不符合条件的条目自动跳过", rules_body)
+        self.assertIn("任意一个账号接收所属渠道资料后", rules_body)
+        self.assertIn("不需等待同类别其他账号逐一接收", rules_body)
+        self.assertIn("“同款”由任意天猫类或唯品类账号接收后", rules_body)
         self.assertIn("全渠道账号可记录个人接收，但不参与全局状态判断", rules_body)
         for username in ("a_editor", "b_editor", "c_viewer", "admin_reviewer"):
             account_cookie = self.login(username, "demo123")
