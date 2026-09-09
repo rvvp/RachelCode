@@ -5844,11 +5844,10 @@ class CatalogApplication:
       flex-wrap: wrap;
     }}
     .products-list-control-bar {{
-      display: flex;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
       align-items: center;
-      justify-content: space-between;
       gap: 12px;
-      flex-wrap: wrap;
       margin: 0 0 14px;
       padding: 10px 12px;
       border: 1px solid rgba(94, 67, 40, 0.1);
@@ -5859,33 +5858,29 @@ class CatalogApplication:
       display: flex;
       align-items: center;
       justify-content: center;
-      flex: 1 1 520px;
+      grid-column: 2;
+      grid-row: 1;
+      justify-self: center;
       min-width: 0;
       min-height: 36px;
     }}
-    .products-list-control-meta {{
+    .products-list-control-selection,
+    .products-list-control-bulk {{
       display: flex;
       align-items: center;
       justify-content: flex-end;
       gap: 12px;
-      flex: 1 1 auto;
-      flex-wrap: wrap;
-    }}
-    .products-list-control-actions {{
-      display: flex;
-      align-items: center;
-      justify-content: flex-end;
-      gap: 12px;
-      width: auto;
       min-width: 0;
     }}
-    .products-list-control-meta > .products-selection-summary {{
-      order: 2;
-      margin-left: auto;
+    .products-list-control-selection {{
+      grid-column: 1;
+      grid-row: 1;
+      justify-self: start;
     }}
-    .products-list-control-meta > .products-pagination-summary {{
-      order: 3;
-      white-space: nowrap;
+    .products-list-control-bulk {{
+      grid-column: 3;
+      grid-row: 1;
+      justify-self: end;
     }}
     .products-pagination-links .pill {{
       min-width: 38px;
@@ -7905,6 +7900,20 @@ class CatalogApplication:
         justify-self: end;
         width: 100%;
       }}
+      .products-list-control-bar {{
+        display: flex;
+        align-items: stretch;
+      }}
+      .products-list-page-row,
+      .products-list-control-selection,
+      .products-list-control-bulk {{
+        flex: 1 1 100%;
+        justify-content: flex-start;
+      }}
+      .products-list-control-bulk .products-bulk-lifecycle-actions {{
+        width: 100%;
+        justify-content: flex-start;
+      }}
       .nav-session {{
         margin-left: 0;
       }}
@@ -9698,13 +9707,9 @@ class CatalogApplication:
         """
         pagination_top_markup = f"""
         <nav class="products-list-control-bar" id="products-list-control-bar" aria-label="资料列表顶部分页">
-          {f'<div class="products-list-page-row">{pagination_links_markup}</div>' if total_pages > 1 else ''}
-          <div class="products-list-control-meta">
-            <div class="products-list-control-actions">
-              {selection_toolbar_markup}
-              {bulk_lifecycle_markup}
-            </div>
-          </div>
+          <div class="products-list-control-selection">{selection_toolbar_markup}</div>
+          {f'<div class="products-list-page-row">{pagination_links_markup}</div>' if total_pages > 1 else '<div class="products-list-page-row" aria-hidden="true"></div>'}
+          <div class="products-list-control-bulk">{bulk_lifecycle_markup}</div>
         </nav>
         """
         pagination_bottom_markup = f"""

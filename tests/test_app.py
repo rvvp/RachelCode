@@ -626,8 +626,10 @@ class CatalogAppTests(unittest.TestCase):
         self.assertNotIn("NH-2601", a_body)
         self.assertIn("season_year=2026%E7%A7%8B", a_body)
         self.assertIn(".products-filter-form-a {\n      grid-template-columns: repeat(5, minmax(0, 1fr));", a_body)
-        self.assertIn(".products-list-control-bar {\n      display: flex;", a_body)
-        self.assertIn('class="products-list-control-actions"', a_body)
+        self.assertIn(".products-list-control-bar {\n      display: grid;", a_body)
+        self.assertIn('class="products-list-control-selection"', a_body)
+        self.assertIn('class="products-list-control-bulk"', a_body)
+        self.assertIn("grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);", a_body)
 
         b_body = self.request(
             "/products?season_year=2026%E7%A7%8B",
