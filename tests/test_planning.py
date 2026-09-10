@@ -3216,17 +3216,20 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("<option value='针织上衣' ", default_html)
         self.assertIn("<option value='半身裙' ", default_html)
         self.assertNotIn("name='category' value=", default_html)
-        self.assertIn("统计款式</span><strong>1</strong>", default_html)
+        self.assertIn("合计 1 款", default_html)
+        self.assertNotIn("统计款式", default_html)
+        self.assertNotIn("最低价格带", default_html)
+        self.assertNotIn("最高价格带", default_html)
 
         all_seasons_page = self.wsgi_request(app, "/stats?season_year=", cookie=cookie)
         all_seasons_html = all_seasons_page["body"].decode("utf-8")
         self.assertIn("<option value='' selected>全部季节</option>", all_seasons_html)
-        self.assertIn("统计款式</span><strong>2</strong>", all_seasons_html)
+        self.assertIn("合计 2 款", all_seasons_html)
 
         category_page = self.wsgi_request(app, "/stats?season_year=2026%E7%A7%8B%E5%86%AC&category=%E9%92%88%E7%BB%87%E4%B8%8A%E8%A1%A3", cookie=cookie)
         category_html = category_page["body"].decode("utf-8")
         self.assertIn("<option value='针织上衣' selected>", category_html)
-        self.assertIn("统计款式</span><strong>1</strong>", category_html)
+        self.assertIn("合计 1 款", category_html)
 
 
 if __name__ == "__main__":

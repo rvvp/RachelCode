@@ -2238,8 +2238,7 @@ class PlanningApplication:
         content = f"""
         <section class='page-heading'><div><div class='eyebrow'>PRICE ARCHITECTURE</div><h1>价格带统计</h1><p>统计口径为已确认或已发布的款式数，未定价商品不计入占比。</p></div></section>
         <section class='filter-bar'><form method='get' action='/stats'><label>年份季节<select name='season_year'><option value='' {'selected' if not season else ''}>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>品类<select name='category'>{''.join(category_select_options)}</select></label><button type='submit'>刷新统计</button></form></section>
-        <section class='metrics'><div><span>统计款式</span><strong>{total}</strong><small>已确认 / 已发布</small></div><div><span>最低价格带</span><strong>{stats[0]['count'] if stats else 0}</strong><small>300 及以下</small></div><div><span>最高价格带</span><strong>{stats[-1]['count'] if stats else 0}</strong><small>1201 以上</small></div></section>
-        <section class='panel'><div class='panel-head'><div><div class='eyebrow'>CURRENT MIX</div><h2>价格带分布</h2></div></div>{bars or '<p class="empty">暂无已确认定价。</p>'}</section>
+        <section class='panel'><div class='panel-head'><div><div class='eyebrow'>CURRENT MIX</div><h2>价格带分布</h2></div><span class='count'>合计 {total} 款</span></div>{bars or '<p class="empty">暂无已确认定价。</p>'}</section>
         """
         return self.shell("价格带统计", content, user, "stats")
 
