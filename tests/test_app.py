@@ -5492,6 +5492,93 @@ class CatalogAppTests(unittest.TestCase):
         headers = dict(media_response["headers"])
         self.assertEqual(headers["Content-Type"], "image/png")
 
+    def test_b_image_mapping_allows_multiple_style_colors_to_share_one_image(self):
+        cookie = self.login("b_editor", "demo123")
+        users = {item["department"]: item for item in db.list_users(self.db_path)}
+        with db.get_connection(self.db_path) as connection:
+            second_color_id = db.create_product(
+                connection,
+                self.a_complete_fields_payload(
+                    style_code="SP-8420",
+                    style_color="针织开衫-黑",
+                    color_name="黑色",
+                    product_name="毛感针织开衫",
+                ),
+                users["A"]["id"],
+                "A",
+            )
+            db.change_product_status(
+                connection,
+                second_color_id,
+                "pending",
+                users["A"]["id"],
+                "开启商品部协作",
+                "测试同款多色共用图片。",
+            )
+
+        shared_image = self.make_png_bytes()
+        workbook_bytes = self.make_image_mapping_workbook_bytes(
+            [
+                ("针织开衫-米白", "shared-main.png"),
+                ("针织开衫-黑", "shared-main.png"),
+            ]
+        )
+        response = self.request(
+            "/import-images",
+            method="POST",
+            body=self.build_multi_multipart(
+                files=[
+                    ("mapping_workbook", "shared-image-map.xlsx", workbook_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                    ("image_files", "shared-main.png", shared_image, "image/png"),
+                    ("image_files", "shared-main.png", shared_image, "image/png"),
+                ],
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(response["status"].startswith("200"))
+        body = response["body"].decode("utf-8")
+        self.assertIn("已读取 2 条 Excel 映射", body)
+        self.assertIn("接收 1 张图片", body)
+        self.assertIn("成功更新 2 条资料", body)
+        self.assertNotIn("重复命名的图片</strong>", body)
+        first_color = db.get_product(self.db_path, 2)
+        second_color = db.get_product(self.db_path, second_color_id)
+        self.assertEqual(first_color["image_url"], second_color["image_url"])
+        self.assertEqual(
+            json.loads(first_color["image_gallery_json"]),
+            json.loads(second_color["image_gallery_json"]),
+        )
+        self.assertTrue(media_file_path(self.upload_dir, first_color["image_url"]).exists())
+        self.assertEqual(len(list(self.upload_dir.glob("*.png"))), 1)
+
+    def test_b_image_mapping_still_blocks_same_filename_with_different_images(self):
+        cookie = self.login("b_editor", "demo123")
+        workbook_bytes = self.make_image_mapping_workbook_bytes(
+            [("针织开衫-米白", "ambiguous-main.png")]
+        )
+        second_image = io.BytesIO()
+        PillowImage.new("RGB", (16, 12), color=(47, 111, 85)).save(second_image, format="PNG")
+        original_image_url = db.get_product(self.db_path, 2)["image_url"]
+        response = self.request(
+            "/import-images",
+            method="POST",
+            body=self.build_multi_multipart(
+                files=[
+                    ("mapping_workbook", "ambiguous-image-map.xlsx", workbook_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                    ("image_files", "ambiguous-main.png", self.make_png_bytes(), "image/png"),
+                    ("image_files", "ambiguous-main.png", second_image.getvalue(), "image/png"),
+                ],
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(response["status"].startswith("200"))
+        body = response["body"].decode("utf-8")
+        self.assertIn("成功更新 0 条资料", body)
+        self.assertIn("ambiguous-main.png（检测到 2 个同名图片）", body)
+        self.assertEqual(db.get_product(self.db_path, 2)["image_url"], original_image_url)
+
     def test_b_image_reimport_replaces_primary_and_retains_previous_file_for_two_days(self):
         cookie = self.login("b_editor", "demo123")
         workbook_bytes = self.make_image_mapping_workbook_bytes(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cgi
+import hashlib
 import html
 import io
 import json
@@ -969,6 +970,43 @@ class CatalogApplication:
             uploads_by_filename.setdefault(filename_key, []).append((original_filename, payload))
             uploads_by_stem.setdefault(stem_key, []).append((original_filename, payload))
 
+        fingerprint_cache: dict[int, str] = {}
+
+        def distinct_uploads(upload_items: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+            identity_unique = []
+            seen_payload_ids = set()
+            for item in upload_items:
+                payload_id = id(item[1])
+                if payload_id in seen_payload_ids:
+                    continue
+                seen_payload_ids.add(payload_id)
+                identity_unique.append(item)
+            if len(identity_unique) < 2:
+                return identity_unique
+            content_unique = []
+            seen_fingerprints = set()
+            for item in identity_unique:
+                payload_id = id(item[1])
+                fingerprint = fingerprint_cache.get(payload_id)
+                if fingerprint is None:
+                    fingerprint = self.image_upload_fingerprint(item[1])
+                    fingerprint_cache[payload_id] = fingerprint
+                if fingerprint in seen_fingerprints:
+                    continue
+                seen_fingerprints.add(fingerprint)
+                content_unique.append(item)
+            return content_unique
+
+        uploads_by_filename = {
+            key: distinct_uploads(items) for key, items in uploads_by_filename.items()
+        }
+        uploads_by_stem = {
+            key: distinct_uploads(items) for key, items in uploads_by_stem.items()
+        }
+        unique_upload_count = len(
+            {id(item[1]) for items in uploads_by_filename.values() for item in items}
+        )
+
         matched: list[str] = []
         unmatched_products: list[str] = []
         unmatched_images: list[str] = []
@@ -976,8 +1014,8 @@ class CatalogApplication:
         ambiguous_matches: list[str] = []
         duplicate_mapping_rows: list[str] = []
         updated_count = 0
-        used_upload_payload_ids: set[int] = set()
         seen_style_keys: set[str] = set()
+        saved_media_paths: dict[int, str] = {}
 
         with db.get_connection(self.db_path) as connection:
             rows = connection.execute(
@@ -1027,13 +1065,15 @@ class CatalogApplication:
 
                 payload = upload_items[0][1]
                 payload_id = id(payload)
-                if payload_id in used_upload_payload_ids:
-                    duplicate_mapping_rows.append(f"{style_color_name} -> {image_reference}（同一张图片被重复引用）")
-                    continue
-                used_upload_payload_ids.add(payload_id)
-
                 product = target_products[0]
-                self.apply_imported_image_to_product(connection, user, product, payload)
+                media_path = self.apply_imported_image_to_product(
+                    connection,
+                    user,
+                    product,
+                    payload,
+                    media_path=saved_media_paths.get(payload_id),
+                )
+                saved_media_paths[payload_id] = media_path
                 updated_count += 1
                 matched.append(f"{style_color_name} <- {image_reference} -> 资料 #{product['id']}")
 
@@ -1041,7 +1081,7 @@ class CatalogApplication:
             "mode": "workbook",
             "workbook_name": workbook_name,
             "mapping_row_count": len(mapping_rows),
-            "selected_count": len(upload_payloads),
+            "selected_count": unique_upload_count,
             "updated_count": updated_count,
             "matched": matched,
             "unmatched": unmatched_products,
@@ -1053,9 +1093,41 @@ class CatalogApplication:
         }
         return self.html_response(start_response, self.render_image_import_page(user, report=report))
 
-    def apply_imported_image_to_product(self, connection, user, product: dict, payload: dict) -> None:
+    @staticmethod
+    def image_upload_fingerprint(payload: dict) -> str:
+        digest = hashlib.sha256()
+        content = payload.get("content")
+        if content is not None:
+            digest.update(bytes(content))
+        else:
+            source = payload.get("file")
+            if source is None:
+                return ""
+            try:
+                original_position = source.tell()
+            except (AttributeError, OSError, TypeError, ValueError):
+                original_position = 0
+            source.seek(0)
+            while True:
+                chunk = source.read(UPLOAD_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            source.seek(original_position)
+        return digest.hexdigest()
+
+    def apply_imported_image_to_product(
+        self,
+        connection,
+        user,
+        product: dict,
+        payload: dict,
+        *,
+        media_path: str | None = None,
+    ) -> str:
         existing_gallery = self.image_gallery_values(product)
-        media_path = save_image_upload(self.upload_dir, payload)
+        created_media = not media_path
+        media_path = media_path or save_image_upload(self.upload_dir, payload)
         updated_payload = {field.key: product.get(field.key) for field in PRODUCT_FIELDS}
         updated_payload["image_url"] = media_path
         updated_payload["image_gallery_json"] = json.dumps([media_path], ensure_ascii=False)
@@ -1064,11 +1136,13 @@ class CatalogApplication:
             connection.commit()
         except Exception:
             connection.rollback()
-            delete_local_media(self.upload_dir, media_path)
+            if created_media:
+                delete_local_media(self.upload_dir, media_path)
             raise
         for old_media_path in existing_gallery:
             if old_media_path != media_path:
                 retain_local_media_backup(self.upload_dir, old_media_path)
+        return media_path
 
     def handle_export(self, start_response, user, query):
         selected_product_ids = {
@@ -12510,7 +12584,7 @@ class CatalogApplication:
           <div class="panel">
             <div class="eyebrow">{html.escape(console_eyebrow)}</div>
             <h1>导入图片</h1>
-            <p>支持两种导入方式：一是直接上传多张 JPG、JPEG、PNG、WEBP 或 GIF 图片，系统按文件名去掉扩展名后的“款色”自动匹配；二是上传图片映射 Excel，传统映射表另选图片，WPS/Excel“网址转图片”格式可直接读取表格内嵌图片，按 Excel 指定关系更新资料。</p>
+            <p>支持两种导入方式：一是直接上传多张 JPG、JPEG、PNG、WEBP 或 GIF 图片，系统按文件名去掉扩展名后的“款色”自动匹配；二是上传图片映射 Excel，传统映射表另选图片，WPS/Excel“网址转图片”格式可直接读取表格内嵌图片，按 Excel 指定关系更新资料。同一款号的不同款色可以复用同一张图片。</p>
           </div>
           <div class="panel">
             <div class="stats">
@@ -12523,7 +12597,7 @@ class CatalogApplication:
         </section>
         <section class="panel">
           <h2>导入图片</h2>
-          <p class="meta">方式一示例：如果资料里的款色是“短袖连衣裙-蓝”，图片文件名就命名为“短袖连衣裙-蓝.jpg”。方式二支持传统映射表和包含内嵌图片的 WPS/Excel 文件。单个图片或图片映射文件最大 3GB；新图覆盖后，旧本地图片保留 2 天再自动清理。</p>
+          <p class="meta">方式一示例：如果资料里的款色是“短袖连衣裙-蓝”，图片文件名就命名为“短袖连衣裙-蓝.jpg”。方式二支持传统映射表和包含内嵌图片的 WPS/Excel 文件；多个款色可在映射表中引用同一张图片。单个图片或图片映射文件最大 3GB；新图覆盖后，旧本地图片保留 2 天再自动清理。</p>
           {error_block}
           {report_block}
           <form method="post" action="/import-images" enctype="multipart/form-data">
