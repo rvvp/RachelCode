@@ -330,6 +330,33 @@ def init_db(
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS product_c_recall_notices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                recipient_user_id INTEGER NOT NULL,
+                release_no INTEGER NOT NULL,
+                recalled_version_no INTEGER NOT NULL,
+                recalled_by INTEGER NOT NULL,
+                recalled_at TEXT NOT NULL,
+                resolved_at TEXT,
+                resolved_release_no INTEGER,
+                style_code_snapshot TEXT NOT NULL DEFAULT '',
+                style_color_snapshot TEXT NOT NULL DEFAULT '',
+                product_name_snapshot TEXT NOT NULL DEFAULT '',
+                launch_channel_snapshot TEXT NOT NULL DEFAULT '',
+                UNIQUE(product_id, recipient_user_id, release_no),
+                FOREIGN KEY(product_id) REFERENCES products(id),
+                FOREIGN KEY(recipient_user_id) REFERENCES users(id),
+                FOREIGN KEY(recalled_by) REFERENCES users(id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_product_c_recall_notices_recipient_active "
+            "ON product_c_recall_notices(recipient_user_id, resolved_at, recalled_at)"
+        )
+        connection.execute(
+            """
             UPDATE products
             SET launch_channel = '天猫'
             WHERE TRIM(COALESCE(launch_channel, '')) IN ('天猫/京东/抖音', '天猫、京东、抖音')
@@ -2660,6 +2687,14 @@ def change_product_status(
     c_published_version_no = current_row["c_published_version_no"] if current_row else None
     workflow_restart_required = int(current_row["workflow_restart_required"] or 0) if current_row else 0
     revision_flag = 0 if revision_flag_override is None else int(revision_flag_override)
+    if current_row["status"] == "received" and status == "pending":
+        create_c_recall_notices(
+            connection,
+            product_id,
+            actor_user_id,
+            c_release_no,
+            timestamp,
+        )
     if status == "published":
         if not current_completed_to_c_at:
             completed_to_c_at = timestamp
@@ -2703,6 +2738,8 @@ def change_product_status(
             product_id,
         ),
     )
+    if status == "published":
+        resolve_c_recall_notices(connection, product_id, c_release_no, timestamp)
     log_product_action(connection, product_id, actor_user_id, f"status:{status}", action_label, details)
 
 
@@ -2723,6 +2760,8 @@ def change_product_lifecycle(
         """,
         (lifecycle_status, timestamp, product_id),
     )
+    if lifecycle_status in {"archived", "deleted"}:
+        resolve_c_recall_notices(connection, product_id, None, timestamp)
     log_product_action(connection, product_id, actor_user_id, f"lifecycle:{lifecycle_status}", action_label, details)
 
 
@@ -3744,6 +3783,109 @@ def record_c_product_receipt(
         (product_id, recipient_user_id, release_no, utc_now()),
     )
     return result.rowcount > 0
+
+
+def create_c_recall_notices(
+    connection: sqlite3.Connection,
+    product_id: int,
+    recalled_by: int,
+    release_no: int,
+    recalled_at: str | None = None,
+) -> int:
+    """Notify each C account that received the recalled release."""
+    timestamp = recalled_at or utc_now()
+    result = connection.execute(
+        """
+        INSERT OR IGNORE INTO product_c_recall_notices (
+            product_id, recipient_user_id, release_no, recalled_version_no,
+            recalled_by, recalled_at, style_code_snapshot, style_color_snapshot,
+            product_name_snapshot, launch_channel_snapshot
+        )
+        SELECT
+            product.id, receipt.recipient_user_id, receipt.release_no,
+            product.current_version_no, ?, ?,
+            COALESCE(product.style_code, ''), COALESCE(product.style_color, ''),
+            COALESCE(product.product_name, ''), COALESCE(product.launch_channel, '')
+        FROM products product
+        JOIN product_c_receipts receipt
+          ON receipt.product_id = product.id
+         AND receipt.release_no = ?
+        JOIN users recipient ON recipient.id = receipt.recipient_user_id
+        WHERE product.id = ?
+          AND recipient.department = 'C'
+        """,
+        (recalled_by, timestamp, release_no, product_id),
+    )
+    return max(0, int(result.rowcount or 0))
+
+
+def resolve_c_recall_notices(
+    connection: sqlite3.Connection,
+    product_id: int,
+    resolved_release_no: int | None,
+    resolved_at: str | None = None,
+) -> int:
+    timestamp = resolved_at or utc_now()
+    result = connection.execute(
+        """
+        UPDATE product_c_recall_notices
+        SET resolved_at = ?, resolved_release_no = ?
+        WHERE product_id = ? AND resolved_at IS NULL
+        """,
+        (timestamp, resolved_release_no, product_id),
+    )
+    return max(0, int(result.rowcount or 0))
+
+
+def c_active_recall_notices(
+    db_path: str | Path,
+    recipient_user_id: int | None,
+) -> list[dict]:
+    with get_connection(db_path) as connection:
+        if recipient_user_id is None:
+            rows = connection.execute(
+                """
+                SELECT
+                    MIN(notice.id) AS id,
+                    notice.product_id,
+                    notice.release_no,
+                    notice.recalled_version_no,
+                    notice.recalled_by,
+                    notice.recalled_at,
+                    notice.style_code_snapshot,
+                    notice.style_color_snapshot,
+                    notice.product_name_snapshot,
+                    notice.launch_channel_snapshot,
+                    COUNT(*) AS recipient_count
+                FROM product_c_recall_notices notice
+                JOIN products product ON product.id = notice.product_id
+                WHERE notice.resolved_at IS NULL
+                  AND product.lifecycle_status = 'active'
+                GROUP BY notice.product_id, notice.release_no, notice.recalled_at
+                ORDER BY notice.recalled_at DESC, notice.product_id DESC
+                """
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT notice.*, 1 AS recipient_count
+                FROM product_c_recall_notices notice
+                JOIN products product ON product.id = notice.product_id
+                WHERE notice.recipient_user_id = ?
+                  AND notice.resolved_at IS NULL
+                  AND product.lifecycle_status = 'active'
+                ORDER BY notice.recalled_at DESC, notice.id DESC
+                """,
+                (recipient_user_id,),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def c_active_recall_notice_count(
+    db_path: str | Path,
+    recipient_user_id: int | None,
+) -> int:
+    return len(c_active_recall_notices(db_path, recipient_user_id))
 
 
 def c_user_receipt_stats(db_path: str | Path, user: dict) -> dict[str, int]:

@@ -2635,6 +2635,8 @@ class CatalogApplication:
             status_filter = ""
             marker_filter = "tax_price_modified"
 
+        recall_notice_mode = user.get("department") == "C" and marker_filter == "recall_notice"
+
         allowed_statuses = {
             "A": {"draft", "pending", "published", "received", "workflow_restart"},
             "EXECUTIVE": {"draft", "pending", "published", "received", "workflow_restart"},
@@ -2649,7 +2651,7 @@ class CatalogApplication:
         completion_ready_filter = b_dashboard_view and marker_filter == "completion_ready"
         if completion_ready_filter:
             status_filter = ""
-        if not tax_price_filter and not completion_ready_filter:
+        if not tax_price_filter and not completion_ready_filter and not recall_notice_mode:
             marker_filter = ""
 
         workflow_restart_filter = status_filter == "workflow_restart" and user.get("department") != "C"
@@ -2702,6 +2704,12 @@ class CatalogApplication:
         elif user.get("department") not in {"C", "DESIGN"} and status_filter in {"published", "received"}:
             products = [product for product in products if not int(product.get("workflow_restart_required") or 0)]
 
+        recall_notices = []
+        if recall_notice_mode:
+            recipient_user_id = None if is_department_monitor(user) else int(user["id"])
+            recall_notices = db.c_active_recall_notices(self.db_path, recipient_user_id)
+            products = []
+
         normalized_query.update(
             {
                 "q": keyword,
@@ -2732,6 +2740,8 @@ class CatalogApplication:
             "tax_price_filter": tax_price_filter,
             "completion_ready_filter": completion_ready_filter,
             "workflow_restart_filter": workflow_restart_filter,
+            "recall_notice_mode": recall_notice_mode,
+            "recall_notices": recall_notices,
             "lifecycle_filter": lifecycle_filter,
         }
 
@@ -9597,14 +9607,23 @@ class CatalogApplication:
         tax_price_filter = filter_context["tax_price_filter"]
         completion_ready_filter = filter_context["completion_ready_filter"]
         workflow_restart_filter = filter_context["workflow_restart_filter"]
+        recall_notice_mode = filter_context["recall_notice_mode"]
         lifecycle_filter = filter_context["lifecycle_filter"]
-        bulk_enabled = not is_department_monitor(user) and (
+        bulk_enabled = not recall_notice_mode and not is_department_monitor(user) and (
             is_admin(user) or user.get("department") in {"A", "B", "C"}
         )
-        selection_enabled = bulk_enabled or is_released_catalog_read_only(user)
-        products = filter_context["products"]
+        selection_enabled = not recall_notice_mode and (bulk_enabled or is_released_catalog_read_only(user))
+        products = (
+            filter_context["recall_notices"]
+            if recall_notice_mode
+            else filter_context["products"]
+        )
         total_products = len(products)
-        filtered_product_ids = [int(product["id"]) for product in products if product.get("id")]
+        filtered_product_ids = (
+            []
+            if recall_notice_mode
+            else [int(product["id"]) for product in products if product.get("id")]
+        )
         page_size = 100
         try:
             requested_page = max(1, int(str(query.get("page", "1") or "1")))
@@ -9614,7 +9633,10 @@ class CatalogApplication:
         current_page = min(requested_page, total_pages)
         page_start = (current_page - 1) * page_size
         products = products[page_start:page_start + page_size]
+        recall_notices = products if recall_notice_mode else []
         page_product_count = len(products)
+        if recall_notice_mode:
+            products = []
         query = {
             **query,
             "supplier": supplier_filter,
@@ -9712,6 +9734,8 @@ class CatalogApplication:
           <div class="products-list-control-bulk">{bulk_lifecycle_markup}</div>
         </nav>
         """
+        if recall_notice_mode:
+            pagination_top_markup = ""
         pagination_bottom_markup = f"""
         <nav class="products-pagination products-pagination-bottom" aria-label="资料列表底部分页">
           {pagination_controls}
@@ -9737,6 +9761,14 @@ class CatalogApplication:
             db.c_department_receipt_stats(self.db_path)
             if user.get("department") == "C" and is_department_monitor(user)
             else (db.c_user_receipt_stats(self.db_path, user) if user.get("department") == "C" else {})
+        )
+        c_recall_notice_count = (
+            db.c_active_recall_notice_count(
+                self.db_path,
+                None if is_department_monitor(user) else int(user["id"]),
+            )
+            if user.get("department") == "C"
+            else 0
         )
         notice = query.get("notice", "")
         notice_block = f'<div class="notice">{html.escape(notice)}</div>' if notice else ""
@@ -9902,6 +9934,50 @@ class CatalogApplication:
             ]
         )
         table_column_count = 7 + len(configured_list_fields) + (1 if selection_enabled else 0)
+        table_header_markup = f"""
+          {selector_header}
+          <th>ID</th>
+          {"".join(dynamic_headers)}
+          <th>状态</th>
+          <th>修改版本</th>
+          <th>历时天数</th>
+          <th>发起人</th>
+          <th>最后更新</th>
+          <th>操作</th>
+        """
+        empty_list_message = "暂无符合条件的商品资料。"
+        if recall_notice_mode:
+            rows = [
+                f"""
+                <tr class="catalog-row recall-notice-row">
+                  <td>{self.list_value_markup(notice.get('style_code_snapshot'))}</td>
+                  <td>{self.list_value_markup(notice.get('style_color_snapshot'))}</td>
+                  <td>{self.list_value_markup(notice.get('product_name_snapshot'))}</td>
+                  <td>{self.list_value_markup(notice.get('launch_channel_snapshot'))}</td>
+                  <td class="table-updated-cell">{self.list_value_markup(self.format_list_timestamp(notice.get('recalled_at')), mono=True)}</td>
+                  <td><span class="pill">资料已召回，等待重新提交</span></td>
+                </tr>
+                """
+                for notice in recall_notices
+            ]
+            table_header_markup = """
+              <th>款号</th>
+              <th>款色</th>
+              <th>商品名称</th>
+              <th>上新渠道</th>
+              <th>召回时间</th>
+              <th>提醒</th>
+            """
+            table_column_keys = [
+                "style_code",
+                "style_color",
+                "product_name",
+                "launch_channel",
+                "recalled_at",
+                "recall_notice",
+            ]
+            table_column_count = len(table_column_keys)
+            empty_list_message = "暂无待处理的召回提醒。"
         new_button = (
             '<a class="pill" href="/products/new">新建资料</a>'
             if can_create_product(user)
@@ -9925,6 +10001,7 @@ class CatalogApplication:
               <div class="stat-card"><span>总接收</span><strong>{c_receipt_stats.get('received', 0)}</strong></div>
               <div class="stat-card"><span>近7天新增</span><strong>{c_receipt_stats.get('recent_created', 0)}</strong></div>
               <div class="stat-card"><span>待运营接收</span><strong>{c_receipt_stats.get('pending', 0)}</strong></div>
+              <a class="stat-card stat-card-link" href="/products?marker=recall_notice#products-list"><span>召回提醒</span><strong>{c_recall_notice_count}</strong><small>点击查看召回款式</small></a>
             </div>
             """
             insights_grid_class += " products-insights-single"
@@ -9966,7 +10043,7 @@ class CatalogApplication:
             insights_grid_class += " products-insights-single"
         else:
             stats_markup = ""
-        bulk_tools_markup = self.render_bulk_tools(user)
+        bulk_tools_markup = "" if recall_notice_mode else self.render_bulk_tools(user)
         lifecycle_filter_markup = f"""
               <select name="lifecycle_status">
                 <option value="">全部类型</option>
@@ -10089,6 +10166,11 @@ class CatalogApplication:
                 '<div class="notice products-filter-result-note">已展示资料完成为 Y 且等待商品部提交运营部的资料；提交后会自动移出此列表。'
                 '<a class="pill" href="/products#products-list">清除筛选</a></div>'
             )
+        elif recall_notice_mode:
+            marker_filter_note = (
+                '<div class="notice products-filter-result-note">以下资料已从运营阶段召回，等待 A/B 修订并重新提交；重新提交后会自动移出提醒。'
+                '<a class="pill" href="/products#products-list">返回正常资料列表</a></div>'
+            )
         if user["department"] == "C" and not is_department_monitor(user):
             c_note = ""
         layout_settings_button = (
@@ -10118,7 +10200,7 @@ class CatalogApplication:
               {new_button}
               {import_button}
               {import_image_button}
-              {self.export_menu(user)}
+              {'' if recall_notice_mode else self.export_menu(user)}
               {'<a class="pill" href="/products/review">流转看板</a>' if is_admin(user) else ''}
             </div>
             {workflow_rule_note}
@@ -10158,22 +10240,14 @@ class CatalogApplication:
             <input type="hidden" name="selection_scope" id="products-selection-scope" value="selected">
             <input type="hidden" name="filtered_product_ids" value="{html.escape(filtered_product_ids_value, quote=True)}">
           <div class="table-wrap products-list-scroll-wrap">
-            <table class="catalog-table">
+            <table class="catalog-table{' recall-notice-table' if recall_notice_mode else ''}">
               <thead>
                 <tr>
-                  {selector_header}
-                  <th>ID</th>
-                  {"".join(dynamic_headers)}
-                  <th>状态</th>
-                  <th>修改版本</th>
-                  <th>历时天数</th>
-                  <th>发起人</th>
-                  <th>最后更新</th>
-                  <th>操作</th>
+                  {table_header_markup}
                 </tr>
               </thead>
               <tbody>
-                {''.join(rows) if rows else f'<tr><td colspan="{str(table_column_count)}"><div class="empty-state">暂无符合条件的商品资料。</div></td></tr>'}
+                {''.join(rows) if rows else f'<tr><td colspan="{str(table_column_count)}"><div class="empty-state">{empty_list_message}</div></td></tr>'}
               </tbody>
             </table>
           </div>
@@ -12558,6 +12632,7 @@ class CatalogApplication:
               <div class="rule-callout"><strong>删除</strong><span>A 原始发起人仅可在“跟单整理中”或“A/B 协作中”删除自己发起的正常资料，可勾选多条后使用“批量删除”。系统会逐条校验权限，不符合条件的条目自动跳过。进入运营阶段后，必须先召回；已删除资料仅管理员可恢复。</span></div>
               <div class="rule-callout"><strong>归档</strong><span>A 跟单部任一账号可批量归档“已接收”资料，也可在“已归档”筛选中恢复；管理员可按管理权限归档或恢复。</span></div>
               <div class="rule-callout"><strong>召回</strong><span>A 原始发起人、B 商品部和管理员可对“待运营接收”或“已接收”资料执行“召回到 A/B 协作”。A 同部门非发起人仅能查看禁用入口。召回会清除当前运营接收标记，保留历史版本和操作日志。</span></div>
+              <div class="rule-callout"><strong>召回提醒</strong><span>“待运营接收”资料召回时不提醒运营部；“已接收”资料召回时，系统只提醒实际接收过该批次的运营账号，无需运营部同意。全渠道账号如实际接收过也会收到提醒，但仍不参与全局状态判断。A/B 重新提交运营部后提醒自动关闭，运营部按新批次重新接收。</span></div>
             </div>
           </div>
           <div class="rule-section">
