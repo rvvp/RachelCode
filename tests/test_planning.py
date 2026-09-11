@@ -2456,6 +2456,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("复核通过", review_page)
         self.assertIn("grid-template-columns:max-content max-content", review_page)
         self.assertIn(".review-approve-button{grid-column:2;justify-self:end}", review_page)
+        self.assertIn("name='return_status' value='review_pending'", review_page)
         rejected_review_fractional = self.wsgi_request(
             app,
             f"/pricing/{record['id']}/approve",
@@ -2490,10 +2491,25 @@ class PlanningCenterTests(unittest.TestCase):
             app,
             f"/pricing/{record['id']}/review-save",
             method="POST",
-            body=urlencode({"launch_price": "579", "channel": "唯品"}).encode(),
+            body=urlencode(
+                {
+                    "launch_price": "579",
+                    "channel": "唯品",
+                    "return_season_year": "2026秋冬",
+                    "return_status": "review_pending",
+                    "return_search": "M031,黑",
+                    "return_page": "2",
+                }
+            ).encode(),
             cookie=admin_cookie,
         )
         self.assertTrue(saved_review["status"].startswith("302"))
+        saved_location = dict(saved_review["headers"])["Location"]
+        self.assertIn("season_year=2026%E7%A7%8B%E5%86%AC", saved_location)
+        self.assertIn("status=review_pending", saved_location)
+        self.assertIn("search=M031%2C%E9%BB%91", saved_location)
+        self.assertIn("page=2", saved_location)
+        self.assertTrue(saved_location.endswith("#pricing-row-31"))
         saved_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
         self.assertEqual(saved_record["status"], "review_pending")
         self.assertEqual(saved_record["launch_price"], 579)
@@ -2502,10 +2518,25 @@ class PlanningCenterTests(unittest.TestCase):
             app,
             f"/pricing/{record['id']}/approve",
             method="POST",
-            body=urlencode({"launch_price": "579", "channel": "唯品"}).encode(),
+            body=urlencode(
+                {
+                    "launch_price": "579",
+                    "channel": "唯品",
+                    "return_season_year": "2026秋冬",
+                    "return_status": "review_pending",
+                    "return_search": "M031,黑",
+                    "return_page": "2",
+                }
+            ).encode(),
             cookie=admin_cookie,
         )
         self.assertTrue(approved["status"].startswith("302"))
+        approved_location = dict(approved["headers"])["Location"]
+        self.assertIn("season_year=2026%E7%A7%8B%E5%86%AC", approved_location)
+        self.assertIn("status=review_pending", approved_location)
+        self.assertIn("search=M031%2C%E9%BB%91", approved_location)
+        self.assertIn("page=2", approved_location)
+        self.assertTrue(approved_location.endswith("#pricing-row-31"))
         approved_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
         self.assertEqual(approved_record["status"], "confirmed")
         self.assertEqual(approved_record["launch_price"], 579)

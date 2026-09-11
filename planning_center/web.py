@@ -166,6 +166,25 @@ class PlanningApplication:
             raise ValueError("记录编号不正确。")
         return int(value)
 
+    def workbench_redirect_location(self, form: dict, message: str, record: dict | None = None) -> str:
+        """Return to the workbench view that submitted an inline workflow action."""
+        query = {}
+        for key in ("season_year", "status", "search"):
+            value = str(form.get(f"return_{key}") or "").strip()
+            if value:
+                query[key] = value
+        try:
+            page = max(1, int(str(form.get("return_page") or "1").strip()))
+        except (TypeError, ValueError):
+            page = 1
+        if page > 1:
+            query["page"] = str(page)
+        query["notice"] = message
+        location = "/workbench?" + urlencode(query)
+        if record:
+            location += f"#pricing-row-{int(record['source_product_id'])}"
+        return location
+
     def current_user(self, environ):
         parsed = cookies.SimpleCookie(environ.get("HTTP_COOKIE", ""))
         token = parsed.get("planning_session")
@@ -558,7 +577,14 @@ class PlanningApplication:
             form.get("channel", ""),
             user.get("display_name", "企划管理员"),
         )
-        return self.redirect(start_response, "/workbench?notice=" + self.q(f"{record['style_code'] or record['product_name']} 的复核上新价与渠道已保存。"))
+        return self.redirect(
+            start_response,
+            self.workbench_redirect_location(
+                form,
+                f"{record['style_code'] or record['product_name']} 的复核上新价与渠道已保存。",
+                record,
+            ),
+        )
 
     def handle_approve(self, environ, start_response, user, record_id: int):
         self.require_rule_manager(user)
@@ -570,7 +596,14 @@ class PlanningApplication:
             form.get("channel", ""),
             user.get("display_name", "企划管理员"),
         )
-        return self.redirect(start_response, "/workbench?notice=" + self.q(f"{record['style_code'] or record['product_name']} 已复核通过，可回传藏宝阁。"))
+        return self.redirect(
+            start_response,
+            self.workbench_redirect_location(
+                form,
+                f"{record['style_code'] or record['product_name']} 已复核通过，可回传藏宝阁。",
+                record,
+            ),
+        )
 
     def handle_pricing_export(self, start_response, user, query: dict):
         self.require_export_access(user)
@@ -1362,6 +1395,16 @@ class PlanningApplication:
         current_page = min(requested_page, total_pages)
         page_start = (current_page - 1) * page_size
         page_products = filtered_products[page_start : page_start + page_size]
+        review_return_context = "".join(
+            f"<input type='hidden' name='return_{key}' value='{html.escape(str(value), quote=True)}'>"
+            for key, value in (
+                ("season_year", season),
+                ("status", status),
+                ("search", search),
+                ("page", current_page if current_page > 1 else ""),
+            )
+            if str(value)
+        )
         toolbar_message = notice or sync_message
         seasons = sorted({item.get("season_year", "") for item in db.list_source_products(self.db_path) if item.get("season_year")}, reverse=True)
         catalog_sync_action = (
@@ -1565,6 +1608,7 @@ class PlanningApplication:
                     controls = f"""
                     <div class='review-controls'><span class='review-note'>商品部初审已提交，请进行复核</span>
                       <form class='table-action-form price-review-form review-approval-form' method='post' action='/pricing/{record['id']}/review-save'>
+                        {review_return_context}
                         <label>复核上新价<input name='launch_price' type='number' min='1' step='1' inputmode='numeric' value='{price_value}' data-saved-value='{price_value}' required></label>
                         <button type='submit'>修改保存</button>
                         <label>复核渠道<select name='channel' data-saved-value='{html.escape(record.get('channel') or '', quote=True)}' required>{select_options(channel_options, record.get('channel') or '', '请选择渠道')}</select></label>
