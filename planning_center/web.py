@@ -510,7 +510,11 @@ class PlanningApplication:
                 record["channel"],
                 user.get("display_name", "企划管理员"),
             )
-            message = f"定价记录 {record['publication_id']} 已复核通过。"
+            sync_count = int(record.get("_style_sync_count") or 1)
+            message = f"定价记录 {record['publication_id']} 已复核通过"
+            if sync_count > 1:
+                message += f"，同款 {sync_count} 个款色一并完成复核"
+            message += "。"
         else:
             record = db.submit_pricing_for_review(self.db_path, record_id, record["launch_price"], user.get("display_name", "商品部企划员"))
             message = f"定价记录 {record['publication_id']} 已提交复核。"
@@ -577,11 +581,13 @@ class PlanningApplication:
             form.get("channel", ""),
             user.get("display_name", "企划管理员"),
         )
+        sync_count = int(record.get("_style_sync_count") or 1)
+        sync_note = f"，同款 {sync_count} 个款色已同步" if sync_count > 1 else ""
         return self.redirect(
             start_response,
             self.workbench_redirect_location(
                 form,
-                f"{record['style_code'] or record['product_name']} 的复核上新价与渠道已保存。",
+                f"{record['style_code'] or record['product_name']} 的复核上新价与渠道已保存{sync_note}。",
                 record,
             ),
         )
@@ -596,11 +602,13 @@ class PlanningApplication:
             form.get("channel", ""),
             user.get("display_name", "企划管理员"),
         )
+        sync_count = int(record.get("_style_sync_count") or 1)
+        sync_note = f"，同款 {sync_count} 个款色一并完成复核" if sync_count > 1 else ""
         return self.redirect(
             start_response,
             self.workbench_redirect_location(
                 form,
-                f"{record['style_code'] or record['product_name']} 已复核通过，可回传藏宝阁。",
+                f"{record['style_code'] or record['product_name']} 已复核通过{sync_note}，可回传藏宝阁。",
                 record,
             ),
         )
@@ -1001,14 +1009,22 @@ class PlanningApplication:
                     or clean_channel != record["channel"]
                 ):
                     raise ValueError(f"{record['style_code'] or record['product_name']} 的复核上新价或渠道已修改，请先点击“修改保存”。")
+            approved_style_keys = set()
+            approved_count = 0
             for record in records:
-                db.approve_pricing_record(
+                style_code = str(record.get("style_code") or "").strip()
+                approval_key = (str(record.get("season_year") or ""), style_code) if style_code else ("record", int(record["id"]))
+                if approval_key in approved_style_keys:
+                    continue
+                approved_record = db.approve_pricing_record(
                     self.db_path,
                     record["id"],
                     record["launch_price"],
                     record["channel"],
                     user.get("display_name", "企划管理员"),
                 )
+                approved_count += int(approved_record.get("_style_sync_count") or 1)
+                approved_style_keys.add(approval_key)
             return self.redirect(
                 start_response,
                 "/workbench?"
@@ -1018,7 +1034,7 @@ class PlanningApplication:
                         for key, value in (
                             ("status", "confirmed"),
                             ("search", search_filter),
-                            ("notice", f"已批量复核通过 {len(records)} 款上新定价。"),
+                            ("notice", f"已批量复核通过 {approved_count} 个款色。"),
                         )
                         if value
                     }

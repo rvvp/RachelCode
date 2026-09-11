@@ -1714,12 +1714,28 @@ def save_review_price(
         if row["status"] != "review_pending":
             raise ValueError("当前定价记录不在企划管理员复核阶段。")
         clean_channel = validate_channel_option(db_path, channel)
-        connection.execute(
-            "UPDATE pricing_records SET launch_price = ?, channel = ?, operator_name = ?, error_message = '' WHERE id = ?",
-            (price, clean_channel, operator_name, record_id),
-        )
+        style_code = str(row["style_code"] or "").strip()
+        if style_code:
+            # Price and channel are defined at style level. Keep the workflow
+            # boundary intact by synchronizing only sibling colors that are
+            # currently waiting for the same administrator review.
+            updated_count = connection.execute(
+                """
+                UPDATE pricing_records
+                SET launch_price = ?, channel = ?, operator_name = ?, error_message = ''
+                WHERE TRIM(style_code) = ? AND season_year = ? AND status = 'review_pending'
+                """,
+                (price, clean_channel, operator_name, style_code, row["season_year"]),
+            ).rowcount
+        else:
+            updated_count = connection.execute(
+                "UPDATE pricing_records SET launch_price = ?, channel = ?, operator_name = ?, error_message = '' WHERE id = ?",
+                (price, clean_channel, operator_name, record_id),
+            ).rowcount
         updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
-    return dict(updated)
+    result = dict(updated)
+    result["_style_sync_count"] = int(updated_count or 0)
+    return result
 
 
 def approve_pricing_record(
@@ -1739,12 +1755,27 @@ def approve_pricing_record(
         clean_channel = validate_channel_option(db_path, channel)
         if price != validated_launch_price(row["launch_price"]) or clean_channel != row["channel"]:
             raise ValueError("复核上新价或渠道已修改，请先点击“修改保存”，再进行复核通过。")
-        connection.execute(
-            "UPDATE pricing_records SET status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = '' WHERE id = ?",
-            (operator_name, utc_now(), record_id),
-        )
+        style_code = str(row["style_code"] or "").strip()
+        if style_code:
+            # Approval follows the same style-level rule as review saving:
+            # approve all sibling colors still waiting for this review.
+            updated_count = connection.execute(
+                """
+                UPDATE pricing_records
+                SET status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = ''
+                WHERE TRIM(style_code) = ? AND season_year = ? AND status = 'review_pending'
+                """,
+                (operator_name, utc_now(), style_code, row["season_year"]),
+            ).rowcount
+        else:
+            updated_count = connection.execute(
+                "UPDATE pricing_records SET status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = '' WHERE id = ?",
+                (operator_name, utc_now(), record_id),
+            ).rowcount
         updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
-    return dict(updated)
+    result = dict(updated)
+    result["_style_sync_count"] = int(updated_count or 0)
+    return result
 
 
 def mark_record_published(db_path: str | Path, record_id: int, result: dict) -> dict:

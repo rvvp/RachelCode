@@ -2102,6 +2102,148 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(records["XLSX-002"]["channel"], "唯品")
         self.assertEqual(records["XLSX-002"]["status"], "suggested")
 
+    def test_review_save_and_approve_sync_same_style_colors(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2027秋冬", None, 600, 4)
+        products = [
+            {
+                "id": 4141,
+                "style_code": "STYLE-SYNC-001",
+                "style_color": "STYLE-SYNC-001-黑",
+                "product_name": "同款联动测试款黑",
+                "season_year": "2027秋冬",
+                "supplier": "同款联动供应商",
+                "category": "其他",
+                "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 1,
+            },
+            {
+                "id": 4142,
+                "style_code": "STYLE-SYNC-001",
+                "style_color": "STYLE-SYNC-001-白",
+                "product_name": "同款联动测试款白",
+                "season_year": "2027秋冬",
+                "supplier": "同款联动供应商",
+                "category": "其他",
+                "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 1,
+            },
+            {
+                "id": 4143,
+                "style_code": "STYLE-SYNC-002",
+                "style_color": "STYLE-SYNC-002-黑",
+                "product_name": "不同款号测试款",
+                "season_year": "2027秋冬",
+                "supplier": "同款联动供应商",
+                "category": "其他",
+                "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 1,
+            },
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        records = [planning_db.create_pricing_record(self.planning_db_path, product, "商品部企划员") for product in products]
+        for record, price, channel in zip(records, (609, 619, 629), ("天猫", "唯品", "天猫")):
+            planning_db.submit_pricing_for_review(
+                self.planning_db_path,
+                record["id"],
+                price,
+                "商品部企划员",
+                "其他",
+                channel,
+            )
+
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+        saved = self.wsgi_request(
+            app,
+            f"/pricing/{records[0]['id']}/review-save",
+            method="POST",
+            body=urlencode({"launch_price": "699", "channel": "唯品"}).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(saved["status"].startswith("302"))
+        self.assertIn("同款 2 个款色已同步", unquote(dict(saved["headers"])["Location"]).replace("+", " "))
+        synced_records = {
+            int(record["id"]): record
+            for record in planning_db.list_pricing_records(self.planning_db_path)
+        }
+        self.assertEqual(synced_records[records[0]["id"]]["launch_price"], 699)
+        self.assertEqual(synced_records[records[0]["id"]]["channel"], "唯品")
+        self.assertEqual(synced_records[records[1]["id"]]["launch_price"], 699)
+        self.assertEqual(synced_records[records[1]["id"]]["channel"], "唯品")
+        self.assertEqual(synced_records[records[2]["id"]]["launch_price"], 629)
+        self.assertEqual(synced_records[records[2]["id"]]["channel"], "天猫")
+
+        approved = self.wsgi_request(
+            app,
+            f"/pricing/{records[0]['id']}/approve",
+            method="POST",
+            body=urlencode({"launch_price": "699", "channel": "唯品"}).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(approved["status"].startswith("302"))
+        self.assertIn("同款 2 个款色一并完成复核", unquote(dict(approved["headers"])["Location"]).replace("+", " "))
+        final_records = {
+            int(record["id"]): record
+            for record in planning_db.list_pricing_records(self.planning_db_path)
+        }
+        self.assertEqual(final_records[records[0]["id"]]["status"], "confirmed")
+        self.assertEqual(final_records[records[1]["id"]]["status"], "confirmed")
+        self.assertEqual(final_records[records[2]["id"]]["status"], "review_pending")
+
+    def test_batch_approve_handles_same_style_colors_without_duplicate_failure(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2027秋冬", None, 600, 4)
+        products = [
+            {
+                "id": 4151 + offset,
+                "style_code": "STYLE-BATCH-SYNC",
+                "style_color": f"STYLE-BATCH-SYNC-{color}",
+                "product_name": f"同款批量测试款{color}",
+                "season_year": "2027秋冬",
+                "supplier": "同款批量供应商",
+                "category": "其他",
+                "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 1,
+            }
+            for offset, color in enumerate(("黑", "白"))
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        records = [planning_db.create_pricing_record(self.planning_db_path, product, "商品部企划员") for product in products]
+        for record in records:
+            planning_db.submit_pricing_for_review(
+                self.planning_db_path,
+                record["id"],
+                599,
+                "商品部企划员",
+                "其他",
+                "天猫",
+            )
+
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+        body_values = [
+            ("batch_action", "approve"),
+            ("approve_ids", str(records[0]["id"])),
+            ("approve_ids", str(records[1]["id"])),
+            (f"review_price_{records[0]['id']}", "599"),
+            (f"review_price_{records[1]['id']}", "599"),
+            (f"review_channel_{records[0]['id']}", "天猫"),
+            (f"review_channel_{records[1]['id']}", "天猫"),
+        ]
+        approved = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode(body_values).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(approved["status"].startswith("302"))
+        self.assertIn("status=confirmed", dict(approved["headers"])["Location"])
+        self.assertTrue(all(record["status"] == "confirmed" for record in planning_db.list_pricing_records(self.planning_db_path)))
+
     def test_review_excel_export_and_import_is_editable_for_admin_only(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2027秋冬", None, 600, 4)
         product = {
