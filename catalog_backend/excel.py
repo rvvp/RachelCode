@@ -18,8 +18,8 @@ from openpyxl.styles import Font, PatternFill
 from PIL import Image as PillowImage
 from PIL import ImageOps
 
-from catalog_backend.db import normalize_optional_date_text, normalize_product_data
-from catalog_backend.fields import EXCEL_HEADERS, PRODUCT_FIELDS
+from catalog_backend.db import PRODUCT_DATE_FIELD_KEYS, normalize_optional_date_text, normalize_product_data, normalize_value
+from catalog_backend.fields import EXCEL_HEADERS, PRODUCT_FIELDS, PRODUCT_FIELD_MAP
 from catalog_backend.uploads import MAX_IMAGE_BYTES, UPLOAD_COPY_CHUNK_BYTES, formatted_size_limit
 
 
@@ -197,6 +197,74 @@ def parse_workbook(file_obj) -> list[dict]:
             continue
         products.append(normalize_product_data(row_payload))
     return products
+
+
+def parse_incremental_product_workbook(file_obj) -> tuple[list[dict], tuple[str, ...]]:
+    """Read a style-color keyed workbook without manufacturing absent fields."""
+    workbook = load_workbook(file_obj, data_only=True)
+    worksheet = workbook[workbook.sheetnames[0]]
+    raw_headers = [worksheet.cell(1, column).value for column in range(1, worksheet.max_column + 1)]
+    normalized_headers = [normalize_header(header) for header in raw_headers]
+    style_color_header = normalize_header("款色")
+    if style_color_header not in normalized_headers:
+        raise ValueError("增量导入 Excel 缺少“款色”表头。")
+
+    duplicate_headers = sorted(
+        {
+            normalized
+            for normalized in normalized_headers
+            if normalized and normalized_headers.count(normalized) > 1
+        }
+    )
+    if duplicate_headers:
+        raise ValueError(f"增量导入 Excel 存在重复表头：{'、'.join(duplicate_headers)}。")
+
+    unknown_headers = [
+        str(raw_header).strip()
+        for raw_header, normalized in zip(raw_headers, normalized_headers)
+        if normalized and normalized not in HEADER_KEY_LOOKUP and normalized != LEGACY_COMPOSITION_HEADER
+    ]
+    if unknown_headers:
+        raise ValueError(f"增量导入 Excel 包含无法识别的表头：{'、'.join(unknown_headers)}。")
+
+    has_material_header = normalize_header("材质") in normalized_headers
+    column_field_keys: list[str | None] = []
+    for normalized in normalized_headers:
+        field_key = HEADER_KEY_LOOKUP.get(normalized)
+        if normalized == LEGACY_COMPOSITION_HEADER:
+            field_key = None if has_material_header else "material"
+        column_field_keys.append(field_key)
+    imported_field_keys = tuple(dict.fromkeys(key for key in column_field_keys if key))
+    if not any(key != "style_color" for key in imported_field_keys):
+        raise ValueError("增量导入 Excel 除“款色”外，请至少保留一个需要补充的字段。")
+
+    rows = []
+    for row_index in range(2, worksheet.max_row + 1):
+        raw_values = [worksheet.cell(row_index, column).value for column in range(1, worksheet.max_column + 1)]
+        if all(value in (None, "") for value in raw_values):
+            continue
+        row_payload = {}
+        for field_key, value in zip(column_field_keys, raw_values):
+            if not field_key or value in (None, ""):
+                continue
+            field = PRODUCT_FIELD_MAP[field_key]
+            try:
+                if field_key in PRODUCT_DATE_FIELD_KEYS:
+                    normalized_value = normalize_optional_date_text(value)
+                else:
+                    normalized_value = normalize_value(value, field.storage_type)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"增量导入 Excel 第 {row_index} 行“{field.label}”格式不正确。") from error
+            if normalized_value not in (None, ""):
+                row_payload[field_key] = normalized_value
+        style_color = str(row_payload.get("style_color") or "").strip()
+        if not style_color:
+            raise ValueError(f"增量导入 Excel 第 {row_index} 行缺少款色。")
+        row_payload["style_color"] = style_color
+        rows.append(row_payload)
+    if not rows:
+        raise ValueError("增量导入 Excel 没有可读取的资料行。")
+    return rows, imported_field_keys
 
 
 def _parse_image_mapping_rows(worksheet, embedded_images_by_id: dict[str, dict] | None = None) -> tuple[list[dict], list[dict]]:
@@ -422,6 +490,23 @@ def workbook_bytes(
     for index, field in enumerate(export_fields, start=start_index):
         minimum_width = 20 if field.key == "image_url" and image_fetcher else 12
         worksheet.column_dimensions[worksheet.cell(1, index).column_letter].width = max(minimum_width, len(field.label) + 4)
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def incremental_product_template_bytes(allowed_fields) -> bytes:
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "按款色增量补充"
+    fields = [field for field in allowed_fields if field.key not in {"style_color", "completion_flag"}]
+    worksheet.append([PRODUCT_FIELD_MAP["style_color"].excel_header, *(field.excel_header for field in fields)])
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill(fill_type="solid", fgColor="5B4B3A")
+    worksheet.freeze_panes = "A2"
+    for index, field in enumerate([PRODUCT_FIELD_MAP["style_color"], *fields], start=1):
+        worksheet.column_dimensions[worksheet.cell(1, index).column_letter].width = max(14, len(field.label) + 4)
     buffer = BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()

@@ -21,8 +21,10 @@ from catalog_backend.excel import (
     brand_bill_dashboard_workbook_bytes,
     brand_bill_template_bytes,
     dashboard_rows_from_brand_bill_summary,
+    incremental_product_template_bytes,
     parse_brand_bill_workbook,
     parse_image_mapping_workbook_with_embedded_images,
+    parse_incremental_product_workbook,
     parse_supplier_bill_workbook,
     parse_supplier_master_workbook,
     parse_supplier_settlement_workbook,
@@ -36,6 +38,7 @@ from catalog_backend.excel import (
 )
 from catalog_backend.fields import CATALOG_EXPORT_FIELD_ORDER, FIELDS_BY_GROUP, FieldDef, PRODUCT_FIELDS, PRODUCT_FIELD_MAP
 from catalog_backend.policies import (
+    A_STAGE_FIELD_KEYS,
     B_CATALOG_EDITABLE_FIELD_KEYS,
     B_STAGE_FIELD_KEYS,
     BILLING_PLATFORM_OPTIONS,
@@ -105,7 +108,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.09.09-field-permissions-v1"
+CATALOG_BUILD_VERSION = "2026.09.14-incremental-import-v1"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -349,6 +352,11 @@ class CatalogApplication:
                     )
                 return self.require_product_importer(start_response, user) or self.handle_import(
                     environ,
+                    start_response,
+                    user,
+                )
+            if path == "/import/incremental-template.xlsx" and method == "GET":
+                return self.require_product_importer(start_response, user) or self.handle_incremental_import_template(
                     start_response,
                     user,
                 )
@@ -700,7 +708,7 @@ class CatalogApplication:
         return self.html_response(start_response, self.render_product_detail(user, product, notice))
 
     def handle_import(self, environ, start_response, user):
-        _, files = self.parse_form(environ)
+        form, files = self.parse_form(environ)
         workbook_field = files.get("workbook")
         if workbook_field is None or getattr(workbook_field, "file", None) is None:
             return self.html_response(
@@ -709,7 +717,31 @@ class CatalogApplication:
                 status="400 Bad Request",
             )
         workbook_field.file.seek(0)
-        products = parse_workbook(workbook_field.file)
+        import_mode = str(form.get("import_mode") or "full").strip().lower()
+        if import_mode == "incremental":
+            if user.get("department") != "A" or is_department_monitor(user):
+                return self.html_response(
+                    start_response,
+                    self.render_import_page(user, error="按款色增量补充仅开放给 A 跟单部账号。"),
+                    status="403 Forbidden",
+                )
+            try:
+                rows, imported_field_keys = parse_incremental_product_workbook(workbook_field.file)
+            except ValueError as error:
+                return self.html_response(
+                    start_response,
+                    self.render_import_page(user, error=str(error)),
+                    status="400 Bad Request",
+                )
+            return self.handle_a_incremental_import(start_response, user, rows, imported_field_keys)
+        try:
+            products = parse_workbook(workbook_field.file)
+        except ValueError as error:
+            return self.html_response(
+                start_response,
+                self.render_import_page(user, error=str(error)),
+                status="400 Bad Request",
+            )
         if user.get("department") == "B":
             return self.handle_b_stage_import(start_response, user, products)
         created = 0
@@ -740,6 +772,122 @@ class CatalogApplication:
                 preview = f"{preview}；另有 {len(blocked) - 3} 条未更新"
             report = f"{report} 以下资料未更新：{preview}"
         return self.html_response(start_response, self.render_import_page(user, report=report))
+
+    def handle_a_incremental_import(
+        self,
+        start_response,
+        user,
+        rows: list[dict],
+        imported_field_keys: tuple[str, ...],
+    ):
+        allowed_field_keys = set(A_STAGE_FIELD_KEYS)
+        forbidden_field_keys = set(imported_field_keys) - allowed_field_keys - {"style_color"}
+        if forbidden_field_keys:
+            labels = "、".join(
+                PRODUCT_FIELD_MAP[key].label
+                for key in PRODUCT_FIELD_MAP
+                if key in forbidden_field_keys
+            )
+            return self.html_response(
+                start_response,
+                self.render_import_page(
+                    user,
+                    error=(
+                        f"增量导入包含非跟单部维护字段：{labels}。"
+                        "图片由商品部维护；品类、上新价格和上新渠道由商品企划中心维护；资料完成由系统判断。"
+                    ),
+                ),
+                status="400 Bad Request",
+            )
+
+        updated = 0
+        unchanged = 0
+        unmatched: list[str] = []
+        ambiguous: list[str] = []
+        blocked: list[str] = []
+        duplicate_rows: list[str] = []
+        style_color_counts: dict[str, int] = {}
+        style_color_labels: dict[str, str] = {}
+        for row in rows:
+            style_color = str(row.get("style_color") or "").strip()
+            style_key = self.style_color_match_key(style_color)
+            style_color_counts[style_key] = style_color_counts.get(style_key, 0) + 1
+            style_color_labels.setdefault(style_key, style_color)
+        duplicate_style_keys = {
+            style_key for style_key, count in style_color_counts.items() if count > 1
+        }
+        duplicate_rows.extend(style_color_labels[style_key] for style_key in sorted(duplicate_style_keys))
+        with db.get_connection(self.db_path) as connection:
+            for row in rows:
+                style_color = str(row.get("style_color") or "").strip()
+                style_key = self.style_color_match_key(style_color)
+                if style_key in duplicate_style_keys:
+                    continue
+                candidates = db.find_active_products_by_style_color(connection, style_color)
+                if not candidates:
+                    unmatched.append(style_color)
+                    continue
+                if len(candidates) > 1:
+                    ambiguous.append(style_color)
+                    continue
+                product = candidates[0]
+                if not can_edit_product(user, product):
+                    blocked.append(f"{style_color}（仅原发起人可修改）")
+                    continue
+                update_values = {
+                    field_key: value
+                    for field_key, value in row.items()
+                    if field_key != "style_color" and field_key in allowed_field_keys and value not in (None, "")
+                }
+                changed_field_keys = db.imported_field_changes(
+                    product,
+                    update_values,
+                    update_values.keys(),
+                    ignore_empty=False,
+                )
+                if not changed_field_keys:
+                    unchanged += 1
+                    continue
+                try:
+                    db.update_product(connection, int(product["id"]), update_values, int(user["id"]))
+                except PermissionError as error:
+                    blocked.append(f"{style_color}（{error}）")
+                    continue
+                updated += 1
+
+        report = f"增量导入完成：读取 {len(rows)} 条，成功补充或更新 {updated} 条。"
+        detail_parts = []
+        if unchanged:
+            detail_parts.append(f"已有内容相同或未填写补充字段 {unchanged} 条")
+        if unmatched:
+            detail_parts.append(f"未找到对应款色 {len(unmatched)} 条：{'、'.join(unmatched[:3])}")
+        if ambiguous:
+            detail_parts.append(f"款色匹配到多条资料 {len(ambiguous)} 条：{'、'.join(ambiguous[:3])}")
+        if duplicate_rows:
+            detail_parts.append(f"Excel 内重复款色 {len(duplicate_rows)} 条：{'、'.join(duplicate_rows[:3])}")
+        if blocked:
+            detail_parts.append(f"权限或流程限制 {len(blocked)} 条：{'；'.join(blocked[:3])}")
+        if detail_parts:
+            report = f"{report} 另外：{'；'.join(detail_parts)}。"
+        return self.html_response(start_response, self.render_import_page(user, report=report))
+
+    def handle_incremental_import_template(self, start_response, user):
+        if user.get("department") != "A" or is_department_monitor(user):
+            return self.html_response(
+                start_response,
+                self.render_message_page("权限不足", "增量导入模板仅开放给 A 跟单部账号。", user),
+                status="403 Forbidden",
+            )
+        allowed_keys = set(A_STAGE_FIELD_KEYS)
+        fields = [field for field in PRODUCT_FIELDS if field.key in allowed_keys]
+        body = incremental_product_template_bytes(fields)
+        headers = [
+            ("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            ("Content-Disposition", 'attachment; filename="catalog-incremental-template.xlsx"'),
+            ("Content-Length", str(len(body))),
+        ]
+        start_response("200 OK", headers)
+        return [body]
 
     def handle_b_stage_import(self, start_response, user, products: list[dict]):
         updated = 0
@@ -3534,7 +3682,7 @@ class CatalogApplication:
     def list_layout_cell_markup(self, field, payload: dict) -> str:
         if field.key == "completion_flag":
             return self.list_value_markup(payload.get("completion_flag"), mono=True)
-        if field.key in {"shooting_date", "inspection_date"}:
+        if field.key in {"shooting_date", "inspection_date", "bulk_arrival_date"}:
             return self.list_value_markup(
                 self.format_list_date(payload.get(field.key)),
                 mono=True,
@@ -12461,18 +12609,44 @@ class CatalogApplication:
             section_title = "导入商品部补充文件"
             button_text = "开始导入商品部 Excel"
             hint_text = "导入后请回到资料列表，勾选对应条目，再使用“批量提交运营部”继续流转。未填写图片的行会跳过，其他字段不会被导入修改。"
+            incremental_section = ""
         else:
-            page_title = "从参考模板导入 Excel"
-            intro_text = "导入时会读取第一张工作表，并按模板第一行表头识别字段。若发现与你本人已录入的同款号、同颜色、同商品名记录，则更新；否则新增。"
+            page_title = "导入跟单部 Excel"
+            intro_text = "保留完整模板导入，并新增按款色增量补充。增量模式只更新 Excel 中实际填写的跟单部字段，不新增资料，也不会用空白单元格清除已有内容。"
             stat_one = "工作表"
             stat_one_value = "首张表"
             stat_two = "识别方式"
-            stat_two_value = "模板表头"
-            stat_three = "重复策略"
-            stat_three_value = "同人更新"
-            section_title = "导入文件"
-            button_text = "开始导入"
-            hint_text = ""
+            stat_two_value = "完整或款色增量"
+            stat_three = "权限边界"
+            stat_three_value = "A 字段独立维护"
+            section_title = "完整字段导入"
+            button_text = "开始完整导入"
+            hint_text = "沿用现有规则：使用完整模板新增资料，或更新本人已发起的既有资料。"
+            incremental_section = """
+            <section class="panel">
+              <div class="detail-panel-head">
+                <div class="detail-panel-main">
+                  <h2>按款色增量补充</h2>
+                  <p class="meta">Excel 第一列保留“款色”，其余只需保留本次要补充的一个或多个字段。空白单元格会跳过，不会覆盖已有资料。</p>
+                </div>
+                <div class="detail-panel-tools">
+                  <a class="pill" href="/import/incremental-template.xlsx">下载增量模板</a>
+                </div>
+              </div>
+              <form method="post" action="/import" enctype="multipart/form-data">
+                <input type="hidden" name="import_mode" value="incremental">
+                <div class="form-grid">
+                  <label class="field field-wide">
+                    <span>选择增量 Excel 文件</span>
+                    <input type="file" name="workbook" accept=".xlsx" required>
+                  </label>
+                </div>
+                <div class="tools" style="margin-top:16px; margin-bottom:0; justify-content:flex-end;">
+                  <button type="submit">按款色补充资料</button>
+                </div>
+              </form>
+            </section>
+            """
         content = f"""
         <section class="hero">
           <div class="panel">
@@ -12496,6 +12670,7 @@ class CatalogApplication:
           {report_block}
           {error_block}
           <form method="post" action="/import" enctype="multipart/form-data">
+            <input type="hidden" name="import_mode" value="full">
             <div class="form-grid">
               <label class="field field-wide">
                 <span>选择 Excel 文件</span>
@@ -12508,6 +12683,7 @@ class CatalogApplication:
             </div>
           </form>
         </section>
+        {incremental_section}
         """
         return self.page("导入 Excel - 商品资料后台", content, user, current_page="products", back_href="/products")
 

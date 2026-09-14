@@ -33,6 +33,13 @@ PRODUCT_FIELDS: list[FieldDef] = [
     ),
     FieldDef("detection_report", "检测报告", "检测报告", "商品基础", visible_to_c=False),
     FieldDef("shipping_warehouse", "发货仓库", "发货仓库", "商品基础", visible_to_c=False),
+    FieldDef(
+        "bulk_arrival_date",
+        "大货到仓",
+        "大货到仓",
+        "商品基础",
+        placeholder="例如 2026-09-14",
+    ),
     FieldDef("brand_name", "品牌名称", "品牌\n名称", "商品基础"),
     FieldDef(
         "season_year",
@@ -105,6 +112,7 @@ CATALOG_EXPORT_FIELD_ORDER: tuple[str, ...] = (
     "detection_report",
     "size_chart",
     "shipping_warehouse",
+    "bulk_arrival_date",
     "brand_name",
     "season_year",
     "image_url",

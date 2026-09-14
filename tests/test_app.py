@@ -3828,9 +3828,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.09-field-permissions-v1")
+        self.assertEqual(payload["build_version"], "2026.09.14-incremental-import-v1")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.09-field-permissions-v1")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.14-incremental-import-v1")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -4401,7 +4401,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("<th>资料完成</th><th>送拍时间</th><th>送检时间</th>", body)
         self.assertIn("<th>送拍时间</th>", body)
         self.assertIn("<th>送检时间</th>", body)
-        self.assertIn("<th>检测报告</th><th>发货仓库</th>", body)
+        self.assertIn("<th>检测报告</th><th>发货仓库</th><th>大货到仓</th>", body)
         self.assertIn("<th>品牌名称</th><th>年份季节</th><th>款色</th>", body)
         self.assertIn("<th>款色</th><th>款号</th><th>供应商款号</th><th>颜色名称</th>", body)
         self.assertIn("<th>供应商</th><th>供应商编号</th><th>合作模式</th>", body)
@@ -4410,7 +4410,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("<th>含税价</th>", body)
         self.assertIn("<th>成分(英文)</th>", body)
         self.assertIn("<th>69码</th>", body)
-        self.assertIn("<th>发货仓库</th><th>品牌名称</th>", body)
+        self.assertIn("<th>发货仓库</th><th>大货到仓</th><th>品牌名称</th>", body)
         self.assertNotIn("<th>图片</th>", body)
         self.assertNotIn("<th>上新价格</th>", body)
         self.assertNotIn("<th>F</th>", body)
@@ -4719,6 +4719,206 @@ class CatalogAppTests(unittest.TestCase):
         products = parse_workbook(buffer)
         self.assertEqual(products[0]["material"], "100%棉")
         self.assertNotIn("composition", products[0])
+
+    def test_bulk_arrival_field_is_available_in_catalog_and_incremental_template(self):
+        a_cookie = self.login("a_editor", "demo123")
+        products_body = self.request("/products", cookie=a_cookie)["body"].decode("utf-8")
+        self.assertIn("<th>大货到仓</th>", products_body)
+
+        form_body = self.request("/products/2/edit", cookie=a_cookie)["body"].decode("utf-8")
+        self.assertIn('name="bulk_arrival_date"', form_body)
+        self.assertIn("大货到仓", form_body)
+
+        export_response = self.request("/export.xlsx", cookie=a_cookie)
+        export_workbook = load_workbook(io.BytesIO(export_response["body"]), data_only=True)
+        self.assertIn("大货到仓", [cell.value for cell in export_workbook.active[1]])
+
+        import_page = self.request("/import", cookie=a_cookie)["body"].decode("utf-8")
+        self.assertIn("按款色增量补充", import_page)
+        self.assertIn('href="/import/incremental-template.xlsx"', import_page)
+        template_response = self.request("/import/incremental-template.xlsx", cookie=a_cookie)
+        self.assertTrue(template_response["status"].startswith("200"))
+        template = load_workbook(io.BytesIO(template_response["body"]), data_only=True)
+        headers = [cell.value for cell in template.active[1]]
+        self.assertEqual(headers[0], "款色")
+        self.assertIn("大货到仓", headers)
+        for excluded_header in ("图片", "品类", "上新价格", "上新渠道", "资料完成"):
+            self.assertNotIn(excluded_header, headers)
+
+        b_cookie = self.login("b_editor", "demo123")
+        b_page = self.request("/import", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertNotIn("按款色增量补充", b_page)
+        self.assertTrue(
+            self.request("/import/incremental-template.xlsx", cookie=b_cookie)["status"].startswith("403")
+        )
+
+    def test_a_incremental_excel_import_can_fill_multiple_rounds_without_clearing_existing_values(self):
+        cookie = self.login("a_editor", "demo123")
+        before = db.get_product(self.db_path, 2)
+
+        first_workbook = Workbook()
+        first_sheet = first_workbook.active
+        first_sheet.append(["款色", "供应商编号", "大货到仓", "洗涤方式"])
+        first_sheet.append([before["style_color"], "SUP-INCREMENT-01", datetime(2026, 9, 20), ""])
+        first_buffer = io.BytesIO()
+        first_workbook.save(first_buffer)
+        first_response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "incremental-1.xlsx",
+                first_buffer.getvalue(),
+                extra_fields={"import_mode": "incremental"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(first_response["status"].startswith("200"))
+        self.assertIn("成功补充或更新 1 条", first_response["body"].decode("utf-8"))
+        after_first = db.get_product(self.db_path, 2)
+        self.assertEqual(after_first["supplier_code"], "SUP-INCREMENT-01")
+        self.assertEqual(after_first["bulk_arrival_date"], "2026-09-20")
+        self.assertEqual(after_first["washing_method"], before["washing_method"])
+        self.assertEqual(after_first["material"], before["material"])
+        self.assertEqual(after_first["launch_price"], before["launch_price"])
+
+        second_workbook = Workbook()
+        second_sheet = second_workbook.active
+        second_sheet.append(["款色", "材质", "含税价"])
+        second_sheet.append([before["style_color"], "精纺针织", 175.5])
+        second_buffer = io.BytesIO()
+        second_workbook.save(second_buffer)
+        second_response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "incremental-2.xlsx",
+                second_buffer.getvalue(),
+                extra_fields={"import_mode": "incremental"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(second_response["status"].startswith("200"))
+        after_second = db.get_product(self.db_path, 2)
+        self.assertEqual(after_second["material"], "精纺针织")
+        self.assertEqual(after_second["tax_included_price"], 175.5)
+        self.assertEqual(after_second["supplier_code"], "SUP-INCREMENT-01")
+        self.assertEqual(after_second["bulk_arrival_date"], "2026-09-20")
+        self.assertEqual(after_second["current_version_no"], before["current_version_no"] + 2)
+        self.assertEqual(db.list_product_price_history(self.db_path, 2)[0]["new_price"], 175.5)
+
+    def test_a_incremental_excel_import_rejects_non_a_fields_and_ambiguous_style_colors(self):
+        cookie = self.login("a_editor", "demo123")
+        before = db.get_product(self.db_path, 2)
+
+        forbidden_workbook = Workbook()
+        forbidden_sheet = forbidden_workbook.active
+        forbidden_sheet.append(["款色", "上新价格"])
+        forbidden_sheet.append([before["style_color"], 999])
+        forbidden_buffer = io.BytesIO()
+        forbidden_workbook.save(forbidden_buffer)
+        forbidden_response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "forbidden-incremental.xlsx",
+                forbidden_buffer.getvalue(),
+                extra_fields={"import_mode": "incremental"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(forbidden_response["status"].startswith("400"))
+        forbidden_body = forbidden_response["body"].decode("utf-8")
+        self.assertIn("增量导入包含非跟单部维护字段：上新价格", forbidden_body)
+        self.assertEqual(db.get_product(self.db_path, 2)["launch_price"], before["launch_price"])
+
+        duplicate_row_workbook = Workbook()
+        duplicate_row_sheet = duplicate_row_workbook.active
+        duplicate_row_sheet.append(["款色", "供应商编号"])
+        duplicate_row_sheet.append([before["style_color"], "DUPLICATE-ROW-01"])
+        duplicate_row_sheet.append([before["style_color"], "DUPLICATE-ROW-02"])
+        duplicate_row_buffer = io.BytesIO()
+        duplicate_row_workbook.save(duplicate_row_buffer)
+        duplicate_row_response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "duplicate-row-incremental.xlsx",
+                duplicate_row_buffer.getvalue(),
+                extra_fields={"import_mode": "incremental"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertIn("Excel 内重复款色 1 条", duplicate_row_response["body"].decode("utf-8"))
+        self.assertNotIn(
+            db.get_product(self.db_path, 2)["supplier_code"],
+            {"DUPLICATE-ROW-01", "DUPLICATE-ROW-02"},
+        )
+
+        a_user = next(user for user in db.list_users(self.db_path) if user["username"] == "a_editor")
+        with db.get_connection(self.db_path) as connection:
+            duplicate_id = db.create_product(
+                connection,
+                {
+                    "style_color": before["style_color"],
+                    "style_code": "DUPLICATE-STYLE-COLOR",
+                    "product_name": "重复款色测试",
+                },
+                a_user["id"],
+                "A",
+            )
+
+        ambiguous_workbook = Workbook()
+        ambiguous_sheet = ambiguous_workbook.active
+        ambiguous_sheet.append(["款色", "供应商编号"])
+        ambiguous_sheet.append([before["style_color"], "MUST-NOT-SAVE"])
+        ambiguous_buffer = io.BytesIO()
+        ambiguous_workbook.save(ambiguous_buffer)
+        ambiguous_response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "ambiguous-incremental.xlsx",
+                ambiguous_buffer.getvalue(),
+                extra_fields={"import_mode": "incremental"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(ambiguous_response["status"].startswith("200"))
+        self.assertIn("款色匹配到多条资料 1 条", ambiguous_response["body"].decode("utf-8"))
+        self.assertNotEqual(db.get_product(self.db_path, duplicate_id)["supplier_code"], "MUST-NOT-SAVE")
+        self.assertNotEqual(db.get_product(self.db_path, 2)["supplier_code"], "MUST-NOT-SAVE")
+
+    def test_b_cannot_forge_a_incremental_excel_import(self):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["款色", "供应商编号"])
+        worksheet.append(["针织开衫-米白", "MUST-NOT-SAVE"])
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "forged-a-incremental.xlsx",
+                buffer.getvalue(),
+                extra_fields={"import_mode": "incremental"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=self.login("b_editor", "demo123"),
+        )
+        self.assertTrue(response["status"].startswith("403"))
+        self.assertNotEqual(db.get_product(self.db_path, 2)["supplier_code"], "MUST-NOT-SAVE")
 
     def test_import_updates_owned_record(self):
         cookie = self.login("a_editor", "demo123")

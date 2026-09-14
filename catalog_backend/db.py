@@ -54,7 +54,7 @@ PLATFORM_BILL_FILE_ROLE_LABELS = {
 }
 PLATFORM_SETTINGS_KEY = "platform_bill_platforms_json"
 SUPPLIER_BILL_CHANGE_WINDOW_DAYS = 30
-PRODUCT_DATE_FIELD_KEYS = {"shooting_date", "inspection_date"}
+PRODUCT_DATE_FIELD_KEYS = {"shooting_date", "inspection_date", "bulk_arrival_date"}
 EMPTY_DATE_MARKERS = {
     "0",
     "0.0",
@@ -1043,6 +1043,7 @@ def backfill_list_layout_virtual_fields(connection: sqlite3.Connection) -> None:
 
 def backfill_supplier_product_list_layout_fields(connection: sqlite3.Connection) -> None:
     insertions = (
+        ("shipping_warehouse", "bulk_arrival_date"),
         ("style_code", "supplier_style_code"),
         ("supplier", "supplier_code"),
     )
@@ -1429,6 +1430,7 @@ def seed_default_settings(connection: sqlite3.Connection) -> None:
             "detection_report",
             "size_chart",
             "shipping_warehouse",
+            "bulk_arrival_date",
             "brand_name",
             "season_year",
             "image_url",
@@ -1462,6 +1464,7 @@ def seed_default_settings(connection: sqlite3.Connection) -> None:
             "detection_report",
             "size_chart",
             "shipping_warehouse",
+            "bulk_arrival_date",
             "brand_name",
             "season_year",
             "image_url",
@@ -3511,6 +3514,26 @@ def find_matching_products_for_import(
         if color_name_matches:
             return color_name_matches
     return candidates
+
+
+def find_active_products_by_style_color(
+    connection: sqlite3.Connection,
+    style_color: str | None,
+) -> list[dict]:
+    clean_style_color = str(style_color or "").strip()
+    if not clean_style_color:
+        return []
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM products
+        WHERE lifecycle_status = 'active'
+          AND TRIM(COALESCE(style_color, '')) = ?
+        ORDER BY id DESC
+        """,
+        (clean_style_color,),
+    ).fetchall()
+    return [row_to_dict(row) for row in rows]
 
 
 def list_products(
