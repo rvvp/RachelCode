@@ -3331,8 +3331,10 @@ class PlanningCenterTests(unittest.TestCase):
     def test_stats_defaults_to_latest_season_and_uses_rule_category_options(self):
         planning_db.save_category_option(self.planning_db_path, "针织上衣", "针织上衣", 20)
         planning_db.save_category_option(self.planning_db_path, "半身裙", "半身裙", 30)
+        planning_db.save_category_option(self.planning_db_path, "T恤", "T恤", 40)
         planning_db.save_category_cost_rule(self.planning_db_path, "2026春夏", None, 600, 4)
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 600, 4)
+        planning_db.save_category_rule(self.planning_db_path, "2026秋冬", "连衣裙", 4.2)
         products = [
             {
                 "id": 5101,
@@ -3355,6 +3357,30 @@ class PlanningCenterTests(unittest.TestCase):
                 "supplier": "统计供应商",
                 "category": "针织上衣",
                 "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 1,
+            },
+            {
+                "id": 5103,
+                "style_code": "STATS-AW-002",
+                "style_color": "STATS-AW-002-白",
+                "product_name": "连衣裙秋冬款",
+                "season_year": "2026秋冬",
+                "supplier": "统计供应商",
+                "category": "连衣裙",
+                "actual_cost": 200,
+                "status": "pending",
+                "source_version_no": 1,
+            },
+            {
+                "id": 5104,
+                "style_code": "STATS-AW-003",
+                "style_color": "STATS-AW-003-灰",
+                "product_name": "T恤秋冬款",
+                "season_year": "2026秋冬",
+                "supplier": "统计供应商",
+                "category": "T恤",
+                "actual_cost": 75,
                 "status": "pending",
                 "source_version_no": 1,
             },
@@ -3385,11 +3411,13 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(default_page["status"].startswith("200"))
         self.assertIn("<option value='2026秋冬' selected>2026秋冬</option>", default_html)
         self.assertNotIn("<option value='2026春夏' selected>", default_html)
-        self.assertIn("<option value='' selected>全部品类</option>", default_html)
-        self.assertIn("<option value='针织上衣' ", default_html)
-        self.assertIn("<option value='半身裙' ", default_html)
-        self.assertNotIn("name='category' value=", default_html)
-        self.assertIn("合计 1 款", default_html)
+        self.assertIn("data-stats-category-all checked", default_html)
+        self.assertIn("name='category' value='针织上衣'", default_html)
+        self.assertIn("name='category' value='半身裙'", default_html)
+        self.assertIn("name='category' value='T恤'", default_html)
+        self.assertIn("合计 3 款色", default_html)
+        self.assertNotIn("合计 3 款</span>", default_html)
+        self.assertIn("款色数", default_html)
         self.assertNotIn("统计款式", default_html)
         self.assertNotIn("最低价格带", default_html)
         self.assertNotIn("最高价格带", default_html)
@@ -3397,12 +3425,29 @@ class PlanningCenterTests(unittest.TestCase):
         all_seasons_page = self.wsgi_request(app, "/stats?season_year=", cookie=cookie)
         all_seasons_html = all_seasons_page["body"].decode("utf-8")
         self.assertIn("<option value='' selected>全部季节</option>", all_seasons_html)
-        self.assertIn("合计 2 款", all_seasons_html)
+        self.assertIn("合计 4 款色", all_seasons_html)
 
         category_page = self.wsgi_request(app, "/stats?season_year=2026%E7%A7%8B%E5%86%AC&category=%E9%92%88%E7%BB%87%E4%B8%8A%E8%A1%A3", cookie=cookie)
         category_html = category_page["body"].decode("utf-8")
-        self.assertIn("<option value='针织上衣' selected>", category_html)
-        self.assertIn("合计 1 款", category_html)
+        self.assertIn("name='category' value='针织上衣' data-stats-category-option checked", category_html)
+        self.assertIn("合计 1 款色", category_html)
+        self.assertIn("<h2>针织上衣</h2>", category_html)
+
+        multi_category_page = self.wsgi_request(
+            app,
+            "/stats?season_year=2026%E7%A7%8B%E5%86%AC&category=%E8%BF%9E%E8%A1%A3%E8%A3%99&category=%E9%92%88%E7%BB%87%E4%B8%8A%E8%A1%A3&category=T%E6%81%A4",
+            cookie=cookie,
+        )
+        multi_category_html = multi_category_page["body"].decode("utf-8")
+        self.assertTrue(multi_category_page["status"].startswith("200"))
+        self.assertEqual(multi_category_html.count("class='panel stats-band-card'"), 3)
+        self.assertIn("<h2>连衣裙</h2>", multi_category_html)
+        self.assertIn("<h2>针织上衣</h2>", multi_category_html)
+        self.assertIn("<h2>T恤</h2>", multi_category_html)
+        self.assertEqual(multi_category_html.count("合计 1 款色"), 3)
+        self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", multi_category_html)
+        self.assertIn("@media(max-width:900px){.stats-band-grid{grid-template-columns:1fr}", multi_category_html)
+        self.assertIn("summary data-stats-category-summary>已选 3 个品类</summary>", multi_category_html)
 
 
 if __name__ == "__main__":

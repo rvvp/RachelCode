@@ -29,7 +29,12 @@ class PlanningApplication:
     def __call__(self, environ, start_response):
         method = environ.get("REQUEST_METHOD", "GET").upper()
         path = environ.get("PATH_INFO", "/")
-        query = {key: values[0] for key, values in parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True).items()}
+        parsed_query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+        query = {key: values[0] for key, values in parsed_query.items()}
+        # Most pages use scalar query values, while the stats page accepts
+        # repeated category parameters for its multi-select filter.
+        if "category" in parsed_query:
+            query["categories"] = tuple(parsed_query["category"])
         user = self.current_user(environ)
         try:
             if path == "/healthz" and method == "GET":
@@ -2265,7 +2270,19 @@ class PlanningApplication:
 
     def render_stats(self, user: dict, query: dict) -> str:
         requested_season = query.get("season_year")
-        category = str(query.get("category", "") or "").strip()
+        raw_categories = query.get("categories")
+        if raw_categories is None:
+            raw_categories = [query.get("category", "")]
+        elif isinstance(raw_categories, str):
+            raw_categories = [raw_categories]
+        requested_categories = []
+        for raw_category in raw_categories:
+            requested_categories.extend(
+                part.strip()
+                for part in re.split(r"[,，]", str(raw_category or ""))
+                if part.strip()
+            )
+        requested_categories = list(dict.fromkeys(requested_categories))
         # Statistics only include confirmed/published records. Use the newest
         # season represented by that dataset on first entry, while retaining
         # an explicit empty value as the user's intentional "all seasons"
@@ -2279,26 +2296,73 @@ class PlanningApplication:
         ]
         seasons = sorted({str(record["season_year"]).strip() for record in statistic_records}, reverse=True)
         season = seasons[0] if requested_season is None and seasons else str(requested_season or "").strip()
-        stats = db.pricing_stats(self.db_path, season, category)
-        total = sum(item["count"] for item in stats)
         category_options = [
             str(item["name"])
             for item in db.list_category_options(self.db_path, enabled_only=True)
             if str(item.get("name") or "").strip()
         ]
         category_options = list(dict.fromkeys(category_options))
-        category_select_options = [
-            f"<option value='' {'selected' if not category else ''}>全部品类</option>"
-        ]
-        category_select_options.extend(
-            f"<option value='{html.escape(option, quote=True)}' {'selected' if option == category else ''}>{html.escape(option)}</option>"
-            for option in category_options
+        selected_categories = [category for category in requested_categories if category in category_options]
+        category_picker_label = (
+            "全部品类"
+            if not selected_categories
+            else selected_categories[0]
+            if len(selected_categories) == 1
+            else f"已选 {len(selected_categories)} 个品类"
         )
-        bars = ''.join(f"<div class='band-row'><div class='band-label'><span>{html.escape(item['label'])}</span><strong>{item['count']} 款 · {item['share']:.1f}%</strong></div><div class='bar'><i style='width:{min(100, item['share'])}%'></i></div></div>" for item in stats)
+        category_checkboxes = (
+            f"<label class='stats-category-option stats-category-option-all'><input type='checkbox' name='category' value='' data-stats-category-all {'checked' if not selected_categories else ''}><span>全部品类</span></label>"
+            + "".join(
+                f"<label class='stats-category-option'><input type='checkbox' name='category' value='{html.escape(option, quote=True)}' data-stats-category-option {'checked' if option in selected_categories else ''}><span>{html.escape(option)}</span></label>"
+                for option in category_options
+            )
+        )
+
+        def band_card(title: str, stats: list[dict]) -> str:
+            total = sum(item["count"] for item in stats)
+            bars = "".join(
+                f"<div class='band-row'><div class='band-label'><span>{html.escape(item['label'])}</span><strong>{item['count']} 款色 · {item['share']:.1f}%</strong></div><div class='bar'><i style='width:{min(100, item['share'])}%'></i></div></div>"
+                for item in stats
+            )
+            card_body = bars or '<p class="empty">暂无已确认款色。</p>'
+            return (
+                f"<section class='panel stats-band-card'><div class='panel-head'><div><div class='eyebrow'>CURRENT MIX</div><h2>{html.escape(title)}</h2></div><span class='count'>合计 {total} 款色</span></div>"
+                f"{card_body}</section>"
+            )
+
+        if selected_categories:
+            band_cards = "".join(
+                band_card(category, db.pricing_stats(self.db_path, season, category))
+                for category in selected_categories
+            )
+        else:
+            band_cards = band_card("价格带分布", db.pricing_stats(self.db_path, season, ""))
         content = f"""
-        <section class='page-heading'><div><div class='eyebrow'>PRICE ARCHITECTURE</div><h1>价格带统计</h1><p>统计口径为已确认或已发布的款式数，未定价商品不计入占比。</p></div></section>
-        <section class='filter-bar'><form method='get' action='/stats'><label>年份季节<select name='season_year'><option value='' {'selected' if not season else ''}>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>品类<select name='category'>{''.join(category_select_options)}</select></label><button type='submit'>刷新统计</button></form></section>
-        <section class='panel'><div class='panel-head'><div><div class='eyebrow'>CURRENT MIX</div><h2>价格带分布</h2></div><span class='count'>合计 {total} 款</span></div>{bars or '<p class="empty">暂无已确认定价。</p>'}</section>
+        <section class='page-heading'><div><div class='eyebrow'>PRICE ARCHITECTURE</div><h1>价格带统计</h1><p>统计口径为已确认或已发布的款色数，未定价商品不计入占比。</p></div></section>
+        <section class='filter-bar'><form method='get' action='/stats'><label>年份季节<select name='season_year'><option value='' {'selected' if not season else ''}>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><div class='stats-category-filter'><span>品类（可多选）</span><details class='stats-category-picker'><summary data-stats-category-summary>{html.escape(category_picker_label)}</summary><div class='stats-category-options'>{category_checkboxes}</div></details></div><button type='submit'>刷新统计</button></form></section>
+        <div class='stats-band-grid'>{band_cards}</div>
+        <script>
+        (() => {{
+          const allOption = document.querySelector('[data-stats-category-all]');
+          const categoryOptions = Array.from(document.querySelectorAll('[data-stats-category-option]'));
+          const summary = document.querySelector('[data-stats-category-summary]');
+          const updateSummary = () => {{
+            const checked = categoryOptions.filter((option) => option.checked);
+            if (!checked.length) {{
+              allOption.checked = true;
+              summary.textContent = '全部品类';
+            }} else {{
+              allOption.checked = false;
+              summary.textContent = checked.length === 1 ? checked[0].nextElementSibling.textContent : `已选 ${{checked.length}} 个品类`;
+            }}
+          }};
+          allOption?.addEventListener('change', () => {{
+            if (allOption.checked) categoryOptions.forEach((option) => {{ option.checked = false; }});
+            updateSummary();
+          }});
+          categoryOptions.forEach((option) => option.addEventListener('change', updateSummary));
+        }})();
+        </script>
         """
         return self.shell("价格带统计", content, user, "stats")
 
@@ -2404,7 +2468,7 @@ class PlanningApplication:
 
     def page(self, title: str, content: str, user: dict | None) -> str:
         body_class = "app-body" if user else "login-body"
-        price_display_css = ".pricing-table .price-cell .final-price{display:block;font-size:30px;line-height:1.1}.pricing-table .price-cell .calculated-price{display:block;margin-top:5px;font-size:12px;color:var(--muted)}.pricing-excel-toolbar-only>a{grid-column:3}"
+        price_display_css = ".pricing-table .price-cell .final-price{display:block;font-size:30px;line-height:1.1}.pricing-table .price-cell .calculated-price{display:block;margin-top:5px;font-size:12px;color:var(--muted)}.pricing-excel-toolbar-only>a{grid-column:3}.stats-category-filter{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.stats-category-picker{position:relative;min-width:250px;color:var(--ink);font-size:14px}.stats-category-picker summary{min-height:42px;padding:9px 34px 9px 10px;border:1px solid #cfd8d1;border-radius:3px;background:#fff;cursor:pointer;list-style-position:inside}.stats-category-options{position:absolute;z-index:6;top:calc(100% + 5px);left:0;width:100%;max-height:300px;padding:7px;background:#fff;border:1px solid #cfd8d1;box-shadow:0 12px 30px rgba(20,31,25,.14);overflow:auto}.filter-bar .stats-category-option{display:flex;flex-direction:row;align-items:center;gap:9px;padding:7px 8px;color:var(--ink);font-size:13px;cursor:pointer}.filter-bar .stats-category-option:hover{background:#f4f7f4}.stats-category-option input{flex:0 0 auto;width:16px;height:16px;margin:0;accent-color:var(--deep)}.stats-category-option-all{border-bottom:1px solid var(--line);margin-bottom:4px;font-weight:600}.stats-band-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px;align-items:start}.stats-band-card{margin-bottom:0}.stats-band-card:only-child{grid-column:1/-1}.stats-band-card .panel-head{margin-bottom:18px}@media(max-width:900px){.stats-band-grid{grid-template-columns:1fr}.stats-band-card:only-child{grid-column:auto}.stats-category-picker{min-width:0;width:100%}.stats-category-options{position:static;margin-top:5px}.stats-category-filter{width:100%}}"
         return f"<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{html.escape(title)}</title><style>{self.css()}</style><style>{price_display_css}</style></head><body class='{body_class}'>{content}</body></html>"
 
     def shell(self, title: str, content: str, user: dict, current: str) -> str:
