@@ -234,11 +234,8 @@ def parse_incremental_product_workbook(file_obj) -> tuple[list[dict], tuple[str,
         if normalized == LEGACY_COMPOSITION_HEADER:
             field_key = None if has_material_header else "material"
         column_field_keys.append(field_key)
-    imported_field_keys = tuple(dict.fromkeys(key for key in column_field_keys if key))
-    if not any(key != "style_color" for key in imported_field_keys):
-        raise ValueError("增量导入 Excel 除“款色”外，请至少保留一个需要补充的字段。")
-
     rows = []
+    populated_field_keys: set[str] = set()
     for row_index in range(2, worksheet.max_row + 1):
         raw_values = [worksheet.cell(row_index, column).value for column in range(1, worksheet.max_column + 1)]
         if all(value in (None, "") for value in raw_values):
@@ -257,6 +254,7 @@ def parse_incremental_product_workbook(file_obj) -> tuple[list[dict], tuple[str,
                 raise ValueError(f"增量导入 Excel 第 {row_index} 行“{field.label}”格式不正确。") from error
             if normalized_value not in (None, ""):
                 row_payload[field_key] = normalized_value
+                populated_field_keys.add(field_key)
         style_color = str(row_payload.get("style_color") or "").strip()
         if not style_color:
             raise ValueError(f"增量导入 Excel 第 {row_index} 行缺少款色。")
@@ -264,6 +262,14 @@ def parse_incremental_product_workbook(file_obj) -> tuple[list[dict], tuple[str,
         rows.append(row_payload)
     if not rows:
         raise ValueError("增量导入 Excel 没有可读取的资料行。")
+    # A full exported template still contains headers for B-owned fields. A
+    # blank column is not an attempted edit, so only populated fields should
+    # participate in the permission check.
+    imported_field_keys = tuple(
+        dict.fromkeys(key for key in column_field_keys if key and key in populated_field_keys)
+    )
+    if not any(key != "style_color" for key in imported_field_keys):
+        raise ValueError("增量导入 Excel 除“款色”外，请至少保留一个需要补充的字段。")
     return rows, imported_field_keys
 
 

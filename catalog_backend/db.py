@@ -3402,16 +3402,45 @@ def restore_product_version(
     return next_version_no
 
 
-def find_matching_owned_product(
+def find_matching_owned_products(
     connection: sqlite3.Connection,
     created_by: int,
     style_code: str | None,
+    style_color: str | None,
     color_name: str | None,
     product_name: str | None,
-) -> dict | None:
+) -> list[dict]:
+    clean_style_color = str(style_color or "").strip()
+    if clean_style_color:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM products
+            WHERE created_by = ?
+              AND TRIM(COALESCE(style_color, '')) = ?
+            ORDER BY id DESC
+            """,
+            (created_by, clean_style_color),
+        ).fetchall()
+        candidates = [row_to_dict(row) for row in rows]
+        if len(candidates) <= 1:
+            return candidates
+
+        # A malformed legacy database may contain duplicate 款色 values. Use
+        # the old composite identity only when it resolves to one record;
+        # otherwise the import caller must stop instead of guessing.
+        detailed = [
+            item
+            for item in candidates
+            if str(item.get("style_code") or "").strip() == str(style_code or "").strip()
+            and str(item.get("color_name") or "").strip() == str(color_name or "").strip()
+            and str(item.get("product_name") or "").strip() == str(product_name or "").strip()
+        ]
+        return detailed if len(detailed) == 1 else candidates
+
     if not style_code and not product_name:
-        return None
-    row = connection.execute(
+        return []
+    rows = connection.execute(
         """
         SELECT *
         FROM products
@@ -3420,11 +3449,10 @@ def find_matching_owned_product(
           AND COALESCE(color_name, '') = COALESCE(?, '')
           AND COALESCE(product_name, '') = COALESCE(?, '')
         ORDER BY id DESC
-        LIMIT 1
         """,
         (created_by, style_code or "", color_name or "", product_name or ""),
-    ).fetchone()
-    return row_to_dict(row)
+    ).fetchall()
+    return [row_to_dict(row) for row in rows]
 
 
 def save_or_update_owned_product(
@@ -3436,13 +3464,26 @@ def save_or_update_owned_product(
     if owner_department != "A":
         raise ValueError("只有 A 部门可以通过导入创建或更新主体资料。")
     with get_connection(db_path) as connection:
-        existing = find_matching_owned_product(
+        matching_candidates = find_matching_owned_products(
             connection,
             created_by,
             raw_values.get("style_code"),
+            raw_values.get("style_color"),
             raw_values.get("color_name"),
             raw_values.get("product_name"),
         )
+        if len(matching_candidates) > 1:
+            raise ValueError(
+                f"款色“{str(raw_values.get('style_color') or '').strip()}”匹配到多条本人资料，已停止该行导入，请先清理重复资料。"
+            )
+        existing = matching_candidates[0] if matching_candidates else None
+        style_color = str(raw_values.get("style_color") or "").strip()
+        if style_color and not existing:
+            existing_style_color_products = find_active_products_by_style_color(connection, style_color)
+            if existing_style_color_products:
+                raise PermissionError(
+                    f"款色“{style_color}”已存在，但不是当前账号发起的资料，不能新建重复条目。"
+                )
         protected_import_changes = imported_field_changes(
             existing or {},
             raw_values,
@@ -3460,16 +3501,23 @@ def save_or_update_owned_product(
             )
         sanitized_values = dict(raw_values)
         for field in PRODUCT_FIELDS:
-            if field.key in B_STAGE_FIELD_KEYS:
-                sanitized_values[field.key] = existing.get(field.key) if existing else ""
-                continue
-            if field.key not in sanitized_values and existing:
-                sanitized_values[field.key] = existing.get(field.key)
+            if existing:
+                # Full exports are also used as partial update sheets. Empty
+                # cells mean "leave the current value unchanged".
+                if field.key in B_STAGE_FIELD_KEYS or not has_meaningful_value(sanitized_values.get(field.key)):
+                    sanitized_values[field.key] = existing.get(field.key)
+            elif field.key in B_STAGE_FIELD_KEYS:
+                sanitized_values[field.key] = ""
         if existing:
             sanitized_values["image_gallery_json"] = existing.get("image_gallery_json") or "[]"
         if existing:
             update_product(connection, existing["id"], sanitized_values, created_by)
             return "updated", existing["id"]
+        if (
+            not has_meaningful_value(raw_values.get("style_code"))
+            or not has_meaningful_value(raw_values.get("product_name"))
+        ):
+            raise ValueError("未找到对应款色，且缺少款号或商品名称，不能作为新资料创建。")
         product_id = create_product(connection, sanitized_values, created_by, owner_department)
         return "created", product_id
 

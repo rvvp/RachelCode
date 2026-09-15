@@ -108,7 +108,7 @@ from catalog_backend.uploads import (
 
 
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.09.14-incremental-import-v1"
+CATALOG_BUILD_VERSION = "2026.09.15-partial-import-fix-v1"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -755,7 +755,7 @@ class CatalogApplication:
                     user["id"],
                     user["department"],
                 )
-            except PermissionError as error:
+            except (PermissionError, ValueError) as error:
                 row_label = str(
                     product.get("style_code") or product.get("style_color") or product.get("product_name") or "未命名资料"
                 ).strip()
@@ -12621,13 +12621,13 @@ class CatalogApplication:
             stat_three_value = "A 字段独立维护"
             section_title = "完整字段导入"
             button_text = "开始完整导入"
-            hint_text = "沿用现有规则：使用完整模板新增资料，或更新本人已发起的既有资料。"
+            hint_text = "系统会优先按款色更新本人已发起的既有资料；空白单元格保留原内容。只有款色不存在，且款号、商品名称齐全时才会新增资料。"
             incremental_section = """
             <section class="panel">
               <div class="detail-panel-head">
                 <div class="detail-panel-main">
                   <h2>按款色增量补充</h2>
-                  <p class="meta">Excel 第一列保留“款色”，其余只需保留本次要补充的一个或多个字段。空白单元格会跳过，不会覆盖已有资料。</p>
+                  <p class="meta">Excel 必须保留“款色”列，其余只需保留本次要补充的一个或多个字段。也可直接使用完整导出模板并只填写本次内容；空白单元格不会覆盖已有资料。</p>
                 </div>
                 <div class="detail-panel-tools">
                   <a class="pill" href="/import/incremental-template.xlsx">下载增量模板</a>

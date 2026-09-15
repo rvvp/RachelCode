@@ -3828,9 +3828,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.14-incremental-import-v1")
+        self.assertEqual(payload["build_version"], "2026.09.15-partial-import-fix-v1")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.14-incremental-import-v1")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.15-partial-import-fix-v1")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -4809,6 +4809,117 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(after_second["bulk_arrival_date"], "2026-09-20")
         self.assertEqual(after_second["current_version_no"], before["current_version_no"] + 2)
         self.assertEqual(db.list_product_price_history(self.db_path, 2)[0]["new_price"], 175.5)
+
+    def test_a_partial_full_template_import_uses_style_color_and_preserves_blank_fields(self):
+        from catalog_backend.fields import PRODUCT_FIELDS
+
+        cookie = self.login("a_editor", "demo123")
+        before = db.get_product(self.db_path, 2)
+        product_count_before = len(db.list_products(self.db_path))
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append([field.excel_header for field in PRODUCT_FIELDS])
+        partial_row = [None] * len(PRODUCT_FIELDS)
+        field_indexes = {field.key: index for index, field in enumerate(PRODUCT_FIELDS)}
+        partial_row[field_indexes["style_color"]] = before["style_color"]
+        partial_row[field_indexes["material"]] = "补充后的材质"
+        partial_row[field_indexes["composition_en"]] = "UPDATED COMPOSITION"
+        worksheet.append(partial_row)
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+
+        response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart("workbook", "partial-full-template.xlsx", buffer.getvalue()),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(response["status"].startswith("200"))
+        body = response["body"].decode("utf-8")
+        self.assertIn("新增 0 条，更新 1 条", body)
+        after = db.get_product(self.db_path, 2)
+        self.assertEqual(len(db.list_products(self.db_path)), product_count_before)
+        self.assertEqual(after["id"], before["id"])
+        self.assertEqual(after["style_code"], before["style_code"])
+        self.assertEqual(after["product_name"], before["product_name"])
+        self.assertEqual(after["material"], "补充后的材质")
+        self.assertEqual(after["composition_en"], "UPDATED COMPOSITION")
+        self.assertEqual(after["launch_price"], before["launch_price"])
+        self.assertEqual(after["launch_channel"], before["launch_channel"])
+
+    def test_a_partial_full_template_import_does_not_duplicate_another_owners_style_color(self):
+        from catalog_backend.fields import PRODUCT_FIELDS
+
+        db.create_user(
+            self.db_path,
+            "a_second",
+            "第二位跟单",
+            "A",
+            "second-pass",
+            must_change_password=False,
+        )
+        cookie = self.login("a_second", "second-pass")
+        existing = db.get_product(self.db_path, 2)
+        product_count_before = len(db.list_products(self.db_path))
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append([field.excel_header for field in PRODUCT_FIELDS])
+        partial_row = [None] * len(PRODUCT_FIELDS)
+        field_indexes = {field.key: index for index, field in enumerate(PRODUCT_FIELDS)}
+        partial_row[field_indexes["style_color"]] = existing["style_color"]
+        partial_row[field_indexes["material"]] = "不得写入"
+        worksheet.append(partial_row)
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+
+        response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart("workbook", "other-owner-partial.xlsx", buffer.getvalue()),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(response["status"].startswith("200"))
+        body = response["body"].decode("utf-8")
+        self.assertIn("新增 0 条，更新 0 条", body)
+        self.assertIn("不能新建重复条目", body)
+        self.assertEqual(len(db.list_products(self.db_path)), product_count_before)
+        self.assertEqual(db.get_product(self.db_path, 2)["material"], existing["material"])
+
+    def test_a_incremental_import_accepts_full_template_when_non_a_columns_are_blank(self):
+        from catalog_backend.fields import PRODUCT_FIELDS
+
+        cookie = self.login("a_editor", "demo123")
+        before = db.get_product(self.db_path, 2)
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append([field.excel_header for field in PRODUCT_FIELDS])
+        partial_row = [None] * len(PRODUCT_FIELDS)
+        field_indexes = {field.key: index for index, field in enumerate(PRODUCT_FIELDS)}
+        partial_row[field_indexes["style_color"]] = before["style_color"]
+        partial_row[field_indexes["material"]] = "增量入口补充材质"
+        worksheet.append(partial_row)
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+
+        response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "incremental-from-full-template.xlsx",
+                buffer.getvalue(),
+                extra_fields={"import_mode": "incremental"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertIn("成功补充或更新 1 条", response["body"].decode("utf-8"))
+        after = db.get_product(self.db_path, 2)
+        self.assertEqual(after["material"], "增量入口补充材质")
+        self.assertEqual(after["launch_price"], before["launch_price"])
 
     def test_a_incremental_excel_import_rejects_non_a_fields_and_ambiguous_style_colors(self):
         cookie = self.login("a_editor", "demo123")
