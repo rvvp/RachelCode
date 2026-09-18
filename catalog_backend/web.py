@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import base64
 import cgi
+import fcntl
 import hashlib
+import hmac
 import html
 import io
 import json
 import logging
 import math
+import os
 import re
 import secrets
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import cookies
@@ -19,6 +24,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from catalog_backend import db
+from catalog_backend.concurrency import FileSlotPool, TaskCapacityError
 from catalog_backend.excel import (
     brand_bill_dashboard_workbook_bytes,
     brand_bill_template_bytes,
@@ -110,14 +116,19 @@ from catalog_backend.uploads import (
 
 
 LOGGER = logging.getLogger(__name__)
-SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.09.18-login-stability-v1"
+CATALOG_BUILD_VERSION = "2026.09.18-concurrency-capacity-v2"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
 # phone-camera files and matching the catalog export image limit.
 MAX_PLANNING_IMAGE_BYTES = 20 * 1024 * 1024
 IMAGE_BACKUP_CLEANUP_INTERVAL_SECONDS = 60 * 60
+SESSION_TTL_SECONDS = 24 * 60 * 60
+DEFAULT_IMPORT_WRITE_SLOTS = 1
+DEFAULT_IMPORT_SLOTS = 2
+DEFAULT_EXPORT_SLOTS = 4
+DEFAULT_IMAGE_EXPORT_SLOTS = 2
+DEFAULT_HEAVY_TASK_WAIT_SECONDS = 15 * 60
 LIST_LAYOUT_VIRTUAL_FIELDS: tuple[FieldDef, ...] = ()
 LIST_LAYOUT_VIRTUAL_FIELD_MAP = {}
 LIST_LAYOUT_HIDDEN_FIELD_KEYS = {
@@ -155,9 +166,57 @@ class CatalogApplication:
         self.upload_dir = str(upload_dir)
         self.brand_config = self.build_brand_config(brand_config or {})
         self.planning_api_token = str(planning_api_token or "").strip()
+        self.session_secret = db.get_or_create_session_secret(self.db_path).encode("utf-8")
+        task_lock_dir = Path(self.upload_dir) / ".runtime-locks"
+        task_wait_seconds = self.positive_env_int(
+            "CATALOG_HEAVY_TASK_WAIT_SECONDS",
+            DEFAULT_HEAVY_TASK_WAIT_SECONDS,
+        )
+        self.import_write_pool = FileSlotPool(
+            task_lock_dir,
+            "catalog-import-write",
+            self.positive_env_int("CATALOG_IMPORT_WRITE_SLOTS", DEFAULT_IMPORT_WRITE_SLOTS),
+            wait_seconds=task_wait_seconds,
+        )
+        self.import_pool = FileSlotPool(
+            task_lock_dir,
+            "catalog-import",
+            self.positive_env_int("CATALOG_IMPORT_SLOTS", DEFAULT_IMPORT_SLOTS),
+            wait_seconds=task_wait_seconds,
+        )
+        self.export_pool = FileSlotPool(
+            task_lock_dir,
+            "catalog-export",
+            self.positive_env_int("CATALOG_EXPORT_SLOTS", DEFAULT_EXPORT_SLOTS),
+            wait_seconds=task_wait_seconds,
+        )
+        self.image_export_pool = FileSlotPool(
+            task_lock_dir,
+            "catalog-image-export",
+            self.positive_env_int("CATALOG_IMAGE_EXPORT_SLOTS", DEFAULT_IMAGE_EXPORT_SLOTS),
+            wait_seconds=task_wait_seconds,
+        )
         self._last_image_backup_cleanup_at: float | None = None
         self._image_backup_cleanup_lock = Lock()
         self._image_backup_cleanup_thread: Thread | None = None
+
+    @staticmethod
+    def positive_env_int(name: str, default: int) -> int:
+        try:
+            return max(1, int(str(os.environ.get(name, default)).strip()))
+        except (TypeError, ValueError):
+            return int(default)
+
+    def task_capacity_response(self, start_response, user, task_label: str):
+        return self.html_response(
+            start_response,
+            self.render_message_page(
+                f"{task_label}任务较多",
+                f"当前{task_label}任务正在排队，请稍后重新操作。页面浏览和其他功能不受影响。",
+                user,
+            ),
+            status="503 Service Unavailable",
+        )
 
     def build_brand_config(self, overrides: dict) -> dict:
         config = {
@@ -181,8 +240,14 @@ class CatalogApplication:
 
     def cleanup_expired_image_backups(self) -> None:
         try:
-            referenced_paths = db.current_local_media_paths(self.db_path)
-            cleanup_expired_local_media_backups(self.upload_dir, referenced_paths)
+            lock_path = Path(self.upload_dir) / ".image-backup-cleanup.lock"
+            with lock_path.open("a+") as lock_file:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                referenced_paths = db.current_local_media_paths(self.db_path)
+                cleanup_expired_local_media_backups(self.upload_dir, referenced_paths)
         except Exception:
             LOGGER.exception("Failed to clean expired catalog image backups")
         finally:
@@ -471,10 +536,42 @@ class CatalogApplication:
         session_cookie = parsed_cookie.get("session")
         if not session_cookie:
             return None
-        user_id = SESSIONS.get(session_cookie.value)
+        user_id = self.session_user_id(session_cookie.value)
         if not user_id:
             return None
-        return db.get_user_by_id(self.db_path, user_id)
+        user = db.get_user_by_id(self.db_path, user_id)
+        return user if user and user.get("is_active") else None
+
+    def create_session_token(self, user_id: int) -> str:
+        expires_at = int(datetime.now(timezone.utc).timestamp()) + SESSION_TTL_SECONDS
+        payload = f"{int(user_id)}:{expires_at}:{secrets.token_urlsafe(12)}".encode("utf-8")
+        encoded_payload = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+        signature = hmac.new(
+            self.session_secret,
+            encoded_payload.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        return f"{encoded_payload}.{signature}"
+
+    def session_user_id(self, token: str) -> int | None:
+        try:
+            encoded_payload, supplied_signature = str(token or "").split(".", 1)
+            expected_signature = hmac.new(
+                self.session_secret,
+                encoded_payload.encode("ascii"),
+                hashlib.sha256,
+            ).hexdigest()
+            if not secrets.compare_digest(supplied_signature, expected_signature):
+                return None
+            padding = "=" * (-len(encoded_payload) % 4)
+            payload = base64.urlsafe_b64decode(encoded_payload + padding).decode("utf-8")
+            user_id_text, expires_at_text, _nonce = payload.split(":", 2)
+            if int(expires_at_text) <= int(datetime.now(timezone.utc).timestamp()):
+                return None
+            user_id = int(user_id_text)
+            return user_id if user_id > 0 else None
+        except (UnicodeDecodeError, ValueError, TypeError):
+            return None
 
     def department_monitor_user(self, user: dict, department: str, path: str, query: dict) -> dict:
         """Build a read-only departmental view for an administrator without impersonation."""
@@ -573,21 +670,15 @@ class CatalogApplication:
                 self.render_login("账号或密码不正确，请重试。连续失败过多会临时锁定登录。"),
                 status="401 Unauthorized",
             )
-        token = secrets.token_urlsafe(24)
-        SESSIONS[token] = user["id"]
+        token = self.create_session_token(user["id"])
         headers = [
             ("Location", "/profile/password" if user.get("must_change_password") else "/modules"),
-            ("Set-Cookie", f"session={token}; Path=/; HttpOnly; SameSite=Lax"),
+            ("Set-Cookie", f"session={token}; Path=/; Max-Age={SESSION_TTL_SECONDS}; HttpOnly; SameSite=Lax"),
         ]
         start_response("302 Found", headers)
         return [b""]
 
     def handle_logout(self, environ, start_response):
-        raw_cookie = environ.get("HTTP_COOKIE", "")
-        parsed_cookie = cookies.SimpleCookie(raw_cookie)
-        session_cookie = parsed_cookie.get("session")
-        if session_cookie and session_cookie.value in SESSIONS:
-            del SESSIONS[session_cookie.value]
         headers = [
             ("Location", "/login"),
             ("Set-Cookie", "session=deleted; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT"),
@@ -727,6 +818,13 @@ class CatalogApplication:
         return self.html_response(start_response, self.render_product_detail(user, product, notice))
 
     def handle_import(self, environ, start_response, user):
+        try:
+            with self.import_pool.acquire():
+                return self._handle_import(environ, start_response, user)
+        except TaskCapacityError:
+            return self.task_capacity_response(start_response, user, "导入")
+
+    def _handle_import(self, environ, start_response, user):
         form, files = self.parse_form(environ)
         workbook_field = files.get("workbook")
         if workbook_field is None or getattr(workbook_field, "file", None) is None:
@@ -752,7 +850,11 @@ class CatalogApplication:
                     self.render_import_page(user, error=str(error)),
                     status="400 Bad Request",
                 )
-            return self.handle_a_incremental_import(start_response, user, rows, imported_field_keys)
+            try:
+                with self.import_write_pool.acquire():
+                    return self.handle_a_incremental_import(start_response, user, rows, imported_field_keys)
+            except TaskCapacityError:
+                return self.task_capacity_response(start_response, user, "导入")
         try:
             products = parse_workbook(workbook_field.file)
         except ValueError as error:
@@ -762,28 +864,41 @@ class CatalogApplication:
                 status="400 Bad Request",
             )
         if user.get("department") == "B":
-            return self.handle_b_stage_import(start_response, user, products)
+            try:
+                with self.import_write_pool.acquire():
+                    return self.handle_b_stage_import(start_response, user, products)
+            except TaskCapacityError:
+                return self.task_capacity_response(start_response, user, "导入")
         created = 0
         updated = 0
         blocked: list[str] = []
-        for product in products:
-            try:
-                action, _ = db.save_or_update_owned_product(
-                    self.db_path,
-                    product,
-                    user["id"],
-                    user["department"],
-                )
-            except (PermissionError, ValueError) as error:
-                row_label = str(
-                    product.get("style_code") or product.get("style_color") or product.get("product_name") or "未命名资料"
-                ).strip()
-                blocked.append(f"{row_label}：{error}")
-                continue
-            if action == "created":
-                created += 1
-            else:
-                updated += 1
+        actor_context = {
+            "department": str(user.get("department") or ""),
+            "username": str(user.get("username") or ""),
+        }
+        try:
+            with self.import_write_pool.acquire(), db.get_connection(self.db_path) as connection:
+                for product in products:
+                    try:
+                        action, _ = db.save_or_update_owned_product_in_connection(
+                            connection,
+                            product,
+                            user["id"],
+                            user["department"],
+                            actor_context=actor_context,
+                        )
+                    except (PermissionError, ValueError) as error:
+                        row_label = str(
+                            product.get("style_code") or product.get("style_color") or product.get("product_name") or "未命名资料"
+                        ).strip()
+                        blocked.append(f"{row_label}：{error}")
+                        continue
+                    if action == "created":
+                        created += 1
+                    else:
+                        updated += 1
+        except TaskCapacityError:
+            return self.task_capacity_response(start_response, user, "导入")
         report = f"导入完成：新增 {created} 条，更新 {updated} 条。"
         if blocked:
             preview = "；".join(blocked[:3])
@@ -836,13 +951,22 @@ class CatalogApplication:
             style_key for style_key, count in style_color_counts.items() if count > 1
         }
         duplicate_rows.extend(style_color_labels[style_key] for style_key in sorted(duplicate_style_keys))
+        actor_context = {
+            "department": str(user.get("department") or ""),
+            "username": str(user.get("username") or ""),
+        }
         with db.get_connection(self.db_path) as connection:
+            products_by_style_key: dict[str, list[dict]] = {}
+            for product in db.list_active_products_for_import(connection):
+                style_key = self.style_color_match_key(product.get("style_color"))
+                if style_key:
+                    products_by_style_key.setdefault(style_key, []).append(product)
             for row in rows:
                 style_color = str(row.get("style_color") or "").strip()
                 style_key = self.style_color_match_key(style_color)
                 if style_key in duplicate_style_keys:
                     continue
-                candidates = db.find_active_products_by_style_color(connection, style_color)
+                candidates = products_by_style_key.get(style_key, [])
                 if not candidates:
                     unmatched.append(style_color)
                     continue
@@ -868,7 +992,14 @@ class CatalogApplication:
                     unchanged += 1
                     continue
                 try:
-                    db.update_product(connection, int(product["id"]), update_values, int(user["id"]))
+                    db.update_product(
+                        connection,
+                        int(product["id"]),
+                        update_values,
+                        int(user["id"]),
+                        before_product=product,
+                        actor_context=actor_context,
+                    )
                 except PermissionError as error:
                     blocked.append(f"{style_color}（{error}）")
                     continue
@@ -991,6 +1122,13 @@ class CatalogApplication:
         return self.html_response(start_response, self.render_import_page(user, report=report))
 
     def handle_image_import(self, environ, start_response, user):
+        try:
+            with self.import_pool.acquire():
+                return self._handle_image_import(environ, start_response, user)
+        except TaskCapacityError:
+            return self.task_capacity_response(start_response, user, "导入")
+
+    def _handle_image_import(self, environ, start_response, user):
         _, files = self.parse_form(environ)
         try:
             mapping_workbook = read_validated_file_upload(
@@ -1034,13 +1172,17 @@ class CatalogApplication:
                     self.render_image_import_page(user, error="使用传统 Excel 映射导入时，请同时上传对应的 JPG 或 PNG 图片文件；如果图片已嵌入 Excel，请确认使用的是包含 DISPIMG 图片的 xlsx 文件。"),
                     status="400 Bad Request",
                 )
-            return self.handle_image_import_by_workbook(
-                start_response,
-                user,
-                mapping_rows,
-                upload_payloads,
-                workbook_name=str(mapping_workbook.get("original_filename") or "").strip(),
-            )
+            try:
+                with self.import_write_pool.acquire():
+                    return self.handle_image_import_by_workbook(
+                        start_response,
+                        user,
+                        mapping_rows,
+                        upload_payloads,
+                        workbook_name=str(mapping_workbook.get("original_filename") or "").strip(),
+                    )
+            except TaskCapacityError:
+                return self.task_capacity_response(start_response, user, "导入")
 
         if not upload_payloads:
             return self.html_response(
@@ -1048,7 +1190,11 @@ class CatalogApplication:
                 self.render_image_import_page(user, error="请选择至少一张图片后再导入。"),
                 status="400 Bad Request",
             )
-        return self.handle_image_import_by_filename(start_response, user, upload_payloads)
+        try:
+            with self.import_write_pool.acquire():
+                return self.handle_image_import_by_filename(start_response, user, upload_payloads)
+        except TaskCapacityError:
+            return self.task_capacity_response(start_response, user, "导入")
 
     def handle_image_import_by_filename(self, start_response, user, upload_payloads: list[dict]):
         uploads_by_style_color: dict[str, list[tuple[str, dict]]] = {}
@@ -1339,11 +1485,18 @@ class CatalogApplication:
         ]
         visible_fields = self.visible_fields_for_user(user)
         include_images = query.get("include_images", "").strip() == "1"
-        body = workbook_bytes(
-            products,
-            visible_fields,
-            image_fetcher=self.fetch_export_image if include_images else None,
-        )
+        try:
+            with ExitStack() as task_slots:
+                task_slots.enter_context(self.export_pool.acquire())
+                if include_images:
+                    task_slots.enter_context(self.image_export_pool.acquire())
+                body = workbook_bytes(
+                    products,
+                    visible_fields,
+                    image_fetcher=self.fetch_export_image if include_images else None,
+                )
+        except TaskCapacityError:
+            return self.task_capacity_response(start_response, user, "导出")
         filename = "catalog-export-with-images.xlsx" if include_images else "catalog-export.xlsx"
         headers = [
             ("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),

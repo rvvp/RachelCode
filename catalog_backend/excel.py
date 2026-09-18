@@ -13,8 +13,10 @@ from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 from PIL import Image as PillowImage
 from PIL import ImageOps
 
@@ -160,9 +162,10 @@ EMBEDDED_IMAGE_CONTENT_TYPES = {
 
 
 def parse_workbook(file_obj) -> list[dict]:
-    workbook = load_workbook(file_obj, data_only=True)
+    workbook = load_workbook(file_obj, data_only=True, read_only=True)
     worksheet = workbook[workbook.sheetnames[0]]
-    raw_headers = [worksheet.cell(1, column).value for column in range(1, worksheet.max_column + 1)]
+    row_iterator = worksheet.iter_rows(values_only=True)
+    raw_headers = list(next(row_iterator, ()))
     normalized_headers = [normalize_header(header) for header in raw_headers]
     material_header = normalize_header("材质")
     has_material_header = material_header in normalized_headers
@@ -179,31 +182,32 @@ def parse_workbook(file_obj) -> list[dict]:
         raise ValueError("模板表头不匹配，请确认使用参考模板的第一行表头。")
 
     products = []
-    for row_index in range(2, worksheet.max_row + 1):
+    for raw_values in row_iterator:
         row_payload = {}
         has_content = False
-        for column_index, normalized in enumerate(normalized_headers, start=1):
+        for normalized, value in zip(normalized_headers, raw_values):
             field_key = HEADER_KEY_LOOKUP.get(normalized)
             if normalized == LEGACY_COMPOSITION_HEADER:
                 # Keep old templates usable without reintroducing a duplicate field.
                 field_key = None if has_material_header else "material"
             if not field_key:
                 continue
-            value = worksheet.cell(row_index, column_index).value
             if value not in (None, ""):
                 has_content = True
             row_payload[field_key] = value
         if not has_content:
             continue
         products.append(normalize_product_data(row_payload))
+    workbook.close()
     return products
 
 
 def parse_incremental_product_workbook(file_obj) -> tuple[list[dict], tuple[str, ...]]:
     """Read a style-color keyed workbook without manufacturing absent fields."""
-    workbook = load_workbook(file_obj, data_only=True)
+    workbook = load_workbook(file_obj, data_only=True, read_only=True)
     worksheet = workbook[workbook.sheetnames[0]]
-    raw_headers = [worksheet.cell(1, column).value for column in range(1, worksheet.max_column + 1)]
+    row_iterator = worksheet.iter_rows(values_only=True)
+    raw_headers = list(next(row_iterator, ()))
     normalized_headers = [normalize_header(header) for header in raw_headers]
     style_color_header = normalize_header("款色")
     if style_color_header not in normalized_headers:
@@ -236,8 +240,7 @@ def parse_incremental_product_workbook(file_obj) -> tuple[list[dict], tuple[str,
         column_field_keys.append(field_key)
     rows = []
     populated_field_keys: set[str] = set()
-    for row_index in range(2, worksheet.max_row + 1):
-        raw_values = [worksheet.cell(row_index, column).value for column in range(1, worksheet.max_column + 1)]
+    for row_index, raw_values in enumerate(row_iterator, start=2):
         if all(value in (None, "") for value in raw_values):
             continue
         row_payload = {}
@@ -270,6 +273,7 @@ def parse_incremental_product_workbook(file_obj) -> tuple[list[dict], tuple[str,
     )
     if not any(key != "style_color" for key in imported_field_keys):
         raise ValueError("增量导入 Excel 除“款色”外，请至少保留一个需要补充的字段。")
+    workbook.close()
     return rows, imported_field_keys
 
 
@@ -440,9 +444,6 @@ def workbook_bytes(
     visible_fields,
     image_fetcher: Callable[[str], bytes] | None = None,
 ) -> bytes:
-    workbook = Workbook()
-    worksheet = workbook.active
-    worksheet.title = "商品资料"
     include_completion_flag = any(field.key == "completion_flag" for field in visible_fields)
     export_fields = [
         field for field in visible_fields
@@ -452,13 +453,43 @@ def workbook_bytes(
     if include_completion_flag:
         headers.append("资料完成")
     headers.extend(field.excel_header for field in export_fields)
+    start_index = 2
+    if include_completion_flag:
+        start_index = 3
+
+    if image_fetcher is None:
+        workbook = Workbook(write_only=True)
+        worksheet = workbook.create_sheet("商品资料")
+        worksheet.freeze_panes = "A2"
+        worksheet.column_dimensions["A"].width = 12
+        if include_completion_flag:
+            worksheet.column_dimensions["B"].width = 12
+        for index, field in enumerate(export_fields, start=start_index):
+            worksheet.column_dimensions[get_column_letter(index)].width = max(12, len(field.label) + 4)
+        header_cells = []
+        for header in headers:
+            cell = WriteOnlyCell(worksheet, value=header)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(fill_type="solid", fgColor="5B4B3A")
+            header_cells.append(cell)
+        worksheet.append(header_cells)
+        for product in products:
+            row = [product.get("elapsed_days_label", "")]
+            if include_completion_flag:
+                row.append(product.get("completion_flag", ""))
+            row.extend(product.get(field.key) for field in export_fields)
+            worksheet.append(row)
+        buffer = BytesIO()
+        workbook.save(buffer)
+        return buffer.getvalue()
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "商品资料"
     worksheet.append(headers)
     for cell in worksheet[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill(fill_type="solid", fgColor="5B4B3A")
-    start_index = 2
-    if include_completion_flag:
-        start_index = 3
     image_column_index = next(
         (
             index

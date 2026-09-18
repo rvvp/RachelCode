@@ -27,6 +27,7 @@ DEMO_PASSWORD = "demo123"
 LOGIN_FAILURE_LIMIT = 5
 LOGIN_LOCK_MINUTES = 15
 SQLITE_BUSY_TIMEOUT_MS = 15_000
+SESSION_SECRET_SETTING_KEY = "catalog_session_secret"
 UTC = timezone.utc
 LIST_LAYOUT_VIRTUAL_KEYS = ("completion_flag",)
 LIST_LAYOUT_HIDDEN_KEYS = (
@@ -894,6 +895,10 @@ def init_db(
             "CREATE INDEX IF NOT EXISTS idx_products_lifecycle_status ON products(lifecycle_status)"
         )
         connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_products_active_style_color "
+            "ON products(lifecycle_status, style_color)"
+        )
+        connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_product_logs_product_id ON product_logs(product_id)"
         )
         connection.execute(
@@ -1610,6 +1615,30 @@ def authenticate_user(db_path: str | Path, username: str, password: str) -> dict
     if verify_password(password, user["password_hash"]):
         return user
     return None
+
+
+def get_or_create_session_secret(db_path: str | Path) -> str:
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT setting_value FROM app_settings WHERE setting_key = ?",
+            (SESSION_SECRET_SETTING_KEY,),
+        ).fetchone()
+        if row and str(row["setting_value"] or "").strip():
+            return str(row["setting_value"]).strip()
+        secret = secrets.token_urlsafe(48)
+        connection.execute(
+            """
+            INSERT INTO app_settings (setting_key, setting_value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(setting_key) DO NOTHING
+            """,
+            (SESSION_SECRET_SETTING_KEY, secret, utc_now()),
+        )
+        stored = connection.execute(
+            "SELECT setting_value FROM app_settings WHERE setting_key = ?",
+            (SESSION_SECRET_SETTING_KEY,),
+        ).fetchone()
+        return str(stored["setting_value"] if stored else secret).strip()
 
 
 def process_login_attempt(db_path: str | Path, username: str, password: str) -> dict:
@@ -2455,9 +2484,20 @@ def apply_workflow_restart_state(
     return []
 
 
-def update_product(connection: sqlite3.Connection, product_id: int, raw_values: dict, actor_user_id: int | None = None) -> None:
-    before_row = connection.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
-    before_product = row_to_dict(before_row) or {}
+def update_product(
+    connection: sqlite3.Connection,
+    product_id: int,
+    raw_values: dict,
+    actor_user_id: int | None = None,
+    *,
+    before_product: dict | None = None,
+    actor_context: dict | None = None,
+) -> None:
+    if before_product is None:
+        before_row = connection.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+        before_product = row_to_dict(before_row) or {}
+    else:
+        before_product = dict(before_product)
     if not before_product:
         raise LookupError("商品资料不存在。")
     requested_payload = normalize_product_data({**before_product, **raw_values})
@@ -2465,12 +2505,14 @@ def update_product(connection: sqlite3.Connection, product_id: int, raw_values: 
     actor_username = ""
     allowed_field_keys = {field.key for field in PRODUCT_FIELDS}
     if actor_user_id:
-        actor_row = connection.execute(
-            "SELECT department, username FROM users WHERE id = ?",
-            (actor_user_id,),
-        ).fetchone()
-        actor_department = str(actor_row["department"] if actor_row else "")
-        actor_username = str(actor_row["username"] if actor_row else "")
+        if actor_context is None:
+            actor_row = connection.execute(
+                "SELECT department, username FROM users WHERE id = ?",
+                (actor_user_id,),
+            ).fetchone()
+            actor_context = dict(actor_row) if actor_row else {}
+        actor_department = str(actor_context.get("department") or "")
+        actor_username = str(actor_context.get("username") or "")
         if actor_username == "planning_service":
             allowed_field_keys = set(B_PLANNING_MANAGED_FIELD_KEYS)
         elif actor_department == "A":
@@ -3546,65 +3588,87 @@ def save_or_update_owned_product(
     created_by: int,
     owner_department: str,
 ) -> tuple[str, int]:
+    with get_connection(db_path) as connection:
+        return save_or_update_owned_product_in_connection(
+            connection,
+            raw_values,
+            created_by,
+            owner_department,
+        )
+
+
+def save_or_update_owned_product_in_connection(
+    connection: sqlite3.Connection,
+    raw_values: dict,
+    created_by: int,
+    owner_department: str,
+    *,
+    actor_context: dict | None = None,
+) -> tuple[str, int]:
     if owner_department != "A":
         raise ValueError("只有 A 部门可以通过导入创建或更新主体资料。")
-    with get_connection(db_path) as connection:
-        matching_candidates = find_matching_owned_products(
-            connection,
-            created_by,
-            raw_values.get("style_code"),
-            raw_values.get("style_color"),
-            raw_values.get("color_name"),
-            raw_values.get("product_name"),
+    matching_candidates = find_matching_owned_products(
+        connection,
+        created_by,
+        raw_values.get("style_code"),
+        raw_values.get("style_color"),
+        raw_values.get("color_name"),
+        raw_values.get("product_name"),
+    )
+    if len(matching_candidates) > 1:
+        raise ValueError(
+            f"款色“{str(raw_values.get('style_color') or '').strip()}”匹配到多条本人资料，已停止该行导入，请先清理重复资料。"
         )
-        if len(matching_candidates) > 1:
-            raise ValueError(
-                f"款色“{str(raw_values.get('style_color') or '').strip()}”匹配到多条本人资料，已停止该行导入，请先清理重复资料。"
-            )
-        existing = matching_candidates[0] if matching_candidates else None
-        style_color = str(raw_values.get("style_color") or "").strip()
-        if style_color and not existing:
-            existing_style_color_products = find_active_products_by_style_color(connection, style_color)
-            if existing_style_color_products:
-                raise PermissionError(
-                    f"款色“{style_color}”已存在，但不是当前账号发起的资料，不能新建重复条目。"
-                )
-        protected_import_changes = imported_field_changes(
-            existing or {},
-            raw_values,
-            B_CATALOG_PROTECTED_FIELD_KEYS,
-        )
-        if protected_import_changes:
-            labels = "、".join(
-                PRODUCT_FIELD_MAP[key].label
-                for key in sorted(protected_import_changes)
-                if key in PRODUCT_FIELD_MAP
-            )
+    existing = matching_candidates[0] if matching_candidates else None
+    style_color = str(raw_values.get("style_color") or "").strip()
+    if style_color and not existing:
+        existing_style_color_products = find_active_products_by_style_color(connection, style_color)
+        if existing_style_color_products:
             raise PermissionError(
-                f"当前账号不能通过 Excel 导入或修改这些商品部字段：{labels}。"
-                "品类、上新价格和上新渠道只能由商品企划中心维护并回传。"
+                f"款色“{style_color}”已存在，但不是当前账号发起的资料，不能新建重复条目。"
             )
-        sanitized_values = dict(raw_values)
-        for field in PRODUCT_FIELDS:
-            if existing:
-                # Full exports are also used as partial update sheets. Empty
-                # cells mean "leave the current value unchanged".
-                if field.key in B_STAGE_FIELD_KEYS or not has_meaningful_value(sanitized_values.get(field.key)):
-                    sanitized_values[field.key] = existing.get(field.key)
-            elif field.key in B_STAGE_FIELD_KEYS:
-                sanitized_values[field.key] = ""
+    protected_import_changes = imported_field_changes(
+        existing or {},
+        raw_values,
+        B_CATALOG_PROTECTED_FIELD_KEYS,
+    )
+    if protected_import_changes:
+        labels = "、".join(
+            PRODUCT_FIELD_MAP[key].label
+            for key in sorted(protected_import_changes)
+            if key in PRODUCT_FIELD_MAP
+        )
+        raise PermissionError(
+            f"当前账号不能通过 Excel 导入或修改这些商品部字段：{labels}。"
+            "品类、上新价格和上新渠道只能由商品企划中心维护并回传。"
+        )
+    sanitized_values = dict(raw_values)
+    for field in PRODUCT_FIELDS:
         if existing:
-            sanitized_values["image_gallery_json"] = existing.get("image_gallery_json") or "[]"
-        if existing:
-            update_product(connection, existing["id"], sanitized_values, created_by)
-            return "updated", existing["id"]
-        if (
-            not has_meaningful_value(raw_values.get("style_code"))
-            or not has_meaningful_value(raw_values.get("product_name"))
-        ):
-            raise ValueError("未找到对应款色，且缺少款号或商品名称，不能作为新资料创建。")
-        product_id = create_product(connection, sanitized_values, created_by, owner_department)
-        return "created", product_id
+            # Full exports are also used as partial update sheets. Empty
+            # cells mean "leave the current value unchanged".
+            if field.key in B_STAGE_FIELD_KEYS or not has_meaningful_value(sanitized_values.get(field.key)):
+                sanitized_values[field.key] = existing.get(field.key)
+        elif field.key in B_STAGE_FIELD_KEYS:
+            sanitized_values[field.key] = ""
+    if existing:
+        sanitized_values["image_gallery_json"] = existing.get("image_gallery_json") or "[]"
+        update_product(
+            connection,
+            existing["id"],
+            sanitized_values,
+            created_by,
+            before_product=existing,
+            actor_context=actor_context,
+        )
+        return "updated", existing["id"]
+    if (
+        not has_meaningful_value(raw_values.get("style_code"))
+        or not has_meaningful_value(raw_values.get("product_name"))
+    ):
+        raise ValueError("未找到对应款色，且缺少款号或商品名称，不能作为新资料创建。")
+    product_id = create_product(connection, sanitized_values, created_by, owner_department)
+    return "created", product_id
 
 
 def find_matching_products_for_import(
@@ -3665,6 +3729,18 @@ def find_active_products_by_style_color(
         ORDER BY id DESC
         """,
         (clean_style_color,),
+    ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def list_active_products_for_import(connection: sqlite3.Connection) -> list[dict]:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM products
+        WHERE lifecycle_status = 'active'
+        ORDER BY id DESC
+        """
     ).fetchall()
     return [row_to_dict(row) for row in rows]
 

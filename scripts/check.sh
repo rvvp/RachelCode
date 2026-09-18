@@ -47,6 +47,7 @@ fi
 if [ -f "$ROOT_DIR/requirements.txt" ]; then
   echo "运行依赖检查"
   "$PYTHON_BIN" -m pip show openpyxl >/dev/null 2>&1 && echo "OK openpyxl 已安装" || echo "WARN openpyxl 未安装，Excel 导入导出不可用"
+  "$PYTHON_BIN" -m pip show gunicorn >/dev/null 2>&1 && echo "OK gunicorn 已安装" || echo "WARN gunicorn 未安装，生产多进程服务不可用"
 fi
 
 echo "运行代码编译检查"

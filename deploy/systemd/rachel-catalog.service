@@ -10,7 +10,16 @@ Group=rachelcode
 WorkingDirectory=/opt/rachelcode/app
 Environment=PYTHONUNBUFFERED=1
 Environment=CATALOG_BRAND_MARK=Sienna
-ExecStart=/opt/rachelcode/venv/bin/python /opt/rachelcode/app/app.py --host 0.0.0.0 --port 8765 --db /data/rachelcode/catalog/catalog.db --uploads /data/rachelcode/catalog/uploads --no-seed-demo --no-seed-samples
+Environment=CATALOG_DB=/data/rachelcode/catalog/catalog.db
+Environment=CATALOG_UPLOADS=/data/rachelcode/catalog/uploads
+Environment=CATALOG_SEED_DEMO=0
+Environment=CATALOG_SEED_SAMPLES=0
+Environment=CATALOG_IMPORT_SLOTS=2
+Environment=CATALOG_IMPORT_WRITE_SLOTS=1
+Environment=CATALOG_EXPORT_SLOTS=4
+Environment=CATALOG_IMAGE_EXPORT_SLOTS=2
+Environment=CATALOG_HEAVY_TASK_WAIT_SECONDS=900
+ExecStart=/opt/rachelcode/venv/bin/gunicorn --chdir /opt/rachelcode/app --bind 0.0.0.0:8765 --workers 8 --threads 4 --worker-class gthread --timeout 1800 --graceful-timeout 30 --keep-alive 5 --max-requests 1000 --max-requests-jitter 100 --worker-tmp-dir /dev/shm catalog_wsgi:application
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20

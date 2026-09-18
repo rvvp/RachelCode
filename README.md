@@ -145,6 +145,11 @@ http://127.0.0.1:8765
 - `CATALOG_BACKUP_MINUTE`
 - `CATALOG_SEED_DEMO`
 - `CATALOG_SEED_SAMPLES`
+- `CATALOG_IMPORT_SLOTS`（默认 `2`）
+- `CATALOG_IMPORT_WRITE_SLOTS`（SQLite 正式环境保持 `1`）
+- `CATALOG_EXPORT_SLOTS`（默认 `4`）
+- `CATALOG_IMAGE_EXPORT_SLOTS`（默认 `2`）
+- `CATALOG_HEAVY_TASK_WAIT_SECONDS`（默认 `900`）
 - `CATALOG_BOOTSTRAP_ADMIN_USERNAME`
 - `CATALOG_BOOTSTRAP_ADMIN_PASSWORD`
 - `CATALOG_BOOTSTRAP_ADMIN_NAME`
@@ -166,6 +171,8 @@ http://127.0.0.1:8765
 3. 按你的正式环境修改数据库路径、上传目录和管理员初始化信息
 4. 用 `scripts/start.sh` 启动
 5. 用 `/healthz` 检查服务是否正常
+
+`scripts/start.sh` 仅适合本机开发。Linux 正式服务器应安装 `deploy/systemd/rachel-catalog.service`，使用 8 个 Gunicorn 进程和 32 个请求位置；该配置已按 4 个导入、12 个导出、10 个浏览/登录的混合峰值验证。Windows 10/11 的 Edge、Chrome、Office 和 WPS 均走标准网页及 `.xlsx` 上传下载流程。
 
 如果是“开发目录”发布到“正式运行目录”的本机模式，后续建议不要手工覆盖正式目录，而是使用：
 

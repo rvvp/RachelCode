@@ -20,6 +20,7 @@ from PIL import Image as PillowImage
 
 from catalog_backend import CatalogApplication, init_db
 from catalog_backend import db
+from catalog_backend.concurrency import FileSlotPool, TaskCapacityError
 from catalog_backend.policies import available_status_actions
 from catalog_backend.uploads import (
     IMAGE_BACKUP_RETENTION_SECONDS,
@@ -3832,9 +3833,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.18-login-stability-v1")
+        self.assertEqual(payload["build_version"], "2026.09.18-concurrency-capacity-v2")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.18-login-stability-v1")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.18-concurrency-capacity-v2")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -3882,6 +3883,56 @@ class CatalogAppTests(unittest.TestCase):
         status_after = db.get_login_attempt_status(self.db_path, "a_editor")
         self.assertEqual(status_after["failure_count"], 0)
 
+    def test_signed_login_session_is_shared_between_application_workers(self):
+        cookie = self.login("a_editor", "demo123")
+        second_worker = CatalogApplication(self.db_path, self.upload_dir)
+
+        original_app = self.app
+        try:
+            self.app = second_worker
+            response = self.request("/modules", cookie=cookie)
+            tampered = self.request("/modules", cookie=cookie + "x")
+        finally:
+            self.app = original_app
+
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertIn("商品资料后台", response["body"].decode("utf-8"))
+        self.assertTrue(tampered["status"].startswith("302"))
+
+    def test_file_slot_pool_limits_tasks_across_application_instances(self):
+        lock_dir = Path(self.temp_dir.name) / "task-locks"
+        first_pool = FileSlotPool(lock_dir, "export", 1, wait_seconds=0)
+        second_pool = FileSlotPool(lock_dir, "export", 1, wait_seconds=0)
+
+        with first_pool.acquire():
+            with self.assertRaises(TaskCapacityError):
+                with second_pool.acquire():
+                    pass
+
+    def test_export_capacity_limit_keeps_request_bounded(self):
+        cookie = self.login("a_editor", "demo123")
+        lock_dir = Path(self.temp_dir.name) / "export-capacity"
+        occupied_pool = FileSlotPool(lock_dir, "export", 1, wait_seconds=0)
+        self.app.export_pool = FileSlotPool(lock_dir, "export", 1, wait_seconds=0)
+
+        with occupied_pool.acquire():
+            response = self.request("/export.xlsx", cookie=cookie)
+
+        self.assertTrue(response["status"].startswith("503"))
+        self.assertIn("导出任务较多", response["body"].decode("utf-8"))
+
+    def test_import_capacity_limit_rejects_before_reading_a_large_upload(self):
+        cookie = self.login("a_editor", "demo123")
+        lock_dir = Path(self.temp_dir.name) / "import-capacity"
+        occupied_pool = FileSlotPool(lock_dir, "import", 1, wait_seconds=0)
+        self.app.import_pool = FileSlotPool(lock_dir, "import", 1, wait_seconds=0)
+
+        with occupied_pool.acquire():
+            response = self.request("/import", method="POST", cookie=cookie)
+
+        self.assertTrue(response["status"].startswith("503"))
+        self.assertIn("导入任务较多", response["body"].decode("utf-8"))
+
     def test_init_db_can_skip_demo_seed_and_create_bootstrap_admin(self):
         clean_db_path = Path(self.temp_dir.name) / "clean-catalog.db"
         init_db(
@@ -3921,6 +3972,12 @@ class CatalogAppTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "authenticated")
             self.assertEqual(result["user"]["username"], "a_editor")
+            login_response = self.request(
+                "/login",
+                method="POST",
+                body=urlencode({"username": "a_editor", "password": "demo123"}).encode("utf-8"),
+            )
+            self.assertTrue(login_response["status"].startswith("302"))
             writer.rollback()
 
     def test_init_db_without_demo_seed_does_not_create_sample_products(self):

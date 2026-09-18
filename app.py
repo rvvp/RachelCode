@@ -49,7 +49,7 @@ def env_text(name: str, default: str) -> str:
     return value.strip() or default
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="思安娜的藏寶閣")
     parser.add_argument("--host", default=os.environ.get("CATALOG_HOST", "127.0.0.1"), help="监听地址")
     parser.add_argument("--port", type=int, default=env_int("CATALOG_PORT", 8765), help="监听端口")
@@ -81,12 +81,10 @@ def parse_args():
     parser.add_argument("--brand-accent-strong", default=env_text("CATALOG_BRAND_ACCENT_STRONG", "#7f3b08"), help="深主色")
     parser.add_argument("--brand-accent-deep", default=env_text("CATALOG_BRAND_ACCENT_DEEP", "#355f52"), help="辅色")
     parser.add_argument("--planning-api-token", default=os.environ.get("CATALOG_PLANNING_API_TOKEN", ""), help="商品企划中心内部接口 Token")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main():
-    load_env_file(Path(__file__).resolve().parent / ".env")
-    args = parse_args()
+def build_application(args):
     bootstrap_admin = None
     if args.bootstrap_admin_username and args.bootstrap_admin_password:
         bootstrap_admin = {
@@ -101,7 +99,7 @@ def main():
         seed_samples=args.seed_samples and args.seed_demo,
         bootstrap_admin=bootstrap_admin,
     )
-    app = CatalogApplication(
+    return CatalogApplication(
         args.db,
         args.uploads,
         brand_config={
@@ -117,6 +115,17 @@ def main():
         },
         planning_api_token=args.planning_api_token,
     )
+
+
+def application_from_environment():
+    load_env_file(Path(__file__).resolve().parent / ".env")
+    return build_application(parse_args([]))
+
+
+def main():
+    load_env_file(Path(__file__).resolve().parent / ".env")
+    args = parse_args()
+    app = build_application(args)
     print("思安娜的藏寶閣已启动")
     print(f"访问地址: http://{args.host}:{args.port}")
     print(f"数据库: {args.db}")
@@ -127,9 +136,9 @@ def main():
         print(f"  商品部: b_editor / {DEMO_PASSWORD}")
         print(f"  运营部: c_viewer / {DEMO_PASSWORD}")
         print(f"  系统管理员: admin_reviewer / {DEMO_PASSWORD}")
-    elif bootstrap_admin:
+    elif args.bootstrap_admin_username and args.bootstrap_admin_password:
         print("已启用正式初始化模式:")
-        print(f"  管理员账号: {bootstrap_admin['username']}")
+        print(f"  管理员账号: {args.bootstrap_admin_username}")
         print("  建议首次登录后立即修改密码。")
     else:
         print("当前未注入演示账号。请先通过初始化管理员参数创建首个管理员账号。")

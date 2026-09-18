@@ -33,8 +33,8 @@
    `CATALOG_BOOTSTRAP_ADMIN_NAME`
 9. 首次启动前执行：
    `chmod +x scripts/*.sh`
-10. 启动服务：
-   `./scripts/start.sh`
+10. 本机开发可使用 `./scripts/start.sh`；Linux 正式服务器必须使用
+    `deploy/systemd/rachel-catalog.service` 中的 Gunicorn 多进程配置，不能继续使用单进程开发服务器。
 11. 健康检查：
    `http://127.0.0.1:8765/healthz`
 12. 启动前后建议执行：
@@ -43,6 +43,20 @@
    `./scripts/install_launchd.sh`
 14. 如果要开启每日自动备份：
    `./scripts/install_backup_launchd.sh`
+
+## 第一阶段并发容量
+
+当前正式配置按实际使用量的约 2 倍预留：
+
+- 8 个 Gunicorn 工作进程，每个进程 4 个线程，共 32 个请求位置
+- 最多 2 个商品导入任务同时解析，数据库写入按 1 个任务依次执行
+- 最多 4 个普通 Excel 同时生成
+- 最多 2 个含图片 Excel 同时生成
+- 登录、页面浏览和普通查询不进入重任务队列
+
+建议服务器至少 4 核 CPU、4GB 可用内存；同时运行商品企划中心等其他应用时建议 8GB 或以上。上线后用 `/healthz` 核对版本，并确认服务进程由 Gunicorn 启动。
+
+客户端以 Windows 10/11 的 Edge、Chrome 以及 Microsoft Office/WPS 为兼容基线。用户电脑不需要安装 Python；导入、导出和计算都在服务器完成。
 
 ## 本机安全同步建议
 
