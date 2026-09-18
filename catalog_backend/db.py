@@ -26,6 +26,7 @@ from catalog_backend.policies import (
 DEMO_PASSWORD = "demo123"
 LOGIN_FAILURE_LIMIT = 5
 LOGIN_LOCK_MINUTES = 15
+SQLITE_BUSY_TIMEOUT_MS = 15_000
 UTC = timezone.utc
 LIST_LAYOUT_VIRTUAL_KEYS = ("completion_flag",)
 LIST_LAYOUT_HIDDEN_KEYS = (
@@ -104,8 +105,12 @@ def utc_now() -> str:
 
 
 def get_connection(db_path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(
+        str(db_path),
+        timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+    )
     connection.row_factory = sqlite3.Row
+    connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
@@ -178,6 +183,9 @@ def init_db(
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with get_connection(db_path) as connection:
+        # WAL lets normal page reads and logins continue while imports or
+        # catalog updates are writing to the same SQLite database.
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -1602,6 +1610,83 @@ def authenticate_user(db_path: str | Path, username: str, password: str) -> dict
     if verify_password(password, user["password_hash"]):
         return user
     return None
+
+
+def process_login_attempt(db_path: str | Path, username: str, password: str) -> dict:
+    """Validate one login using a single database connection and transaction."""
+    clean_username = username.strip()
+    now = datetime.now(UTC)
+    with get_connection(db_path) as connection:
+        attempt_row = connection.execute(
+            """
+            SELECT username, failure_count, locked_until, last_attempt_at
+            FROM login_attempts
+            WHERE username = ?
+            """,
+            (clean_username,),
+        ).fetchone()
+        locked_until = parse_utc(attempt_row["locked_until"]) if attempt_row else None
+        if locked_until and locked_until > now:
+            return {
+                "status": "locked",
+                "user": None,
+                "failure_count": int(attempt_row["failure_count"] or 0),
+                "remaining_seconds": max(0, int((locked_until - now).total_seconds())),
+            }
+
+        user_row = connection.execute(
+            "SELECT * FROM users WHERE username = ?",
+            (clean_username,),
+        ).fetchone()
+        user = dict(user_row) if user_row else None
+        authenticated = bool(
+            user
+            and user.get("is_active")
+            and verify_password(password, user["password_hash"])
+        )
+        if authenticated:
+            # Most successful logins have no failure row. Avoid taking a write
+            # lock in that common case so imports cannot delay normal access.
+            if attempt_row:
+                connection.execute(
+                    "DELETE FROM login_attempts WHERE username = ?",
+                    (clean_username,),
+                )
+            return {
+                "status": "authenticated",
+                "user": user,
+                "failure_count": 0,
+                "remaining_seconds": 0,
+            }
+
+        current_failure_count = 0
+        if attempt_row:
+            expired_lock = bool(locked_until and locked_until <= now)
+            if not expired_lock:
+                current_failure_count = int(attempt_row["failure_count"] or 0)
+        failure_count = current_failure_count + 1
+        locked_until_value = None
+        if failure_count >= LOGIN_FAILURE_LIMIT:
+            locked_until_value = (
+                now + timedelta(minutes=LOGIN_LOCK_MINUTES)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        connection.execute(
+            """
+            INSERT INTO login_attempts (username, failure_count, locked_until, last_attempt_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+                failure_count = excluded.failure_count,
+                locked_until = excluded.locked_until,
+                last_attempt_at = excluded.last_attempt_at
+            """,
+            (clean_username, failure_count, locked_until_value, utc_now()),
+        )
+        return {
+            "status": "locked" if locked_until_value else "invalid",
+            "user": None,
+            "failure_count": failure_count,
+            "remaining_seconds": LOGIN_LOCK_MINUTES * 60 if locked_until_value else 0,
+        }
 
 
 def get_login_attempt_status(db_path: str | Path, username: str) -> dict:

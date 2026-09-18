@@ -5,6 +5,7 @@ import hashlib
 import html
 import io
 import json
+import logging
 import math
 import re
 import secrets
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import cookies
 from pathlib import Path
+from threading import Lock, Thread
 from time import monotonic
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -107,8 +109,9 @@ from catalog_backend.uploads import (
 )
 
 
+LOGGER = logging.getLogger(__name__)
 SESSIONS: dict[str, int] = {}
-CATALOG_BUILD_VERSION = "2026.09.15-partial-import-fix-v1"
+CATALOG_BUILD_VERSION = "2026.09.18-login-stability-v1"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -153,6 +156,8 @@ class CatalogApplication:
         self.brand_config = self.build_brand_config(brand_config or {})
         self.planning_api_token = str(planning_api_token or "").strip()
         self._last_image_backup_cleanup_at: float | None = None
+        self._image_backup_cleanup_lock = Lock()
+        self._image_backup_cleanup_thread: Thread | None = None
 
     def build_brand_config(self, overrides: dict) -> dict:
         config = {
@@ -174,6 +179,15 @@ class CatalogApplication:
                 config[key] = clean_value
         return config
 
+    def cleanup_expired_image_backups(self) -> None:
+        try:
+            referenced_paths = db.current_local_media_paths(self.db_path)
+            cleanup_expired_local_media_backups(self.upload_dir, referenced_paths)
+        except Exception:
+            LOGGER.exception("Failed to clean expired catalog image backups")
+        finally:
+            self._image_backup_cleanup_lock.release()
+
     def maybe_cleanup_expired_image_backups(self) -> None:
         current_time = monotonic()
         if (
@@ -181,12 +195,25 @@ class CatalogApplication:
             and current_time - self._last_image_backup_cleanup_at < IMAGE_BACKUP_CLEANUP_INTERVAL_SECONDS
         ):
             return
+        # A new installation may not have an uploads directory yet. Avoid
+        # creating it from a background maintenance task during a login.
+        if not Path(self.upload_dir).is_dir():
+            self._last_image_backup_cleanup_at = current_time
+            return
+        if not self._image_backup_cleanup_lock.acquire(blocking=False):
+            return
         self._last_image_backup_cleanup_at = current_time
         try:
-            referenced_paths = db.current_local_media_paths(self.db_path)
-            cleanup_expired_local_media_backups(self.upload_dir, referenced_paths)
+            cleanup_thread = Thread(
+                target=self.cleanup_expired_image_backups,
+                name="catalog-image-backup-cleanup",
+                daemon=True,
+            )
+            self._image_backup_cleanup_thread = cleanup_thread
+            cleanup_thread.start()
         except Exception:
-            return
+            self._image_backup_cleanup_lock.release()
+            LOGGER.exception("Failed to start catalog image backup cleanup")
 
     def __call__(self, environ, start_response):
         self.maybe_cleanup_expired_image_backups()
@@ -531,29 +558,21 @@ class CatalogApplication:
     def handle_login(self, start_response, form):
         username = form.get("username", "").strip()
         password = form.get("password", "")
-        login_status = db.get_login_attempt_status(self.db_path, username)
-        if login_status["is_locked"]:
-            minutes_left = max(1, (login_status["remaining_seconds"] + 59) // 60)
+        login_result = db.process_login_attempt(self.db_path, username, password)
+        if login_result["status"] == "locked":
+            minutes_left = max(1, (login_result["remaining_seconds"] + 59) // 60)
             return self.html_response(
                 start_response,
                 self.render_login(f"登录失败次数过多，账号已临时锁定。请约 {minutes_left} 分钟后再试。"),
                 status="423 Locked",
             )
-        user = db.authenticate_user(self.db_path, username, password)
-        if not user:
-            failure_status = db.register_login_failure(self.db_path, username)
-            if failure_status["is_locked"]:
-                return self.html_response(
-                    start_response,
-                    self.render_login(f"登录失败次数过多，账号已临时锁定 {db.LOGIN_LOCK_MINUTES} 分钟。"),
-                    status="423 Locked",
-                )
+        user = login_result.get("user")
+        if login_result["status"] != "authenticated" or not user:
             return self.html_response(
                 start_response,
                 self.render_login("账号或密码不正确，请重试。连续失败过多会临时锁定登录。"),
                 status="401 Unauthorized",
             )
-        db.clear_login_failures(self.db_path, username)
         token = secrets.token_urlsafe(24)
         SESSIONS[token] = user["id"]
         headers = [

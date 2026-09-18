@@ -7,6 +7,7 @@ import unittest
 from base64 import b64decode
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic, sleep
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import unquote_plus
@@ -39,6 +40,9 @@ class CatalogAppTests(unittest.TestCase):
         self.app = CatalogApplication(self.db_path, self.upload_dir)
 
     def tearDown(self):
+        cleanup_thread = getattr(self.app, "_image_backup_cleanup_thread", None)
+        if cleanup_thread is not None:
+            cleanup_thread.join(timeout=2)
         self.temp_dir.cleanup()
 
     def request(
@@ -3828,9 +3832,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.15-partial-import-fix-v1")
+        self.assertEqual(payload["build_version"], "2026.09.18-login-stability-v1")
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.15-partial-import-fix-v1")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.18-login-stability-v1")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
@@ -3896,6 +3900,28 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(users[0]["username"], "owner_admin")
         self.assertEqual(users[0]["department"], "ADMIN")
         self.assertIsNotNone(db.authenticate_user(clean_db_path, "owner_admin", "OwnerPass123"))
+
+    def test_catalog_database_uses_wal_and_busy_timeout(self):
+        with db.get_connection(self.db_path) as connection:
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+
+        self.assertEqual(str(journal_mode).lower(), "wal")
+        self.assertEqual(busy_timeout, db.SQLITE_BUSY_TIMEOUT_MS)
+
+    def test_login_can_read_while_catalog_write_transaction_is_open(self):
+        with db.get_connection(self.db_path) as writer:
+            writer.execute("BEGIN EXCLUSIVE")
+            writer.execute(
+                "UPDATE app_settings SET updated_at = updated_at WHERE setting_key = ?",
+                ("c_visible_fields",),
+            )
+
+            result = db.process_login_attempt(self.db_path, "a_editor", "demo123")
+
+            self.assertEqual(result["status"], "authenticated")
+            self.assertEqual(result["user"]["username"], "a_editor")
+            writer.rollback()
 
     def test_init_db_without_demo_seed_does_not_create_sample_products(self):
         clean_db_path = Path(self.temp_dir.name) / "no-demo-catalog.db"
@@ -5674,6 +5700,9 @@ class CatalogAppTests(unittest.TestCase):
         response = self.request("/healthz")
 
         self.assertTrue(response["status"].startswith("200"))
+        deadline = monotonic() + 2
+        while expired_path.exists() and monotonic() < deadline:
+            sleep(0.01)
         self.assertFalse(expired_path.exists())
 
     def test_editor_can_upload_multiple_images_and_reorder_gallery(self):
