@@ -249,7 +249,7 @@ class CatalogApplication:
                 return self.handle_logout(environ, start_response)
             if path == "/api/products" and method == "GET":
                 return self.handle_api(environ, start_response, user, query)
-            if path == "/api/internal/planning/products" and method == "GET":
+            if path == "/api/internal/planning/products" and method in {"GET", "POST"}:
                 return self.handle_planning_products_api(environ, start_response, query)
             if path.startswith("/api/internal/planning/products/") and path.endswith("/image") and method == "GET":
                 product_id_text = path[len("/api/internal/planning/products/") : -len("/image")].strip("/")
@@ -1479,10 +1479,22 @@ class CatalogApplication:
         products = db.planning_source_payloads(self.db_path, product_id)
         withdrawn_ids = db.planning_withdrawn_source_ids(self.db_path, product_id)
         known_ids = []
-        raw_known_ids = str(query.get("known_ids") or "")
-        for value in raw_known_ids.split(","):
-            if value.strip().isdigit():
-                known_ids.append(int(value.strip()))
+        if environ.get("REQUEST_METHOD", "GET").upper() == "POST":
+            body = self.parse_json_body(environ)
+            raw_known_ids = body.get("known_ids") or []
+            if not isinstance(raw_known_ids, list):
+                return self.json_error_response(
+                    start_response,
+                    "invalid_known_ids",
+                    "已同步商品编号格式不正确。",
+                    "400 Bad Request",
+                )
+            known_ids = [int(value) for value in raw_known_ids if str(value).isdigit()]
+        else:
+            raw_known_ids = str(query.get("known_ids") or "")
+            for value in raw_known_ids.split(","):
+                if value.strip().isdigit():
+                    known_ids.append(int(value.strip()))
         image_updates = db.planning_source_image_payloads(self.db_path, known_ids)
         season_year = str(query.get("season_year") or "").strip()
         status = str(query.get("status") or "").strip()

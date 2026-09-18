@@ -3,9 +3,14 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from wsgiref.simple_server import make_server
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import WSGIServer, make_server
 
 from planning_center import DEMO_PASSWORD, PlanningApplication, init_db
+
+
+class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
 
 
 def parse_args():
@@ -40,7 +45,7 @@ def main():
     if args.seed_demo:
         print(f"商品部企划员: planner / {DEMO_PASSWORD}")
         print(f"企划管理员: planning_admin / {DEMO_PASSWORD}")
-    with make_server(args.host, args.port, app) as server:
+    with make_server(args.host, args.port, app, server_class=ThreadingWSGIServer) as server:
         server.serve_forever()
 
 

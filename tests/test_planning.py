@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 from urllib.parse import unquote, urlencode
 from wsgiref.util import setup_testing_defaults
@@ -209,6 +210,51 @@ class PlanningCenterTests(unittest.TestCase):
         )
         self.assertTrue(rejected_completed["status"].startswith("400"))
         self.assertIn("已完成资料", rejected_completed["body"].decode("utf-8"))
+
+    def test_internal_planning_api_accepts_large_known_id_payloads_by_post(self):
+        app = CatalogApplication(
+            self.catalog_db_path,
+            Path(self.temp.name) / "uploads",
+            planning_api_token="planning-secret",
+        )
+        product = next(item for item in catalog_db.list_products(self.catalog_db_path))
+        body = json.dumps({"known_ids": [product["id"], 999999]}).encode("utf-8")
+        response = self.wsgi_request(
+            app,
+            "/api/internal/planning/products",
+            method="POST",
+            body=body,
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+
+        self.assertTrue(response["status"].startswith("200"))
+        payload = json.loads(response["body"].decode("utf-8"))
+        self.assertEqual(payload["source"], "cangbaoge")
+        self.assertTrue(any(item["id"] == product["id"] for item in payload["image_updates"]))
+
+    def test_planning_sync_uses_json_post_for_large_source_history(self):
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test", "planning-secret")
+        response_payload = json.dumps(
+            {
+                "source": "cangbaoge",
+                "items": [],
+                "withdrawn_ids": [],
+                "image_updates": [],
+                "workflow_gate": True,
+                "image_gate": True,
+                "cost_gate": True,
+                "eligibility_gate_version": 1,
+            }
+        ).encode("utf-8")
+
+        with patch("planning_center.web.urlopen", return_value=io.BytesIO(response_payload)) as mocked_urlopen:
+            app.fetch_catalog_products(list(range(1, 1002)))
+
+        request = mocked_urlopen.call_args.args[0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.full_url, "http://catalog.test/api/internal/planning/products")
+        self.assertEqual(len(json.loads(request.data.decode("utf-8"))["known_ids"]), 1001)
 
     def test_internal_planning_image_api_serves_pending_product_media(self):
         upload_dir = Path(self.temp.name) / "uploads"
@@ -781,6 +827,10 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         self.assertEqual(response["body"], image_bytes)
         self.assertEqual(dict(response["headers"])["Content-Type"], "image/png")
+        self.assertEqual(
+            dict(response["headers"])["Cache-Control"],
+            "private, max-age=86400, immutable",
+        )
         request = mocked_urlopen.call_args.args[0]
         self.assertEqual(request.full_url, "http://catalog.test/api/internal/planning/products/77/image")
         self.assertEqual(request.get_header("Authorization"), "Bearer planning-secret")
@@ -1453,12 +1503,123 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(planning_db.get_source_product(self.planning_db_path, 9)["style_code"], "M009")
         self.assertIsNone(planning_db.get_source_product(self.planning_db_path, 10))
 
-        with patch.object(app, "fetch_catalog_products", return_value=catalog_payload):
+        # Exercise the automatic path independently from the just-completed
+        # manual sync, which normally suppresses a redundant immediate retry.
+        app._automatic_sync_last_started_at = None
+        with patch.object(app, "fetch_catalog_products", return_value=catalog_payload) as fetch_mock:
+            first_workbench = self.wsgi_request(app, "/workbench", cookie=cookie)["body"].decode("utf-8")
+            app.wait_for_automatic_sync()
             workbench = self.wsgi_request(app, "/workbench", cookie=cookie)["body"].decode("utf-8")
+        self.assertIn("正在后台同步藏宝阁资料", first_workbench)
+        fetch_mock.assert_called_once_with([9], timeout=3)
         sync_message = "已自动同步 1 条藏宝阁“待商品部填写”资料。"
         self.assertEqual(workbench.count(sync_message), 1)
         self.assertNotIn("当前结果", workbench)
         self.assertLess(workbench.index(sync_message), workbench.index("<form class='workbench-filter'"))
+
+    def test_automatic_sync_does_not_block_or_duplicate_workbench_reads(self):
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test", "token")
+        user = planning_db.authenticate_user(self.planning_db_path, "planner", "demo123")
+        started = Event()
+        release = Event()
+        payload = {
+            "source": "cangbaoge",
+            "items": [],
+            "withdrawn_ids": [],
+            "image_updates": [],
+            "workflow_gate": True,
+            "image_gate": True,
+            "cost_gate": True,
+            "eligibility_gate_version": 1,
+        }
+
+        def delayed_fetch(*args, **kwargs):
+            started.set()
+            release.wait(timeout=2)
+            return payload
+
+        with patch.object(app, "fetch_catalog_products", side_effect=delayed_fetch) as fetch_mock:
+            first_page = app.render_workbench(user, {})
+            self.assertTrue(started.wait(timeout=1))
+            second_page = app.render_workbench(user, {"status": "waiting"})
+            self.assertEqual(fetch_mock.call_count, 1)
+            self.assertIn("正在后台同步藏宝阁资料", first_page)
+            self.assertIn("正在后台同步藏宝阁资料", second_page)
+            release.set()
+            app.wait_for_automatic_sync()
+            completed_page = app.render_workbench(user, {})
+
+        self.assertIn("已自动同步 0 条藏宝阁“待商品部填写”资料。", completed_page)
+
+    def test_planning_database_uses_wal_and_reads_during_batch_write(self):
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+        self.assertEqual(str(journal_mode).lower(), "wal")
+        self.assertEqual(busy_timeout, planning_db.SQLITE_BUSY_TIMEOUT_MS)
+
+        with planning_db.get_connection(self.planning_db_path) as writer:
+            writer.execute("BEGIN EXCLUSIVE")
+            writer.execute(
+                "UPDATE users SET display_name = display_name WHERE username = ?",
+                ("planner",),
+            )
+            user = planning_db.authenticate_user(self.planning_db_path, "planner", "demo123")
+            self.assertEqual(user["username"], "planner")
+            writer.rollback()
+
+    def test_workbench_rematches_stale_categories_without_per_row_database_queries(self):
+        source = {
+            "id": 991,
+            "style_code": "FAST-991",
+            "product_name": "新款连衣裙",
+            "season_year": "2026秋冬",
+            "supplier": "供应商",
+            "category": "已删除品类",
+            "actual_cost": 150,
+            "tax_included_price": 150,
+            "image_url": "https://example.com/fast.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO pricing_records (
+                    publication_id, source_product_id, source_version_no,
+                    season_year, style_code, product_name, supplier, category,
+                    channel, cost, fixed_multiplier, supplier_coefficient,
+                    raw_price, calculated_price, launch_price, status,
+                    operator_name, created_at
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, '', 150, 4.2, 1, 630, 629, 629, 'suggested', 'F', ?)
+                """,
+                (
+                    "PC-FAST-991",
+                    991,
+                    "2026秋冬",
+                    "FAST-991",
+                    "新款连衣裙",
+                    "供应商",
+                    "已删除品类",
+                    planning_db.utc_now(),
+                ),
+            )
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        with patch.object(
+            planning_db,
+            "validate_category_option",
+            side_effect=AssertionError("工作台不应按条查询品类"),
+        ), patch.object(
+            planning_db,
+            "resolve_product_category",
+            side_effect=AssertionError("工作台不应按条重新打开数据库"),
+        ):
+            entries = app.workbench_entries("2026秋冬", "suggested")
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0][1]["category"], "连衣裙")
 
     def test_sync_withdraws_completed_sources_and_preserves_pricing_audit(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)

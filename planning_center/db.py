@@ -12,6 +12,7 @@ from pathlib import Path
 
 DEMO_PASSWORD = "demo123"
 PASSWORD_MIN_LENGTH = 8
+SQLITE_BUSY_TIMEOUT_MS = 15_000
 UTC = timezone.utc
 
 # Category option names and pricing rule groups are intentionally separate.
@@ -35,8 +36,12 @@ def utc_now() -> str:
 
 
 def get_connection(db_path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(
+        str(db_path),
+        timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+    )
     connection.row_factory = sqlite3.Row
+    connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
@@ -60,6 +65,9 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with get_connection(path) as connection:
+        # Keep normal reads responsive while a sync, Excel import, or batch
+        # workflow update is writing to the planning database.
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -176,7 +184,10 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
                 error_message TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_source_products_season ON source_products(season_year, status);
+            CREATE INDEX IF NOT EXISTS idx_source_products_workflow ON source_products(status, lifecycle_status);
             CREATE INDEX IF NOT EXISTS idx_pricing_records_season ON pricing_records(season_year, category, status);
+            CREATE INDEX IF NOT EXISTS idx_pricing_records_status ON pricing_records(status);
+            CREATE INDEX IF NOT EXISTS idx_pricing_records_source_latest ON pricing_records(source_product_id, created_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_category_cost_rules_lookup ON category_cost_rules(season_year, category, enabled, lower_cost, upper_cost);
             """
         )
@@ -477,6 +488,27 @@ def list_all_source_products(db_path: str | Path) -> list[dict]:
     with get_connection(db_path) as connection:
         rows = connection.execute("SELECT * FROM source_products ORDER BY id").fetchall()
     return [dict(row) for row in rows]
+
+
+def list_source_product_ids(db_path: str | Path) -> list[int]:
+    """Return source ids without loading every source column into memory."""
+    with get_connection(db_path) as connection:
+        rows = connection.execute("SELECT id FROM source_products ORDER BY id").fetchall()
+    return [int(row["id"]) for row in rows]
+
+
+def dashboard_counts(db_path: str | Path) -> dict[str, int]:
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM source_products
+                 WHERE status = 'pending' AND lifecycle_status = 'active') AS pending,
+                (SELECT COUNT(*) FROM pricing_records WHERE status = 'confirmed') AS confirmed,
+                (SELECT COUNT(*) FROM pricing_records WHERE status = 'published') AS published
+            """
+        ).fetchone()
+    return {key: int(row[key] or 0) for key in ("pending", "confirmed", "published")}
 
 
 def get_source_product(db_path: str | Path, product_id: int) -> dict | None:
@@ -1364,6 +1396,30 @@ def list_pricing_records(db_path: str | Path, *, season_year: str = "", status: 
     return [dict(row) for row in rows]
 
 
+def list_latest_pricing_records(db_path: str | Path, *, season_year: str = "") -> list[dict]:
+    """Return only the newest workflow cycle for each source product."""
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT pr.*
+            FROM pricing_records pr
+            WHERE (? = '' OR pr.season_year = ?)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pricing_records newer
+                  WHERE newer.source_product_id = pr.source_product_id
+                    AND (
+                        newer.created_at > pr.created_at
+                        OR (newer.created_at = pr.created_at AND newer.id > pr.id)
+                    )
+              )
+            ORDER BY pr.created_at DESC, pr.id DESC
+            """,
+            (season_year, season_year),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def list_pricing_export_rows(
     db_path: str | Path,
     *,
@@ -1789,13 +1845,69 @@ def mark_record_published(db_path: str | Path, record_id: int, result: dict) -> 
 
 
 def pricing_stats(db_path: str | Path, season_year: str = "", category: str = "") -> list[dict]:
+    key = str(category or "").strip()
+    return pricing_stats_many(db_path, season_year, [key] if key else [""])[key]
+
+
+def list_pricing_statistic_seasons(db_path: str | Path) -> list[str]:
     with get_connection(db_path) as connection:
-        records = [dict(row) for row in connection.execute("SELECT * FROM pricing_records WHERE status IN ('confirmed', 'published') AND (? = '' OR season_year = ?) AND (? = '' OR category = ?)", (season_year, season_year, category, category)).fetchall()]
+        rows = connection.execute(
+            """
+            SELECT DISTINCT season_year
+            FROM pricing_records
+            WHERE status IN ('confirmed', 'published')
+              AND TRIM(season_year) != ''
+            ORDER BY season_year DESC
+            """
+        ).fetchall()
+    return [str(row["season_year"]).strip() for row in rows]
+
+
+def pricing_stats_many(
+    db_path: str | Path,
+    season_year: str = "",
+    categories: list[str] | tuple[str, ...] = (),
+) -> dict[str, list[dict]]:
+    requested_categories = list(
+        dict.fromkeys(str(category or "").strip() for category in categories)
+    ) or [""]
+    specific_categories = [category for category in requested_categories if category]
+    conditions = ["status IN ('confirmed', 'published')", "(? = '' OR season_year = ?)"]
+    params: list[object] = [season_year, season_year]
+    if specific_categories and "" not in requested_categories:
+        placeholders = ", ".join("?" for _ in specific_categories)
+        conditions.append(f"category IN ({placeholders})")
+        params.extend(specific_categories)
+    with get_connection(db_path) as connection:
+        records = [
+            dict(row)
+            for row in connection.execute(
+                f"SELECT category, launch_price FROM pricing_records WHERE {' AND '.join(conditions)}",
+                params,
+            ).fetchall()
+        ]
         bands = [dict(row) for row in connection.execute("SELECT * FROM price_bands WHERE enabled = 1 ORDER BY sort_order, id").fetchall()]
-    total = len(records)
-    output = []
-    for band in bands:
-        lower, upper = band["lower_bound"], band["upper_bound"]
-        count = sum(1 for item in records if (lower is None or item["launch_price"] > lower) and (upper is None or item["launch_price"] <= upper))
-        output.append({**band, "count": count, "share": round((count * 100 / total), 1) if total else 0})
+    output: dict[str, list[dict]] = {}
+    for category in requested_categories:
+        category_records = records if not category else [
+            item for item in records if str(item.get("category") or "").strip() == category
+        ]
+        total = len(category_records)
+        category_stats = []
+        for band in bands:
+            lower, upper = band["lower_bound"], band["upper_bound"]
+            count = sum(
+                1
+                for item in category_records
+                if (lower is None or item["launch_price"] > lower)
+                and (upper is None or item["launch_price"] <= upper)
+            )
+            category_stats.append(
+                {
+                    **band,
+                    "count": count,
+                    "share": round((count * 100 / total), 1) if total else 0,
+                }
+            )
+        output[category] = category_stats
     return output

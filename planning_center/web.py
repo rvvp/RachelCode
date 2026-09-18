@@ -4,10 +4,13 @@ import cgi
 import html
 import io
 import json
+import logging
 import re
 import secrets
 from http import cookies
 from pathlib import Path
+from threading import Lock, Thread
+from time import monotonic
 from urllib.parse import parse_qs, quote, urlencode
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -18,6 +21,9 @@ from catalog_backend.uploads import detect_image_content_type
 
 SESSIONS: dict[str, int] = {}
 MAX_PLANNING_IMAGE_BYTES = 20 * 1024 * 1024
+AUTOMATIC_SYNC_INTERVAL_SECONDS = 60
+AUTOMATIC_SYNC_TIMEOUT_SECONDS = 3
+LOGGER = logging.getLogger(__name__)
 
 
 class PlanningApplication:
@@ -25,6 +31,12 @@ class PlanningApplication:
         self.db_path = str(db_path)
         self.catalog_api_url = str(catalog_api_url or "http://127.0.0.1:8765").rstrip("/")
         self.catalog_api_token = str(catalog_api_token or "").strip()
+        self._automatic_sync_run_lock = Lock()
+        self._automatic_sync_state_lock = Lock()
+        self._automatic_sync_last_started_at: float | None = None
+        self._automatic_sync_notice = ""
+        self._automatic_sync_error = ""
+        self._automatic_sync_thread: Thread | None = None
 
     def __call__(self, environ, start_response):
         method = environ.get("REQUEST_METHOD", "GET").upper()
@@ -327,14 +339,26 @@ class PlanningApplication:
 
     def handle_sync(self, start_response, user):
         self.require_catalog_operator(user)
-        payload = self.fetch_catalog_products(self.known_source_product_ids())
-        items, withdrawn_ids, image_updates = self.catalog_sync_details(payload)
-        result = db.synchronize_source_products(
-            self.db_path,
-            items,
-            withdrawn_ids=withdrawn_ids,
-            image_updates=image_updates,
-        )
+        if not self._automatic_sync_run_lock.acquire(blocking=False):
+            return self.redirect(
+                start_response,
+                "/workbench?notice=" + self.q("藏宝阁资料正在后台同步，无需重复提交。"),
+            )
+        try:
+            payload = self.fetch_catalog_products(self.known_source_product_ids())
+            items, withdrawn_ids, image_updates = self.catalog_sync_details(payload)
+            result = db.synchronize_source_products(
+                self.db_path,
+                items,
+                withdrawn_ids=withdrawn_ids,
+                image_updates=image_updates,
+            )
+            with self._automatic_sync_state_lock:
+                self._automatic_sync_last_started_at = monotonic()
+                self._automatic_sync_notice = ""
+                self._automatic_sync_error = ""
+        finally:
+            self._automatic_sync_run_lock.release()
         return self.redirect(start_response, "/workbench?notice=" + self.q(self.source_sync_message(result)))
 
     def source_sync_message(self, result: dict, *, automatic: bool = False) -> str:
@@ -352,27 +376,106 @@ class PlanningApplication:
         return message
 
     def known_source_product_ids(self) -> list[int]:
-        return [int(item["id"]) for item in db.list_all_source_products(self.db_path)]
+        return db.list_source_product_ids(self.db_path)
 
-    def fetch_catalog_products(self, known_ids: list[int] | tuple[int, ...] = ()) -> dict:
+    def fetch_catalog_products(
+        self,
+        known_ids: list[int] | tuple[int, ...] = (),
+        *,
+        timeout: int = 10,
+    ) -> dict:
         if not self.catalog_api_token:
             raise ValueError("尚未配置藏宝阁内部 Token，请在启动环境变量中设置 PLANNING_CATALOG_API_TOKEN。")
-        query = ""
-        clean_ids = [str(int(item_id)) for item_id in known_ids if str(item_id).isdigit()]
-        if clean_ids:
-            query = "?" + urlencode({"known_ids": ",".join(clean_ids)})
-        request = Request(
-            f"{self.catalog_api_url}/api/internal/planning/products{query}",
-            headers={"Authorization": f"Bearer {self.catalog_api_token}", "Accept": "application/json"},
-        )
+        clean_ids = [int(item_id) for item_id in known_ids if str(item_id).isdigit()]
+        request_headers = {
+            "Authorization": f"Bearer {self.catalog_api_token}",
+            "Accept": "application/json",
+        }
+        # Keep small requests compatible with earlier catalog deployments.
+        # Large histories use JSON so thousands of ids do not overflow the
+        # proxy/server request-line limit.
+        if len(clean_ids) > 500:
+            request_headers["Content-Type"] = "application/json"
+            request = Request(
+                f"{self.catalog_api_url}/api/internal/planning/products",
+                data=json.dumps({"known_ids": clean_ids}).encode("utf-8"),
+                headers=request_headers,
+                method="POST",
+            )
+        else:
+            query = "?" + urlencode({"known_ids": ",".join(map(str, clean_ids))}) if clean_ids else ""
+            request = Request(
+                f"{self.catalog_api_url}/api/internal/planning/products{query}",
+                headers=request_headers,
+            )
         try:
-            with urlopen(request, timeout=10) as response:
+            with urlopen(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except Exception as error:
             raise ValueError(f"读取藏宝阁失败：{error}")
         if not isinstance(payload, dict) or payload.get("error"):
             raise ValueError(payload.get("message") if isinstance(payload, dict) else "藏宝阁返回内容异常。")
         return payload
+
+    def automatic_sync_worker(self) -> None:
+        notice = ""
+        error = ""
+        try:
+            payload = self.fetch_catalog_products(
+                self.known_source_product_ids(),
+                timeout=AUTOMATIC_SYNC_TIMEOUT_SECONDS,
+            )
+            items, withdrawn_ids, image_updates = self.catalog_sync_details(payload)
+            result = db.synchronize_source_products(
+                self.db_path,
+                items,
+                withdrawn_ids=withdrawn_ids,
+                image_updates=image_updates,
+            )
+            notice = self.source_sync_message(result, automatic=True)
+        except ValueError as sync_error:
+            error = f"自动同步暂未完成：{sync_error}"
+        except Exception:
+            LOGGER.exception("Planning center automatic catalog sync failed")
+            error = "自动同步暂未完成，请使用“同步藏宝阁”重试。"
+        finally:
+            with self._automatic_sync_state_lock:
+                self._automatic_sync_notice = notice
+                self._automatic_sync_error = error
+            self._automatic_sync_run_lock.release()
+
+    def start_automatic_sync_if_due(self) -> tuple[str, str, bool]:
+        """Start a bounded background sync and return completed status once."""
+        with self._automatic_sync_state_lock:
+            notice = self._automatic_sync_notice
+            error = self._automatic_sync_error
+            self._automatic_sync_notice = ""
+            self._automatic_sync_error = ""
+            last_started_at = self._automatic_sync_last_started_at
+        now = monotonic()
+        due = last_started_at is None or now - last_started_at >= AUTOMATIC_SYNC_INTERVAL_SECONDS
+        if not due or not self._automatic_sync_run_lock.acquire(blocking=False):
+            running = bool(self._automatic_sync_thread and self._automatic_sync_thread.is_alive())
+            return notice, error, running
+        with self._automatic_sync_state_lock:
+            self._automatic_sync_last_started_at = now
+        sync_thread = Thread(
+            target=self.automatic_sync_worker,
+            name="planning-catalog-auto-sync",
+            daemon=True,
+        )
+        self._automatic_sync_thread = sync_thread
+        try:
+            sync_thread.start()
+        except Exception:
+            self._automatic_sync_run_lock.release()
+            raise
+        return notice, error, True
+
+    def wait_for_automatic_sync(self, timeout: float = 5) -> None:
+        sync_thread = self._automatic_sync_thread
+        if sync_thread is not None:
+            sync_thread.join(timeout=timeout)
 
     def catalog_sync_items(self, payload: dict | list[dict]) -> tuple[list[dict], list[int]]:
         items, withdrawn_ids, _ = self.catalog_sync_details(payload)
@@ -445,7 +548,10 @@ class PlanningApplication:
             [
                 ("Content-Type", content_type),
                 ("Content-Length", str(len(body))),
-                ("Cache-Control", "private, max-age=300"),
+                # The workbench image URL contains image_version_no, so a
+                # replacement receives a new URL and the old version is safe
+                # to cache across page changes.
+                ("Cache-Control", "private, max-age=86400, immutable"),
                 ("X-Content-Type-Options", "nosniff"),
             ],
         )
@@ -783,11 +889,21 @@ class PlanningApplication:
         season_year: str = "",
         status: str = "",
         search: str = "",
+        category_options: list[dict] | None = None,
     ) -> list[tuple[dict, dict | None, str]]:
         """Return the same filtered source/record rows used by the workbench and batch APIs."""
         season = str(season_year or "").strip()
         requested_status = str(status or "").strip()
         search_terms = self.workbench_search_terms(search)
+        active_category_options = category_options or db.list_category_options(
+            self.db_path,
+            enabled_only=True,
+        )
+        enabled_category_names = {
+            str(option.get("name") or "").strip()
+            for option in active_category_options
+            if str(option.get("name") or "").strip()
+        }
         products = db.list_source_products(self.db_path, season_year=season)
         if not requested_status or requested_status == "published":
             known_product_ids = {int(item["id"]) for item in products}
@@ -796,7 +912,7 @@ class PlanningApplication:
                 for item in db.list_published_source_products(self.db_path, season_year=season)
                 if int(item["id"]) not in known_product_ids
             )
-        records = db.list_pricing_records(self.db_path, season_year=season)
+        records = db.list_latest_pricing_records(self.db_path, season_year=season)
         latest_records: dict[int, dict] = {}
         for record in records:
             latest_records.setdefault(int(record["source_product_id"]), record)
@@ -807,16 +923,23 @@ class PlanningApplication:
             record = latest_records.get(int(item["id"]))
             workflow_status = str(record.get("status") if record else "waiting")
             if record and workflow_status in {"suggested", "conflict"}:
-                try:
-                    db.validate_category_option(self.db_path, record.get("category", ""))
-                except ValueError:
+                if str(record.get("category") or "").strip() not in enabled_category_names:
                     # Pricing records may outlive a renamed or removed rule
-                    # option. Keep the active review row usable by rematching
-                    # its source product against the current options.
-                    try:
-                        rematched_category = db.resolve_product_category(self.db_path, item)
-                    except ValueError:
-                        rematched_category = ""
+                    # option. Rematch in memory rather than reopening SQLite
+                    # once for every row in a large workbench.
+                    rematched_category = next(
+                        (
+                            str(value).strip()
+                            for value in (item.get("category"), item.get("category_suggestion"))
+                            if str(value or "").strip() in enabled_category_names
+                        ),
+                        "",
+                    )
+                    if not rematched_category:
+                        rematched_category = db.infer_category(
+                            str(item.get("product_name") or ""),
+                            active_category_options,
+                        )
                     if rematched_category:
                         record = {**record, "category": rematched_category}
             if requested_status and workflow_status != requested_status:
@@ -1311,11 +1434,10 @@ class PlanningApplication:
         return self.page("登录 - 商品企划中心", content, None)
 
     def render_dashboard(self, user: dict) -> str:
-        sources = db.list_source_products(self.db_path)
-        records = db.list_pricing_records(self.db_path)
-        pending = sum(1 for item in sources if item.get("status") == "pending")
-        confirmed = sum(1 for item in records if item.get("status") == "confirmed")
-        published = sum(1 for item in records if item.get("status") == "published")
+        counts = db.dashboard_counts(self.db_path)
+        pending = counts["pending"]
+        confirmed = counts["confirmed"]
+        published = counts["published"]
         catalog_sync_action = (
             "<form class='catalog-sync-form' method='post' action='/sync'><button class='primary' type='submit'>立即同步藏宝阁</button><small class='sync-condition-note'>同步条件：待商品部填写、已提交商品部、已上传图片、含税价为大于 0 的有效数字</small></form>"
             if user.get("role") == "planner"
@@ -1356,21 +1478,21 @@ class PlanningApplication:
         except ValueError:
             requested_page = 1
         if self.catalog_api_token and user.get("role") == "planner":
-            try:
-                payload = self.fetch_catalog_products(self.known_source_product_ids())
-                items, withdrawn_ids, image_updates = self.catalog_sync_details(payload)
-                result = db.synchronize_source_products(
-                    self.db_path,
-                    items,
-                    withdrawn_ids=withdrawn_ids,
-                    image_updates=image_updates,
-                )
-                sync_message = self.source_sync_message(result, automatic=True)
-            except ValueError as sync_error:
-                if not error:
-                    error = str(sync_error)
-        filtered_products = self.workbench_entries(season, status, search)
+            sync_notice, sync_error, sync_running = self.start_automatic_sync_if_due()
+            sync_message = sync_notice or (
+                "正在后台同步藏宝阁资料，当前页面先显示已同步数据。"
+                if sync_running
+                else ""
+            )
+            if sync_error and not error:
+                error = sync_error
         category_options = db.list_category_options(self.db_path, enabled_only=True)
+        filtered_products = self.workbench_entries(
+            season,
+            status,
+            search,
+            category_options=category_options,
+        )
         channel_options = db.list_channel_options(self.db_path, enabled_only=True)
         workflow_labels = {
             "waiting": "待计算",
@@ -2289,14 +2411,7 @@ class PlanningApplication:
         # season represented by that dataset on first entry, while retaining
         # an explicit empty value as the user's intentional "all seasons"
         # selection.
-        all_pricing_records = db.list_pricing_records(self.db_path)
-        statistic_records = [
-            record
-            for record in all_pricing_records
-            if str(record.get("status") or "") in {"confirmed", "published"}
-            and str(record.get("season_year") or "").strip()
-        ]
-        seasons = sorted({str(record["season_year"]).strip() for record in statistic_records}, reverse=True)
+        seasons = db.list_pricing_statistic_seasons(self.db_path)
         season = seasons[0] if requested_season is None and seasons else str(requested_season or "").strip()
         category_options = [
             str(item["name"])
@@ -2333,8 +2448,13 @@ class PlanningApplication:
             )
 
         if selected_categories:
+            stats_by_category = db.pricing_stats_many(
+                self.db_path,
+                season,
+                selected_categories,
+            )
             band_cards = "".join(
-                band_card(category, db.pricing_stats(self.db_path, season, category))
+                band_card(category, stats_by_category[category])
                 for category in selected_categories
             )
         else:
