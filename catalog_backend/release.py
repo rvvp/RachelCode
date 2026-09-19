@@ -26,8 +26,20 @@ def catalog_release_commit(root_dir: str | Path | None = None) -> str:
     if configured_commit:
         return configured_commit
 
-    # A live checkout must report its current HEAD even if an older deployment
-    # manifest was left behind by a previous release.
+    # The deployment manifest describes the files in a packaged release. It
+    # must win over Git metadata because the runtime directory can retain an
+    # older .git directory while a new release package is being activated.
+    manifest_path = root / ".release-commit"
+    if manifest_path.is_file():
+        try:
+            manifest_commit = _normalized_commit(manifest_path.read_text(encoding="utf-8"))
+            if manifest_commit:
+                return manifest_commit
+        except OSError:
+            pass
+
+    # Direct Git deployments refresh .release-commit before activation. Git is
+    # therefore only a fallback for checkouts that have not been packaged yet.
     if (root / ".git").exists():
         try:
             result = subprocess.run(
@@ -41,15 +53,6 @@ def catalog_release_commit(root_dir: str | Path | None = None) -> str:
             if git_commit:
                 return git_commit
         except (OSError, subprocess.SubprocessError):
-            pass
-
-    manifest_path = root / ".release-commit"
-    if manifest_path.is_file():
-        try:
-            manifest_commit = _normalized_commit(manifest_path.read_text(encoding="utf-8"))
-            if manifest_commit:
-                return manifest_commit
-        except OSError:
             pass
     return "unknown"
 

@@ -11,11 +11,27 @@ from catalog_backend.release import catalog_release_commit
 
 
 class CatalogReleaseTests(unittest.TestCase):
-    def test_live_checkout_uses_head_instead_of_stale_manifest(self):
+    def test_packaged_release_manifest_wins_over_stale_git_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / ".git").mkdir()
             (root / ".release-commit").write_text("a" * 40, encoding="utf-8")
+
+            with (
+                patch.dict(os.environ, {}, clear=False),
+                patch(
+                    "catalog_backend.release.subprocess.run",
+                    return_value=SimpleNamespace(returncode=0, stdout="b" * 40),
+                ) as git_run,
+            ):
+                os.environ.pop("CATALOG_RELEASE_COMMIT", None)
+                self.assertEqual(catalog_release_commit(root), "a" * 40)
+                git_run.assert_not_called()
+
+    def test_live_checkout_without_manifest_falls_back_to_head(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".git").mkdir()
 
             with (
                 patch.dict(os.environ, {}, clear=False),
