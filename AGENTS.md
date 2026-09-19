@@ -20,6 +20,18 @@ The configured remotes are:
 - `origin`: `https://git.lu9.com/lu9/RachelCode.git`
 - `github`: `git@github.com:rvvp/RachelCode.git`
 
+## Deployment Topology
+
+The only production deployment path is:
+
+`local workstation -> origin/main -> company server -> public site`
+
+`origin/main` is the deployment source. Its Webhook may notify the company
+server to pull, activate, and verify a release. The `github` remote is a code
+backup only: it must not connect to the company server, trigger deployment, or
+run public-site verification. A push to `github` is never evidence that a
+production release started or completed.
+
 After an explicitly requested push, verify the requested remote branch or
 branches. For a dual-remote push, verify that both remotes point to the same
 commit. Never commit or push local databases, exported reports, credentials,
