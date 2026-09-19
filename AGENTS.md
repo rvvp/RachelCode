@@ -26,11 +26,16 @@ The only production deployment path is:
 
 `local workstation -> origin/main -> company server -> public site`
 
-`origin/main` is the deployment source. Its Webhook may notify the company
-server to pull, activate, and verify a release. The `github` remote is a code
-backup only: it must not connect to the company server, trigger deployment, or
-run public-site verification. A push to `github` is never evidence that a
-production release started or completed.
+`origin/main` is the deployment source. Its existing Webhook automatically
+notifies the company server to pull, activate, and verify every release; the
+server administrator does not participate in routine deployments. After an
+`origin/main` push, verify the public commit and build directly. If propagation
+is delayed or fails, investigate the automated release path first instead of
+asking the administrator to perform the deployment manually.
+
+The `github` remote is a code backup only: it must not connect to the company
+server, trigger deployment, or run public-site verification. A push to
+`github` is never evidence that a production release started or completed.
 
 After an explicitly requested push, verify the requested remote branch or
 branches. For a dual-remote push, verify that both remotes point to the same

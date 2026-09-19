@@ -122,7 +122,7 @@ from catalog_backend.uploads import (
 
 
 LOGGER = logging.getLogger(__name__)
-CATALOG_BUILD_VERSION = "2026.09.19-release-watchdog-v4"
+CATALOG_BUILD_VERSION = "2026.09.19-release-watchdog-v5"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal

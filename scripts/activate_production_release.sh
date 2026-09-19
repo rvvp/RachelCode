@@ -10,6 +10,18 @@ POST_RELEASE_VERIFY_TIMER_FILE="${CATALOG_POST_RELEASE_VERIFY_TIMER_FILE:-/etc/s
 LOCAL_URL="${CATALOG_LOCAL_URL:-http://127.0.0.1:8765}"
 PUBLIC_URL="${1:-${CATALOG_PUBLIC_URL:-}}"
 VENV_DIR="${CATALOG_VENV_DIR:-/opt/rachelcode/venv}"
+
+# Direct Git deployments can retain an untracked manifest from an older
+# release. Refresh it before calculating the expected public version.
+GIT_ROOT="$(git -C "$ROOT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ "$GIT_ROOT" = "$ROOT_DIR" ]; then
+  GIT_RELEASE_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
+  if [[ "$GIT_RELEASE_COMMIT" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+    printf '%s\n' "$GIT_RELEASE_COMMIT" | tr '[:upper:]' '[:lower:]' > "$ROOT_DIR/.release-commit"
+    chmod 0644 "$ROOT_DIR/.release-commit"
+  fi
+fi
+
 EXPECTED_BUILD="$(sed -n 's/^CATALOG_BUILD_VERSION = "\([^"]*\)"/\1/p' "$ROOT_DIR/catalog_backend/web.py" | head -n 1)"
 EXPECTED_SOURCE="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("catalog_backend/release.py")["CATALOG_SOURCE_FINGERPRINT"])')"
 EXPECTED_COMMIT="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("catalog_backend/release.py")["CATALOG_RELEASE_COMMIT"])')"

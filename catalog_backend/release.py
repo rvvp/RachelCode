@@ -11,34 +11,46 @@ from pathlib import Path
 PROCESS_STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _normalized_commit(value: object) -> str | None:
+    candidate = str(value or "").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{40,64}", candidate):
+        return candidate.lower()
+    return None
+
+
 def catalog_release_commit(root_dir: str | Path | None = None) -> str:
     """Return the repository commit represented by this deployed release."""
     root = Path(root_dir).resolve() if root_dir else Path(__file__).resolve().parent.parent
-    candidates = [
-        str(os.environ.get("CATALOG_RELEASE_COMMIT") or "").strip(),
-    ]
+
+    configured_commit = _normalized_commit(os.environ.get("CATALOG_RELEASE_COMMIT"))
+    if configured_commit:
+        return configured_commit
+
+    # A live checkout must report its current HEAD even if an older deployment
+    # manifest was left behind by a previous release.
+    if (root / ".git").exists():
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=2,
+            )
+            git_commit = _normalized_commit(result.stdout) if result.returncode == 0 else None
+            if git_commit:
+                return git_commit
+        except (OSError, subprocess.SubprocessError):
+            pass
+
     manifest_path = root / ".release-commit"
     if manifest_path.is_file():
         try:
-            candidates.append(manifest_path.read_text(encoding="utf-8").strip())
+            manifest_commit = _normalized_commit(manifest_path.read_text(encoding="utf-8"))
+            if manifest_commit:
+                return manifest_commit
         except OSError:
             pass
-    for candidate in candidates:
-        if re.fullmatch(r"[0-9a-fA-F]{40,64}", candidate):
-            return candidate.lower()
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=2,
-        )
-        candidate = result.stdout.strip()
-        if result.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40,64}", candidate):
-            return candidate.lower()
-    except (OSError, subprocess.SubprocessError):
-        pass
     return "unknown"
 
 

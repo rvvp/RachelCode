@@ -18,6 +18,7 @@ logs/
 dist/
 tmp/
 .run-*.log
+.release-commit
 
 # Runtime business data, downloaded platform reports, and browser profiles.
 replenishment_data/
