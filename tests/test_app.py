@@ -3833,12 +3833,28 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.18-concurrency-capacity-v2")
+        self.assertEqual(payload["build_version"], "2026.09.19-import-deployment-v3")
+        self.assertRegex(payload["source_fingerprint"], r"^[0-9a-f]{16}$")
+        self.assertTrue(payload["process_started_at"].endswith("Z"))
+        self.assertGreater(payload["worker_pid"], 0)
+        self.assertEqual(payload["runtime_mode"], "development")
+        self.assertTrue(payload["production_runtime_ready"])
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.18-concurrency-capacity-v2")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.19-import-deployment-v3")
+        self.assertEqual(headers["X-Catalog-Source"], payload["source_fingerprint"])
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
         self.assertEqual(payload["user_count"], 4)
+
+    def test_healthz_rejects_development_server_in_production_mode(self):
+        with patch("catalog_backend.web.CATALOG_RUNTIME_MODE", "production"):
+            response = self.request("/healthz")
+
+        self.assertTrue(response["status"].startswith("503"))
+        payload = json.loads(response["body"].decode("utf-8"))
+        self.assertEqual(payload["status"], "degraded")
+        self.assertFalse(payload["production_runtime_ready"])
+        self.assertNotIn("gunicorn", payload["server_software"].lower())
 
     def test_login_is_temporarily_locked_after_repeated_failures(self):
         for _ in range(db.LOGIN_FAILURE_LIMIT - 1):
@@ -3959,6 +3975,7 @@ class CatalogAppTests(unittest.TestCase):
 
         self.assertEqual(str(journal_mode).lower(), "wal")
         self.assertEqual(busy_timeout, db.SQLITE_BUSY_TIMEOUT_MS)
+        self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()[0], 1)
 
     def test_login_can_read_while_catalog_write_transaction_is_open(self):
         with db.get_connection(self.db_path) as writer:
@@ -4892,6 +4909,15 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(after_second["bulk_arrival_date"], "2026-09-20")
         self.assertEqual(after_second["current_version_no"], before["current_version_no"] + 2)
         self.assertEqual(db.list_product_price_history(self.db_path, 2)[0]["new_price"], 175.5)
+
+    def test_import_page_prevents_duplicate_submissions_and_shows_progress(self):
+        cookie = self.login("a_editor", "demo123")
+        body = self.request("/import", cookie=cookie)["body"].decode("utf-8")
+
+        self.assertEqual(body.count('class="excel-import-form"'), 2)
+        self.assertIn("正在上传并处理 Excel，请勿重复提交或关闭页面。", body)
+        self.assertIn("form.dataset.submitting === '1'", body)
+        self.assertIn("button.disabled = true", body)
 
     def test_a_partial_full_template_import_uses_style_color_and_preserves_blank_fields(self):
         from catalog_backend.fields import PRODUCT_FIELDS

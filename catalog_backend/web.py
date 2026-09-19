@@ -45,6 +45,7 @@ from catalog_backend.excel import (
     workbook_bytes,
 )
 from catalog_backend.fields import CATALOG_EXPORT_FIELD_ORDER, FIELDS_BY_GROUP, FieldDef, PRODUCT_FIELDS, PRODUCT_FIELD_MAP
+from catalog_backend.release import CATALOG_RUNTIME_MODE, CATALOG_SOURCE_FINGERPRINT, PROCESS_STARTED_AT
 from catalog_backend.policies import (
     A_STAGE_FIELD_KEYS,
     B_CATALOG_EDITABLE_FIELD_KEYS,
@@ -116,7 +117,7 @@ from catalog_backend.uploads import (
 
 
 LOGGER = logging.getLogger(__name__)
-CATALOG_BUILD_VERSION = "2026.09.18-concurrency-capacity-v2"
+CATALOG_BUILD_VERSION = "2026.09.19-import-deployment-v3"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -129,6 +130,7 @@ DEFAULT_IMPORT_SLOTS = 2
 DEFAULT_EXPORT_SLOTS = 4
 DEFAULT_IMAGE_EXPORT_SLOTS = 2
 DEFAULT_HEAVY_TASK_WAIT_SECONDS = 15 * 60
+DEFAULT_IMPORT_TASK_WAIT_SECONDS = 5
 LIST_LAYOUT_VIRTUAL_FIELDS: tuple[FieldDef, ...] = ()
 LIST_LAYOUT_VIRTUAL_FIELD_MAP = {}
 LIST_LAYOUT_HIDDEN_FIELD_KEYS = {
@@ -172,17 +174,21 @@ class CatalogApplication:
             "CATALOG_HEAVY_TASK_WAIT_SECONDS",
             DEFAULT_HEAVY_TASK_WAIT_SECONDS,
         )
+        import_task_wait_seconds = self.positive_env_int(
+            "CATALOG_IMPORT_TASK_WAIT_SECONDS",
+            DEFAULT_IMPORT_TASK_WAIT_SECONDS,
+        )
         self.import_write_pool = FileSlotPool(
             task_lock_dir,
             "catalog-import-write",
             self.positive_env_int("CATALOG_IMPORT_WRITE_SLOTS", DEFAULT_IMPORT_WRITE_SLOTS),
-            wait_seconds=task_wait_seconds,
+            wait_seconds=import_task_wait_seconds,
         )
         self.import_pool = FileSlotPool(
             task_lock_dir,
             "catalog-import",
             self.positive_env_int("CATALOG_IMPORT_SLOTS", DEFAULT_IMPORT_SLOTS),
-            wait_seconds=task_wait_seconds,
+            wait_seconds=import_task_wait_seconds,
         )
         self.export_pool = FileSlotPool(
             task_lock_dir,
@@ -302,7 +308,7 @@ class CatalogApplication:
             if path == "/":
                 return self.redirect(start_response, "/modules" if user else "/login")
             if path == "/healthz" and method == "GET":
-                return self.handle_healthz(start_response)
+                return self.handle_healthz(environ, start_response)
             if path == "/assets/cangbaoge-weibei-mask.png" and method == "GET":
                 return self.handle_brand_title_asset(start_response)
             if path == "/login":
@@ -878,6 +884,7 @@ class CatalogApplication:
         }
         try:
             with self.import_write_pool.acquire(), db.get_connection(self.db_path) as connection:
+                import_index = db.build_owned_product_import_index(connection, int(user["id"]))
                 for product in products:
                     try:
                         action, _ = db.save_or_update_owned_product_in_connection(
@@ -886,6 +893,7 @@ class CatalogApplication:
                             user["id"],
                             user["department"],
                             actor_context=actor_context,
+                            import_index=import_index,
                         )
                     except (PermissionError, ValueError) as error:
                         row_label = str(
@@ -1046,15 +1054,38 @@ class CatalogApplication:
         skipped: list[str] = []
         unauthorized: list[tuple[str, set[str]]] = []
         with db.get_connection(self.db_path) as connection:
+            products_by_identity: dict[tuple[str, str], list[dict]] = {}
+            for product in db.list_active_products_for_import(connection):
+                identity_key = (
+                    str(product.get("style_code") or "").strip(),
+                    str(product.get("product_name") or "").strip(),
+                )
+                products_by_identity.setdefault(identity_key, []).append(product)
             for row in products:
                 row_label = str(row.get("style_code") or row.get("product_name") or "未命名资料").strip()
-                candidates = db.find_matching_products_for_import(
-                    connection,
-                    row.get("style_code"),
-                    row.get("style_color"),
-                    row.get("color_name"),
-                    row.get("product_name"),
+                identity_key = (
+                    str(row.get("style_code") or "").strip(),
+                    str(row.get("product_name") or "").strip(),
                 )
+                candidates = list(products_by_identity.get(identity_key, [])) if all(identity_key) else []
+                style_color = str(row.get("style_color") or "").strip()
+                matched_by_style_color = False
+                if style_color:
+                    style_color_matches = [
+                        item for item in candidates
+                        if str(item.get("style_color") or "").strip() == style_color
+                    ]
+                    if style_color_matches:
+                        candidates = style_color_matches
+                        matched_by_style_color = True
+                color_name = str(row.get("color_name") or "").strip()
+                if color_name and not matched_by_style_color:
+                    color_matches = [
+                        item for item in candidates
+                        if str(item.get("color_name") or "").strip() == color_name
+                    ]
+                    if color_matches:
+                        candidates = color_matches
                 editable_candidates = [item for item in candidates if can_edit_product(user, item)]
                 if not editable_candidates:
                     unmatched.append(row_label)
@@ -1091,7 +1122,17 @@ class CatalogApplication:
                 if not changed:
                     skipped.append(row_label)
                     continue
-                db.update_product(connection, product["id"], updated_payload, user["id"])
+                db.update_product(
+                    connection,
+                    product["id"],
+                    updated_payload,
+                    user["id"],
+                    before_product=product,
+                    actor_context={
+                        "department": str(user.get("department") or ""),
+                        "username": str(user.get("username") or ""),
+                    },
+                )
                 updated += 1
         report = f"导入完成：已回填 {updated} 条商品部资料。"
         detail_parts = []
@@ -1783,14 +1824,25 @@ class CatalogApplication:
             status = "409 Conflict" if code == "version_conflict" else "400 Bad Request"
             return self.json_error_response(start_response, code, str(error), status)
 
-    def handle_healthz(self, start_response):
+    def handle_healthz(self, environ, start_response):
         db_exists = Path(self.db_path).exists()
         uploads_exists = Path(self.upload_dir).exists()
         user_count = len(db.list_users(self.db_path)) if db_exists else 0
+        server_software = str(environ.get("SERVER_SOFTWARE") or "unknown")
+        production_runtime_ready = (
+            CATALOG_RUNTIME_MODE != "production"
+            or "gunicorn" in server_software.lower()
+        )
         payload = json.dumps(
             {
-                "status": "ok",
+                "status": "ok" if production_runtime_ready else "degraded",
                 "build_version": CATALOG_BUILD_VERSION,
+                "source_fingerprint": CATALOG_SOURCE_FINGERPRINT,
+                "process_started_at": PROCESS_STARTED_AT,
+                "worker_pid": os.getpid(),
+                "runtime_mode": CATALOG_RUNTIME_MODE,
+                "server_software": server_software,
+                "production_runtime_ready": production_runtime_ready,
                 "db_path": self.db_path,
                 "db_exists": db_exists,
                 "uploads_path": self.upload_dir,
@@ -1801,11 +1853,12 @@ class CatalogApplication:
             indent=2,
         ).encode("utf-8")
         start_response(
-            "200 OK",
+            "200 OK" if production_runtime_ready else "503 Service Unavailable",
             [
                 ("Content-Type", "application/json; charset=utf-8"),
                 ("Cache-Control", "no-store"),
                 ("X-Catalog-Build", CATALOG_BUILD_VERSION),
+                ("X-Catalog-Source", CATALOG_SOURCE_FINGERPRINT),
                 ("Content-Length", str(len(payload))),
             ],
         )
@@ -12817,7 +12870,7 @@ class CatalogApplication:
                   <a class="pill" href="/import/incremental-template.xlsx">下载增量模板</a>
                 </div>
               </div>
-              <form method="post" action="/import" enctype="multipart/form-data">
+              <form class="excel-import-form" method="post" action="/import" enctype="multipart/form-data">
                 <input type="hidden" name="import_mode" value="incremental">
                 <div class="form-grid">
                   <label class="field field-wide">
@@ -12826,8 +12879,9 @@ class CatalogApplication:
                   </label>
                 </div>
                 <div class="tools" style="margin-top:16px; margin-bottom:0; justify-content:flex-end;">
-                  <button type="submit">按款色补充资料</button>
+                  <button type="submit" data-idle-label="按款色补充资料">按款色补充资料</button>
                 </div>
+                <div class="notice import-progress" style="margin-top:14px;" hidden>正在上传并处理 Excel，请勿重复提交或关闭页面。</div>
               </form>
             </section>
             """
@@ -12853,7 +12907,7 @@ class CatalogApplication:
           {f'<p class="meta">{html.escape(hint_text)}</p>' if hint_text else ''}
           {report_block}
           {error_block}
-          <form method="post" action="/import" enctype="multipart/form-data">
+          <form class="excel-import-form" method="post" action="/import" enctype="multipart/form-data">
             <input type="hidden" name="import_mode" value="full">
             <div class="form-grid">
               <label class="field field-wide">
@@ -12863,11 +12917,32 @@ class CatalogApplication:
             </div>
             <div class="tools" style="margin-top:16px; margin-bottom:0;">
               <a class="pill" href="/products">返回资料列表</a>
-              <button type="submit">{html.escape(button_text)}</button>
+              <button type="submit" data-idle-label="{html.escape(button_text)}">{html.escape(button_text)}</button>
             </div>
+            <div class="notice import-progress" style="margin-top:14px;" hidden>正在上传并处理 Excel，请勿重复提交或关闭页面。</div>
           </form>
         </section>
         {incremental_section}
+        <script>
+          document.querySelectorAll('.excel-import-form').forEach((form) => {{
+            form.addEventListener('submit', (event) => {{
+              if (form.dataset.submitting === '1') {{
+                event.preventDefault();
+                return;
+              }}
+              event.preventDefault();
+              form.dataset.submitting = '1';
+              const button = form.querySelector('button[type="submit"]');
+              const progress = form.querySelector('.import-progress');
+              if (button) {{
+                button.disabled = true;
+                button.textContent = '正在处理...';
+              }}
+              if (progress) progress.hidden = false;
+              window.requestAnimationFrame(() => window.setTimeout(() => form.submit(), 40));
+            }});
+          }});
+        </script>
         """
         return self.page("导入 Excel - 商品资料后台", content, user, current_page="products", back_href="/products")
 

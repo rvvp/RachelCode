@@ -113,6 +113,7 @@ def get_connection(db_path: str | Path) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA synchronous = NORMAL")
     return connection
 
 
@@ -897,6 +898,10 @@ def init_db(
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_products_active_style_color "
             "ON products(lifecycle_status, style_color)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_products_creator_style_color "
+            "ON products(created_by, style_color)"
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_product_logs_product_id ON product_logs(product_id)"
@@ -3582,6 +3587,105 @@ def find_matching_owned_products(
     return [row_to_dict(row) for row in rows]
 
 
+class OwnedProductImportIndex:
+    """In-memory lookup used for one A-department Excel import transaction."""
+
+    def __init__(self, products: list[dict], created_by: int):
+        self.created_by = int(created_by)
+        self.products_by_id: dict[int, dict] = {}
+        self.owned_by_style_color: dict[str, list[dict]] = {}
+        self.owned_by_identity: dict[tuple[str, str, str], list[dict]] = {}
+        self.active_by_style_color: dict[str, list[dict]] = {}
+        for product in products:
+            self.add(product)
+
+    @staticmethod
+    def style_color_key(value) -> str:
+        return str(value or "").strip()
+
+    @staticmethod
+    def identity_key(product: dict) -> tuple[str, str, str]:
+        return (
+            str(product.get("style_code") or "").strip(),
+            str(product.get("color_name") or "").strip(),
+            str(product.get("product_name") or "").strip(),
+        )
+
+    @staticmethod
+    def _append(mapping: dict, key, product: dict) -> None:
+        if key:
+            mapping.setdefault(key, []).append(product)
+
+    @staticmethod
+    def _remove(mapping: dict, key, product_id: int) -> None:
+        if not key or key not in mapping:
+            return
+        remaining = [item for item in mapping[key] if int(item.get("id") or 0) != product_id]
+        if remaining:
+            mapping[key] = remaining
+        else:
+            mapping.pop(key, None)
+
+    def add(self, raw_product: dict) -> None:
+        product = dict(raw_product)
+        product_id = int(product.get("id") or 0)
+        if not product_id:
+            return
+        if product_id in self.products_by_id:
+            self.remove(product_id)
+        self.products_by_id[product_id] = product
+        style_key = self.style_color_key(product.get("style_color"))
+        if int(product.get("created_by") or 0) == self.created_by:
+            self._append(self.owned_by_style_color, style_key, product)
+            self._append(self.owned_by_identity, self.identity_key(product), product)
+        if str(product.get("lifecycle_status") or "") == "active":
+            self._append(self.active_by_style_color, style_key, product)
+
+    def remove(self, product_id: int) -> None:
+        product = self.products_by_id.pop(int(product_id), None)
+        if not product:
+            return
+        style_key = self.style_color_key(product.get("style_color"))
+        self._remove(self.owned_by_style_color, style_key, int(product_id))
+        self._remove(self.owned_by_identity, self.identity_key(product), int(product_id))
+        self._remove(self.active_by_style_color, style_key, int(product_id))
+
+    def replace(self, product: dict) -> None:
+        self.add(product)
+
+    def matching_owned_products(self, raw_values: dict) -> list[dict]:
+        style_key = self.style_color_key(raw_values.get("style_color"))
+        if style_key:
+            candidates = list(self.owned_by_style_color.get(style_key, []))
+            if len(candidates) <= 1:
+                return candidates
+            identity_key = self.identity_key(raw_values)
+            detailed = [item for item in candidates if self.identity_key(item) == identity_key]
+            return detailed if len(detailed) == 1 else candidates
+        if not raw_values.get("style_code") and not raw_values.get("product_name"):
+            return []
+        return list(self.owned_by_identity.get(self.identity_key(raw_values), []))
+
+    def active_style_color_products(self, value) -> list[dict]:
+        return list(self.active_by_style_color.get(self.style_color_key(value), []))
+
+
+def build_owned_product_import_index(
+    connection: sqlite3.Connection,
+    created_by: int,
+) -> OwnedProductImportIndex:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM products
+        WHERE created_by = ? OR lifecycle_status = 'active'
+        ORDER BY id DESC
+        """,
+        (int(created_by),),
+    ).fetchall()
+    return OwnedProductImportIndex([row_to_dict(row) for row in rows], int(created_by))
+
+
 def save_or_update_owned_product(
     db_path: str | Path,
     raw_values: dict,
@@ -3604,17 +3708,21 @@ def save_or_update_owned_product_in_connection(
     owner_department: str,
     *,
     actor_context: dict | None = None,
+    import_index: OwnedProductImportIndex | None = None,
 ) -> tuple[str, int]:
     if owner_department != "A":
         raise ValueError("只有 A 部门可以通过导入创建或更新主体资料。")
-    matching_candidates = find_matching_owned_products(
-        connection,
-        created_by,
-        raw_values.get("style_code"),
-        raw_values.get("style_color"),
-        raw_values.get("color_name"),
-        raw_values.get("product_name"),
-    )
+    if import_index is None:
+        matching_candidates = find_matching_owned_products(
+            connection,
+            created_by,
+            raw_values.get("style_code"),
+            raw_values.get("style_color"),
+            raw_values.get("color_name"),
+            raw_values.get("product_name"),
+        )
+    else:
+        matching_candidates = import_index.matching_owned_products(raw_values)
     if len(matching_candidates) > 1:
         raise ValueError(
             f"款色“{str(raw_values.get('style_color') or '').strip()}”匹配到多条本人资料，已停止该行导入，请先清理重复资料。"
@@ -3622,7 +3730,11 @@ def save_or_update_owned_product_in_connection(
     existing = matching_candidates[0] if matching_candidates else None
     style_color = str(raw_values.get("style_color") or "").strip()
     if style_color and not existing:
-        existing_style_color_products = find_active_products_by_style_color(connection, style_color)
+        existing_style_color_products = (
+            import_index.active_style_color_products(style_color)
+            if import_index is not None
+            else find_active_products_by_style_color(connection, style_color)
+        )
         if existing_style_color_products:
             raise PermissionError(
                 f"款色“{style_color}”已存在，但不是当前账号发起的资料，不能新建重复条目。"
@@ -3661,6 +3773,13 @@ def save_or_update_owned_product_in_connection(
             before_product=existing,
             actor_context=actor_context,
         )
+        if import_index is not None:
+            refreshed_row = connection.execute(
+                "SELECT * FROM products WHERE id = ?",
+                (int(existing["id"]),),
+            ).fetchone()
+            if refreshed_row:
+                import_index.replace(row_to_dict(refreshed_row))
         return "updated", existing["id"]
     if (
         not has_meaningful_value(raw_values.get("style_code"))
@@ -3668,6 +3787,17 @@ def save_or_update_owned_product_in_connection(
     ):
         raise ValueError("未找到对应款色，且缺少款号或商品名称，不能作为新资料创建。")
     product_id = create_product(connection, sanitized_values, created_by, owner_department)
+    if import_index is not None:
+        import_index.add(
+            {
+                **sanitized_values,
+                "id": product_id,
+                "created_by": created_by,
+                "owner_department": owner_department,
+                "status": "draft",
+                "lifecycle_status": "active",
+            }
+        )
     return "created", product_id
 
 

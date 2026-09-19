@@ -60,4 +60,12 @@ else
   echo "WARN 当前环境没有 curl，跳过健康检查请求"
 fi
 
+if [ "${CATALOG_RUNTIME_MODE:-development}" = "production" ]; then
+  SERVER_SOFTWARE="$(curl --fail --silent "$HEALTH_URL" | "$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("server_software", ""))' 2>/dev/null || true)"
+  if [[ "${SERVER_SOFTWARE:l}" != *gunicorn* ]]; then
+    echo "ERROR 正式环境当前不是由 Gunicorn 提供服务: ${SERVER_SOFTWARE:-unknown}" >&2
+    exit 1
+  fi
+fi
+
 echo "自检完成"

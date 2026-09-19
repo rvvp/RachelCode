@@ -14,8 +14,10 @@ Environment=CATALOG_DB=/data/rachelcode/catalog/catalog.db
 Environment=CATALOG_UPLOADS=/data/rachelcode/catalog/uploads
 Environment=CATALOG_SEED_DEMO=0
 Environment=CATALOG_SEED_SAMPLES=0
+Environment=CATALOG_RUNTIME_MODE=production
 Environment=CATALOG_IMPORT_SLOTS=2
 Environment=CATALOG_IMPORT_WRITE_SLOTS=1
+Environment=CATALOG_IMPORT_TASK_WAIT_SECONDS=5
 Environment=CATALOG_EXPORT_SLOTS=4
 Environment=CATALOG_IMAGE_EXPORT_SLOTS=2
 Environment=CATALOG_HEAVY_TASK_WAIT_SECONDS=900
