@@ -1,0 +1,64 @@
+name: Catalog deployment probe
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  inspect-runner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify exact origin commit can be downloaded
+        env:
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+          archive="$(mktemp)"
+          curl --fail --silent --show-error --location --max-time 60 \
+            --header "Authorization: token ${GITEA_TOKEN}" \
+            --output "$archive" \
+            "${SERVER_URL}/api/v1/repos/${REPOSITORY}/archive/${EXPECTED_COMMIT}.tar.gz"
+          tar -tzf "$archive" > /tmp/catalog-archive-list.txt
+          manifest="$(sed -n '1p' /tmp/catalog-archive-list.txt)"
+          test -n "$manifest"
+          echo "OK exact origin commit archive is available: ${EXPECTED_COMMIT}"
+
+      - name: Inspect production access without modifying the host
+        run: |
+          set -euo pipefail
+          echo "runner=$(uname -srm)"
+          for path in /opt/rachelcode/app /data/rachelcode/catalog /var/run/docker.sock; do
+            if [ -e "$path" ]; then
+              echo "visible: $path"
+              ls -ld "$path"
+            else
+              echo "not-visible: $path"
+            fi
+          done
+
+          gateway="$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')"
+          echo "container-gateway=${gateway:-unknown}"
+          for base_url in \
+            http://127.0.0.1:8765 \
+            "${gateway:+http://${gateway}:8765}" \
+            http://host.docker.internal:8765 \
+            http://203.205.90.232:8765; do
+            [ -n "$base_url" ] || continue
+            code="$(curl --silent --output /tmp/catalog-health.json --write-out '%{http_code}' \
+              --connect-timeout 2 --max-time 5 "${base_url}/healthz" 2>/dev/null || true)"
+            echo "health ${base_url}: HTTP ${code:-unavailable}"
+            if [ "$code" = "200" ]; then
+              python3 -c 'import json; from pathlib import Path; p=json.loads(Path("/tmp/catalog-health.json").read_text()); print("  commit=%s build=%s source=%s" % (p.get("release_commit"), p.get("build_version"), p.get("source_fingerprint")))'
+            fi
+          done
+
+          if [ -S /var/run/docker.sock ] && command -v docker >/dev/null 2>&1; then
+            docker info --format 'docker-host={{.Name}} server={{.ServerVersion}}' 2>/dev/null \
+              || echo "docker socket exists but is not accessible"
+          fi
