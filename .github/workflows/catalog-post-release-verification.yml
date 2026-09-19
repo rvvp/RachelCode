@@ -33,12 +33,11 @@ jobs:
             payload="$(curl --fail --silent --show-error --max-time 15 --connect-timeout 5 \
               --header 'Cache-Control: no-cache' --header 'Connection: close' \
               "${PUBLIC_HEALTH_URL}?post_release_check=${GITHUB_RUN_ID}-${attempt}")"
-            worker_pid="$(PAYLOAD="$payload" python3 <<'PY'
+            worker_result="$(PAYLOAD="$payload" python3 <<'PY'
           import json
           import os
 
           payload = json.loads(os.environ["PAYLOAD"])
-          expected_commit = os.environ["EXPECTED_COMMIT"].lower()
           errors = []
           release_commit = payload.get("release_commit")
           if not isinstance(release_commit, str) or len(release_commit) < 40:
@@ -57,8 +56,8 @@ jobs:
           print(f"{release_commit} {worker_pid}")
           PY
             )"
-            observed_commit="${worker_pid%% *}"
-            observed_pid="${worker_pid##* }"
+            observed_commit="${worker_result%% *}"
+            observed_pid="${worker_result##* }"
             if [ -z "$public_commit" ]; then
               public_commit="$observed_commit"
             elif [ "$public_commit" != "$observed_commit" ]; then

@@ -81,9 +81,9 @@
 
 正式激活脚本会为每次成功发布重新安排一个单次任务：30 分钟后再执行一次公网验收，验证提交号、构建号、源码指纹和 8 个 Gunicorn 工作进程。任务执行一次后即结束，不存在每小时或每天的循环巡检。
 
-仓库同时提供 `.gitea/workflows/catalog-post-release-verification.yml`。`main` 分支每次更新都会由 Gitea Actions 独立等待 30 分钟后检查公网提交号和全部工作进程。若期间又发布了更新版本，只要公网提交的历史已包含本次待验收提交，即判定为正常。因为该任务由仓库更新事件触发，即使部署 Webhook 完全遗漏，也能独立发现公网仍是旧提交并将任务标记为失败。
+仓库同时提供 `.github/workflows/catalog-post-release-verification.yml`。GitHub `main` 分支每次更新都会由 GitHub Actions 独立等待 30 分钟后检查公网提交号和全部工作进程。若期间又发布了更新版本，只要公网提交的历史已包含本次待验收提交，即判定为正常。因为该任务由 GitHub 仓库更新事件触发，即使 Gitea 侧的部署 Webhook 完全遗漏，也能独立发现公网仍是旧提交并将任务标记为失败。
 
-Gitea Actions 需要仓库已启用 Actions 且至少有一个可用 Runner。在 Actions 页面确认延迟验收任务可正常运行前，不得把它作为 Webhook 漏发的已生效保障。
+当次更新必须按项目发布要求同时推送 `origin` 和 `github`，否则 GitHub 无法得知仅发生在 Gitea 的更新。在 GitHub Actions 页面确认首次延迟验收任务成功前，不得把它作为 Webhook 漏发的已生效保障。
 
 ## 本机安全同步建议
 
