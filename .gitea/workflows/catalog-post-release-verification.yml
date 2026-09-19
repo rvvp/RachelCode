@@ -1,0 +1,53 @@
+name: Catalog post-release verification
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  verify-public-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download exact release and verify public workers
+        env:
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+          PUBLIC_URL: http://203.205.90.232:8765
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+          archive="$(mktemp)"
+          workspace="$(mktemp -d)"
+          curl --fail --silent --show-error --location --max-time 60 \
+            --header "Authorization: token ${GITEA_TOKEN}" \
+            --output "$archive" \
+            "${SERVER_URL}/api/v1/repos/${REPOSITORY}/archive/${EXPECTED_COMMIT}.tar.gz"
+          tar -xzf "$archive" -C "$workspace"
+          source_root="$(find "$workspace" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          test -x "$source_root/scripts/verify_public_deployment.sh"
+
+          ready=0
+          for attempt in $(seq 1 20); do
+            if CATALOG_RELEASE_COMMIT="$EXPECTED_COMMIT" \
+              CATALOG_DEPLOYMENT_CHECK_COUNT=1 \
+              CATALOG_EXPECTED_WORKERS=1 \
+              "$source_root/scripts/verify_public_deployment.sh" "$PUBLIC_URL" >/dev/null 2>&1; then
+              ready=1
+              echo "Public release became ready on attempt ${attempt}."
+              break
+            fi
+            sleep 15
+          done
+          if [ "$ready" != "1" ]; then
+            echo "Public release did not switch to ${EXPECTED_COMMIT} within five minutes." >&2
+            exit 1
+          fi
+
+          CATALOG_RELEASE_COMMIT="$EXPECTED_COMMIT" \
+            CATALOG_DEPLOYMENT_CHECK_COUNT=256 \
+            CATALOG_EXPECTED_WORKERS=8 \
+            "$source_root/scripts/verify_public_deployment.sh" "$PUBLIC_URL"
