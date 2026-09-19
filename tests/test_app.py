@@ -3836,16 +3836,18 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.19-release-watchdog-v6")
+        self.assertEqual(payload["build_version"], "2026.09.19-release-watchdog-v7")
         self.assertRegex(payload["release_commit"], r"^[0-9a-f]{40,64}$")
+        self.assertGreater(payload["release_generation"], 0)
         self.assertRegex(payload["source_fingerprint"], r"^[0-9a-f]{16}$")
         self.assertTrue(payload["process_started_at"].endswith("Z"))
         self.assertGreater(payload["worker_pid"], 0)
         self.assertEqual(payload["runtime_mode"], "development")
         self.assertTrue(payload["production_runtime_ready"])
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.19-release-watchdog-v6")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.19-release-watchdog-v7")
         self.assertEqual(headers["X-Catalog-Commit"], payload["release_commit"])
+        self.assertEqual(headers["X-Catalog-Generation"], str(payload["release_generation"]))
         self.assertEqual(headers["X-Catalog-Source"], payload["source_fingerprint"])
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertTrue(payload["db_exists"])
@@ -3872,6 +3874,19 @@ class CatalogAppTests(unittest.TestCase):
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "degraded")
         self.assertEqual(payload["release_commit"], "unknown")
+        self.assertFalse(payload["production_runtime_ready"])
+
+    def test_healthz_rejects_release_without_generation_in_production_mode(self):
+        with (
+            patch("catalog_backend.web.CATALOG_RUNTIME_MODE", "production"),
+            patch("catalog_backend.web.CATALOG_RELEASE_GENERATION", 0),
+        ):
+            response = self.request("/healthz", server_software="gunicorn/23.0.0")
+
+        self.assertTrue(response["status"].startswith("503"))
+        payload = json.loads(response["body"].decode("utf-8"))
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["release_generation"], 0)
         self.assertFalse(payload["production_runtime_ready"])
 
     def test_login_is_temporarily_locked_after_repeated_failures(self):

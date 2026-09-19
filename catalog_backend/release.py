@@ -18,6 +18,14 @@ def _normalized_commit(value: object) -> str | None:
     return None
 
 
+def _normalized_generation(value: object) -> int | None:
+    try:
+        generation = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return generation if generation > 0 else None
+
+
 def catalog_release_commit(root_dir: str | Path | None = None) -> str:
     """Return the repository commit represented by this deployed release."""
     root = Path(root_dir).resolve() if root_dir else Path(__file__).resolve().parent.parent
@@ -57,6 +65,64 @@ def catalog_release_commit(root_dir: str | Path | None = None) -> str:
     return "unknown"
 
 
+def catalog_release_generation(root_dir: str | Path | None = None) -> int:
+    """Return a monotonic Git history number for stale-release protection."""
+    root = Path(root_dir).resolve() if root_dir else Path(__file__).resolve().parent.parent
+
+    configured_generation = _normalized_generation(os.environ.get("CATALOG_RELEASE_GENERATION"))
+    if configured_generation:
+        return configured_generation
+
+    manifest_path = root / ".release-generation"
+    if manifest_path.is_file():
+        try:
+            manifest_generation = _normalized_generation(manifest_path.read_text(encoding="utf-8"))
+            if manifest_generation:
+                return manifest_generation
+        except OSError:
+            pass
+
+    if (root / ".git").exists():
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), "rev-list", "--count", "HEAD"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=2,
+            )
+            git_generation = _normalized_generation(result.stdout) if result.returncode == 0 else None
+            if git_generation:
+                return git_generation
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return 0
+
+
+def stale_release_reason(
+    current_generation: object,
+    current_commit: object,
+    candidate_generation: object,
+    candidate_commit: object,
+) -> str | None:
+    """Explain why a candidate must not replace the running release."""
+    current_number = _normalized_generation(current_generation) or 0
+    candidate_number = _normalized_generation(candidate_generation) or 0
+    current_revision = _normalized_commit(current_commit) or "unknown"
+    candidate_revision = _normalized_commit(candidate_commit) or "unknown"
+    if current_number > candidate_number:
+        return (
+            f"current release {current_revision}/{current_number} is newer than "
+            f"candidate {candidate_revision}/{candidate_number}"
+        )
+    if current_number > 0 and current_number == candidate_number and current_revision != candidate_revision:
+        return (
+            f"release generation {current_number} is already occupied by "
+            f"{current_revision}, not {candidate_revision}"
+        )
+    return None
+
+
 def catalog_source_fingerprint() -> str:
     """Identify the exact application source loaded by the current process."""
     root_dir = Path(__file__).resolve().parent.parent
@@ -85,4 +151,5 @@ def catalog_source_fingerprint() -> str:
 
 CATALOG_SOURCE_FINGERPRINT = catalog_source_fingerprint()
 CATALOG_RELEASE_COMMIT = catalog_release_commit()
+CATALOG_RELEASE_GENERATION = catalog_release_generation()
 CATALOG_RUNTIME_MODE = str(os.environ.get("CATALOG_RUNTIME_MODE") or "development").strip().lower()

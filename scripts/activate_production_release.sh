@@ -16,15 +16,21 @@ VENV_DIR="${CATALOG_VENV_DIR:-/opt/rachelcode/venv}"
 GIT_ROOT="$(git -C "$ROOT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
 if [ "$GIT_ROOT" = "$ROOT_DIR" ]; then
   GIT_RELEASE_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
+  GIT_RELEASE_GENERATION="$(git -C "$ROOT_DIR" rev-list --count HEAD 2>/dev/null || true)"
   if [[ "$GIT_RELEASE_COMMIT" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
     printf '%s\n' "$GIT_RELEASE_COMMIT" | tr '[:upper:]' '[:lower:]' > "$ROOT_DIR/.release-commit"
     chmod 0644 "$ROOT_DIR/.release-commit"
+  fi
+  if [[ "$GIT_RELEASE_GENERATION" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "$GIT_RELEASE_GENERATION" > "$ROOT_DIR/.release-generation"
+    chmod 0644 "$ROOT_DIR/.release-generation"
   fi
 fi
 
 EXPECTED_BUILD="$(sed -n 's/^CATALOG_BUILD_VERSION = "\([^"]*\)"/\1/p' "$ROOT_DIR/catalog_backend/web.py" | head -n 1)"
 EXPECTED_SOURCE="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("catalog_backend/release.py")["CATALOG_SOURCE_FINGERPRINT"])')"
 EXPECTED_COMMIT="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("catalog_backend/release.py")["CATALOG_RELEASE_COMMIT"])')"
+EXPECTED_GENERATION="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("catalog_backend/release.py")["CATALOG_RELEASE_GENERATION"])')"
 
 if [ "$(uname -s)" != "Linux" ]; then
   echo "ERROR 正式服务器激活脚本只能在 Linux 服务器上运行。" >&2
@@ -42,6 +48,10 @@ if [ "$EXPECTED_COMMIT" = "unknown" ]; then
   echo "ERROR 无法确定待发布提交号，拒绝激活无法追溯的代码。" >&2
   exit 1
 fi
+if ! [[ "$EXPECTED_GENERATION" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR 无法确定待发布版本序号，拒绝激活可能乱序的代码。" >&2
+  exit 1
+fi
 
 run_root() {
   if [ "$(id -u)" -eq 0 ]; then
@@ -53,7 +63,20 @@ run_root() {
 
 echo "准备激活构建: $EXPECTED_BUILD"
 echo "准备激活提交: $EXPECTED_COMMIT"
+echo "准备激活序号: $EXPECTED_GENERATION"
 echo "准备激活源码指纹: $EXPECTED_SOURCE"
+
+# A delayed webhook must never roll production back after a newer release has
+# already started. Older builds do not expose a generation and are allowed
+# once so this guard can bootstrap itself.
+CURRENT_RELEASE="$(curl --fail --silent --max-time 5 "$LOCAL_URL/healthz" 2>/dev/null || true)"
+if [ -n "$CURRENT_RELEASE" ]; then
+  STALE_REASON="$(cd "$ROOT_DIR" && CURRENT_RELEASE="$CURRENT_RELEASE" EXPECTED_GENERATION="$EXPECTED_GENERATION" EXPECTED_COMMIT="$EXPECTED_COMMIT" python3 -c 'import json,os; from catalog_backend.release import stale_release_reason; p=json.loads(os.environ["CURRENT_RELEASE"]); print(stale_release_reason(p.get("release_generation"), p.get("release_commit"), os.environ["EXPECTED_GENERATION"], os.environ["EXPECTED_COMMIT"]) or "")' 2>/dev/null || true)"
+  if [ -n "$STALE_REASON" ]; then
+    echo "ERROR 拒绝乱序发布: $STALE_REASON" >&2
+    exit 1
+  fi
+fi
 
 "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check -r "$ROOT_DIR/requirements.txt"
 run_root install -m 0644 "$ROOT_DIR/deploy/systemd/rachel-catalog.service" "$SERVICE_FILE"
