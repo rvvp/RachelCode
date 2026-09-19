@@ -4,11 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVICE_NAME="${CATALOG_SERVICE_NAME:-rachel-catalog}"
 SERVICE_FILE="${CATALOG_SERVICE_FILE:-/etc/systemd/system/${SERVICE_NAME}.service}"
+POST_RELEASE_VERIFY_NAME="${CATALOG_POST_RELEASE_VERIFY_NAME:-rachel-catalog-post-release-verify}"
+POST_RELEASE_VERIFY_SERVICE_FILE="${CATALOG_POST_RELEASE_VERIFY_SERVICE_FILE:-/etc/systemd/system/${POST_RELEASE_VERIFY_NAME}.service}"
+POST_RELEASE_VERIFY_TIMER_FILE="${CATALOG_POST_RELEASE_VERIFY_TIMER_FILE:-/etc/systemd/system/${POST_RELEASE_VERIFY_NAME}.timer}"
 LOCAL_URL="${CATALOG_LOCAL_URL:-http://127.0.0.1:8765}"
 PUBLIC_URL="${1:-${CATALOG_PUBLIC_URL:-}}"
 VENV_DIR="${CATALOG_VENV_DIR:-/opt/rachelcode/venv}"
 EXPECTED_BUILD="$(sed -n 's/^CATALOG_BUILD_VERSION = "\([^"]*\)"/\1/p' "$ROOT_DIR/catalog_backend/web.py" | head -n 1)"
 EXPECTED_SOURCE="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("catalog_backend/release.py")["CATALOG_SOURCE_FINGERPRINT"])')"
+EXPECTED_COMMIT="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("catalog_backend/release.py")["CATALOG_RELEASE_COMMIT"])')"
 
 if [ "$(uname -s)" != "Linux" ]; then
   echo "ERROR 正式服务器激活脚本只能在 Linux 服务器上运行。" >&2
@@ -22,6 +26,10 @@ if [ ! -x "$VENV_DIR/bin/gunicorn" ]; then
   echo "ERROR 未找到 Gunicorn: $VENV_DIR/bin/gunicorn" >&2
   exit 1
 fi
+if [ "$EXPECTED_COMMIT" = "unknown" ]; then
+  echo "ERROR 无法确定待发布提交号，拒绝激活无法追溯的代码。" >&2
+  exit 1
+fi
 
 run_root() {
   if [ "$(id -u)" -eq 0 ]; then
@@ -32,10 +40,13 @@ run_root() {
 }
 
 echo "准备激活构建: $EXPECTED_BUILD"
+echo "准备激活提交: $EXPECTED_COMMIT"
 echo "准备激活源码指纹: $EXPECTED_SOURCE"
 
 "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check -r "$ROOT_DIR/requirements.txt"
 run_root install -m 0644 "$ROOT_DIR/deploy/systemd/rachel-catalog.service" "$SERVICE_FILE"
+run_root install -m 0644 "$ROOT_DIR/deploy/systemd/rachel-catalog-post-release-verify.service" "$POST_RELEASE_VERIFY_SERVICE_FILE"
+run_root install -m 0644 "$ROOT_DIR/deploy/systemd/rachel-catalog-post-release-verify.timer" "$POST_RELEASE_VERIFY_TIMER_FILE"
 run_root systemctl daemon-reload
 run_root systemctl restart "$SERVICE_NAME"
 
@@ -63,4 +74,8 @@ else
   exit 1
 fi
 
-echo "OK 正式服务已重启，本机与公网均已加载本次源码。"
+# Re-arm a single delayed verification for this release. OnActiveSec has no
+# recurring interval, so the timer becomes idle after its one execution.
+run_root systemctl restart "${POST_RELEASE_VERIFY_NAME}.timer"
+
+echo "OK 正式服务已重启，本机与公网均已加载本次源码，30 分钟后将再执行一次固定验收。"

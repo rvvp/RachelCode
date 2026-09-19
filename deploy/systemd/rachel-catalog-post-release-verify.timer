@@ -1,0 +1,10 @@
+[Unit]
+Description=Run one Rachel Catalog public verification 30 minutes after release
+
+[Timer]
+OnActiveSec=30min
+AccuracySec=30s
+Unit=rachel-catalog-post-release-verify.service
+
+[Install]
+WantedBy=timers.target

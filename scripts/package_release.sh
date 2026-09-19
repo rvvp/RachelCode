@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/bash
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -7,6 +7,12 @@ PACKAGE_NAME="catalog-backend-delivery"
 TIMESTAMP="$(date +"%Y%m%d-%H%M%S")"
 STAGING_DIR="$DIST_DIR/${PACKAGE_NAME}-${TIMESTAMP}"
 ARCHIVE_FILE="$DIST_DIR/${PACKAGE_NAME}-${TIMESTAMP}.tar.gz"
+RELEASE_COMMIT="${CATALOG_RELEASE_COMMIT:-$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)}"
+
+if ! [[ "$RELEASE_COMMIT" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+  echo "ERROR 无法确定交付包对应的 Git 提交号。" >&2
+  exit 1
+fi
 
 mkdir -p "$DIST_DIR"
 rm -rf "$STAGING_DIR"
@@ -31,6 +37,7 @@ copy_path "DEPLOYMENT_CHECKLIST.md"
 copy_path "requirements.txt"
 copy_path ".env.example"
 copy_path "上新模板.xlsx"
+printf '%s\n' "$RELEASE_COMMIT" | tr '[:upper:]' '[:lower:]' > "$STAGING_DIR/.release-commit"
 
 find "$STAGING_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} +
 find "$STAGING_DIR" -name '*.pyc' -type f -delete

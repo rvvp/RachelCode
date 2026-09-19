@@ -1,0 +1,13 @@
+[Unit]
+Description=Verify Rachel Catalog public deployment after release
+After=network-online.target rachel-catalog.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=CATALOG_DEPLOYMENT_CHECK_COUNT=256
+Environment=CATALOG_EXPECTED_WORKERS=8
+ExecStart=/opt/rachelcode/app/scripts/verify_public_deployment.sh http://203.205.90.232:8765
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=900

@@ -45,7 +45,12 @@ from catalog_backend.excel import (
     workbook_bytes,
 )
 from catalog_backend.fields import CATALOG_EXPORT_FIELD_ORDER, FIELDS_BY_GROUP, FieldDef, PRODUCT_FIELDS, PRODUCT_FIELD_MAP
-from catalog_backend.release import CATALOG_RUNTIME_MODE, CATALOG_SOURCE_FINGERPRINT, PROCESS_STARTED_AT
+from catalog_backend.release import (
+    CATALOG_RELEASE_COMMIT,
+    CATALOG_RUNTIME_MODE,
+    CATALOG_SOURCE_FINGERPRINT,
+    PROCESS_STARTED_AT,
+)
 from catalog_backend.policies import (
     A_STAGE_FIELD_KEYS,
     B_CATALOG_EDITABLE_FIELD_KEYS,
@@ -117,7 +122,7 @@ from catalog_backend.uploads import (
 
 
 LOGGER = logging.getLogger(__name__)
-CATALOG_BUILD_VERSION = "2026.09.19-import-deployment-v3"
+CATALOG_BUILD_VERSION = "2026.09.19-release-watchdog-v4"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -1831,12 +1836,16 @@ class CatalogApplication:
         server_software = str(environ.get("SERVER_SOFTWARE") or "unknown")
         production_runtime_ready = (
             CATALOG_RUNTIME_MODE != "production"
-            or "gunicorn" in server_software.lower()
+            or (
+                "gunicorn" in server_software.lower()
+                and CATALOG_RELEASE_COMMIT != "unknown"
+            )
         )
         payload = json.dumps(
             {
                 "status": "ok" if production_runtime_ready else "degraded",
                 "build_version": CATALOG_BUILD_VERSION,
+                "release_commit": CATALOG_RELEASE_COMMIT,
                 "source_fingerprint": CATALOG_SOURCE_FINGERPRINT,
                 "process_started_at": PROCESS_STARTED_AT,
                 "worker_pid": os.getpid(),
@@ -1858,6 +1867,7 @@ class CatalogApplication:
                 ("Content-Type", "application/json; charset=utf-8"),
                 ("Cache-Control", "no-store"),
                 ("X-Catalog-Build", CATALOG_BUILD_VERSION),
+                ("X-Catalog-Commit", CATALOG_RELEASE_COMMIT),
                 ("X-Catalog-Source", CATALOG_SOURCE_FINGERPRINT),
                 ("Content-Length", str(len(payload))),
             ],
