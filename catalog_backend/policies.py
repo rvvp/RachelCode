@@ -302,7 +302,7 @@ def editable_field_keys_for_user(user: dict | None, product: dict | None = None)
             return A_STAGE_FIELD_KEYS
         if product.get("lifecycle_status") != "active":
             return ()
-        if user.get("id") != product.get("created_by"):
+        if product.get("owner_department") != "A":
             return ()
         if product.get("status") in {"draft", "pending", "published", "received"}:
             return A_STAGE_FIELD_KEYS
@@ -324,7 +324,7 @@ def available_status_actions(user: dict | None, product: dict | None) -> list[tu
     if product.get("lifecycle_status") != "active":
         return []
     status = product.get("status") or "draft"
-    if user.get("department") == "A" and user.get("id") == product.get("created_by"):
+    if user.get("department") == "A" and product.get("owner_department") == "A":
         actions = []
         if status == "draft":
             actions.append(("pending", "开启商品部协作"))
@@ -387,21 +387,21 @@ def can_manage_lifecycle(user: dict | None, product: dict | None) -> bool:
 
 
 def can_delete_product(user: dict | None, product: dict | None) -> bool:
-    """Only A may delete its own early-stage records; administrators retain full control."""
+    """A may delete department records in early stages; administrators retain full control."""
     if not user or not product or is_department_monitor(user):
         return False
     if is_admin(user):
         return True
     return bool(
         user.get("department") == "A"
-        and user.get("id") == product.get("created_by")
+        and product.get("owner_department") == "A"
         and product.get("lifecycle_status") == "active"
         and product.get("status") in {"draft", "pending"}
     )
 
 
 def can_recall_product(user: dict | None, product: dict | None) -> bool:
-    """The source A user, B team, or an administrator may recall released records."""
+    """The A or B team, or an administrator, may recall released records."""
     if not user or not product or is_department_monitor(user):
         return False
     if product.get("lifecycle_status") != "active" or product.get("status") not in {"published", "received"}:
@@ -411,7 +411,7 @@ def can_recall_product(user: dict | None, product: dict | None) -> bool:
         or user.get("department") == "B"
         or (
             user.get("department") == "A"
-            and user.get("id") == product.get("created_by")
+            and product.get("owner_department") == "A"
         )
     )
 
@@ -424,6 +424,7 @@ def can_archive_product(user: dict | None, product: dict | None) -> bool:
         return product.get("lifecycle_status") == "active"
     return bool(
         user.get("department") == "A"
+        and product.get("owner_department") == "A"
         and product.get("lifecycle_status") == "active"
         and product.get("status") == "received"
     )
@@ -437,6 +438,7 @@ def can_restore_product(user: dict | None, product: dict | None) -> bool:
         return product.get("lifecycle_status") in {"archived", "deleted"}
     return bool(
         user.get("department") == "A"
+        and product.get("owner_department") == "A"
         and product.get("lifecycle_status") == "archived"
     )
 

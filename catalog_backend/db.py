@@ -2552,6 +2552,8 @@ def update_product(
             allowed_field_keys = set(B_CATALOG_EDITABLE_FIELD_KEYS)
         else:
             allowed_field_keys = set()
+        if actor_department == "A" and before_product.get("owner_department") != "A":
+            raise PermissionError("跟单部账号只能维护跟单部发起的资料。")
         requested_changes = {
             field.key
             for field in PRODUCT_FIELDS
@@ -2578,7 +2580,6 @@ def update_product(
         blocked_restart_changes = requested_changes & WORKFLOW_RESTART_FIELD_KEYS
         if (
             actor_department == "A"
-            and actor_user_id == before_product.get("created_by")
             and before_product.get("lifecycle_status") == "active"
             and before_product.get("status") in {"published", "received"}
             and blocked_restart_changes
@@ -3560,9 +3561,9 @@ def restore_product_version(
     return next_version_no
 
 
-def find_matching_owned_products(
+def find_matching_department_products(
     connection: sqlite3.Connection,
-    created_by: int,
+    owner_department: str,
     style_code: str | None,
     style_color: str | None,
     color_name: str | None,
@@ -3574,11 +3575,12 @@ def find_matching_owned_products(
             """
             SELECT *
             FROM products
-            WHERE created_by = ?
+            WHERE owner_department = ?
+              AND lifecycle_status = 'active'
               AND TRIM(COALESCE(style_color, '')) = ?
             ORDER BY id DESC
             """,
-            (created_by, clean_style_color),
+            (owner_department, clean_style_color),
         ).fetchall()
         candidates = [row_to_dict(row) for row in rows]
         if len(candidates) <= 1:
@@ -3602,25 +3604,26 @@ def find_matching_owned_products(
         """
         SELECT *
         FROM products
-        WHERE created_by = ?
+        WHERE owner_department = ?
+          AND lifecycle_status = 'active'
           AND COALESCE(style_code, '') = COALESCE(?, '')
           AND COALESCE(color_name, '') = COALESCE(?, '')
           AND COALESCE(product_name, '') = COALESCE(?, '')
         ORDER BY id DESC
         """,
-        (created_by, style_code or "", color_name or "", product_name or ""),
+        (owner_department, style_code or "", color_name or "", product_name or ""),
     ).fetchall()
     return [row_to_dict(row) for row in rows]
 
 
-class OwnedProductImportIndex:
-    """In-memory lookup used for one A-department Excel import transaction."""
+class DepartmentProductImportIndex:
+    """In-memory lookup for A-department records in one Excel import transaction."""
 
-    def __init__(self, products: list[dict], created_by: int):
-        self.created_by = int(created_by)
+    def __init__(self, products: list[dict], owner_department: str):
+        self.owner_department = str(owner_department or "").strip()
         self.products_by_id: dict[int, dict] = {}
-        self.owned_by_style_color: dict[str, list[dict]] = {}
-        self.owned_by_identity: dict[tuple[str, str, str], list[dict]] = {}
+        self.department_by_style_color: dict[str, list[dict]] = {}
+        self.department_by_identity: dict[tuple[str, str, str], list[dict]] = {}
         self.active_by_style_color: dict[str, list[dict]] = {}
         for product in products:
             self.add(product)
@@ -3661,9 +3664,12 @@ class OwnedProductImportIndex:
             self.remove(product_id)
         self.products_by_id[product_id] = product
         style_key = self.style_color_key(product.get("style_color"))
-        if int(product.get("created_by") or 0) == self.created_by:
-            self._append(self.owned_by_style_color, style_key, product)
-            self._append(self.owned_by_identity, self.identity_key(product), product)
+        if (
+            str(product.get("owner_department") or "").strip() == self.owner_department
+            and str(product.get("lifecycle_status") or "") == "active"
+        ):
+            self._append(self.department_by_style_color, style_key, product)
+            self._append(self.department_by_identity, self.identity_key(product), product)
         if str(product.get("lifecycle_status") or "") == "active":
             self._append(self.active_by_style_color, style_key, product)
 
@@ -3672,17 +3678,17 @@ class OwnedProductImportIndex:
         if not product:
             return
         style_key = self.style_color_key(product.get("style_color"))
-        self._remove(self.owned_by_style_color, style_key, int(product_id))
-        self._remove(self.owned_by_identity, self.identity_key(product), int(product_id))
+        self._remove(self.department_by_style_color, style_key, int(product_id))
+        self._remove(self.department_by_identity, self.identity_key(product), int(product_id))
         self._remove(self.active_by_style_color, style_key, int(product_id))
 
     def replace(self, product: dict) -> None:
         self.add(product)
 
-    def matching_owned_products(self, raw_values: dict) -> list[dict]:
+    def matching_department_products(self, raw_values: dict) -> list[dict]:
         style_key = self.style_color_key(raw_values.get("style_color"))
         if style_key:
-            candidates = list(self.owned_by_style_color.get(style_key, []))
+            candidates = list(self.department_by_style_color.get(style_key, []))
             if len(candidates) <= 1:
                 return candidates
             identity_key = self.identity_key(raw_values)
@@ -3690,26 +3696,25 @@ class OwnedProductImportIndex:
             return detailed if len(detailed) == 1 else candidates
         if not raw_values.get("style_code") and not raw_values.get("product_name"):
             return []
-        return list(self.owned_by_identity.get(self.identity_key(raw_values), []))
+        return list(self.department_by_identity.get(self.identity_key(raw_values), []))
 
     def active_style_color_products(self, value) -> list[dict]:
         return list(self.active_by_style_color.get(self.style_color_key(value), []))
 
 
-def build_owned_product_import_index(
+def build_department_product_import_index(
     connection: sqlite3.Connection,
-    created_by: int,
-) -> OwnedProductImportIndex:
+    owner_department: str,
+) -> DepartmentProductImportIndex:
     rows = connection.execute(
         """
         SELECT *
         FROM products
-        WHERE created_by = ? OR lifecycle_status = 'active'
+        WHERE lifecycle_status = 'active'
         ORDER BY id DESC
-        """,
-        (int(created_by),),
+        """
     ).fetchall()
-    return OwnedProductImportIndex([row_to_dict(row) for row in rows], int(created_by))
+    return DepartmentProductImportIndex([row_to_dict(row) for row in rows], owner_department)
 
 
 def save_or_update_owned_product(
@@ -3734,24 +3739,24 @@ def save_or_update_owned_product_in_connection(
     owner_department: str,
     *,
     actor_context: dict | None = None,
-    import_index: OwnedProductImportIndex | None = None,
+    import_index: DepartmentProductImportIndex | None = None,
 ) -> tuple[str, int]:
     if owner_department != "A":
         raise ValueError("只有 A 部门可以通过导入创建或更新主体资料。")
     if import_index is None:
-        matching_candidates = find_matching_owned_products(
+        matching_candidates = find_matching_department_products(
             connection,
-            created_by,
+            owner_department,
             raw_values.get("style_code"),
             raw_values.get("style_color"),
             raw_values.get("color_name"),
             raw_values.get("product_name"),
         )
     else:
-        matching_candidates = import_index.matching_owned_products(raw_values)
+        matching_candidates = import_index.matching_department_products(raw_values)
     if len(matching_candidates) > 1:
         raise ValueError(
-            f"款色“{str(raw_values.get('style_color') or '').strip()}”匹配到多条本人资料，已停止该行导入，请先清理重复资料。"
+            f"款色“{str(raw_values.get('style_color') or '').strip()}”匹配到多条跟单部资料，已停止该行导入，请先清理重复资料。"
         )
     existing = matching_candidates[0] if matching_candidates else None
     style_color = str(raw_values.get("style_color") or "").strip()
@@ -3763,7 +3768,7 @@ def save_or_update_owned_product_in_connection(
         )
         if existing_style_color_products:
             raise PermissionError(
-                f"款色“{style_color}”已存在，但不是当前账号发起的资料，不能新建重复条目。"
+                f"款色“{style_color}”已存在，但不属于跟单部可维护资料，不能新建重复条目。"
             )
     protected_import_changes = imported_field_changes(
         existing or {},

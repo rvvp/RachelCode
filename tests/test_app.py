@@ -4998,7 +4998,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(after["launch_price"], before["launch_price"])
         self.assertEqual(after["launch_channel"], before["launch_channel"])
 
-    def test_a_partial_full_template_import_does_not_duplicate_another_owners_style_color(self):
+    def test_a_colleague_full_and_incremental_import_update_department_record_with_audit(self):
         from catalog_backend.fields import PRODUCT_FIELDS
 
         db.create_user(
@@ -5011,6 +5011,7 @@ class CatalogAppTests(unittest.TestCase):
         )
         cookie = self.login("a_second", "second-pass")
         existing = db.get_product(self.db_path, 2)
+        original_creator_id = int(existing["created_by"])
         product_count_before = len(db.list_products(self.db_path))
         workbook = Workbook()
         worksheet = workbook.active
@@ -5018,7 +5019,7 @@ class CatalogAppTests(unittest.TestCase):
         partial_row = [None] * len(PRODUCT_FIELDS)
         field_indexes = {field.key: index for index, field in enumerate(PRODUCT_FIELDS)}
         partial_row[field_indexes["style_color"]] = existing["style_color"]
-        partial_row[field_indexes["material"]] = "不得写入"
+        partial_row[field_indexes["material"]] = "同部门协作更新材质"
         worksheet.append(partial_row)
         buffer = io.BytesIO()
         workbook.save(buffer)
@@ -5026,16 +5027,48 @@ class CatalogAppTests(unittest.TestCase):
         response = self.request(
             "/import",
             method="POST",
-            body=self.build_multipart("workbook", "other-owner-partial.xlsx", buffer.getvalue()),
+            body=self.build_multipart("workbook", "department-collaboration.xlsx", buffer.getvalue()),
             content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
             cookie=cookie,
         )
         self.assertTrue(response["status"].startswith("200"))
         body = response["body"].decode("utf-8")
-        self.assertIn("新增 0 条，更新 0 条", body)
-        self.assertIn("不能新建重复条目", body)
+        self.assertIn("新增 0 条，更新 1 条", body)
         self.assertEqual(len(db.list_products(self.db_path)), product_count_before)
-        self.assertEqual(db.get_product(self.db_path, 2)["material"], existing["material"])
+        after_full = db.get_product(self.db_path, 2)
+        self.assertEqual(after_full["material"], "同部门协作更新材质")
+        self.assertEqual(int(after_full["created_by"]), original_creator_id)
+
+        incremental_workbook = Workbook()
+        incremental_sheet = incremental_workbook.active
+        incremental_sheet.append(["款色", "供应商编号"])
+        incremental_sheet.append([existing["style_color"], "A-COLLAB-001"])
+        incremental_buffer = io.BytesIO()
+        incremental_workbook.save(incremental_buffer)
+        incremental_response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "department-collaboration-incremental.xlsx",
+                incremental_buffer.getvalue(),
+                extra_fields={"import_mode": "incremental"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(incremental_response["status"].startswith("200"))
+        self.assertIn("成功补充或更新 1 条", incremental_response["body"].decode("utf-8"))
+        after_incremental = db.get_product(self.db_path, 2)
+        self.assertEqual(after_incremental["supplier_code"], "A-COLLAB-001")
+        self.assertEqual(int(after_incremental["created_by"]), original_creator_id)
+        colleague = next(item for item in db.list_users(self.db_path) if item["username"] == "a_second")
+        colleague_updates = [
+            item
+            for item in db.get_product_logs(self.db_path, 2)
+            if item["action"] == "update" and int(item["actor_user_id"]) == int(colleague["id"])
+        ]
+        self.assertGreaterEqual(len(colleague_updates), 2)
 
     def test_a_incremental_import_accepts_full_template_when_non_a_columns_are_blank(self):
         from catalog_backend.fields import PRODUCT_FIELDS
@@ -7197,7 +7230,7 @@ class CatalogAppTests(unittest.TestCase):
         product = db.get_product(self.db_path, 1)
         self.assertEqual(product["lifecycle_status"], "active")
 
-    def test_only_a_creator_or_admin_can_delete_product_records(self):
+    def test_a_department_colleague_or_admin_can_delete_early_product_records(self):
         b_cookie = self.login("b_editor", "demo123")
         b_list_response = self.request("/products", cookie=b_cookie)
         self.assertNotIn(b'data-delete-button="1"', b_list_response["body"])
@@ -7226,7 +7259,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(delete_response["status"].startswith("302"))
         self.assertEqual(db.get_product(self.db_path, 2)["lifecycle_status"], "deleted")
 
-        db.create_user(
+        colleague_id = db.create_user(
             self.db_path,
             "a_other_editor",
             "另一位跟单员",
@@ -7235,20 +7268,35 @@ class CatalogAppTests(unittest.TestCase):
             must_change_password=False,
         )
         other_a_cookie = self.login("a_other_editor", "demo123")
+        a_user = next(item for item in db.list_users(self.db_path) if item["username"] == "a_editor")
+        with db.get_connection(self.db_path) as connection:
+            shared_product_id = db.create_product(
+                connection,
+                {"style_code": "A-SHARED-DELETE", "product_name": "部门协作删除资料"},
+                a_user["id"],
+                "A",
+            )
         other_a_body = self.request("/products", cookie=other_a_cookie)["body"].decode("utf-8")
         self.assertIn('data-bulk-delete-button="1"', other_a_body)
-        self.assertNotIn('class="table-action-danger"', other_a_body)
-        self.assertIn("仅资料原发起人可以删除该条目", other_a_body)
-        forbidden_a_delete = self.request(
-            "/products/1/lifecycle",
+        self.assertIn('class="table-action-danger"', other_a_body)
+        shared_delete = self.request(
+            f"/products/{shared_product_id}/lifecycle",
             method="POST",
             body=urlencode({"lifecycle_status": "deleted", "confirm_text": "DELETE"}).encode("utf-8"),
             cookie=other_a_cookie,
         )
-        self.assertTrue(forbidden_a_delete["status"].startswith("403"))
-        self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "active")
+        self.assertTrue(shared_delete["status"].startswith("302"))
+        deleted_product = db.get_product(self.db_path, shared_product_id)
+        self.assertEqual(deleted_product["lifecycle_status"], "deleted")
+        self.assertEqual(int(deleted_product["created_by"]), int(a_user["id"]))
+        delete_log = next(
+            item
+            for item in db.get_product_logs(self.db_path, shared_product_id)
+            if item["action"] == "lifecycle:deleted"
+        )
+        self.assertEqual(int(delete_log["actor_user_id"]), int(colleague_id))
 
-    def test_a_creator_can_bulk_delete_early_records_and_ineligible_records_are_skipped(self):
+    def test_a_department_can_bulk_delete_early_records_and_ineligible_records_are_skipped(self):
         users = {item["username"]: item for item in db.list_users(self.db_path)}
         a_user = users["a_editor"]
         other_a_id = db.create_user(
@@ -7293,6 +7341,10 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('name="bulk_action" value="delete_selected"', list_body)
         self.assertIn('data-bulk-delete-button="1"', list_body)
         self.assertLess(
+            list_body.index('value="recall_selected"'),
+            list_body.index('value="delete_selected"'),
+        )
+        self.assertLess(
             list_body.index('value="delete_selected"'),
             list_body.index('value="archive_selected"'),
         )
@@ -7331,12 +7383,11 @@ class CatalogAppTests(unittest.TestCase):
         )
         self.assertTrue(delete_response["status"].startswith("302"))
         notice = unquote_plus(dict(delete_response["headers"])["Location"])
-        self.assertIn("批量删除完成：成功 2 条，跳过 2 条", notice)
-        self.assertIn("仅资料原始发起人可以删除该条目", notice)
+        self.assertIn("批量删除完成：成功 3 条，跳过 1 条", notice)
         self.assertIn("请先召回到 A/B 协作后再删除", notice)
         self.assertEqual(db.get_product(self.db_path, own_draft_id)["lifecycle_status"], "deleted")
         self.assertEqual(db.get_product(self.db_path, own_pending_id)["lifecycle_status"], "deleted")
-        self.assertEqual(db.get_product(self.db_path, other_draft_id)["lifecycle_status"], "active")
+        self.assertEqual(db.get_product(self.db_path, other_draft_id)["lifecycle_status"], "deleted")
         self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "active")
         self.assertTrue(
             any(
@@ -7345,7 +7396,8 @@ class CatalogAppTests(unittest.TestCase):
             )
         )
 
-    def test_a_non_creator_can_archive_and_restore_but_cannot_delete_or_recall(self):
+    def test_a_colleague_can_edit_flow_recall_archive_and_restore_department_records(self):
+        original_creator_id = int(db.get_product(self.db_path, 1)["created_by"])
         with db.get_connection(self.db_path) as connection:
             connection.execute("UPDATE products SET status = 'received' WHERE id = 1")
         db.create_user(
@@ -7359,17 +7411,17 @@ class CatalogAppTests(unittest.TestCase):
         colleague_cookie = self.login("a_colleague", "demo123")
         list_body = self.request("/products", cookie=colleague_cookie)["body"].decode("utf-8")
         self.assertIn("products-bulk-archive-button", list_body)
-        self.assertIn("grid-template-columns: minmax(0, 1fr) auto;", list_body)
+        self.assertIn("products-bulk-recall-button", list_body)
         self.assertIn(".products-bulk-delete-button,", list_body)
+        self.assertIn(".products-bulk-recall-button,", list_body)
         self.assertIn(".products-bulk-archive-button {", list_body)
         self.assertIn("width: auto;", list_body)
         self.assertIn('class="ghost-button products-bulk-delete-button"', list_body)
         self.assertIn('class="ghost-button products-bulk-archive-button"', list_body)
-        self.assertIn("仅资料原发起人可以删除该条目", list_body)
-        self.assertIn("仅资料原发起人可以召回该条目", list_body)
         self.assertIn('<summary title="删除或召回">删除</summary>', list_body)
         self.assertIn('data-bulk-delete-button="1"', list_body)
-        self.assertNotIn('class="table-action-danger"', list_body)
+        self.assertIn(">召回</button>", list_body)
+        self.assertIn('href="/products/1/edit"', list_body)
 
         archive_response = self.request(
             "/products/bulk",
@@ -7397,14 +7449,188 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(restore_response["status"].startswith("302"))
         self.assertEqual(db.get_product(self.db_path, 1)["lifecycle_status"], "active")
 
+        colleague = next(item for item in db.list_users(self.db_path) if item["username"] == "a_colleague")
+        before_recall = db.get_product(self.db_path, 1)
+        with db.get_connection(self.db_path) as connection:
+            db.update_product(
+                connection,
+                1,
+                {"supplier": "同部门协作供应商"},
+                colleague["id"],
+            )
+            with self.assertRaisesRegex(PermissionError, "请先使用“召回到 A/B 协作”"):
+                db.update_product(
+                    connection,
+                    1,
+                    {"product_name": f"{before_recall['product_name']}-召回前禁止修改"},
+                    colleague["id"],
+                )
+        self.assertEqual(db.get_product(self.db_path, 1)["supplier"], "同部门协作供应商")
+
         recall_response = self.request(
             "/products/1/status",
             method="POST",
             body=urlencode({"status": "pending"}).encode("utf-8"),
             cookie=colleague_cookie,
         )
-        self.assertTrue(recall_response["status"].startswith("403"))
-        self.assertEqual(db.get_product(self.db_path, 1)["status"], "received")
+        self.assertTrue(recall_response["status"].startswith("302"))
+        recalled = db.get_product(self.db_path, 1)
+        self.assertEqual(recalled["status"], "pending")
+        self.assertEqual(int(recalled["created_by"]), original_creator_id)
+        recall_log = next(
+            item
+            for item in db.get_product_logs(self.db_path, 1)
+            if item["action"] == "status:pending" and int(item["actor_user_id"]) == int(colleague["id"])
+        )
+        self.assertEqual(int(recall_log["actor_user_id"]), int(colleague["id"]))
+        with db.get_connection(self.db_path) as connection:
+            db.update_product(
+                connection,
+                1,
+                {"product_name": f"{before_recall['product_name']}-协作修订"},
+                colleague["id"],
+            )
+        revised = db.get_product(self.db_path, 1)
+        self.assertEqual(revised["product_name"], f"{before_recall['product_name']}-协作修订")
+        self.assertEqual(int(revised["created_by"]), original_creator_id)
+        latest_update_log = next(
+            item for item in db.get_product_logs(self.db_path, 1) if item["action"] == "update"
+        )
+        self.assertEqual(int(latest_update_log["actor_user_id"]), int(colleague["id"]))
+
+    def test_a_and_b_can_batch_recall_with_skips_notices_and_actual_actor_logs(self):
+        users = {item["username"]: item for item in db.list_users(self.db_path)}
+        a_user = users["a_editor"]
+        b_user = users["b_editor"]
+        c_user = users["c_viewer"]
+        colleague_id = db.create_user(
+            self.db_path,
+            "a_batch_recall_colleague",
+            "批量召回跟单员",
+            "A",
+            "demo123",
+            must_change_password=False,
+        )
+        with db.get_connection(self.db_path) as connection:
+            published_id = db.create_product(
+                connection,
+                self.a_complete_fields_payload(
+                    style_code="BULK-RECALL-001",
+                    style_color="BULK-RECALL-001-黑",
+                    product_name="批量召回待接收款",
+                    launch_channel="天猫",
+                ),
+                a_user["id"],
+                "A",
+            )
+            received_id = db.create_product(
+                connection,
+                self.a_complete_fields_payload(
+                    style_code="BULK-RECALL-002",
+                    style_color="BULK-RECALL-002-白",
+                    product_name="批量召回已接收款",
+                    launch_channel="天猫",
+                ),
+                a_user["id"],
+                "A",
+            )
+            draft_id = db.create_product(
+                connection,
+                {"style_code": "BULK-RECALL-003", "product_name": "不可召回草稿"},
+                a_user["id"],
+                "A",
+            )
+            for product_id in (published_id, received_id):
+                db.change_product_status(
+                    connection, product_id, "pending", a_user["id"], "开启商品部协作", "批量召回测试。"
+                )
+                db.change_product_status(
+                    connection, product_id, "published", b_user["id"], "提交运营部", "批量召回测试。"
+                )
+            received_product = db.get_product_from_connection(connection, received_id)
+            release_no = int(received_product["c_release_no"])
+            self.assertTrue(db.record_c_product_receipt(connection, received_id, c_user["id"], release_no))
+            db.change_product_status(
+                connection, received_id, "received", c_user["id"], "接收资料", "批量召回测试。"
+            )
+
+        colleague_cookie = self.login("a_batch_recall_colleague", "demo123")
+        list_body = self.request("/products", cookie=colleague_cookie)["body"].decode("utf-8")
+        self.assertLess(
+            list_body.index('value="recall_selected"'),
+            list_body.index('value="delete_selected"'),
+        )
+        recall_response = self.request(
+            "/products/bulk",
+            method="POST",
+            body=urlencode(
+                [
+                    ("product_ids", str(published_id)),
+                    ("product_ids", str(received_id)),
+                    ("product_ids", str(draft_id)),
+                    ("bulk_action", "recall_selected"),
+                    ("return_to", "/products"),
+                ]
+            ).encode("utf-8"),
+            cookie=colleague_cookie,
+        )
+        self.assertTrue(recall_response["status"].startswith("302"))
+        recall_notice = unquote_plus(dict(recall_response["headers"])["Location"])
+        self.assertIn("批量召回完成：成功 2 条，跳过 1 条", recall_notice)
+        self.assertIn("仅待运营接收或已接收", recall_notice)
+        self.assertEqual(db.get_product(self.db_path, published_id)["status"], "pending")
+        self.assertEqual(db.get_product(self.db_path, received_id)["status"], "pending")
+        self.assertEqual(db.get_product(self.db_path, draft_id)["status"], "draft")
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, c_user["id"]), 1)
+        for product_id in (published_id, received_id):
+            batch_log = next(
+                item
+                for item in db.get_product_logs(self.db_path, product_id)
+                if item["action"] == "status:pending" and "批量召回" in item["details"]
+            )
+            self.assertEqual(int(batch_log["actor_user_id"]), int(colleague_id))
+
+        with db.get_connection(self.db_path) as connection:
+            b_recall_id = db.create_product(
+                connection,
+                self.a_complete_fields_payload(
+                    style_code="BULK-RECALL-B-001",
+                    style_color="BULK-RECALL-B-001-蓝",
+                    product_name="商品部批量召回款",
+                    launch_channel="天猫",
+                ),
+                a_user["id"],
+                "A",
+            )
+            db.change_product_status(
+                connection, b_recall_id, "pending", a_user["id"], "开启商品部协作", "批量召回测试。"
+            )
+            db.change_product_status(
+                connection, b_recall_id, "published", b_user["id"], "提交运营部", "批量召回测试。"
+            )
+        b_cookie = self.login("b_editor", "demo123")
+        b_body = self.request("/products", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertIn('value="recall_selected"', b_body)
+        self.assertNotIn('value="delete_selected"', b_body)
+        self.assertNotIn('value="archive_selected"', b_body)
+        c_body = self.request("/products", cookie=self.login("c_viewer", "demo123"))["body"].decode("utf-8")
+        self.assertNotIn('value="recall_selected"', c_body)
+        b_recall_response = self.request(
+            "/products/bulk",
+            method="POST",
+            body=urlencode(
+                [("product_ids", str(b_recall_id)), ("bulk_action", "recall_selected")]
+            ).encode("utf-8"),
+            cookie=b_cookie,
+        )
+        self.assertTrue(b_recall_response["status"].startswith("302"))
+        self.assertEqual(db.get_product(self.db_path, b_recall_id)["status"], "pending")
+        b_batch_log = next(
+            item
+            for item in db.get_product_logs(self.db_path, b_recall_id)
+            if item["action"] == "status:pending" and "批量召回" in item["details"]
+        )
+        self.assertEqual(int(b_batch_log["actor_user_id"]), int(b_user["id"]))
 
     def test_a_can_start_collaboration_early_and_a_b_updates_merge_by_field(self):
         users = {user["department"]: user for user in db.list_users(self.db_path)}
@@ -7748,7 +7974,10 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("材质", rules_body)
         self.assertIn("请先使用“召回到 A/B 协作”", rules_body)
         self.assertIn("含税价", rules_body)
-        self.assertIn("可勾选多条后使用“批量删除”", rules_body)
+        self.assertIn("勾选多条后使用“批量删除”", rules_body)
+        self.assertIn("任一 A 账号可补充、修改、导入更新", rules_body)
+        self.assertIn("执行单条或批量召回", rules_body)
+        self.assertIn("记录每次实际操作账号", rules_body)
         self.assertIn("不符合条件的条目自动跳过", rules_body)
         self.assertIn("任意一个账号接收所属渠道资料后", rules_body)
         self.assertIn("不需等待同类别其他账号逐一接收", rules_body)

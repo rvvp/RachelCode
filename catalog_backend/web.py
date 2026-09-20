@@ -729,7 +729,7 @@ class CatalogApplication:
         if not can_edit_product(user, product):
             return self.html_response(
                 start_response,
-                self.render_message_page("不可编辑", "你只能修改自己录入的商品资料。", user),
+                self.render_message_page("不可编辑", "当前账号不能修改这条商品资料。", user),
                 status="403 Forbidden",
             )
         if environ.get("REQUEST_METHOD", "GET").upper() == "GET":
@@ -892,7 +892,7 @@ class CatalogApplication:
         }
         try:
             with self.import_write_pool.acquire(), db.get_connection(self.db_path) as connection:
-                import_index = db.build_owned_product_import_index(connection, int(user["id"]))
+                import_index = db.build_department_product_import_index(connection, user["department"])
                 for product in products:
                     try:
                         action, _ = db.save_or_update_owned_product_in_connection(
@@ -991,7 +991,7 @@ class CatalogApplication:
                     continue
                 product = candidates[0]
                 if not can_edit_product(user, product):
-                    blocked.append(f"{style_color}（仅原发起人可修改）")
+                    blocked.append(f"{style_color}（当前账号无权修改）")
                     continue
                 update_values = {
                     field_key: value
@@ -2328,15 +2328,33 @@ class CatalogApplication:
                     )
                     updated += 1
                     continue
+                if action == "recall_selected":
+                    allowed = dict(available_status_actions(user, product))
+                    if not can_recall_product(user, product) or "pending" not in allowed:
+                        skipped += 1
+                        recall_skip_reason = "仅待运营接收或已接收的正常资料可以召回。"
+                        if user.get("department") not in {"A", "B"} and not is_admin(user):
+                            recall_skip_reason = "当前账号没有召回权限。"
+                        self.append_bulk_skip_reason(skip_reasons, product, recall_skip_reason)
+                        continue
+                    db.change_product_status(
+                        connection,
+                        product_id,
+                        "pending",
+                        user["id"],
+                        allowed["pending"],
+                        f"{self.status_change_details(user, product, 'pending')} 本次为批量召回操作。",
+                        revision_flag_override=self.status_change_revision_flag(user, product, "pending"),
+                    )
+                    updated += 1
+                    continue
                 if action == "delete_selected":
                     allowed = dict(available_lifecycle_actions(user, product))
                     if "deleted" not in allowed:
                         skipped += 1
                         delete_skip_reason = "当前资料不能批量删除。"
                         if user.get("department") == "A":
-                            if int(product.get("created_by") or 0) != int(user.get("id") or 0):
-                                delete_skip_reason = "仅资料原始发起人可以删除该条目。"
-                            elif product.get("status") in {"published", "received"}:
+                            if product.get("status") in {"published", "received"}:
                                 delete_skip_reason = "资料已进入运营流程，请先召回到 A/B 协作后再删除。"
                         self.append_bulk_skip_reason(skip_reasons, product, delete_skip_reason)
                         continue
@@ -2381,6 +2399,8 @@ class CatalogApplication:
             action_label = "批量退回跟单部"
         elif action == "publish_selected":
             action_label = "批量提交运营部"
+        elif action == "recall_selected":
+            action_label = "批量召回"
         elif action == "delete_selected":
             action_label = "批量删除"
         elif action == "archive_selected":
@@ -6422,6 +6442,7 @@ class CatalogApplication:
       white-space: nowrap;
     }}
     .products-bulk-delete-button,
+    .products-bulk-recall-button,
     .products-bulk-archive-button {{
       display: inline-flex;
       align-items: center;
@@ -10301,13 +10322,6 @@ class CatalogApplication:
                         f'formaction="/products/{product["id"]}/status" formmethod="post" '
                         f'title="召回后可修改重要字段或删除资料">召回</button>'
                     )
-                elif user.get("department") == "A":
-                    recall_title = "仅资料原发起人可以召回该条目"
-                    recall_action_markup = (
-                        '<button class="table-action-disabled" type="button" disabled '
-                        f'title="{html.escape(recall_title, quote=True)}" '
-                        f'aria-label="召回不可用：{html.escape(recall_title, quote=True)}">召回</button>'
-                    )
             lifecycle_actions = dict(available_lifecycle_actions(user, product))
             for lifecycle_target in lifecycle_actions:
                 if lifecycle_target == "archived":
@@ -10350,7 +10364,7 @@ class CatalogApplication:
                 delete_title = (
                     "资料已进入运营流程，请先召回到 A/B 协作后再删除"
                     if can_recall_product(user, product)
-                    else "仅资料原发起人可以删除该条目"
+                    else "当前资料状态不可删除"
                 )
                 delete_action_markup = (
                     '<button class="table-action-disabled" type="button" disabled '
@@ -12419,15 +12433,28 @@ class CatalogApplication:
         """
 
     def render_bulk_lifecycle_tools(self, user) -> str:
-        if is_department_monitor(user) or (not is_admin(user) and user.get("department") != "A"):
+        if is_department_monitor(user) or (not is_admin(user) and user.get("department") not in {"A", "B"}):
             return ""
-        return """
+        recall_button = """
+            <button type="submit" name="bulk_action" value="recall_selected"
+              form="products-bulk-form" formmethod="post" formaction="/products/bulk"
+              class="ghost-button products-bulk-recall-button"
+              title="仅召回待运营接收或已接收的资料；其他条目会自动跳过">批量召回</button>
+        """
+        if user.get("department") == "B":
+            return f"""
+              <div class="products-bulk-lifecycle-actions">
+                {recall_button}
+              </div>
+            """
+        return f"""
           <div class="products-bulk-lifecycle-actions">
+            {recall_button}
             <button type="submit" name="bulk_action" value="delete_selected"
               form="products-bulk-form" formmethod="post" formaction="/products/bulk"
               class="ghost-button products-bulk-delete-button"
               data-delete-button="1" data-bulk-delete-button="1"
-              title="仅删除有权限且仍在跟单整理中或 A/B 协作中的资料；其他条目会自动跳过">批量删除</button>
+              title="仅删除仍在跟单整理中或 A/B 协作中的资料；其他条目会自动跳过">批量删除</button>
             <button type="submit" name="bulk_action" value="archive_selected"
               form="products-bulk-form" formmethod="post" formaction="/products/bulk"
               class="ghost-button products-bulk-archive-button"
@@ -12884,7 +12911,7 @@ class CatalogApplication:
             stat_three_value = "A 字段独立维护"
             section_title = "完整字段导入"
             button_text = "开始完整导入"
-            hint_text = "系统会优先按款色更新本人已发起的既有资料；空白单元格保留原内容。只有款色不存在，且款号、商品名称齐全时才会新增资料。"
+            hint_text = "系统会优先按款色更新跟单部已发起的既有资料；空白单元格保留原内容。只有款色不存在，且款号、商品名称齐全时才会新增资料。原始发起人保持不变，实际导入账号会写入操作日志。"
             incremental_section = """
             <section class="panel">
               <div class="detail-panel-head">
@@ -13151,7 +13178,7 @@ class CatalogApplication:
               <table class="rules-table">
                 <thead><tr><th>角色</th><th>可操作内容</th><th>不可操作内容</th></tr></thead>
                 <tbody>
-                  <tr><th>A 跟单部</th><td>维护自己发起资料的 A 阶段字段；在早期状态开启 B 协作；跟单部任一账号可归档及恢复已归档资料。</td><td>不能修改商品部或企划中心负责字段；运营阶段不能直接修改触发字段；只能删除或召回自己发起的资料。</td></tr>
+                  <tr><th>A 跟单部</th><td>跟单部资料按部门协作：任一 A 账号可补充、修改、导入更新、流转、召回、删除、归档及恢复符合流程条件的 A 部门资料。系统保留原始发起人，并记录每次实际操作账号。</td><td>不能修改商品部或企划中心负责字段；运营阶段不能直接修改触发字段；不能操作其他部门发起的资料。</td></tr>
                   <tr><th>B 商品部</th><td>在 A/B 协作中推进商品资料；当前藏宝阁内直接维护图片，资料完成后提交运营部。发现商品部或企划字段有误时，可从运营阶段召回。</td><td>不能删除或归档；不能修改 A 阶段字段。品类、上新价格、上新渠道由商品企划中心维护并回传。</td></tr>
                   <tr><th>C 运营部</th><td>按账号渠道属性查看并接收资料。天猫类或唯品类中任意一个账号接收所属渠道资料后，全局状态即更新为“已接收”，不需等待同类别其他账号逐一接收；“同款”由任意天猫类或唯品类账号接收后，即显示“已接收”。全渠道账号可记录个人接收，但不参与全局状态判断；账单属性仍独立授权。</td><td>不能修改资料、删除、归档或召回。</td></tr>
                   <tr><th>总经办 / 美工部</th><td>按各自只读范围查看资料。</td><td>不能上传、修改、删除、归档或召回。</td></tr>
@@ -13164,9 +13191,9 @@ class CatalogApplication:
             <div class="eyebrow">Lifecycle</div>
             <h2>删除、归档与召回</h2>
             <div class="rule-callouts">
-              <div class="rule-callout"><strong>删除</strong><span>A 原始发起人仅可在“跟单整理中”或“A/B 协作中”删除自己发起的正常资料，可勾选多条后使用“批量删除”。系统会逐条校验权限，不符合条件的条目自动跳过。进入运营阶段后，必须先召回；已删除资料仅管理员可恢复。</span></div>
+              <div class="rule-callout"><strong>删除</strong><span>A 跟单部任一账号可在“跟单整理中”或“A/B 协作中”删除 A 部门的正常资料，也可勾选多条后使用“批量删除”。系统会逐条校验流程条件，不符合条件的条目自动跳过。进入运营阶段后，必须先召回；已删除资料仅管理员可恢复。</span></div>
               <div class="rule-callout"><strong>归档</strong><span>A 跟单部任一账号可批量归档“已接收”资料，也可在“已归档”筛选中恢复；管理员可按管理权限归档或恢复。</span></div>
-              <div class="rule-callout"><strong>召回</strong><span>A 原始发起人、B 商品部和管理员可对“待运营接收”或“已接收”资料执行“召回到 A/B 协作”。A 同部门非发起人仅能查看禁用入口。召回会清除当前运营接收标记，保留历史版本和操作日志。</span></div>
+              <div class="rule-callout"><strong>召回</strong><span>A 跟单部任一账号、B 商品部和管理员可对“待运营接收”或“已接收”资料执行单条或批量召回。召回会将资料转回 A/B 协作，清除当前运营接收标记，并保留原始发起人、历史版本和实际操作账号日志。</span></div>
               <div class="rule-callout"><strong>召回提醒</strong><span>“待运营接收”资料召回时不提醒运营部；“已接收”资料召回时，系统只提醒实际接收过该批次的运营账号，无需运营部同意。全渠道账号如实际接收过也会收到提醒，但仍不参与全局状态判断。A/B 重新提交运营部后提醒自动关闭，运营部按新批次重新接收。</span></div>
             </div>
           </div>
