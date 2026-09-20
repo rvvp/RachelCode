@@ -4,9 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVICE_NAME="${CATALOG_SERVICE_NAME:-rachel-catalog}"
 SERVICE_FILE="${CATALOG_SERVICE_FILE:-/etc/systemd/system/${SERVICE_NAME}.service}"
-POST_RELEASE_VERIFY_NAME="${CATALOG_POST_RELEASE_VERIFY_NAME:-rachel-catalog-post-release-verify}"
-POST_RELEASE_VERIFY_SERVICE_FILE="${CATALOG_POST_RELEASE_VERIFY_SERVICE_FILE:-/etc/systemd/system/${POST_RELEASE_VERIFY_NAME}.service}"
-POST_RELEASE_VERIFY_TIMER_FILE="${CATALOG_POST_RELEASE_VERIFY_TIMER_FILE:-/etc/systemd/system/${POST_RELEASE_VERIFY_NAME}.timer}"
+LEGACY_VERIFY_NAME="rachel-catalog-post-release-verify"
+LEGACY_VERIFY_SERVICE_FILE="/etc/systemd/system/${LEGACY_VERIFY_NAME}.service"
+LEGACY_VERIFY_TIMER_FILE="/etc/systemd/system/${LEGACY_VERIFY_NAME}.timer"
 LOCAL_URL="${CATALOG_LOCAL_URL:-http://127.0.0.1:8765}"
 PUBLIC_URL="${1:-${CATALOG_PUBLIC_URL:-}}"
 VENV_DIR="${CATALOG_VENV_DIR:-/opt/rachelcode/venv}"
@@ -80,8 +80,10 @@ fi
 
 "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check -r "$ROOT_DIR/requirements.txt"
 run_root install -m 0644 "$ROOT_DIR/deploy/systemd/rachel-catalog.service" "$SERVICE_FILE"
-run_root install -m 0644 "$ROOT_DIR/deploy/systemd/rachel-catalog-post-release-verify.service" "$POST_RELEASE_VERIFY_SERVICE_FILE"
-run_root install -m 0644 "$ROOT_DIR/deploy/systemd/rachel-catalog-post-release-verify.timer" "$POST_RELEASE_VERIFY_TIMER_FILE"
+# Retire the removed delayed-verification mechanism on upgraded servers.
+run_root systemctl disable --now "${LEGACY_VERIFY_NAME}.timer" >/dev/null 2>&1 || true
+run_root systemctl stop "${LEGACY_VERIFY_NAME}.service" >/dev/null 2>&1 || true
+run_root rm -f "$LEGACY_VERIFY_SERVICE_FILE" "$LEGACY_VERIFY_TIMER_FILE"
 run_root systemctl daemon-reload
 run_root systemctl restart "$SERVICE_NAME"
 
@@ -109,8 +111,4 @@ else
   exit 1
 fi
 
-# Re-arm a single delayed verification for this release. OnActiveSec has no
-# recurring interval, so the timer becomes idle after its one execution.
-run_root systemctl restart "${POST_RELEASE_VERIFY_NAME}.timer"
-
-echo "OK 正式服务已重启，本机与公网均已加载本次源码，30 分钟后将再执行一次固定验收。"
+echo "OK 正式服务已重启，本机与公网均已加载本次源码。"

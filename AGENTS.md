@@ -1,19 +1,21 @@
 # Repository Workflow
 
-## Push Policy
+## Release Policy
 
-Do not push automatically after code changes or commits. Push only when the
-user gives an explicit push instruction. The instruction defines the scope:
+For Cangbaoge application code, finish each requested change through the
+verified release pipeline unless the user explicitly asks to keep it local:
 
-- "双仓库推送" means push to both configured remotes.
-- "origin 单仓库推送" means push only to `origin`.
-- "github 单仓库推送" means push only to `github`.
+1. Run the relevant local tests and code-format checks successfully.
+2. Commit only application code and tests; never include runtime data.
+3. Run `scripts/publish_verified_release.sh` with the relevant unittest names.
+4. The script pushes the exact commit to `origin/main`, waits for automatic
+   deployment, verifies the public release across all workers, and only then
+   pushes that same commit to `github/main` as a backup.
 
-If the user does not specify a push scope, leave the changes unpushed and ask
-for clarification when a push is needed. Do not infer a dual-remote push from
-the repository layout. The dual-remote requirement currently applies only to
-code in the “应用开发” project; it does not apply automatically to every
-project or code area in this repository.
+Never push to `github` before the public verification passes. A failed local
+test, origin push, deployment, or public verification stops the pipeline and
+leaves GitHub unchanged. For non-Cangbaoge projects or an explicit one-remote
+request, follow the scope given by the user instead of this automatic flow.
 
 The configured remotes are:
 
@@ -37,7 +39,7 @@ The `github` remote is a code backup only: it must not connect to the company
 server, trigger deployment, or run public-site verification. A push to
 `github` is never evidence that a production release started or completed.
 
-After an explicitly requested push, verify the requested remote branch or
-branches. For a dual-remote push, verify that both remotes point to the same
-commit. Never commit or push local databases, exported reports, credentials,
-tokens, environment files, browser profiles, or runtime logs.
+After every release, verify that `origin/main`, the public `/healthz` response,
+and `github/main` all identify the exact same commit. Never commit or push local
+databases, exported reports, credentials, tokens, environment files, browser
+profiles, or runtime logs.

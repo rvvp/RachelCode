@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import subprocess
@@ -124,58 +123,6 @@ def stale_release_reason(
     return None
 
 
-def catalog_post_release_verification(root_dir: str | Path | None = None) -> dict:
-    """Read the latest delayed public verification without caching it in workers."""
-    root = Path(root_dir).resolve() if root_dir else Path(__file__).resolve().parent.parent
-    configured_path = str(os.environ.get("CATALOG_POST_RELEASE_STATE") or "").strip()
-    state_path = Path(configured_path).expanduser() if configured_path else root / ".post-release-verification.json"
-    default_state = {
-        "status": "pending",
-        "verified_at": None,
-        "release_commit": "unknown",
-        "release_generation": 0,
-        "build_version": "",
-        "source_fingerprint": "",
-        "check_count": 0,
-        "expected_workers": 0,
-    }
-    try:
-        payload = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return default_state
-    if not isinstance(payload, dict):
-        return default_state
-    status = str(payload.get("status") or "").strip().lower()
-    return {
-        "status": status if status in {"passed", "failed"} else "pending",
-        "verified_at": str(payload.get("verified_at") or "").strip() or None,
-        "release_commit": _normalized_commit(payload.get("release_commit")) or "unknown",
-        "release_generation": _normalized_generation(payload.get("release_generation")) or 0,
-        "build_version": str(payload.get("build_version") or "").strip(),
-        "source_fingerprint": str(payload.get("source_fingerprint") or "").strip(),
-        "check_count": _normalized_generation(payload.get("check_count")) or 0,
-        "expected_workers": _normalized_generation(payload.get("expected_workers")) or 0,
-    }
-
-
-def post_release_verification_is_current(
-    verification: dict,
-    *,
-    release_commit: str,
-    release_generation: int,
-    build_version: str,
-    source_fingerprint: str,
-) -> bool:
-    """Return whether the delayed verification passed for the running release."""
-    return bool(
-        verification.get("status") == "passed"
-        and verification.get("release_commit") == release_commit
-        and verification.get("release_generation") == release_generation
-        and verification.get("build_version") == build_version
-        and verification.get("source_fingerprint") == source_fingerprint
-    )
-
-
 def catalog_source_fingerprint() -> str:
     """Identify the exact application source loaded by the current process."""
     root_dir = Path(__file__).resolve().parent.parent
@@ -184,10 +131,8 @@ def catalog_source_fingerprint() -> str:
         root_dir / "catalog_wsgi.py",
         root_dir / "requirements.txt",
         root_dir / "deploy" / "systemd" / "rachel-catalog.service",
-        root_dir / "deploy" / "systemd" / "rachel-catalog-post-release-verify.service",
-        root_dir / "deploy" / "systemd" / "rachel-catalog-post-release-verify.timer",
         root_dir / "scripts" / "activate_production_release.sh",
-        root_dir / "scripts" / "run_post_release_verification.sh",
+        root_dir / "scripts" / "publish_verified_release.sh",
         root_dir / "scripts" / "verify_public_deployment.sh",
     ]
     source_paths.extend(sorted((root_dir / "catalog_backend").glob("*.py")))

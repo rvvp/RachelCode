@@ -51,8 +51,6 @@ from catalog_backend.release import (
     CATALOG_RUNTIME_MODE,
     CATALOG_SOURCE_FINGERPRINT,
     PROCESS_STARTED_AT,
-    catalog_post_release_verification,
-    post_release_verification_is_current,
 )
 from catalog_backend.policies import (
     A_STAGE_FIELD_KEYS,
@@ -125,7 +123,7 @@ from catalog_backend.uploads import (
 
 
 LOGGER = logging.getLogger(__name__)
-CATALOG_BUILD_VERSION = "2026.09.20-release-watchdog-v8"
+CATALOG_BUILD_VERSION = "2026.09.20-release-pipeline-v9"
 MAX_EXPORT_IMAGE_BYTES = 20 * 1024 * 1024
 # Planning previews may contain original hand-shot photos or high-resolution
 # professional images. Keep a bounded proxy response while allowing normal
@@ -1837,14 +1835,6 @@ class CatalogApplication:
         uploads_exists = Path(self.upload_dir).exists()
         user_count = len(db.list_users(self.db_path)) if db_exists else 0
         server_software = str(environ.get("SERVER_SOFTWARE") or "unknown")
-        post_release_verification = catalog_post_release_verification()
-        post_release_verification_current = post_release_verification_is_current(
-            post_release_verification,
-            release_commit=CATALOG_RELEASE_COMMIT,
-            release_generation=CATALOG_RELEASE_GENERATION,
-            build_version=CATALOG_BUILD_VERSION,
-            source_fingerprint=CATALOG_SOURCE_FINGERPRINT,
-        )
         production_runtime_ready = (
             CATALOG_RUNTIME_MODE != "production"
             or (
@@ -1865,8 +1855,6 @@ class CatalogApplication:
                 "runtime_mode": CATALOG_RUNTIME_MODE,
                 "server_software": server_software,
                 "production_runtime_ready": production_runtime_ready,
-                "post_release_verification": post_release_verification,
-                "post_release_verification_current": post_release_verification_current,
                 "db_path": self.db_path,
                 "db_exists": db_exists,
                 "uploads_path": self.upload_dir,

@@ -20,7 +20,6 @@ tmp/
 .run-*.log
 .release-commit
 .release-generation
-.post-release-verification.json
 
 # Runtime business data, downloaded platform reports, and browser profiles.
 replenishment_data/

@@ -21,7 +21,6 @@ Environment=CATALOG_IMPORT_TASK_WAIT_SECONDS=120
 Environment=CATALOG_EXPORT_SLOTS=4
 Environment=CATALOG_IMAGE_EXPORT_SLOTS=2
 Environment=CATALOG_HEAVY_TASK_WAIT_SECONDS=900
-Environment=CATALOG_POST_RELEASE_STATE=/data/rachelcode/catalog/post-release-verification.json
 ExecStart=/opt/rachelcode/venv/bin/gunicorn --chdir /opt/rachelcode/app --bind 0.0.0.0:8765 --workers 8 --threads 4 --worker-class gthread --timeout 1800 --graceful-timeout 30 --keep-alive 5 --max-requests 1000 --max-requests-jitter 100 --worker-tmp-dir /dev/shm catalog_wsgi:application
 Restart=on-failure
 RestartSec=3
