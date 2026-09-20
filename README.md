@@ -147,7 +147,7 @@ http://127.0.0.1:8765
 - `CATALOG_SEED_SAMPLES`
 - `CATALOG_IMPORT_SLOTS`（默认 `2`）
 - `CATALOG_IMPORT_WRITE_SLOTS`（SQLite 正式环境保持 `1`）
-- `CATALOG_IMPORT_TASK_WAIT_SECONDS`（默认 `5`，导入任务占满时快速返回明确提示）
+- `CATALOG_IMPORT_TASK_WAIT_SECONDS`（默认 `120`，允许并发导入的第二批任务排队完成，同时继续限制实际解析和写入数量）
 - `CATALOG_EXPORT_SLOTS`（默认 `4`）
 - `CATALOG_IMAGE_EXPORT_SLOTS`（默认 `2`）
 - `CATALOG_HEAVY_TASK_WAIT_SECONDS`（默认 `900`）
@@ -181,7 +181,7 @@ Webhook 将代码自动同步到正式服务器后，自动发布流程必须执
 
 发布包还会记录单调递增的 `.release-generation`。激活前会与当前公网进程的版本序号比较，延迟到达的旧发布任务会被直接拒绝，不能在并发或乱序 Webhook 场景下覆盖较新版本。
 
-正式发布链路固定为：`本机 -> origin/main -> 公司服务器 -> 公网`。`origin/main` 的既有 Webhook 会自动通知公司服务器拉取并激活新版本，日常发布不需要服务器管理员参与；服务器必须立即完成本机和公网验收，成功后再安排一个单次任务，30 分钟后复验公网提交号、构建号、源码指纹和全部 Gunicorn 工作进程。复验执行一次后即结束，不做小时级循环巡检。
+正式发布链路固定为：`本机 -> origin/main -> 公司服务器 -> 公网`。`origin/main` 的既有 Webhook 会自动通知公司服务器拉取并激活新版本，日常发布不需要服务器管理员参与；服务器必须立即完成本机和公网验收，成功后再安排一个单次任务，30 分钟后复验公网提交号、构建号、源码指纹和全部 Gunicorn 工作进程。复验执行一次后即结束，不做小时级循环巡检。复验结果会写入 `CATALOG_POST_RELEASE_STATE`，并由公网 `/healthz` 的 `post_release_verification` 与 `post_release_verification_current` 字段提供可追踪证据。
 
 `github` 仅用于代码备份，不连接公司服务器，不触发部署，也不执行公网验收。是否推送到 `github` 由当次明确的推送指令决定，不能把 GitHub 更新视为正式发布已经开始或完成。
 

@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from catalog_backend.concurrency import FileSlotPool
 from catalog_backend.fields import CATALOG_EXPORT_FIELD_ORDER, PRODUCT_FIELDS, PRODUCT_FIELD_MAP
 from catalog_backend.policies import (
     A_STAGE_FIELD_KEYS,
@@ -176,6 +177,31 @@ def ordered_list_layout_keys(available_keys: list[str], department: str) -> list
 
 
 def init_db(
+    db_path: str | Path,
+    *,
+    seed_demo: bool = True,
+    seed_samples: bool = True,
+    bootstrap_admin: dict | None = None,
+) -> None:
+    """Initialize or migrate the catalog once across all Gunicorn workers."""
+    normalized_path = Path(db_path)
+    normalized_path.parent.mkdir(parents=True, exist_ok=True)
+    migration_pool = FileSlotPool(
+        normalized_path.parent / ".runtime-locks",
+        "catalog-database-initialize",
+        1,
+        wait_seconds=300,
+    )
+    with migration_pool.acquire():
+        _init_db_unlocked(
+            normalized_path,
+            seed_demo=seed_demo,
+            seed_samples=seed_samples,
+            bootstrap_admin=bootstrap_admin,
+        )
+
+
+def _init_db_unlocked(
     db_path: str | Path,
     *,
     seed_demo: bool = True,

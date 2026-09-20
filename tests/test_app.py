@@ -3836,7 +3836,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("200"))
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["build_version"], "2026.09.19-release-watchdog-v7")
+        self.assertEqual(payload["build_version"], "2026.09.20-release-watchdog-v8")
         self.assertRegex(payload["release_commit"], r"^[0-9a-f]{40,64}$")
         self.assertGreater(payload["release_generation"], 0)
         self.assertRegex(payload["source_fingerprint"], r"^[0-9a-f]{16}$")
@@ -3844,8 +3844,10 @@ class CatalogAppTests(unittest.TestCase):
         self.assertGreater(payload["worker_pid"], 0)
         self.assertEqual(payload["runtime_mode"], "development")
         self.assertTrue(payload["production_runtime_ready"])
+        self.assertEqual(payload["post_release_verification"]["status"], "pending")
+        self.assertFalse(payload["post_release_verification_current"])
         headers = dict(response["headers"])
-        self.assertEqual(headers["X-Catalog-Build"], "2026.09.19-release-watchdog-v7")
+        self.assertEqual(headers["X-Catalog-Build"], "2026.09.20-release-watchdog-v8")
         self.assertEqual(headers["X-Catalog-Commit"], payload["release_commit"])
         self.assertEqual(headers["X-Catalog-Generation"], str(payload["release_generation"]))
         self.assertEqual(headers["X-Catalog-Source"], payload["source_fingerprint"])
@@ -3957,6 +3959,12 @@ class CatalogAppTests(unittest.TestCase):
             with self.assertRaises(TaskCapacityError):
                 with second_pool.acquire():
                     pass
+
+    def test_import_tasks_allow_a_two_minute_second_wave_queue(self):
+        self.assertEqual(self.app.import_pool.slots, 2)
+        self.assertEqual(self.app.import_pool.wait_seconds, 120)
+        self.assertEqual(self.app.import_write_pool.slots, 1)
+        self.assertEqual(self.app.import_write_pool.wait_seconds, 120)
 
     def test_export_capacity_limit_keeps_request_bounded(self):
         cookie = self.login("a_editor", "demo123")
