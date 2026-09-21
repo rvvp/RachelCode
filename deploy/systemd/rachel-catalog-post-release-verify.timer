@@ -1,0 +1,9 @@
+[Unit]
+Description=Retired Rachel Catalog delayed verification compatibility timer
+
+[Timer]
+Unit=rachel-catalog-post-release-verify.service
+# Keep the legacy unit valid for older deployment scripts without scheduling
+# another verification run.
+OnActiveSec=1000000d
+AccuracySec=1d

@@ -131,6 +131,8 @@ def catalog_source_fingerprint() -> str:
         root_dir / "catalog_wsgi.py",
         root_dir / "requirements.txt",
         root_dir / "deploy" / "systemd" / "rachel-catalog.service",
+        root_dir / "deploy" / "systemd" / "rachel-catalog-post-release-verify.service",
+        root_dir / "deploy" / "systemd" / "rachel-catalog-post-release-verify.timer",
         root_dir / "scripts" / "activate_production_release.sh",
         root_dir / "scripts" / "publish_verified_release.sh",
         root_dir / "scripts" / "verify_public_deployment.sh",

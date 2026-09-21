@@ -1,0 +1,8 @@
+[Unit]
+Description=Retired Rachel Catalog delayed verification compatibility unit
+
+[Service]
+Type=oneshot
+# Kept only because older server deploy scripts expect this file to exist.
+# The delayed verification mechanism has been retired.
+ExecStart=/usr/bin/true
