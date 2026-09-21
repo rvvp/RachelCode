@@ -607,6 +607,80 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertTrue(response["status"].startswith("400"))
         self.assertIn("尚未由商品部确认", response["body"].decode("utf-8"))
 
+    def test_approved_reentry_sync_starts_one_new_pricing_revision(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        source = {
+            "id": 5910,
+            "style_code": "REENTRY-5910",
+            "product_name": "召回重走企划测试款",
+            "season_year": "2026秋冬",
+            "supplier": "召回测试供应商",
+            "category": "其他",
+            "actual_cost": 150,
+            "tax_included_price": 150,
+            "image_url": "https://example.com/images/reentry-5910.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "submitted_to_merchandise": True,
+            "source_version_no": 1,
+            "image_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+        published = planning_db.create_pricing_record(self.planning_db_path, source, "首次企划员")
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                "UPDATE pricing_records SET status = 'published', published_at = ? WHERE id = ?",
+                (planning_db.utc_now(), published["id"]),
+            )
+            connection.execute(
+                "UPDATE source_products SET status = 'published', lifecycle_status = 'withdrawn' WHERE id = ?",
+                (source["id"],),
+            )
+
+        approved_reentry = dict(
+            source,
+            planning_reentry_state="approved",
+            updated_at="2026-09-21T10:00:00Z",
+        )
+        result = planning_db.synchronize_source_products(self.planning_db_path, [approved_reentry])
+
+        self.assertEqual(result["synced"], 1)
+        self.assertEqual(result["revisions_started"], 1)
+        records = planning_db.list_pricing_records(self.planning_db_path)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["status"], "suggested")
+        self.assertEqual(records[1]["status"], "published")
+        self.assertEqual(
+            planning_db.get_source_product(self.planning_db_path, source["id"])["lifecycle_status"],
+            "active",
+        )
+
+        # The next automatic/manual sync must be idempotent while the new
+        # revision is still in progress.
+        second_result = planning_db.synchronize_source_products(self.planning_db_path, [approved_reentry])
+        self.assertNotIn("revisions_started", second_result)
+        self.assertEqual(len(planning_db.list_pricing_records(self.planning_db_path)), 2)
+
+    def test_planning_sync_rejects_recalled_item_without_b_decision(self):
+        source = {
+            "id": 5911,
+            "style_code": "REENTRY-5911",
+            "product_name": "未判定召回款",
+            "season_year": "2026秋冬",
+            "supplier": "召回测试供应商",
+            "tax_included_price": 150,
+            "image_url": "https://example.com/images/reentry-5911.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "submitted_to_merchandise": True,
+            "planning_reentry_state": "decision_pending",
+            "source_version_no": 1,
+        }
+        result = planning_db.synchronize_source_products(self.planning_db_path, [source])
+        self.assertEqual(result["synced"], 0)
+        self.assertEqual(result["rejected"], 1)
+        self.assertIsNone(planning_db.get_source_product(self.planning_db_path, source["id"]))
+
     def test_configured_planning_channel_is_accepted_by_catalog_callback(self):
         planning_db.save_channel_option(self.planning_db_path, "直播首发", 40)
         app = CatalogApplication(

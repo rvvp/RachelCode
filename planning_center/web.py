@@ -373,6 +373,8 @@ class PlanningApplication:
             cleanup.append(f"拦截 {int(result['rejected'])} 条不符合准入条件的资料")
         if result.get("rebased"):
             cleanup.append(f"同时对齐 {int(result['rebased'])} 条未回传定价的来源版本")
+        if result.get("revisions_started"):
+            cleanup.append(f"其中 {int(result['revisions_started'])} 条召回资料已生成新的待初审周期")
         if cleanup:
             message += "；".join(cleanup) + "。"
         return message

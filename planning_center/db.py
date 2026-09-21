@@ -755,6 +755,11 @@ def planning_source_item_is_eligible(item: dict) -> bool:
     return (
         str(item.get("status") or "").strip() == "pending"
         and str(item.get("lifecycle_status") or "active").strip() == "active"
+        # A recalled catalog item must be explicitly approved by department B
+        # before it can re-enter planning. The catalog API applies the same
+        # gate; keeping it here prevents a malformed or stale payload from
+        # reopening work in the planning database.
+        and str(item.get("planning_reentry_state") or "initial").strip() in {"initial", "approved"}
         and item.get("submitted_to_merchandise") is True
         and source_tax_included_cost_value(item) is not None
         and _source_item_has_image(item)
@@ -939,6 +944,27 @@ def synchronize_source_products(
     rejected_incoming_ids = incoming_ids - strict_ids
     explicit_withdrawn_ids = {int(product_id) for product_id in withdrawn_ids}
     synced = upsert_source_products(db_path, eligible_items, require_image=True, require_cost=True)
+    revisions_started = 0
+    # A recalled, already-published style is allowed back into planning only
+    # after B explicitly approves it. At the first sync after that approval,
+    # create a fresh suggested record so the old published audit row remains
+    # intact and the style visibly starts a new pricing/review cycle. Later
+    # syncs see the new active record and leave it alone until publication.
+    for item in eligible_items:
+        if str(item.get("planning_reentry_state") or "initial").strip() != "approved":
+            continue
+        source_id = int(item.get("id") or 0)
+        if source_id <= 0:
+            continue
+        with get_connection(db_path) as connection:
+            latest = connection.execute(
+                "SELECT status FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (source_id,),
+            ).fetchone()
+        if not latest or latest["status"] != "published":
+            continue
+        start_pricing_revision(db_path, source_id, "商品部召回重走企划")
+        revisions_started += 1
     image_updated = upsert_source_image_updates(db_path, list(image_updates))
     rebased = rebase_pricing_record_source_versions(
         db_path,
@@ -998,6 +1024,8 @@ def synchronize_source_products(
         result["image_updated"] = image_updated
     if rebased:
         result["rebased"] = rebased
+    if revisions_started:
+        result["revisions_started"] = revisions_started
     return result
 
 
