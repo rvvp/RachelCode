@@ -76,19 +76,24 @@ class PlanningCenterTests(unittest.TestCase):
                 "UPDATE products SET tax_included_price = 150 WHERE id = ?",
                 (pending_product["id"],),
             )
+            connection.execute(
+                "DELETE FROM product_logs WHERE product_id = ? AND action = 'status:pending'",
+                (pending_product["id"],),
+            )
         response = self.wsgi_request(app, "/api/internal/planning/products")
         self.assertTrue(response["status"].startswith("401"))
         response = self.wsgi_request(app, "/api/internal/planning/products", authorization="Bearer planning-secret")
         payload = json.loads(response["body"])
         self.assertEqual(payload["count"], 1)
         self.assertTrue(payload["workflow_gate"])
+        self.assertEqual(payload["workflow_gate_status"], "pending")
+        self.assertEqual(payload["workflow_gate_label"], "A/B协作中")
         self.assertTrue(payload["image_gate"])
         self.assertTrue(payload["cost_gate"])
-        self.assertEqual(payload["eligibility_gate_version"], 1)
+        self.assertEqual(payload["eligibility_gate_version"], 2)
         self.assertEqual({item["status"] for item in payload["items"]}, {"pending"})
         self.assertEqual({item["lifecycle_status"] for item in payload["items"]}, {"active"})
-        self.assertEqual({item["submitted_to_merchandise"] for item in payload["items"]}, {True})
-        self.assertTrue(payload["withdrawn_ids"])
+        self.assertEqual(payload["withdrawn_ids"], [])
         source = payload["items"][0]
         b_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["username"] == "b_editor")
         before_image_version = int(source["image_version_no"])
@@ -244,7 +249,8 @@ class PlanningCenterTests(unittest.TestCase):
                 "workflow_gate": True,
                 "image_gate": True,
                 "cost_gate": True,
-                "eligibility_gate_version": 1,
+                "workflow_gate_status": "pending",
+                "eligibility_gate_version": 2,
             }
         ).encode("utf-8")
 
@@ -521,7 +527,7 @@ class PlanningCenterTests(unittest.TestCase):
 
         blocked = self.wsgi_request(
             app,
-            "/api/internal/planning/products",
+            f"/api/internal/planning/products?known_ids={source['id']}",
             authorization="Bearer planning-secret",
         )
         blocked_payload = json.loads(blocked["body"])
@@ -625,7 +631,6 @@ class PlanningCenterTests(unittest.TestCase):
             "image_url": "https://example.com/images/reentry-5910.jpg",
             "status": "pending",
             "lifecycle_status": "active",
-            "submitted_to_merchandise": True,
             "source_version_no": 1,
             "image_version_no": 1,
         }
@@ -676,7 +681,6 @@ class PlanningCenterTests(unittest.TestCase):
             "image_url": "https://example.com/images/reentry-5911.jpg",
             "status": "pending",
             "lifecycle_status": "active",
-            "submitted_to_merchandise": True,
             "planning_reentry_state": "decision_pending",
             "source_version_no": 1,
         }
@@ -844,7 +848,7 @@ class PlanningCenterTests(unittest.TestCase):
             )
         response = self.wsgi_request(
             app,
-            "/api/internal/planning/products",
+            f"/api/internal/planning/products?known_ids={pending['id']}",
             authorization="Bearer planning-secret",
         )
         payload = json.loads(response["body"])
@@ -895,7 +899,6 @@ class PlanningCenterTests(unittest.TestCase):
             "image_url": "https://example.com/images/cost-gate-invalid.jpg",
             "status": "pending",
             "lifecycle_status": "active",
-            "submitted_to_merchandise": True,
             "source_version_no": 1,
         }
         valid_tax_fallback = dict(
@@ -941,16 +944,15 @@ class PlanningCenterTests(unittest.TestCase):
             "image_url": "https://example.com/images/strict-sync.jpg",
             "status": "pending",
             "lifecycle_status": "active",
-            "submitted_to_merchandise": True,
             "source_version_no": 1,
         }
         candidates = [
             valid,
-            dict(valid, id=4301, style_code="STRICT-SYNC-NOT-SUBMITTED", submitted_to_merchandise=False),
             dict(valid, id=4302, style_code="STRICT-SYNC-NO-IMAGE", image_url="", image_gallery_json="[]"),
             dict(valid, id=4303, style_code="STRICT-SYNC-NO-COST", tax_included_price=None),
             dict(valid, id=4304, style_code="STRICT-SYNC-WRONG-STATUS", status="published"),
             dict(valid, id=4305, style_code="STRICT-SYNC-INACTIVE", lifecycle_status="withdrawn"),
+            dict(valid, id=4306, style_code="STRICT-SYNC-RECALL-UNDECIDED", planning_reentry_state="decision_pending"),
         ]
 
         result = planning_db.synchronize_source_products(self.planning_db_path, candidates)
@@ -976,7 +978,6 @@ class PlanningCenterTests(unittest.TestCase):
             "image_url": "https://example.com/rebase.jpg",
             "status": "pending",
             "lifecycle_status": "active",
-            "submitted_to_merchandise": True,
             "source_version_no": 1,
             "image_version_no": 1,
         }
@@ -997,7 +998,7 @@ class PlanningCenterTests(unittest.TestCase):
             2,
         )
 
-    def test_resync_does_not_rebase_pricing_record_when_source_cost_changed(self):
+    def test_resync_restarts_review_when_source_cost_changed(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
         source = {
             "id": 4391,
@@ -1011,7 +1012,6 @@ class PlanningCenterTests(unittest.TestCase):
             "image_url": "https://example.com/rebase-cost.jpg",
             "status": "pending",
             "lifecycle_status": "active",
-            "submitted_to_merchandise": True,
             "source_version_no": 1,
             "image_version_no": 1,
         }
@@ -1023,14 +1023,31 @@ class PlanningCenterTests(unittest.TestCase):
                 (record["id"],),
             )
 
-        refreshed = dict(source, source_version_no=2, actual_cost=180, tax_included_price=180)
+        # Catalog data can expose a corrected cost before its source version
+        # changes. This is the production failure mode that previously left a
+        # stale, confirmed pricing row blocking publication.
+        refreshed = dict(source, actual_cost=180, tax_included_price=180)
         result = planning_db.synchronize_source_products(self.planning_db_path, [refreshed])
 
         self.assertNotIn("rebased", result)
-        self.assertEqual(
-            planning_db.get_pricing_record(self.planning_db_path, record["id"])["source_version_no"],
-            1,
-        )
+        self.assertEqual(result["pricing_restarted"], 1)
+        records = planning_db.list_pricing_records(self.planning_db_path)
+        self.assertEqual(len(records), 2)
+        replacement, superseded = records
+        self.assertEqual(superseded["id"], record["id"])
+        self.assertEqual(superseded["status"], "superseded")
+        self.assertEqual(superseded["source_version_no"], 1)
+        self.assertIn("已生成新的审核周期", superseded["error_message"])
+        self.assertEqual(replacement["status"], "suggested")
+        self.assertEqual(replacement["source_version_no"], 1)
+        self.assertEqual(replacement["cost"], 180)
+        self.assertEqual(replacement["raw_price"], 720)
+        self.assertEqual(replacement["calculated_price"], 719)
+        self.assertEqual(replacement["launch_price"], 719)
+
+        second_result = planning_db.synchronize_source_products(self.planning_db_path, [refreshed])
+        self.assertNotIn("pricing_restarted", second_result)
+        self.assertEqual(len(planning_db.list_pricing_records(self.planning_db_path)), 2)
 
     def test_image_only_resync_rebases_active_pricing_record_version(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
@@ -1046,7 +1063,6 @@ class PlanningCenterTests(unittest.TestCase):
             "image_url": "https://example.com/rebase-hand.jpg",
             "status": "pending",
             "lifecycle_status": "active",
-            "submitted_to_merchandise": True,
             "source_version_no": 1,
             "image_version_no": 1,
         }
@@ -1095,7 +1111,6 @@ class PlanningCenterTests(unittest.TestCase):
             "image_url": "https://example.com/publish.jpg",
             "status": "pending",
             "lifecycle_status": "active",
-            "submitted_to_merchandise": True,
             "source_version_no": 2,
         }
         planning_db.upsert_source_products(self.planning_db_path, [source])
@@ -1119,6 +1134,56 @@ class PlanningCenterTests(unittest.TestCase):
         location = dict(response["headers"])["Location"]
         self.assertIn("status=confirmed", location)
         self.assertIn("%E6%9D%A5%E6%BA%90%E8%B5%84%E6%96%99%E7%89%88%E6%9C%AC%E5%B7%B2%E5%8F%98%E5%8C%96", location)
+
+    def test_batch_publish_cost_conflict_returns_to_workbench_and_marks_record(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        source = {
+            "id": 4394,
+            "style_code": "PUBLISH-4394",
+            "product_name": "批量回传成本变化测试款",
+            "season_year": "2026秋冬",
+            "supplier": "回传供应商",
+            "category": "其他",
+            "actual_cost": 150,
+            "tax_included_price": 150,
+            "image_url": "https://example.com/publish-cost.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+        record = planning_db.create_pricing_record(self.planning_db_path, source, "商品部企划员")
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                "UPDATE pricing_records SET status = 'confirmed' WHERE id = ?",
+                (record["id"],),
+            )
+            connection.execute(
+                "UPDATE source_products SET actual_cost = 180, tax_included_price = 180 WHERE id = ?",
+                (source["id"],),
+            )
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test", "token")
+        planner_cookie = self.login_cookie(app, "planner")
+
+        response = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode(
+                {
+                    "batch_action": "publish",
+                    "publish_ids": str(record["id"]),
+                }
+            ).encode("utf-8"),
+            cookie=planner_cookie,
+        )
+
+        self.assertTrue(response["status"].startswith("302"))
+        location = unquote(dict(response["headers"])["Location"]).replace("+", " ")
+        self.assertIn("有 1 款回传失败", location)
+        failed_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+        self.assertEqual(failed_record["status"], "conflict")
+        self.assertIn("含税成本未发生变化", failed_record["error_message"])
 
     def test_planning_revision_reuses_same_source_and_is_visible_in_published_filter(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
@@ -1849,7 +1914,7 @@ class PlanningCenterTests(unittest.TestCase):
         login = self.wsgi_request(app, "/login", method="POST", body=urlencode({"username": "planner", "password": "demo123"}).encode())
         self.assertTrue(login["status"].startswith("302"))
         cookie = dict(login["headers"])["Set-Cookie"].split(";", 1)[0]
-        source = {"id": 9, "style_code": "M009", "product_name": "测试款", "season_year": "2026秋", "supplier": "供应商", "category": "其他", "actual_cost": 150, "tax_included_price": 150, "image_url": "https://example.com/images/m009.jpg", "status": "pending", "lifecycle_status": "active", "submitted_to_merchandise": True, "source_version_no": 1, "updated_at": "", "creator_name": "跟单员"}
+        source = {"id": 9, "style_code": "M009", "product_name": "测试款", "season_year": "2026秋", "supplier": "供应商", "category": "其他", "actual_cost": 150, "tax_included_price": 150, "image_url": "https://example.com/images/m009.jpg", "status": "pending", "lifecycle_status": "active", "source_version_no": 1, "updated_at": "", "creator_name": "跟单员"}
         withdrawn_source = dict(source, id=10, style_code="M010", product_name="误同步的已完成款")
         planning_db.upsert_source_products(self.planning_db_path, [withdrawn_source])
         with patch.object(app, "fetch_catalog_products", return_value={"source": "cangbaoge", "items": [source]}):
@@ -1863,9 +1928,10 @@ class PlanningCenterTests(unittest.TestCase):
             "withdrawn_ids": [10],
             "image_updates": [],
             "workflow_gate": True,
+            "workflow_gate_status": "pending",
             "image_gate": True,
             "cost_gate": True,
-            "eligibility_gate_version": 1,
+            "eligibility_gate_version": 2,
         }
         with patch.object(app, "fetch_catalog_products", return_value=catalog_payload):
             response = self.wsgi_request(app, "/sync", method="POST", cookie=cookie)
@@ -1882,7 +1948,7 @@ class PlanningCenterTests(unittest.TestCase):
             workbench = self.wsgi_request(app, "/workbench", cookie=cookie)["body"].decode("utf-8")
         self.assertIn("正在后台同步藏宝阁资料", first_workbench)
         fetch_mock.assert_called_once_with([9], timeout=3)
-        sync_message = "已自动同步 1 条藏宝阁“待商品部填写”资料。"
+        sync_message = "已自动同步 1 条藏宝阁“A/B协作中”资料。"
         self.assertEqual(workbench.count(sync_message), 1)
         self.assertNotIn("当前结果", workbench)
         self.assertLess(workbench.index(sync_message), workbench.index("<form class='workbench-filter'"))
@@ -1898,9 +1964,10 @@ class PlanningCenterTests(unittest.TestCase):
             "withdrawn_ids": [],
             "image_updates": [],
             "workflow_gate": True,
+            "workflow_gate_status": "pending",
             "image_gate": True,
             "cost_gate": True,
-            "eligibility_gate_version": 1,
+            "eligibility_gate_version": 2,
         }
 
         def delayed_fetch(*args, **kwargs):
@@ -1919,7 +1986,7 @@ class PlanningCenterTests(unittest.TestCase):
             app.wait_for_automatic_sync()
             completed_page = app.render_workbench(user, {})
 
-        self.assertIn("已自动同步 0 条藏宝阁“待商品部填写”资料。", completed_page)
+        self.assertIn("已自动同步 0 条藏宝阁“A/B协作中”资料。", completed_page)
 
     def test_planning_database_uses_wal_and_reads_during_batch_write(self):
         with planning_db.get_connection(self.planning_db_path) as connection:
@@ -1996,7 +2063,7 @@ class PlanningCenterTests(unittest.TestCase):
         pending = {
             "id": 201,
             "style_code": "SYNC-201",
-            "product_name": "待商品部填写毛衣",
+            "product_name": "A/B协作中的针织款",
             "season_year": "2026秋冬",
             "supplier": "同步供应商",
             "category": "其他",
@@ -2004,7 +2071,6 @@ class PlanningCenterTests(unittest.TestCase):
             "tax_included_price": 150,
             "status": "pending",
             "lifecycle_status": "active",
-            "submitted_to_merchandise": True,
             "image_url": "https://example.com/images/sync-201.jpg",
             "source_version_no": 1,
         }
@@ -2043,10 +2109,9 @@ class PlanningCenterTests(unittest.TestCase):
         source = {
             "id": 204,
             "style_code": "SYNC-204",
-            "product_name": "仍待商品部填写的款式",
+            "product_name": "仍在A/B协作中的款式",
             "status": "pending",
             "lifecycle_status": "active",
-            "submitted_to_merchandise": True,
             "source_version_no": 1,
         }
         planning_db.upsert_source_products(self.planning_db_path, [source])
@@ -2976,7 +3041,6 @@ class PlanningCenterTests(unittest.TestCase):
             body=urlencode({"username": "planner", "password": "demo123"}).encode(),
         )
         planner_cookie = dict(planner_login["headers"])["Set-Cookie"].split(";", 1)[0]
-        source["submitted_to_merchandise"] = True
         with patch.object(
             app,
             "fetch_catalog_products",
@@ -2986,9 +3050,10 @@ class PlanningCenterTests(unittest.TestCase):
                 "withdrawn_ids": [],
                 "image_updates": [],
                 "workflow_gate": True,
+                "workflow_gate_status": "pending",
                 "image_gate": True,
                 "cost_gate": True,
-                "eligibility_gate_version": 1,
+                "eligibility_gate_version": 2,
             },
         ):
             self.wsgi_request(app, "/sync", method="POST", cookie=planner_cookie)

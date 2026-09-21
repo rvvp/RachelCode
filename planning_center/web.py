@@ -363,7 +363,7 @@ class PlanningApplication:
 
     def source_sync_message(self, result: dict, *, automatic: bool = False) -> str:
         prefix = "已自动同步" if automatic else "已同步"
-        message = f"{prefix} {int(result.get('synced') or 0)} 条藏宝阁“待商品部填写”资料。"
+        message = f"{prefix} {int(result.get('synced') or 0)} 条藏宝阁“A/B协作中”资料。"
         cleanup = []
         if result.get("removed"):
             cleanup.append(f"撤销 {int(result['removed'])} 条未定价资料")
@@ -375,6 +375,8 @@ class PlanningApplication:
             cleanup.append(f"同时对齐 {int(result['rebased'])} 条未回传定价的来源版本")
         if result.get("revisions_started"):
             cleanup.append(f"其中 {int(result['revisions_started'])} 条召回资料已生成新的待初审周期")
+        if result.get("pricing_restarted"):
+            cleanup.append(f"另有 {int(result['pricing_restarted'])} 条因含税成本或来源资料变化重新进入待初审")
         if cleanup:
             message += "；".join(cleanup) + "。"
         return message
@@ -493,11 +495,13 @@ class PlanningApplication:
         required_gates = ("workflow_gate", "image_gate", "cost_gate")
         if any(payload.get(gate) is not True for gate in required_gates):
             raise ValueError("藏宝阁未完成流程、图片和含税价准入校验，已停止同步。")
+        if payload.get("workflow_gate_status") != "pending":
+            raise ValueError("藏宝阁同步接口未按“A/B协作中”状态筛选资料，已停止同步。")
         try:
             eligibility_gate_version = int(payload.get("eligibility_gate_version") or 0)
         except (TypeError, ValueError):
             eligibility_gate_version = 0
-        if eligibility_gate_version < 1:
+        if eligibility_gate_version < 2:
             raise ValueError("藏宝阁同步准入协议版本无效，已停止同步。")
         items = payload.get("items") or []
         withdrawn_ids = payload.get("withdrawn_ids") or []
@@ -1179,7 +1183,14 @@ class PlanningApplication:
         published = []
         failed = []
         for record in records:
-            updated = self.publish_pricing_record(record, user)
+            try:
+                updated = self.publish_pricing_record(record, user)
+            except (LookupError, ValueError) as error:
+                updated = db.mark_record_published(
+                    self.db_path,
+                    record["id"],
+                    {"status": "failed", "message": str(error)},
+                )
             if updated["status"] == "published":
                 published.append(updated)
             else:
@@ -1451,7 +1462,7 @@ class PlanningApplication:
         confirmed = counts["confirmed"]
         published = counts["published"]
         catalog_sync_action = (
-            "<form class='catalog-sync-form' method='post' action='/sync'><button class='primary' type='submit'>立即同步藏宝阁</button><small class='sync-condition-note'>同步条件：待商品部填写、已提交商品部、已上传图片、含税价为大于 0 的有效数字</small></form>"
+            "<form class='catalog-sync-form' method='post' action='/sync'><button class='primary' type='submit'>立即同步藏宝阁</button><small class='sync-condition-note'>同步条件：A/B协作中、有效资料、已上传图片、含税价为大于 0 的有效数字；召回款须已确认重回企划</small></form>"
             if user.get("role") == "planner"
             else "<small class='review-note'>同步与回传由商品部初审人员执行</small>"
         )
@@ -1462,7 +1473,7 @@ class PlanningApplication:
           <article class='module-entry'><div class='module-entry-top'><span class='module-index'>02</span><span class='phase-tag phase-tag-live'>当前可用</span></div><div><div class='eyebrow'>NEW ARRIVAL REVIEW</div><h2>上新审核</h2><p>同步藏宝阁新款，完成价格计算、确认、统计与回传。</p></div><a class='button primary' href='/workbench'>进入工作台</a></article>
         </section>
         <div class='section-label'><div><div class='eyebrow'>PRICING OVERVIEW</div><h2>上新定价概况</h2></div><a href='/stats'>查看价格带统计</a></div>
-        <section class='metrics'><a href='/workbench'><span>待定价商品</span><strong>{pending}</strong><small>来源：藏宝阁已提交资料</small></a><a href='/workbench?status=confirmed'><span>待回传定价</span><strong>{confirmed}</strong><small>复核通过，等待回传</small></a><a href='/workbench?status=published'><span>已发布</span><strong>{published}</strong><small>已写回藏宝阁</small></a></section>
+        <section class='metrics'><a href='/workbench'><span>待定价商品</span><strong>{pending}</strong><small>来源：藏宝阁 A/B 协作资料</small></a><a href='/workbench?status=confirmed'><span>待回传定价</span><strong>{confirmed}</strong><small>复核通过，等待回传</small></a><a href='/workbench?status=published'><span>已发布</span><strong>{published}</strong><small>已写回藏宝阁</small></a></section>
         <section class='split'><div class='panel'><div class='panel-head'><div><div class='eyebrow'>QUICK START</div><h2>今天从这里开始</h2></div></div><div class='quick-grid'><a href='/workbench'><b>01</b><span>打开上新审核工作台</span><small>同步新款、确认品类、生成测算上新价</small></a><a href='/rules'><b>02</b><span>检查规则</span><small>品类、渠道、倍率与供应商系数</small></a><a href='/stats'><b>03</b><span>查看价格带分布</span><small>用当前定价结果校验结构</small></a></div></div><div class='panel notice-panel'><div class='eyebrow'>DATA BOUNDARY</div><h2>成本以藏宝阁为准</h2><p>商品企划中心不录入或估算采购成本。所有成本来自藏宝阁跟单部提交的含税价，回传时会核对资料版本，避免旧成本覆盖新资料。</p>{catalog_sync_action}</div></section>
         """
         return self.shell("企划总览", content, user, "dashboard")
@@ -1563,7 +1574,7 @@ class PlanningApplication:
         toolbar_message = notice or sync_message
         seasons = sorted({item.get("season_year", "") for item in db.list_source_products(self.db_path) if item.get("season_year")}, reverse=True)
         catalog_sync_action = (
-            "<form class='catalog-sync-form' method='post' action='/sync'><button class='primary' type='submit'>同步藏宝阁</button><small class='sync-condition-note'>同步条件：待商品部填写、已提交商品部、已上传图片、含税价为大于 0 的有效数字</small></form>"
+            "<form class='catalog-sync-form' method='post' action='/sync'><button class='primary' type='submit'>同步藏宝阁</button><small class='sync-condition-note'>同步条件：A/B协作中、有效资料、已上传图片、含税价为大于 0 的有效数字；召回款须已确认重回企划</small></form>"
             if user.get("role") == "planner"
             else "<span class='review-note'>同步与回传由商品部初审人员执行</span>"
         )
@@ -1665,7 +1676,7 @@ class PlanningApplication:
         for item, record, workflow_status in page_products:
             cost = item.get("actual_cost")
             can_price = user.get("role") == "planner" and self.has_valid_source_cost(item)
-            source_status_label = {"pending": "已提交商品部", "published": "已完成", "received": "已接收"}.get(item.get("status"), item.get("status") or "未知")
+            source_status_label = {"pending": "A/B协作中", "published": "待运营接收", "received": "已接收"}.get(item.get("status"), item.get("status") or "未知")
             image_url = str(item.get("image_url") or "").strip()
             display_image_url = f"/source-products/{int(item['id'])}/image?v={int(item.get('image_version_no') or 1)}"
             image_label = str(item.get("style_color") or item.get("style_code") or "商品图片")

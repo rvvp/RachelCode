@@ -3156,18 +3156,13 @@ def products_for_c_published_versions(db_path: str | Path, products: list[dict])
 def _planning_source_query() -> str:
     return """
         SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
-               reviewer.display_name AS reviewer_name,
-               1 AS submitted_to_merchandise
+               reviewer.display_name AS reviewer_name
         FROM products p
         JOIN users u ON u.id = p.created_by
         LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
         WHERE p.lifecycle_status = 'active'
           AND p.status = 'pending'
           AND COALESCE(p.planning_reentry_state, 'initial') IN ('initial', 'approved')
-          AND EXISTS (
-              SELECT 1 FROM product_logs pl
-              WHERE pl.product_id = p.id AND pl.action = 'status:pending'
-          )
           AND (
               TRIM(COALESCE(p.image_url, '')) != ''
               OR TRIM(COALESCE(p.image_gallery_json, '')) NOT IN ('', '[]')
@@ -3241,7 +3236,6 @@ def _planning_product_payload(product: dict) -> dict:
         "updated_at": product.get("updated_at") or "",
         "created_at": product.get("created_at") or "",
         "creator_name": product.get("creator_name") or "",
-        "submitted_to_merchandise": bool(product.get("submitted_to_merchandise")),
     }
 
 
@@ -3257,11 +3251,7 @@ def planning_source_image_payloads(db_path: str | Path, product_ids: list[int] |
     placeholders = ", ".join("?" for _ in ids)
     query = f"""
         SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
-               reviewer.display_name AS reviewer_name,
-               EXISTS (
-                   SELECT 1 FROM product_logs pl
-                   WHERE pl.product_id = p.id AND pl.action = 'status:pending'
-               ) AS submitted_to_merchandise
+               reviewer.display_name AS reviewer_name
         FROM products p
         JOIN users u ON u.id = p.created_by
         LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
@@ -3283,26 +3273,25 @@ def planning_source_image_payloads(db_path: str | Path, product_ids: list[int] |
     return [_planning_product_payload(dict(row)) for row in rows]
 
 
-def planning_withdrawn_source_ids(db_path: str | Path, product_id: int | None = None) -> list[int]:
-    query = """
-        SELECT p.*,
-               EXISTS (
-                   SELECT 1 FROM product_logs pl
-                   WHERE pl.product_id = p.id AND pl.action = 'status:pending'
-               ) AS submitted_to_merchandise
-        FROM products p
-        WHERE EXISTS (
-              SELECT 1 FROM product_logs pl
-              WHERE pl.product_id = p.id AND pl.action = 'status:pending'
-          )
-    """
-    params: list[object] = []
-    if product_id is not None:
-        query += " AND p.id = ?"
-        params.append(int(product_id))
-    query += " ORDER BY p.id"
+def planning_withdrawn_source_ids(
+    db_path: str | Path,
+    product_ids: list[int] | tuple[int, ...] | set[int],
+) -> list[int]:
+    """Return known planning sources that no longer pass the current gate."""
+    ids = sorted({int(product_id) for product_id in product_ids if str(product_id).isdigit()})
+    if not ids:
+        return []
+    rows = []
     with get_connection(db_path) as connection:
-        rows = connection.execute(query, params).fetchall()
+        for index in range(0, len(ids), 800):
+            id_chunk = ids[index : index + 800]
+            placeholders = ", ".join("?" for _ in id_chunk)
+            rows.extend(
+                connection.execute(
+                    f"SELECT * FROM products WHERE id IN ({placeholders}) ORDER BY id",
+                    id_chunk,
+                ).fetchall()
+            )
     withdrawn = []
     for row in rows:
         product = dict(row)
@@ -3310,7 +3299,6 @@ def planning_withdrawn_source_ids(db_path: str | Path, product_id: int | None = 
             product.get("lifecycle_status") == "active"
             and product.get("status") == "pending"
             and str(product.get("planning_reentry_state") or "initial") in {"initial", "approved"}
-            and bool(product.get("submitted_to_merchandise"))
             and product_has_image(product)
             and has_valid_tax_included_price(product.get("tax_included_price"))
         )
@@ -3348,12 +3336,6 @@ def publish_planning_price(
     if is_initial_publication:
         if str(product.get("planning_reentry_state") or "initial") not in {"initial", "approved"}:
             raise ValueError("当前召回资料尚未由商品部确认是否重走商品企划，暂不能接收企划回传。")
-        eligible = connection.execute(
-            "SELECT 1 FROM product_logs WHERE product_id = ? AND action = 'status:pending' LIMIT 1",
-            (product_id,),
-        ).fetchone()
-        if not eligible:
-            raise ValueError("当前商品没有有效的提交商品部记录。")
     elif not payload.get("revision"):
         raise ValueError("已完成资料只能通过商品企划中心发起修订后回传；初次回传仅支持状态为“A/B协作中”的资料。")
     publication_id = str(payload.get("publication_id") or "").strip()

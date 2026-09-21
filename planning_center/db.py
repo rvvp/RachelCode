@@ -760,7 +760,6 @@ def planning_source_item_is_eligible(item: dict) -> bool:
         # gate; keeping it here prevents a malformed or stale payload from
         # reopening work in the planning database.
         and str(item.get("planning_reentry_state") or "initial").strip() in {"initial", "approved"}
-        and item.get("submitted_to_merchandise") is True
         and source_tax_included_cost_value(item) is not None
         and _source_item_has_image(item)
     )
@@ -930,6 +929,102 @@ def rebase_pricing_record_source_versions(
     return rebased
 
 
+def restart_pricing_for_changed_sources(
+    db_path: str | Path,
+    items: list[dict] | tuple[dict, ...],
+) -> int:
+    """Start a fresh review when a frozen pricing input changed upstream."""
+    restarted = 0
+    seen_ids: set[int] = set()
+    for incoming in items:
+        source_id = int(incoming.get("id") or 0)
+        if source_id <= 0 or source_id in seen_ids:
+            continue
+        seen_ids.add(source_id)
+        source = get_source_product(db_path, source_id)
+        if not source:
+            continue
+        with get_connection(db_path) as connection:
+            latest_row = connection.execute(
+                "SELECT * FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (source_id,),
+            ).fetchone()
+        if not latest_row or latest_row["status"] not in {"suggested", "review_pending", "confirmed", "conflict"}:
+            continue
+        latest = dict(latest_row)
+        if _pricing_record_can_follow_source(latest, source):
+            continue
+
+        category = resolve_product_category(db_path, source)
+        cost = source_cost_value(source)
+        calculation = calculate_pricing(
+            db_path,
+            source.get("season_year", ""),
+            category,
+            source.get("supplier", ""),
+            cost,
+        )
+        source_version = int(source.get("source_version_no") or 1)
+        publication_id = f"PC-{source_id}-REFRESH-V{source_version}-{secrets.token_hex(4).upper()}"
+        now = utc_now()
+        with get_connection(db_path) as connection:
+            current_row = connection.execute(
+                "SELECT * FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (source_id,),
+            ).fetchone()
+            if (
+                not current_row
+                or current_row["status"] not in {"suggested", "review_pending", "confirmed", "conflict"}
+                or _pricing_record_can_follow_source(dict(current_row), source)
+            ):
+                continue
+            connection.execute(
+                """
+                UPDATE pricing_records
+                SET status = 'superseded',
+                    error_message = '藏宝阁含税成本或定价来源资料已变化，已生成新的审核周期。'
+                WHERE source_product_id = ?
+                  AND status IN ('suggested', 'review_pending', 'confirmed', 'conflict')
+                """,
+                (source_id,),
+            )
+            connection.execute(
+                "UPDATE source_products SET category = ?, status = 'pending', lifecycle_status = 'active', synced_at = ? WHERE id = ?",
+                (category, now, source_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO pricing_records (
+                    publication_id, source_product_id, source_version_no,
+                    season_year, style_code, product_name, supplier, category,
+                    channel, cost, fixed_multiplier, supplier_coefficient,
+                    raw_price, calculated_price, launch_price, status,
+                    operator_name, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)
+                """,
+                (
+                    publication_id,
+                    source_id,
+                    source_version,
+                    source.get("season_year", ""),
+                    source.get("style_code", ""),
+                    source.get("product_name", ""),
+                    source.get("supplier", ""),
+                    category,
+                    cost,
+                    calculation["fixed_multiplier"],
+                    calculation["supplier_coefficient"],
+                    calculation["raw_price"],
+                    calculation["calculated_price"],
+                    calculation["calculated_price"],
+                    "藏宝阁来源资料变更",
+                    now,
+                ),
+            )
+        restarted += 1
+    return restarted
+
+
 def synchronize_source_products(
     db_path: str | Path,
     items: list[dict],
@@ -944,6 +1039,7 @@ def synchronize_source_products(
     rejected_incoming_ids = incoming_ids - strict_ids
     explicit_withdrawn_ids = {int(product_id) for product_id in withdrawn_ids}
     synced = upsert_source_products(db_path, eligible_items, require_image=True, require_cost=True)
+    pricing_restarted = restart_pricing_for_changed_sources(db_path, eligible_items)
     revisions_started = 0
     # A recalled, already-published style is allowed back into planning only
     # after B explicitly approves it. At the first sync after that approval,
@@ -1026,6 +1122,8 @@ def synchronize_source_products(
         result["rebased"] = rebased
     if revisions_started:
         result["revisions_started"] = revisions_started
+    if pricing_restarted:
+        result["pricing_restarted"] = pricing_restarted
     return result
 
 

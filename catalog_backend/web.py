@@ -1678,8 +1678,6 @@ class CatalogApplication:
         if not self.planning_api_authorized(environ):
             return self.json_error_response(start_response, "unauthorized", "需要有效的商品企划内部 Token。", "401 Unauthorized")
         product_id = int(query["id"]) if str(query.get("id") or "").isdigit() else None
-        products = db.planning_source_payloads(self.db_path, product_id)
-        withdrawn_ids = db.planning_withdrawn_source_ids(self.db_path, product_id)
         known_ids = []
         if environ.get("REQUEST_METHOD", "GET").upper() == "POST":
             body = self.parse_json_body(environ)
@@ -1697,6 +1695,9 @@ class CatalogApplication:
             for value in raw_known_ids.split(","):
                 if value.strip().isdigit():
                     known_ids.append(int(value.strip()))
+        products = db.planning_source_payloads(self.db_path, product_id)
+        withdrawal_candidates = [product_id] if product_id is not None else known_ids
+        withdrawn_ids = db.planning_withdrawn_source_ids(self.db_path, withdrawal_candidates)
         image_updates = db.planning_source_image_payloads(self.db_path, known_ids)
         season_year = str(query.get("season_year") or "").strip()
         status = str(query.get("status") or "").strip()
@@ -1709,9 +1710,11 @@ class CatalogApplication:
             {
                 "source": "cangbaoge",
                 "workflow_gate": True,
+                "workflow_gate_status": "pending",
+                "workflow_gate_label": "A/B协作中",
                 "image_gate": True,
                 "cost_gate": True,
-                "eligibility_gate_version": 1,
+                "eligibility_gate_version": 2,
                 "count": len(products),
                 "items": products,
                 "image_updates": image_updates,
