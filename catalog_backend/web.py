@@ -507,6 +507,8 @@ class CatalogApplication:
                     return self.handle_product_edit(environ, start_response, user, product_id)
                 if len(parts) == 3 and parts[2] == "status" and method == "POST":
                     return self.handle_status_change(environ, start_response, user, product_id)
+                if len(parts) == 3 and parts[2] == "planning-reentry" and method == "POST":
+                    return self.handle_planning_reentry_decision(environ, start_response, user, product_id)
                 if len(parts) == 3 and parts[2] == "lifecycle" and method == "POST":
                     return self.handle_lifecycle_change(environ, start_response, user, product_id)
                 if len(parts) == 3 and parts[2] == "logs" and method == "GET":
@@ -1982,6 +1984,46 @@ class CatalogApplication:
             f"/products/{product_id}?notice=" + self.urlencode_message(f"状态已更新为{status_label(target_status)}。"),
         )
 
+    def handle_planning_reentry_decision(self, environ, start_response, user, product_id: int):
+        if is_department_monitor(user) or (user.get("department") != "B" and not is_admin(user)):
+            return self.html_response(
+                start_response,
+                self.render_message_page("权限不足", "只有商品部人员可以判定是否重新进入商品企划中心。", user),
+                status="403 Forbidden",
+            )
+        product = db.get_product(self.db_path, product_id)
+        if not product or not can_see_product(user, product):
+            return self.html_response(
+                start_response,
+                self.render_message_page("记录不存在", "没有找到这条商品资料或当前账号不能处理它。", user),
+                status="404 Not Found",
+            )
+        form, _ = self.parse_form(environ)
+        decision = str(form.get("decision") or "").strip().lower()
+        try:
+            with db.get_connection(self.db_path) as connection:
+                next_state = db.decide_planning_reentry(
+                    connection,
+                    product_id,
+                    decision,
+                    int(user["id"]),
+                )
+        except (LookupError, ValueError) as error:
+            return self.html_response(
+                start_response,
+                self.render_message_page("无法完成判定", str(error), user),
+                status="400 Bad Request",
+            )
+        notice = (
+            "已提交商品企划中心，下一次同步时将进入定价、品类和渠道流程。"
+            if next_state == "approved"
+            else "已标记本次无需重走商品企划，后续同步不会再次带入企划中心。"
+        )
+        return self.redirect(
+            start_response,
+            f"/products/{product_id}?notice=" + self.urlencode_message(notice),
+        )
+
     def handle_lifecycle_change(self, environ, start_response, user, product_id: int):
         product = db.get_product(self.db_path, product_id)
         if not product:
@@ -2237,6 +2279,24 @@ class CatalogApplication:
                     )
                     updated += 1
                     continue
+                if action in {"submit_to_planning_selected", "skip_planning_selected"}:
+                    if is_department_monitor(user) or (user.get("department") != "B" and not is_admin(user)):
+                        skipped += 1
+                        self.append_bulk_skip_reason(skip_reasons, product, "只有商品部人员可以判定是否重走商品企划。")
+                        continue
+                    if product.get("status") != "pending" or str(product.get("planning_reentry_state") or "initial") != "decision_pending":
+                        skipped += 1
+                        self.append_bulk_skip_reason(skip_reasons, product, "资料不在待判定是否重走商品企划节点。")
+                        continue
+                    decision = "approve" if action == "submit_to_planning_selected" else "skip"
+                    try:
+                        db.decide_planning_reentry(connection, product_id, decision, int(user["id"]))
+                    except (LookupError, ValueError) as error:
+                        skipped += 1
+                        self.append_bulk_skip_reason(skip_reasons, product, str(error))
+                        continue
+                    updated += 1
+                    continue
                 if action == "complete_to_c_selected":
                     allowed = dict(available_status_actions(user, product))
                     if "published" not in allowed:
@@ -2379,6 +2439,10 @@ class CatalogApplication:
                 skipped += 1
         if action == "submit_to_b_selected":
             action_label = "批量开启商品部协作"
+        elif action == "submit_to_planning_selected":
+            action_label = "批量提交商品企划中心"
+        elif action == "skip_planning_selected":
+            action_label = "批量标记无需重走商品企划"
         elif action == "complete_to_c_selected":
             action_label = "批量提交运营部"
         elif action == "receive_selected":
@@ -3144,7 +3208,8 @@ class CatalogApplication:
         completion_ready_filter = b_dashboard_view and marker_filter == "completion_ready"
         if completion_ready_filter:
             status_filter = ""
-        if not tax_price_filter and not completion_ready_filter and not recall_notice_mode:
+        planning_reentry_filter = b_dashboard_view and marker_filter == "planning_reentry"
+        if not tax_price_filter and not completion_ready_filter and not planning_reentry_filter and not recall_notice_mode:
             marker_filter = ""
 
         workflow_restart_filter = status_filter == "workflow_restart" and user.get("department") != "C"
@@ -3192,6 +3257,13 @@ class CatalogApplication:
             products = [product for product in products if product.get("status") != "draft"]
         if completion_ready_filter:
             products = [product for product in products if self.product_is_ready_for_b_submission(product)]
+        elif planning_reentry_filter:
+            products = [
+                product
+                for product in products
+                if product.get("status") == "pending"
+                and str(product.get("planning_reentry_state") or "initial") == "decision_pending"
+            ]
         elif workflow_restart_filter:
             products = [product for product in products if int(product.get("workflow_restart_required") or 0)]
         elif user.get("department") not in {"C", "DESIGN"} and status_filter in {"published", "received"}:
@@ -3232,6 +3304,7 @@ class CatalogApplication:
             "launch_channel_filter": launch_channel_filter,
             "tax_price_filter": tax_price_filter,
             "completion_ready_filter": completion_ready_filter,
+            "planning_reentry_filter": planning_reentry_filter,
             "workflow_restart_filter": workflow_restart_filter,
             "recall_notice_mode": recall_notice_mode,
             "recall_notices": recall_notices,
@@ -3268,8 +3341,9 @@ class CatalogApplication:
             else ""
         )
         completion_ready_filter = requested_marker == "completion_ready" and marker_filter_allowed
+        planning_reentry_filter = requested_marker == "planning_reentry" and marker_filter_allowed
         workflow_restart_filter = requested_status == "workflow_restart" and user.get("department") != "C"
-        product_status = "" if tax_price_filter or completion_ready_filter or workflow_restart_filter else requested_status
+        product_status = "" if tax_price_filter or completion_ready_filter or planning_reentry_filter or workflow_restart_filter else requested_status
         exact_matches = []
         released_read_only_view = user.get("department") in {"C", "DESIGN"}
         source_products = db.list_products(
@@ -3296,6 +3370,11 @@ class CatalogApplication:
             if launch_channel_filter and normalize_launch_channel(product.get("launch_channel")) != launch_channel_filter:
                 continue
             if completion_ready_filter and not self.product_is_ready_for_b_submission(product):
+                continue
+            if planning_reentry_filter and not (
+                product.get("status") == "pending"
+                and str(product.get("planning_reentry_state") or "initial") == "decision_pending"
+            ):
                 continue
             if workflow_restart_filter and not int(product.get("workflow_restart_required") or 0):
                 continue
@@ -3994,6 +4073,8 @@ class CatalogApplication:
                 preview = f"{preview} 等 {len(missing_labels)} 项"
             return f"开启商品部协作前，请先补齐这些识别字段：{preview}。"
         if target_status == "published":
+            if str(product.get("planning_reentry_state") or "initial") == "approved":
+                return "当前资料已由商品部标记为需要重走商品企划，请等待企划中心回传后再提交运营部。"
             missing_keys = db.completion_missing_field_keys(product)
             if missing_keys:
                 missing_labels = [PRODUCT_FIELD_MAP[key].label for key in missing_keys if key in PRODUCT_FIELD_MAP]
@@ -10100,6 +10181,7 @@ class CatalogApplication:
         launch_channel_filter = filter_context["launch_channel_filter"]
         tax_price_filter = filter_context["tax_price_filter"]
         completion_ready_filter = filter_context["completion_ready_filter"]
+        planning_reentry_filter = filter_context["planning_reentry_filter"]
         workflow_restart_filter = filter_context["workflow_restart_filter"]
         recall_notice_mode = filter_context["recall_notice_mode"]
         lifecycle_filter = filter_context["lifecycle_filter"]
@@ -10301,6 +10383,23 @@ class CatalogApplication:
                     f'formaction="/products/{product["id"]}/status" formmethod="post">接收</button>'
                 )
             status_actions = dict(available_status_actions(user, product))
+            planning_reentry_action_markup = ""
+            if (
+                not is_department_monitor(user)
+                and (user.get("department") == "B" or is_admin(user))
+                and product.get("status") == "pending"
+                and str(product.get("planning_reentry_state") or "initial") == "decision_pending"
+            ):
+                planning_reentry_action_markup = (
+                    f'<button class="table-action-recall" type="submit" name="decision" value="approve" '
+                    f'formaction="/products/{product["id"]}/planning-reentry" formmethod="post" '
+                    f'title="确认这次召回需要重新进入商品企划中心">提交企划</button>'
+                    f'<button class="table-action-disabled" type="submit" name="decision" value="skip" '
+                    f'formaction="/products/{product["id"]}/planning-reentry" formmethod="post" '
+                    f'title="确认这次召回不需要重新定价、品类和渠道">无需重走</button>'
+                )
+            if planning_reentry_action_markup:
+                actions.append(planning_reentry_action_markup)
             recall_action_markup = ""
             if product.get("lifecycle_status") == "active" and product.get("status") in {"published", "received"}:
                 if can_recall_product(user, product) and "pending" in status_actions:
@@ -10386,6 +10485,8 @@ class CatalogApplication:
             version_parts = [f'<span class="table-version-label">{html.escape(self.version_label(product))}</span>']
             if revision_badge:
                 version_parts.append(revision_badge)
+            if str(product.get("planning_reentry_state") or "initial") == "decision_pending":
+                version_parts.append('<span class="pill" style="background:rgba(178,92,46,0.13); color:#8a4324;">待判定是否重走企划</span>')
             if tax_price_changed:
                 version_parts.append('<span class="pill tax-price-change-badge">含税价已修改</span>')
             rows.append(
@@ -10517,6 +10618,7 @@ class CatalogApplication:
             <div class="stats products-stats-row">
               <div class="stat-card"><span>近7天新增</span><strong>{b_dashboard_stats.get('recent_submitted_to_b', 0)}</strong></div>
               <div class="stat-card"><span>A/B协作中</span><strong>{b_dashboard_stats.get('pending_completion', 0)}</strong></div>
+              <a class="stat-card stat-card-link" href="/products?marker=planning_reentry#products-list"><span>待判断重走企划</span><strong>{b_dashboard_stats.get('planning_reentry_pending', 0)}</strong><small>商品部人工判断是否重新定价</small></a>
               <div class="stat-card"><span>待运营接收</span><strong>{b_dashboard_stats.get('awaiting_receipt', 0)}</strong></div>
               <div class="stat-card"><span>近7天退回</span><strong>{b_dashboard_stats.get('recent_returned_to_a', 0)}</strong></div>
               <a class="stat-card stat-card-link" href="/products?status=workflow_restart#products-list"><span>待商品部重新提交</span><strong>{b_dashboard_stats.get('restart_required', 0)}</strong><small>点击查看需重新流转款式</small></a>
@@ -10587,6 +10689,7 @@ class CatalogApplication:
                 <option value="">全部资料标记</option>
                 <option value="completion_ready" {"selected" if marker_filter == "completion_ready" else ""}>资料完成Y</option>
                 <option value="tax_price_modified" {"selected" if marker_filter == "tax_price_modified" else ""}>含税价修改</option>
+                <option value="planning_reentry" {"selected" if marker_filter == "planning_reentry" else ""}>待判断是否重走企划</option>
               </select>
             """
             if b_dashboard_view
@@ -12399,6 +12502,8 @@ class CatalogApplication:
                 <div class="tools bulk-tools-inline">
                   <button type="submit" name="bulk_action" value="return_to_a_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk" class="ghost-button">批量退回跟单部</button>
                   <button type="submit" name="bulk_action" value="complete_to_c_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交运营部</button>
+                  <button type="submit" name="bulk_action" value="submit_to_planning_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交商品企划中心</button>
+                  <button type="submit" name="bulk_action" value="skip_planning_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk" class="ghost-button">批量标记无需重走企划</button>
                 </div>
               </div>
             """
@@ -12416,6 +12521,8 @@ class CatalogApplication:
           <div class="list-intro-actions">
             <div class="tools">
               <button type="submit" name="bulk_action" value="publish_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交运营部</button>
+              <button type="submit" name="bulk_action" value="submit_to_planning_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交商品企划中心</button>
+              <button type="submit" name="bulk_action" value="skip_planning_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk" class="ghost-button">批量标记无需重走企划</button>
             </div>
           </div>
         """
@@ -12675,6 +12782,29 @@ class CatalogApplication:
             if can_view_tax_included_price_history(user)
             else ""
         )
+        planning_reentry_block = ""
+        if (
+            not is_department_monitor(user)
+            and (user.get("department") == "B" or is_admin(user))
+            and product.get("status") == "pending"
+            and str(product.get("planning_reentry_state") or "initial") == "decision_pending"
+        ):
+            planning_reentry_block = f"""
+            <section class="panel" style="margin-top:18px;">
+              <h2>召回后的商品企划判定</h2>
+              <p class="meta">这条资料是从已完成流程召回的。请由商品部判断是否需要重新进入商品企划中心；未确认前不会同步到企划中心。</p>
+              <div class="tools" style="margin-bottom:0;">
+                <form method="post" action="/products/{product['id']}/planning-reentry" style="display:inline-flex; gap:10px;">
+                  <input type="hidden" name="decision" value="approve">
+                  <button type="submit">重新进入商品企划中心</button>
+                </form>
+                <form method="post" action="/products/{product['id']}/planning-reentry" style="display:inline-flex; gap:10px;">
+                  <input type="hidden" name="decision" value="skip">
+                  <button class="ghost-button" type="submit">本次无需重走企划</button>
+                </form>
+              </div>
+            </section>
+            """
         status_cards = []
         for status_value, action_label in available_status_actions(user, product):
             if user.get("department") == "C" and status_value == "received" and product.get("c_received"):
@@ -12706,6 +12836,7 @@ class CatalogApplication:
               </div>
             </section>
             """
+        status_block = planning_reentry_block + status_block
         lifecycle_forms = "".join(
             f"""
             <form method="post" action="/products/{product['id']}/lifecycle" style="display:inline-flex; gap:10px;">

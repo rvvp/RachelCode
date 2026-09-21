@@ -273,6 +273,7 @@ def _init_db_unlocked(
                 completed_to_c_at TEXT,
                 c_release_no INTEGER NOT NULL DEFAULT 0,
                 c_published_version_no INTEGER,
+                planning_reentry_state TEXT NOT NULL DEFAULT 'initial',
                 workflow_restart_required INTEGER NOT NULL DEFAULT 0,
                 workflow_restart_fields_json TEXT NOT NULL DEFAULT '[]',
                 workflow_restart_started_by INTEGER,
@@ -327,6 +328,9 @@ def _init_db_unlocked(
         if "c_published_version_no" not in existing_columns:
             connection.execute("ALTER TABLE products ADD COLUMN c_published_version_no INTEGER")
             existing_columns.add("c_published_version_no")
+        if "planning_reentry_state" not in existing_columns:
+            connection.execute("ALTER TABLE products ADD COLUMN planning_reentry_state TEXT NOT NULL DEFAULT 'initial'")
+            existing_columns.add("planning_reentry_state")
         if "workflow_restart_required" not in existing_columns:
             connection.execute("ALTER TABLE products ADD COLUMN workflow_restart_required INTEGER NOT NULL DEFAULT 0")
             existing_columns.add("workflow_restart_required")
@@ -536,6 +540,36 @@ def _init_db_unlocked(
             )
             """
         )
+        # Older releases sent every recalled pending product back to the
+        # planning center. Seed the new manual decision state once for those
+        # already-recalled rows; subsequent restarts must not re-mark a row
+        # that B has explicitly decided to skip or re-enter.
+        planning_reentry_migration = connection.execute(
+            "SELECT 1 FROM app_settings WHERE setting_key = ?",
+            ("migration_planning_reentry_gate_v1",),
+        ).fetchone()
+        if not planning_reentry_migration:
+            connection.execute(
+                """
+                UPDATE products
+                SET planning_reentry_state = 'decision_pending'
+                WHERE status = 'pending'
+                  AND COALESCE(planning_reentry_state, 'initial') = 'initial'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM product_logs
+                      WHERE product_logs.product_id = products.id
+                        AND product_logs.action IN ('status:published', 'status:received')
+                  )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                VALUES (?, '1', ?)
+                """,
+                ("migration_planning_reentry_gate_v1", utc_now()),
+            )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS login_attempts (
@@ -917,6 +951,9 @@ def _init_db_unlocked(
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_products_workflow_restart ON products(workflow_restart_required, status)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_products_planning_reentry ON products(planning_reentry_state, status)"
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_products_lifecycle_status ON products(lifecycle_status)"
@@ -2832,7 +2869,7 @@ def change_product_status(
         """
         SELECT status, completed_to_c_at, c_release_no, current_version_no,
                c_published_version_no, workflow_restart_required,
-               received_by, received_at
+               received_by, received_at, planning_reentry_state
         FROM products
         WHERE id = ?
         """,
@@ -2840,6 +2877,11 @@ def change_product_status(
     ).fetchone()
     if not current_row:
         raise LookupError("商品资料不存在。")
+    if (
+        status == "published"
+        and str(current_row["planning_reentry_state"] or "initial") == "approved"
+    ):
+        raise ValueError("当前资料已由商品部标记为需要重走商品企划，请等待企划中心回传后再提交运营部。")
     current_completed_to_c_at = current_row["completed_to_c_at"] if current_row else None
     timestamp = utc_now()
     completed_to_c_at = current_completed_to_c_at
@@ -2848,6 +2890,7 @@ def change_product_status(
     c_release_no = int(current_row["c_release_no"] or 0) if current_row else 0
     c_published_version_no = current_row["c_published_version_no"] if current_row else None
     workflow_restart_required = int(current_row["workflow_restart_required"] or 0) if current_row else 0
+    planning_reentry_state = str(current_row["planning_reentry_state"] or "initial") if current_row else "initial"
     revision_flag = 0 if revision_flag_override is None else int(revision_flag_override)
     if current_row["status"] == "received" and status == "pending":
         create_c_recall_notices(
@@ -2857,6 +2900,10 @@ def change_product_status(
             c_release_no,
             timestamp,
         )
+    if status == "pending" and current_row["status"] in {"published", "received"}:
+        planning_reentry_state = "decision_pending"
+    elif status == "published":
+        planning_reentry_state = "initial"
     if status == "published":
         if not current_completed_to_c_at:
             completed_to_c_at = timestamp
@@ -2880,7 +2927,7 @@ def change_product_status(
         UPDATE products
         SET status = ?, revision_flag = ?, last_reviewed_by = ?, last_reviewed_at = ?,
             completed_to_c_at = ?, c_release_no = ?, c_published_version_no = ?,
-            workflow_restart_required = ?, workflow_restart_fields_json = '[]',
+            planning_reentry_state = ?, workflow_restart_required = ?, workflow_restart_fields_json = '[]',
             workflow_restart_started_by = NULL, workflow_restart_started_at = NULL,
             received_by = ?, received_at = ?, updated_at = ?
         WHERE id = ?
@@ -2893,6 +2940,7 @@ def change_product_status(
             completed_to_c_at,
             c_release_no,
             c_published_version_no,
+            planning_reentry_state,
             workflow_restart_required,
             received_by,
             received_at,
@@ -2903,6 +2951,56 @@ def change_product_status(
     if status == "published":
         resolve_c_recall_notices(connection, product_id, c_release_no, timestamp)
     log_product_action(connection, product_id, actor_user_id, f"status:{status}", action_label, details)
+
+
+def decide_planning_reentry(
+    connection: sqlite3.Connection,
+    product_id: int,
+    decision: str,
+    actor_user_id: int,
+) -> str:
+    """Record B's manual decision for a recalled product.
+
+    A recalled product remains in the catalog's A/B collaboration state, but
+    only an explicit approval makes it eligible for the planning-center API.
+    The skip decision is persisted so a routine re-sync cannot reopen it.
+    """
+    state_by_decision = {
+        "approve": ("approved", "提交商品企划中心重新定价"),
+        "skip": ("not_required", "标记本次无需重走商品企划"),
+    }
+    clean_decision = str(decision or "").strip().lower()
+    if clean_decision not in state_by_decision:
+        raise ValueError("商品企划重走判定无效。")
+    next_state, action_label = state_by_decision[clean_decision]
+    row = connection.execute(
+        "SELECT status, planning_reentry_state FROM products WHERE id = ?",
+        (product_id,),
+    ).fetchone()
+    if not row:
+        raise LookupError("商品资料不存在。")
+    if row["status"] != "pending":
+        raise ValueError("只有处于 A/B 协作中的召回资料才能判定是否重走商品企划。")
+    if str(row["planning_reentry_state"] or "initial") != "decision_pending":
+        raise ValueError("当前资料不在待判定是否重走商品企划节点。")
+    connection.execute(
+        "UPDATE products SET planning_reentry_state = ?, updated_at = ? WHERE id = ?",
+        (next_state, utc_now(), product_id),
+    )
+    details = (
+        "商品部确认本次召回需要重新进入商品企划中心，资料将在下一次同步时进入定价、品类和渠道流程。"
+        if clean_decision == "approve"
+        else "商品部确认本次召回不涉及定价、品类或渠道，资料不重新进入商品企划中心。"
+    )
+    log_product_action(
+        connection,
+        product_id,
+        actor_user_id,
+        f"planning_reentry:{clean_decision}",
+        action_label,
+        details,
+    )
+    return next_state
 
 
 def change_product_lifecycle(
@@ -3065,6 +3163,7 @@ def _planning_source_query() -> str:
         LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
         WHERE p.lifecycle_status = 'active'
           AND p.status = 'pending'
+          AND COALESCE(p.planning_reentry_state, 'initial') IN ('initial', 'approved')
           AND EXISTS (
               SELECT 1 FROM product_logs pl
               WHERE pl.product_id = p.id AND pl.action = 'status:pending'
@@ -3138,6 +3237,7 @@ def _planning_product_payload(product: dict) -> dict:
         "lifecycle_status": product.get("lifecycle_status") or "",
         "source_version_no": int(product.get("current_version_no") or 1),
         "image_version_no": int(product.get("image_version_no") or 1),
+        "planning_reentry_state": str(product.get("planning_reentry_state") or "initial"),
         "updated_at": product.get("updated_at") or "",
         "created_at": product.get("created_at") or "",
         "creator_name": product.get("creator_name") or "",
@@ -3209,6 +3309,7 @@ def planning_withdrawn_source_ids(db_path: str | Path, product_id: int | None = 
         eligible = (
             product.get("lifecycle_status") == "active"
             and product.get("status") == "pending"
+            and str(product.get("planning_reentry_state") or "initial") in {"initial", "approved"}
             and bool(product.get("submitted_to_merchandise"))
             and product_has_image(product)
             and has_valid_tax_included_price(product.get("tax_included_price"))
@@ -3245,6 +3346,8 @@ def publish_planning_price(
     if not is_initial_publication and not is_revision_publication:
         raise ValueError("当前商品不在可接收商品企划回传的流程状态；初次回传仅支持状态为“A/B协作中”的资料。")
     if is_initial_publication:
+        if str(product.get("planning_reentry_state") or "initial") not in {"initial", "approved"}:
+            raise ValueError("当前召回资料尚未由商品部确认是否重走商品企划，暂不能接收企划回传。")
         eligible = connection.execute(
             "SELECT 1 FROM product_logs WHERE product_id = ? AND action = 'status:pending' LIMIT 1",
             (product_id,),
@@ -3315,6 +3418,7 @@ def publish_planning_price(
         UPDATE products
         SET category = ?, launch_channel = ?,
             launch_price = ?, current_version_no = ?, revision_flag = 0,
+            planning_reentry_state = 'initial',
             last_reviewed_by = ?, last_reviewed_at = ?, updated_at = ?
         WHERE id = ?
         """,
@@ -4018,6 +4122,7 @@ def b_workflow_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
             SELECT
                 COALESCE(SUM(CASE WHEN status IN ('published', 'received') THEN 1 ELSE 0 END), 0) AS completed,
                 COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_completion,
+                COALESCE(SUM(CASE WHEN status = 'pending' AND planning_reentry_state = 'decision_pending' THEN 1 ELSE 0 END), 0) AS planning_reentry_pending,
                 COALESCE(SUM(CASE WHEN status = 'published' AND workflow_restart_required = 0 THEN 1 ELSE 0 END), 0) AS awaiting_receipt,
                 COALESCE(SUM(CASE WHEN workflow_restart_required = 1 THEN 1 ELSE 0 END), 0) AS restart_required
             FROM products
@@ -4058,6 +4163,7 @@ def b_workflow_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
         "completed": int(current["completed"] or 0),
         "recent_submitted_to_b": int(recent["recent_submitted_to_b"] or 0),
         "pending_completion": int(current["pending_completion"] or 0),
+        "planning_reentry_pending": int(current["planning_reentry_pending"] or 0),
         "awaiting_receipt": int(current["awaiting_receipt"] or 0),
         "restart_required": int(current["restart_required"] or 0),
         "recent_returned_to_a": int(recent["recent_returned_to_a"] or 0),

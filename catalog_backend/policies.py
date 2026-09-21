@@ -334,7 +334,8 @@ def available_status_actions(user: dict | None, product: dict | None) -> list[tu
     if user.get("department") == "B":
         actions = []
         if status == "pending":
-            actions.append(("published", "确认资料齐全，提交运营部"))
+            if str(product.get("planning_reentry_state") or "initial") != "approved":
+                actions.append(("published", "确认资料齐全，提交运营部"))
             actions.append(("draft", "退回跟单部补充"))
         if status in {"published", "received"} and can_recall_product(user, product):
             actions.append(("pending", "召回到 A/B 协作"))
@@ -350,7 +351,8 @@ def available_status_actions(user: dict | None, product: dict | None) -> list[tu
         if status in {"published", "received"} and int(product.get("workflow_restart_required") or 0):
             actions.append(("published", "管理员代为重新提交运营部"))
         if status == "pending":
-            actions.append(("published", "管理员代为提交运营部"))
+            if str(product.get("planning_reentry_state") or "initial") != "approved":
+                actions.append(("published", "管理员代为提交运营部"))
             actions.append(("draft", "管理员退回跟单部"))
         if status == "published" and can_recall_product(user, product):
             actions.append(("draft", "管理员转回跟单部修改"))

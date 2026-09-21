@@ -473,6 +473,140 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(c_republished["launch_channel"], "天猫")
         self.assertEqual(c_republished["launch_price"], 629)
 
+    def test_recalled_catalog_product_requires_b_decision_before_planning_sync(self):
+        app = CatalogApplication(
+            self.catalog_db_path,
+            Path(self.temp.name) / "uploads",
+            planning_api_token="planning-secret",
+        )
+        source = next(
+            item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending"
+        )
+        publication = {
+            "publication_id": "PC-RECALL-GATE-INITIAL",
+            "source_version_no": source["current_version_no"],
+            "category": "其他",
+            "launch_channel": "唯品",
+            "launch_price": 599,
+        }
+        response = self.wsgi_request(
+            app,
+            f"/api/internal/planning/products/{source['id']}/price-publication",
+            method="POST",
+            body=json.dumps(publication).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(response["status"].startswith("200"))
+        b_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["username"] == "b_editor")
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.change_product_status(
+                connection,
+                source["id"],
+                "published",
+                b_user["id"],
+                "确认资料齐全，提交运营部",
+                "回归测试发布。",
+            )
+            catalog_db.change_product_status(
+                connection,
+                source["id"],
+                "pending",
+                b_user["id"],
+                "召回到 A/B 协作",
+                "仅修改非企划字段。",
+            )
+        recalled = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(recalled["planning_reentry_state"], "decision_pending")
+
+        blocked = self.wsgi_request(
+            app,
+            "/api/internal/planning/products",
+            authorization="Bearer planning-secret",
+        )
+        blocked_payload = json.loads(blocked["body"])
+        self.assertNotIn(source["id"], {item["id"] for item in blocked_payload["items"]})
+        self.assertIn(source["id"], blocked_payload["withdrawn_ids"])
+
+        b_cookie = self.login_cookie(app, "b_editor")
+        decision_page = self.wsgi_request(
+            app,
+            "/products?marker=planning_reentry",
+            cookie=b_cookie,
+        )
+        decision_page_body = decision_page["body"].decode("utf-8")
+        self.assertIn("待判断是否重走企划", decision_page_body)
+        self.assertIn("批量提交商品企划中心", decision_page_body)
+        self.assertIn("批量标记无需重走企划", decision_page_body)
+        self.assertIn("提交企划", decision_page_body)
+        self.assertIn("无需重走", decision_page_body)
+        decision_response = self.wsgi_request(
+            app,
+            f"/products/{source['id']}/planning-reentry",
+            method="POST",
+            body=urlencode({"decision": "approve"}).encode(),
+            cookie=b_cookie,
+        )
+        self.assertTrue(decision_response["status"].startswith("302"))
+        approved = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(approved["planning_reentry_state"], "approved")
+        allowed = self.wsgi_request(
+            app,
+            "/api/internal/planning/products",
+            authorization="Bearer planning-secret",
+        )
+        allowed_payload = json.loads(allowed["body"])
+        self.assertIn(source["id"], {item["id"] for item in allowed_payload["items"]})
+
+    def test_recalled_catalog_product_marked_skip_cannot_receive_planning_callback(self):
+        app = CatalogApplication(
+            self.catalog_db_path,
+            Path(self.temp.name) / "uploads",
+            planning_api_token="planning-secret",
+        )
+        source = next(
+            item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending"
+        )
+        b_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["username"] == "b_editor")
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.change_product_status(
+                connection,
+                source["id"],
+                "published",
+                b_user["id"],
+                "确认资料齐全，提交运营部",
+                "回归测试发布。",
+            )
+            catalog_db.change_product_status(
+                connection,
+                source["id"],
+                "pending",
+                b_user["id"],
+                "召回到 A/B 协作",
+                "回归测试召回。",
+            )
+            catalog_db.decide_planning_reentry(connection, source["id"], "skip", b_user["id"])
+        skipped = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(skipped["planning_reentry_state"], "not_required")
+        response = self.wsgi_request(
+            app,
+            f"/api/internal/planning/products/{source['id']}/price-publication",
+            method="POST",
+            body=json.dumps(
+                {
+                    "publication_id": "PC-RECALL-GATE-SKIPPED",
+                    "source_version_no": skipped["current_version_no"],
+                    "category": "其他",
+                    "launch_channel": "唯品",
+                    "launch_price": 599,
+                }
+            ).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(response["status"].startswith("400"))
+        self.assertIn("尚未由商品部确认", response["body"].decode("utf-8"))
+
     def test_configured_planning_channel_is_accepted_by_catalog_callback(self):
         planning_db.save_channel_option(self.planning_db_path, "直播首发", 40)
         app = CatalogApplication(
@@ -749,6 +883,164 @@ class PlanningCenterTests(unittest.TestCase):
             [item["id"] for item in planning_db.list_source_products(self.planning_db_path)],
             [valid["id"]],
         )
+
+    def test_resync_rebases_active_pricing_record_when_only_source_version_changed(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        source = {
+            "id": 4390,
+            "style_code": "REBASE-4390",
+            "product_name": "版本对齐测试款",
+            "season_year": "2026秋冬",
+            "supplier": "对齐供应商",
+            "category": "其他",
+            "actual_cost": 150,
+            "tax_included_price": 150,
+            "image_url": "https://example.com/rebase.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "submitted_to_merchandise": True,
+            "source_version_no": 1,
+            "image_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+        record = planning_db.create_pricing_record(self.planning_db_path, source, "商品部企划员")
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                "UPDATE pricing_records SET status = 'confirmed' WHERE id = ?",
+                (record["id"],),
+            )
+
+        refreshed = dict(source, source_version_no=2, updated_at="2026-09-21T10:00:00Z")
+        result = planning_db.synchronize_source_products(self.planning_db_path, [refreshed])
+
+        self.assertEqual(result["rebased"], 1)
+        self.assertEqual(
+            planning_db.get_pricing_record(self.planning_db_path, record["id"])["source_version_no"],
+            2,
+        )
+
+    def test_resync_does_not_rebase_pricing_record_when_source_cost_changed(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        source = {
+            "id": 4391,
+            "style_code": "REBASE-4391",
+            "product_name": "成本变化测试款",
+            "season_year": "2026秋冬",
+            "supplier": "对齐供应商",
+            "category": "其他",
+            "actual_cost": 150,
+            "tax_included_price": 150,
+            "image_url": "https://example.com/rebase-cost.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "submitted_to_merchandise": True,
+            "source_version_no": 1,
+            "image_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+        record = planning_db.create_pricing_record(self.planning_db_path, source, "商品部企划员")
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                "UPDATE pricing_records SET status = 'confirmed' WHERE id = ?",
+                (record["id"],),
+            )
+
+        refreshed = dict(source, source_version_no=2, actual_cost=180, tax_included_price=180)
+        result = planning_db.synchronize_source_products(self.planning_db_path, [refreshed])
+
+        self.assertNotIn("rebased", result)
+        self.assertEqual(
+            planning_db.get_pricing_record(self.planning_db_path, record["id"])["source_version_no"],
+            1,
+        )
+
+    def test_image_only_resync_rebases_active_pricing_record_version(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        source = {
+            "id": 4393,
+            "style_code": "REBASE-4393",
+            "product_name": "专业图替换测试款",
+            "season_year": "2026秋冬",
+            "supplier": "图片供应商",
+            "category": "其他",
+            "actual_cost": 150,
+            "tax_included_price": 150,
+            "image_url": "https://example.com/rebase-hand.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "submitted_to_merchandise": True,
+            "source_version_no": 1,
+            "image_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+        record = planning_db.create_pricing_record(self.planning_db_path, source, "商品部企划员")
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                "UPDATE pricing_records SET status = 'confirmed' WHERE id = ?",
+                (record["id"],),
+            )
+
+        professional_image = dict(
+            source,
+            image_url="https://example.com/rebase-professional.jpg",
+            image_version_no=2,
+            source_version_no=2,
+            updated_at="2026-09-21T10:00:00Z",
+        )
+        result = planning_db.synchronize_source_products(
+            self.planning_db_path,
+            [],
+            image_updates=[professional_image],
+        )
+
+        self.assertEqual(result["image_updated"], 1)
+        self.assertEqual(result["rebased"], 1)
+        refreshed_source = planning_db.get_source_product(self.planning_db_path, source["id"])
+        self.assertEqual(refreshed_source["image_url"], professional_image["image_url"])
+        self.assertEqual(refreshed_source["source_version_no"], 2)
+        self.assertEqual(
+            planning_db.get_pricing_record(self.planning_db_path, record["id"])["source_version_no"],
+            2,
+        )
+
+    def test_single_publish_version_error_returns_to_workbench_with_detail(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        source = {
+            "id": 4392,
+            "style_code": "PUBLISH-4392",
+            "product_name": "回传错误测试款",
+            "season_year": "2026秋冬",
+            "supplier": "回传供应商",
+            "category": "其他",
+            "actual_cost": 150,
+            "tax_included_price": 150,
+            "image_url": "https://example.com/publish.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "submitted_to_merchandise": True,
+            "source_version_no": 2,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+        record = planning_db.create_pricing_record(self.planning_db_path, source, "商品部企划员")
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                "UPDATE pricing_records SET status = 'confirmed', source_version_no = 1 WHERE id = ?",
+                (record["id"],),
+            )
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test", "token")
+        planner_cookie = self.login_cookie(app, "planner")
+
+        response = self.wsgi_request(
+            app,
+            f"/pricing/{record['id']}/publish",
+            method="POST",
+            cookie=planner_cookie,
+        )
+
+        self.assertTrue(response["status"].startswith("302"))
+        location = dict(response["headers"])["Location"]
+        self.assertIn("status=confirmed", location)
+        self.assertIn("%E6%9D%A5%E6%BA%90%E8%B5%84%E6%96%99%E7%89%88%E6%9C%AC%E5%B7%B2%E5%8F%98%E5%8C%96", location)
 
     def test_planning_revision_reuses_same_source_and_is_visible_in_published_filter(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)

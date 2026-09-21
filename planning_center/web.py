@@ -371,6 +371,8 @@ class PlanningApplication:
             cleanup.append(f"另有 {int(result['withdrawn'])} 条已产生定价记录的资料退出工作台并保留记录")
         if result.get("rejected"):
             cleanup.append(f"拦截 {int(result['rejected'])} 条不符合准入条件的资料")
+        if result.get("rebased"):
+            cleanup.append(f"同时对齐 {int(result['rebased'])} 条未回传定价的来源版本")
         if cleanup:
             message += "；".join(cleanup) + "。"
         return message
@@ -1194,7 +1196,15 @@ class PlanningApplication:
             raise LookupError("定价记录不存在。")
         if record["status"] not in {"confirmed", "conflict"}:
             raise ValueError("请先完成复核后再回传。")
-        updated = self.publish_pricing_record(record, user)
+        try:
+            updated = self.publish_pricing_record(record, user)
+        except ValueError as error:
+            return self.redirect(
+                start_response,
+                "/workbench?status=confirmed&error="
+                + self.q(str(error))
+                + f"#pricing-row-{int(record['source_product_id'])}",
+            )
         if updated["status"] == "published":
             return self.redirect(start_response, "/workbench?notice=" + self.q("上新价格已发布回藏宝阁。"))
         return self.redirect(start_response, "/workbench?error=" + self.q(updated.get("error_message") or "回传失败，请重新同步后处理。"))

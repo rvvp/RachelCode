@@ -872,6 +872,59 @@ def upsert_source_image_updates(db_path: str | Path, items: list[dict]) -> int:
     return updated
 
 
+def _pricing_record_can_follow_source(record: dict, source: dict) -> bool:
+    """Whether a source version bump leaves the frozen pricing inputs intact."""
+    source_cost = source_tax_included_cost_value(source)
+    record_cost = source_cost_value({"actual_cost": record.get("cost")})
+    if source_cost is None or record_cost is None or source_cost != record_cost:
+        return False
+    for key in ("season_year", "style_code", "product_name", "supplier"):
+        if str(source.get(key) or "").strip() != str(record.get(key) or "").strip():
+            return False
+    return True
+
+
+def rebase_pricing_record_source_versions(
+    db_path: str | Path,
+    items: list[dict] | tuple[dict, ...],
+) -> int:
+    """Rebind active pricing rows after a safe, non-pricing source update.
+
+    Catalog metadata edits can increment its source version without changing
+    the pricing inputs. Keeping the frozen pricing row on the old version made
+    a successful re-sync unable to reach publication. Only active, unpublished
+    rows with identical pricing inputs are rebased; cost or identity changes
+    remain a real conflict and continue to require a new pricing cycle.
+    """
+    rebased = 0
+    seen_ids: set[int] = set()
+    with get_connection(db_path) as connection:
+        for source in items:
+            source_id = int(source.get("id") or 0)
+            incoming_version = int(source.get("source_version_no") or 1)
+            if source_id <= 0 or source_id in seen_ids:
+                continue
+            seen_ids.add(source_id)
+            rows = connection.execute(
+                """
+                SELECT * FROM pricing_records
+                WHERE source_product_id = ?
+                  AND status IN ('suggested', 'review_pending', 'confirmed', 'conflict')
+                  AND source_version_no != ?
+                """,
+                (source_id, incoming_version),
+            ).fetchall()
+            for row in rows:
+                record = dict(row)
+                if not _pricing_record_can_follow_source(record, source):
+                    continue
+                rebased += connection.execute(
+                    "UPDATE pricing_records SET source_version_no = ?, error_message = '' WHERE id = ? AND source_version_no != ?",
+                    (incoming_version, int(record["id"]), incoming_version),
+                ).rowcount
+    return rebased
+
+
 def synchronize_source_products(
     db_path: str | Path,
     items: list[dict],
@@ -887,6 +940,10 @@ def synchronize_source_products(
     explicit_withdrawn_ids = {int(product_id) for product_id in withdrawn_ids}
     synced = upsert_source_products(db_path, eligible_items, require_image=True, require_cost=True)
     image_updated = upsert_source_image_updates(db_path, list(image_updates))
+    rebased = rebase_pricing_record_source_versions(
+        db_path,
+        [*eligible_items, *list(image_updates)],
+    )
     removed = 0
     withdrawn = 0
     with get_connection(db_path) as connection:
@@ -939,6 +996,8 @@ def synchronize_source_products(
         result["rejected"] = rejected
     if image_updated:
         result["image_updated"] = image_updated
+    if rebased:
+        result["rebased"] = rebased
     return result
 
 
