@@ -88,6 +88,8 @@ class PlanningApplication:
                 return self.html_response(start_response, self.render_dashboard(user))
             if path == "/category-planning" and method == "GET":
                 return self.html_response(start_response, self.render_category_planning(user))
+            if path == "/system-rules" and method == "GET":
+                return self.html_response(start_response, self.render_system_rules(user))
             if path == "/sync" and method == "POST":
                 return self.handle_sync(start_response, user)
             if path == "/workbench" and method == "GET":
@@ -1490,6 +1492,80 @@ class PlanningApplication:
         """
         return self.shell("品类企划", content, user, "category-planning")
 
+    def render_system_rules(self, user: dict) -> str:
+        content = """
+        <section class='page-heading system-rules-heading'><div><div class='eyebrow'>SYSTEM WORKFLOW RULES</div><h1>系统规则</h1><p>统一说明藏宝阁与商品企划中心之间的同步、审核、变更和回传边界。</p></div><span class='system-rules-readonly'>只读说明</span></section>
+        <section class='system-rules-intro' aria-label='系统边界概览'>
+          <div><span>01</span><strong>藏宝阁是资料源</strong><p>图片、含税成本和商品基础资料以藏宝阁为准。</p></div>
+          <div><span>02</span><strong>企划中心负责审核</strong><p>商品部在企划中心完成上新价格、上新渠道和品类的初审与复核。</p></div>
+          <div><span>03</span><strong>只回传三个字段</strong><p>回传仅更新上新价格、上新渠道和品类，其他来源字段不得覆盖。</p></div>
+        </section>
+        <nav class='system-rules-index' aria-label='系统规则目录'>
+          <a href='#initial-sync'>首次同步</a><a href='#review-flow'>审核流程</a><a href='#source-changes'>资料变动</a><a href='#second-planning'>二次企划</a><a href='#image-rule'>图片替换</a><a href='#publication-rule'>回传校验</a><a href='#history-rule'>版本与历史</a>
+        </nav>
+        <section class='panel system-rule-section' id='initial-sync'>
+          <div class='system-rule-title'><span>01</span><div><div class='eyebrow'>ADMISSION</div><h2>首次同步准入条件</h2></div></div>
+          <p>藏宝阁条目必须同时满足以下条件，才进入商品企划中心。缺少任一项时不建立企划资料，也不等到价格测算阶段再补做校验。</p>
+          <div class='system-rule-chip-grid'><span>A/B协作中</span><span>已上传图片</span><span>有效含税成本</span><span>年份季节</span><span>款号</span><span>款色</span><span>商品名称</span><span>供应商</span></div>
+          <p class='system-rule-note'>系统还会校验条目处于正常有效状态。已经回传过或被召回的条目，不因重新满足以上条件而自动生成第二次企划，必须经过商品部人工判断。</p>
+        </section>
+        <section class='panel system-rule-section' id='review-flow'>
+          <div class='system-rule-title'><span>02</span><div><div class='eyebrow'>WORKFLOW</div><h2>上新审核流程与岗位</h2></div></div>
+          <div class='system-rule-flow' aria-label='上新审核流程'><span>同步准入</span><i>→</i><span>测算上新价</span><i>→</i><span>商品部初审</span><i>→</i><span>企划管理员复核</span><i>→</i><span>商品部回传</span></div>
+          <ul class='system-rule-list'>
+            <li><strong>商品部初审人员：</strong>同步资料、测算价格、确认或修改价格/品类/渠道、提交复核、复核前撤回，以及复核通过后的人工回传。</li>
+            <li><strong>企划管理员：</strong>复核上新价格和上新渠道，可先保存修改再复核通过；不负责与藏宝阁之间的传输动作。</li>
+            <li><strong>同款多款色：</strong>价格和渠道按款号统一，页面保存和复核通过时同步处理同款号的全部款色；Excel 导入导出仍按款色逐行核对。</li>
+          </ul>
+        </section>
+        <section class='panel system-rule-section' id='source-changes'>
+          <div class='system-rule-title'><span>03</span><div><div class='eyebrow'>SOURCE CHANGES</div><h2>藏宝阁资料变动处理</h2></div></div>
+          <div class='table-wrap'><table class='system-rule-table'><thead><tr><th>变化字段</th><th>首次回传前</th><th>已经回传后</th><th>是否自动重走企划</th></tr></thead><tbody>
+            <tr><td><strong>图片</strong></td><td>静默替换为藏宝阁最新图片</td><td>静默替换为藏宝阁最新图片</td><td>否</td></tr>
+            <tr><td><strong>商品名称</strong></td><td>静默同步，不改变当前节点和已确认结果</td><td>静默同步，不发起二次企划</td><td>否</td></tr>
+            <tr><td><strong>年份季节、供应商</strong></td><td>首次定价时用于匹配倍率和供应商系数；之后发生变化时静默同步，不撤回、不自动重新测算</td><td>静默同步，原上新价格、渠道和品类保持不变</td><td>否</td></tr>
+            <tr><td><strong>含税成本</strong></td><td>标记“成本有变动”，由初审人员判断是否重新测算并重走初审、复核</td><td>不强制二次企划，由商品部判断维持原结果或发起二次企划</td><td>否，由商品部决定</td></tr>
+            <tr><td><strong>上新价格、上新渠道、品类</strong></td><td colspan='2'>只能在商品企划中心按权限修改，再回传藏宝阁；藏宝阁端不作为日常修改入口</td><td>需要重新审核</td></tr>
+          </tbody></table></div>
+          <p class='system-rule-note'>主动点击重新测算或明确发起二次企划时，系统才使用当时最新的年份季节、供应商、含税成本和有效定价规则重新计算。</p>
+        </section>
+        <section class='panel system-rule-section' id='second-planning'>
+          <div class='system-rule-title'><span>04</span><div><div class='eyebrow'>REVISION</div><h2>二次企划的人工入口</h2></div></div>
+          <div class='system-rule-scenarios'>
+            <article><strong>A/B协作中需要修改</strong><p>条目已经完成过企划回传但仍在“A/B协作中”时，由商品部选择“维持原企划”或“发起二次企划”，系统不自动生成新流程。</p></article>
+            <article><strong>运营阶段召回</strong><p>“待运营接收”或“已接收”的条目先召回到“A/B协作中”，再由商品部在“召回款重新判断”中选择“批量重回企划”或“批量不回企划”。</p></article>
+          </div>
+          <ul class='system-rule-list'>
+            <li>二次企划的目的，是修改上新价格、上新渠道或品类中的至少一项。</li>
+            <li>进入二次企划后使用藏宝阁最新有效资料和最新含税成本；同一商品同一时间只允许一个进行中的企划批次。</li>
+            <li>新批次完成回传后覆盖藏宝阁主资料中的三个企划字段，旧批次保留在历史记录中，不覆盖、不删除。</li>
+          </ul>
+        </section>
+        <section class='panel system-rule-section' id='image-rule'>
+          <div class='system-rule-title'><span>05</span><div><div class='eyebrow'>IMAGE</div><h2>手拍图与专业图</h2></div></div>
+          <p>首次上传手拍图后，只要其他准入条件齐全，资料即可进入企划中心。后续藏宝阁用专业图或平台网址图覆盖手拍图时，企划中心按图片版本更新现有图片，但不新建款式、不改变流程状态、不撤销既有判断，也不产生额外提示。</p>
+        </section>
+        <section class='panel system-rule-section' id='publication-rule'>
+          <div class='system-rule-title'><span>06</span><div><div class='eyebrow'>PUBLICATION</div><h2>回传范围与二次校验</h2></div></div>
+          <div class='system-rule-publication'><div><span>允许回传</span><strong>上新价格</strong><strong>上新渠道</strong><strong>品类</strong></div><div><span>禁止覆盖</span><p>款号、款色、图片、商品名称、年份季节、供应商、含税成本及其他藏宝阁来源字段。</p></div></div>
+          <ul class='system-rule-list'>
+            <li>系统以藏宝阁内部商品 ID 作为稳定主键，款号、款色用于展示和回传前的二次核对，不使用名称文本代替主键。</li>
+            <li>回传时校验来源版本和当前企划批次，使用唯一回传记录号保证重复点击不会重复写入。</li>
+            <li>发现来源版本、商品身份或批次不一致时停止回传，保留当前资料并显示明确错误，不用旧资料覆盖藏宝阁新资料。</li>
+          </ul>
+        </section>
+        <section class='panel system-rule-section' id='history-rule'>
+          <div class='system-rule-title'><span>07</span><div><div class='eyebrow'>AUDIT</div><h2>测算快照、版本与历史</h2></div></div>
+          <ul class='system-rule-list'>
+            <li><strong>当前来源资料：</strong>展示藏宝阁最近一次同步的图片、年份季节、商品名称、供应商和含税成本。</li>
+            <li><strong>本次测算快照：</strong>保存实际测算采用的季节、供应商、成本、倍率、浮动系数和测算价格，用于解释价格依据。</li>
+            <li><strong>企划批次：</strong>首次企划和每次人工发起的二次企划分别记录初审、复核、回传人员与时间。</li>
+            <li><strong>历史保留：</strong>现阶段全部版本、召回记录、修改记录和企划批次永久保留，不执行自动删除。</li>
+          </ul>
+        </section>
+        """
+        return self.shell("系统规则", content, user, "system-rules")
+
     def render_workbench(self, user: dict, query: dict) -> str:
         notice, error = query.get("notice", ""), query.get("error", "")
         sync_message = ""
@@ -2617,7 +2693,7 @@ class PlanningApplication:
         return f"<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{html.escape(title)}</title><style>{self.css()}</style><style>{price_display_css}</style></head><body class='{body_class}'>{content}</body></html>"
 
     def shell(self, title: str, content: str, user: dict, current: str) -> str:
-        nav_items = [("dashboard", "/dashboard", "企划总览"), ("category-planning", "/category-planning", "品类企划"), ("workbench", "/workbench", "上新审核"), ("rules", "/rules", "规则"), ("stats", "/stats", "价格带统计")]
+        nav_items = [("dashboard", "/dashboard", "企划总览"), ("category-planning", "/category-planning", "品类企划"), ("workbench", "/workbench", "上新审核"), ("rules", "/rules", "规则"), ("system-rules", "/system-rules", "系统规则"), ("stats", "/stats", "价格带统计")]
         if user.get("role") == "admin":
             nav_items.append(("accounts", "/accounts", "账号管理"))
         nav_items.append(("settings", "/settings", "连接设置"))
@@ -2650,6 +2726,9 @@ class PlanningApplication:
 
     def css(self) -> str:
         return """
+        .system-rules-heading{align-items:center}.system-rules-readonly{flex:0 0 auto;padding:7px 11px;border:1px solid #cbd5ce;background:#fff;color:var(--muted);font-size:12px}.system-rules-intro{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:16px;border:1px solid var(--line);background:#fff}.system-rules-intro>div{min-width:0;padding:20px 22px;border-right:1px solid var(--line)}.system-rules-intro>div:last-child{border-right:0}.system-rules-intro span,.system-rule-title>span{color:var(--accent);font:21px Georgia,serif}.system-rules-intro strong{display:block;margin:3px 0;font-size:16px}.system-rules-intro p{margin:0;color:var(--muted);font-size:12px}.system-rules-index{display:flex;align-items:center;gap:4px;margin-bottom:24px;padding:8px;border:1px solid var(--line);background:#eef2ee;overflow-x:auto}.system-rules-index a{flex:0 0 auto;padding:6px 10px;border:0;color:var(--deep);font-size:12px}.system-rules-index a:hover{border:0;background:#fff;color:var(--accent)}.system-rule-section{scroll-margin-top:92px}.system-rule-title{display:flex;align-items:center;gap:14px;margin-bottom:13px}.system-rule-title h2{margin:1px 0 0}.system-rule-section>p{margin:0 0 17px;color:var(--muted)}.system-rule-chip-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin:4px 0 17px;border-top:1px solid var(--line);border-left:1px solid var(--line)}.system-rule-chip-grid span{padding:12px 14px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);background:#f8faf8;font-weight:600}.system-rule-note{padding:11px 13px;border-left:3px solid var(--accent);background:#fbf5f1;color:#6f6259!important;font-size:12px}.system-rule-flow{display:flex;align-items:center;gap:8px;margin:4px 0 18px;overflow-x:auto}.system-rule-flow span{flex:0 0 auto;padding:8px 11px;border:1px solid #cfdad2;background:#f2f7f3;color:var(--deep);font-weight:600}.system-rule-flow i{color:#9aa49c;font-style:normal}.system-rule-list{display:grid;gap:9px;margin:0;padding-left:20px}.system-rule-list li{padding-left:3px}.system-rule-table{min-width:960px}.system-rule-table td:first-child{white-space:nowrap}.system-rule-table td:last-child{white-space:nowrap}.system-rule-scenarios{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:18px;border:1px solid var(--line)}.system-rule-scenarios article{padding:17px 19px;border-right:1px solid var(--line)}.system-rule-scenarios article:last-child{border-right:0}.system-rule-scenarios p{margin:5px 0 0;color:var(--muted)}.system-rule-publication{display:grid;grid-template-columns:1fr 1fr;margin-bottom:18px;border:1px solid var(--line)}.system-rule-publication>div{padding:17px 19px;border-right:1px solid var(--line)}.system-rule-publication>div:last-child{border-right:0}.system-rule-publication span{display:block;margin-bottom:7px;color:var(--muted);font-size:12px}.system-rule-publication strong{display:inline-block;margin:0 14px 0 0;color:var(--deep)}.system-rule-publication p{margin:0;color:var(--muted)}
+        @media(max-width:900px){.system-rules-intro{grid-template-columns:1fr}.system-rules-intro>div{border-right:0;border-bottom:1px solid var(--line)}.system-rules-intro>div:last-child{border-bottom:0}.system-rule-chip-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.system-rule-scenarios,.system-rule-publication{grid-template-columns:1fr}.system-rule-scenarios article,.system-rule-publication>div{border-right:0;border-bottom:1px solid var(--line)}.system-rule-scenarios article:last-child,.system-rule-publication>div:last-child{border-bottom:0}}
+        @media(max-width:620px){.system-rules-heading{align-items:flex-start}.system-rule-chip-grid{grid-template-columns:1fr}.system-rule-flow{padding-bottom:4px}.system-rule-section{padding:18px}.system-rule-publication strong{display:block;margin-bottom:4px}}
         .account-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));background:#fff;border:1px solid var(--line);margin-bottom:24px}.account-metrics>div{padding:16px 20px;border-right:1px solid var(--line);display:flex;align-items:baseline;justify-content:space-between;gap:12px}.account-metrics>div:last-child{border-right:0}.account-metrics span{color:var(--muted);font-size:12px}.account-metrics strong{font:25px Georgia,serif;color:var(--deep)}.account-create-form{display:grid;grid-template-columns:1.1fr 1.1fr .9fr 1fr 1fr auto;align-items:end;gap:9px}.account-create-form label,.password-form label,.account-reset label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.account-create-form button{height:42px;white-space:nowrap}.account-table{min-width:960px}.account-table th:last-child,.account-table td:last-child{min-width:275px}.account-role{display:inline-block;padding:3px 7px;border-radius:3px;font-size:12px}.account-role-admin{background:#fff1e7;color:#98431d}.account-role-planner{background:#eaf0eb;color:#315447}.status-account-active{background:#e5f2e9;color:#2d6b42}.status-account-disabled{background:#f0f1ef;color:#68736a}.account-actions{display:flex;align-items:center;gap:9px}.account-actions>form{margin:0}.account-self-note{color:var(--muted);font-size:12px}.account-switch{display:flex;align-items:center;gap:7px;cursor:pointer}.account-switch input{position:absolute;opacity:0;pointer-events:none}.account-switch>span{position:relative;width:34px;height:18px;border-radius:9px;background:#bfc6c1;transition:background .15s}.account-switch>span::after{content:'';position:absolute;top:3px;left:3px;width:12px;height:12px;border-radius:50%;background:#fff;transition:transform .15s}.account-switch input:checked+span{background:var(--deep)}.account-switch input:checked+span::after{transform:translateX(16px)}.account-switch input:focus-visible+span{outline:2px solid var(--accent);outline-offset:2px}.account-switch em{font-style:normal;color:var(--muted);font-size:12px}.account-reset{position:relative}.account-reset summary{cursor:pointer;color:var(--deep);font-size:12px;list-style:none;border:1px solid #cbd5ce;border-radius:4px;padding:5px 9px;white-space:nowrap}.account-reset summary::-webkit-details-marker{display:none}.account-reset[open] summary{border-color:var(--accent);color:var(--accent)}.account-reset form{display:grid;grid-template-columns:1fr 1fr auto;align-items:end;gap:7px;margin-top:9px;min-width:410px}.account-reset input{width:130px;padding:7px 8px}.account-reset button{padding:7px 9px;white-space:nowrap}.account-security-note{margin:18px 0 0;padding-top:14px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}.password-panel{max-width:700px}.password-account{display:grid;grid-template-columns:110px 1fr;align-items:baseline;padding-bottom:18px;margin-bottom:18px;border-bottom:1px solid var(--line)}.password-account span,.password-account small{color:var(--muted);font-size:12px}.password-account strong{font-size:17px}.password-account small{grid-column:2}.password-form{display:grid;gap:15px;max-width:460px}.password-form input{width:100%}.password-form label small{color:var(--muted);font-size:11px}.password-form button{justify-self:start}.profile-password-link{color:var(--deep);font-size:12px}.profile-password-link:hover{text-decoration:underline}
         @media(max-width:1100px){.account-create-form{grid-template-columns:repeat(3,minmax(0,1fr))}.account-create-form button{width:100%}}
         @media(max-width:700px){.account-metrics{grid-template-columns:1fr}.account-metrics>div{border-right:0;border-bottom:1px solid var(--line)}.account-metrics>div:last-child{border-bottom:0}.account-create-form{grid-template-columns:1fr}.account-actions{align-items:flex-start;flex-direction:column}.account-reset form{grid-template-columns:1fr;min-width:220px}.account-reset input{width:100%}.password-account{grid-template-columns:1fr}.password-account small{grid-column:1}.password-form button{width:100%}}

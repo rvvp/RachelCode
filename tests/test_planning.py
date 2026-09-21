@@ -3924,6 +3924,45 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("SKU 数", category_html)
         self.assertIn("第二阶段", category_html)
 
+    def test_system_rules_page_documents_cross_system_boundaries(self):
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+
+        for cookie in (planner_cookie, admin_cookie):
+            dashboard = self.wsgi_request(app, "/dashboard", cookie=cookie)
+            dashboard_html = dashboard["body"].decode("utf-8")
+            self.assertIn("href='/system-rules'>系统规则</a>", dashboard_html)
+
+            response = self.wsgi_request(app, "/system-rules", cookie=cookie)
+            page = response["body"].decode("utf-8")
+            self.assertTrue(response["status"].startswith("200"))
+            self.assertIn("<h1>系统规则</h1>", page)
+            self.assertIn("class='active' href='/system-rules'>系统规则</a>", page)
+            self.assertIn("首次同步准入条件", page)
+            for required_field in (
+                "A/B协作中",
+                "已上传图片",
+                "有效含税成本",
+                "年份季节",
+                "款号",
+                "款色",
+                "商品名称",
+                "供应商",
+            ):
+                self.assertIn(required_field, page)
+            self.assertIn("首次定价时用于匹配倍率和供应商系数", page)
+            self.assertIn("静默同步，不撤回、不自动重新测算", page)
+            self.assertIn("标记“成本有变动”", page)
+            self.assertIn("上新价格</strong><strong>上新渠道</strong><strong>品类", page)
+            self.assertIn("历史保留", page)
+            self.assertEqual(page.count("<form"), 1)
+            self.assertIn("action='/logout'", page)
+
+        unauthenticated = self.wsgi_request(app, "/system-rules")
+        self.assertTrue(unauthenticated["status"].startswith("302"))
+        self.assertEqual(dict(unauthenticated["headers"])["Location"], "/login")
+
     def test_stats_defaults_to_latest_season_and_uses_rule_category_options(self):
         planning_db.save_category_option(self.planning_db_path, "针织上衣", "针织上衣", 20)
         planning_db.save_category_option(self.planning_db_path, "半身裙", "半身裙", 30)
