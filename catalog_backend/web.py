@@ -2440,9 +2440,9 @@ class CatalogApplication:
         if action == "submit_to_b_selected":
             action_label = "批量开启商品部协作"
         elif action == "submit_to_planning_selected":
-            action_label = "批量提交商品企划中心"
+            action_label = "批量重回企划"
         elif action == "skip_planning_selected":
-            action_label = "批量标记无需重走商品企划"
+            action_label = "批量不回企划"
         elif action == "complete_to_c_selected":
             action_label = "批量提交运营部"
         elif action == "receive_selected":
@@ -6512,7 +6512,8 @@ class CatalogApplication:
     }}
     .products-bulk-delete-button,
     .products-bulk-recall-button,
-    .products-bulk-archive-button {{
+    .products-bulk-archive-button,
+    .products-bulk-planning-button {{
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -10618,7 +10619,7 @@ class CatalogApplication:
             <div class="stats products-stats-row">
               <div class="stat-card"><span>近7天新增</span><strong>{b_dashboard_stats.get('recent_submitted_to_b', 0)}</strong></div>
               <div class="stat-card"><span>A/B协作中</span><strong>{b_dashboard_stats.get('pending_completion', 0)}</strong></div>
-              <a class="stat-card stat-card-link" href="/products?marker=planning_reentry#products-list"><span>待判断重走企划</span><strong>{b_dashboard_stats.get('planning_reentry_pending', 0)}</strong><small>商品部人工判断是否重新定价</small></a>
+              <a class="stat-card stat-card-link" href="/products?marker=planning_reentry#products-list"><span>召回款重新判断</span><strong>{b_dashboard_stats.get('planning_reentry_pending', 0)}</strong><small>商品部人工判断是否重新定价</small></a>
               <div class="stat-card"><span>待运营接收</span><strong>{b_dashboard_stats.get('awaiting_receipt', 0)}</strong></div>
               <div class="stat-card"><span>近7天退回</span><strong>{b_dashboard_stats.get('recent_returned_to_a', 0)}</strong></div>
               <a class="stat-card stat-card-link" href="/products?status=workflow_restart#products-list"><span>待商品部重新提交</span><strong>{b_dashboard_stats.get('restart_required', 0)}</strong><small>点击查看需重新流转款式</small></a>
@@ -10689,7 +10690,7 @@ class CatalogApplication:
                 <option value="">全部资料标记</option>
                 <option value="completion_ready" {"selected" if marker_filter == "completion_ready" else ""}>资料完成Y</option>
                 <option value="tax_price_modified" {"selected" if marker_filter == "tax_price_modified" else ""}>含税价修改</option>
-                <option value="planning_reentry" {"selected" if marker_filter == "planning_reentry" else ""}>待判断是否重走企划</option>
+                <option value="planning_reentry" {"selected" if marker_filter == "planning_reentry" else ""}>召回款重新判断</option>
               </select>
             """
             if b_dashboard_view
@@ -12502,8 +12503,6 @@ class CatalogApplication:
                 <div class="tools bulk-tools-inline">
                   <button type="submit" name="bulk_action" value="return_to_a_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk" class="ghost-button">批量退回跟单部</button>
                   <button type="submit" name="bulk_action" value="complete_to_c_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交运营部</button>
-                  <button type="submit" name="bulk_action" value="submit_to_planning_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交商品企划中心</button>
-                  <button type="submit" name="bulk_action" value="skip_planning_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk" class="ghost-button">批量标记无需重走企划</button>
                 </div>
               </div>
             """
@@ -12521,8 +12520,6 @@ class CatalogApplication:
           <div class="list-intro-actions">
             <div class="tools">
               <button type="submit" name="bulk_action" value="publish_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交运营部</button>
-              <button type="submit" name="bulk_action" value="submit_to_planning_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk">批量提交商品企划中心</button>
-              <button type="submit" name="bulk_action" value="skip_planning_selected" form="products-bulk-form" formmethod="post" formaction="/products/bulk" class="ghost-button">批量标记无需重走企划</button>
             </div>
           </div>
         """
@@ -12536,15 +12533,27 @@ class CatalogApplication:
               class="ghost-button products-bulk-recall-button"
               title="仅召回待运营接收或已接收的资料；其他条目会自动跳过">批量召回</button>
         """
+        planning_reentry_buttons = """
+            <button type="submit" name="bulk_action" value="submit_to_planning_selected"
+              form="products-bulk-form" formmethod="post" formaction="/products/bulk"
+              class="ghost-button products-bulk-planning-button"
+              title="仅处理已召回且待判断的资料；确认后下次同步进入商品企划中心">批量重回企划</button>
+            <button type="submit" name="bulk_action" value="skip_planning_selected"
+              form="products-bulk-form" formmethod="post" formaction="/products/bulk"
+              class="ghost-button products-bulk-planning-button"
+              title="仅处理已召回且待判断的资料；确认本次不再进入商品企划中心">批量不回企划</button>
+        """
         if user.get("department") == "B":
             return f"""
               <div class="products-bulk-lifecycle-actions">
                 {recall_button}
+                {planning_reentry_buttons}
               </div>
             """
         return f"""
           <div class="products-bulk-lifecycle-actions">
             {recall_button}
+            {planning_reentry_buttons}
             <button type="submit" name="bulk_action" value="delete_selected"
               form="products-bulk-form" formmethod="post" formaction="/products/bulk"
               class="ghost-button products-bulk-delete-button"

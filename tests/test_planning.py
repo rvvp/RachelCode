@@ -535,9 +535,13 @@ class PlanningCenterTests(unittest.TestCase):
             cookie=b_cookie,
         )
         decision_page_body = decision_page["body"].decode("utf-8")
-        self.assertIn("待判断是否重走企划", decision_page_body)
-        self.assertIn("批量提交商品企划中心", decision_page_body)
-        self.assertIn("批量标记无需重走企划", decision_page_body)
+        self.assertIn("召回款重新判断", decision_page_body)
+        self.assertIn("批量重回企划", decision_page_body)
+        self.assertIn("批量不回企划", decision_page_body)
+        self.assertLess(decision_page_body.index("批量召回"), decision_page_body.index("批量重回企划"))
+        self.assertLess(decision_page_body.index("批量重回企划"), decision_page_body.index("批量不回企划"))
+        self.assertIn('value="submit_to_planning_selected"', decision_page_body)
+        self.assertIn('value="skip_planning_selected"', decision_page_body)
         self.assertIn("提交企划", decision_page_body)
         self.assertIn("无需重走", decision_page_body)
         decision_response = self.wsgi_request(
