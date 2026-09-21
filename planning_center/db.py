@@ -99,6 +99,8 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
                 lifecycle_status TEXT NOT NULL DEFAULT '',
                 source_version_no INTEGER NOT NULL DEFAULT 1,
                 image_version_no INTEGER NOT NULL DEFAULT 1,
+                planning_request_no INTEGER NOT NULL DEFAULT 0,
+                planning_reentry_state TEXT NOT NULL DEFAULT 'initial',
                 source_updated_at TEXT NOT NULL DEFAULT '',
                 creator_name TEXT NOT NULL DEFAULT '',
                 synced_at TEXT NOT NULL
@@ -164,6 +166,7 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
                 publication_id TEXT NOT NULL UNIQUE,
                 source_product_id INTEGER NOT NULL,
                 source_version_no INTEGER NOT NULL,
+                planning_request_no INTEGER NOT NULL DEFAULT 0,
                 season_year TEXT NOT NULL,
                 style_code TEXT NOT NULL DEFAULT '',
                 product_name TEXT NOT NULL DEFAULT '',
@@ -198,12 +201,18 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
             connection.execute("ALTER TABLE source_products ADD COLUMN category_suggestion TEXT NOT NULL DEFAULT ''")
         if "image_version_no" not in source_columns:
             connection.execute("ALTER TABLE source_products ADD COLUMN image_version_no INTEGER NOT NULL DEFAULT 1")
+        if "planning_request_no" not in source_columns:
+            connection.execute("ALTER TABLE source_products ADD COLUMN planning_request_no INTEGER NOT NULL DEFAULT 0")
+        if "planning_reentry_state" not in source_columns:
+            connection.execute("ALTER TABLE source_products ADD COLUMN planning_reentry_state TEXT NOT NULL DEFAULT 'initial'")
         pricing_columns = {row["name"] for row in connection.execute("PRAGMA table_info(pricing_records)").fetchall()}
         if "calculated_price" not in pricing_columns:
             connection.execute("ALTER TABLE pricing_records ADD COLUMN calculated_price REAL")
             connection.execute("UPDATE pricing_records SET calculated_price = launch_price WHERE calculated_price IS NULL")
         if "channel" not in pricing_columns:
             connection.execute("ALTER TABLE pricing_records ADD COLUMN channel TEXT NOT NULL DEFAULT ''")
+        if "planning_request_no" not in pricing_columns:
+            connection.execute("ALTER TABLE pricing_records ADD COLUMN planning_request_no INTEGER NOT NULL DEFAULT 0")
 
         # Migrate the old shared label while preserving record ids and status.
         # The category option and cost-rule group now have distinct meanings.
@@ -752,6 +761,11 @@ def has_valid_source_cost(item: dict) -> bool:
 
 
 def planning_source_item_is_eligible(item: dict) -> bool:
+    reentry_state = str(item.get("planning_reentry_state") or "initial").strip()
+    try:
+        request_no = int(item.get("planning_request_no") or 0)
+    except (TypeError, ValueError):
+        request_no = -1
     return (
         str(item.get("status") or "").strip() == "pending"
         and str(item.get("lifecycle_status") or "active").strip() == "active"
@@ -759,9 +773,13 @@ def planning_source_item_is_eligible(item: dict) -> bool:
         # before it can re-enter planning. The catalog API applies the same
         # gate; keeping it here prevents a malformed or stale payload from
         # reopening work in the planning database.
-        and str(item.get("planning_reentry_state") or "initial").strip() in {"initial", "approved"}
+        and (reentry_state == "initial" or (reentry_state == "approved" and request_no > 0))
         and source_tax_included_cost_value(item) is not None
         and _source_item_has_image(item)
+        and all(
+            str(item.get(key) or "").strip()
+            for key in ("season_year", "style_code", "style_color", "product_name", "supplier")
+        )
     )
 
 
@@ -808,8 +826,9 @@ def upsert_source_products(
                 INSERT INTO source_products (
                     id, style_code, style_color, color_name, product_name, brand_name, season_year,
                     supplier, supplier_code, supplier_style_code, category, category_suggestion, actual_cost, tax_included_price,
-                    image_url, status, lifecycle_status, source_version_no, image_version_no, source_updated_at, creator_name, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    image_url, status, lifecycle_status, source_version_no, image_version_no,
+                    planning_request_no, planning_reentry_state, source_updated_at, creator_name, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     style_code=excluded.style_code, style_color=excluded.style_color, color_name=excluded.color_name,
                     product_name=excluded.product_name, brand_name=excluded.brand_name, season_year=excluded.season_year,
@@ -817,6 +836,7 @@ def upsert_source_products(
                     category=CASE WHEN NOT EXISTS (SELECT 1 FROM pricing_records WHERE source_product_id = excluded.id) THEN excluded.category ELSE source_products.category END,
                     category_suggestion=excluded.category_suggestion, actual_cost=excluded.actual_cost, tax_included_price=excluded.tax_included_price, image_url=excluded.image_url,
                     status=excluded.status, lifecycle_status=excluded.lifecycle_status, source_version_no=excluded.source_version_no, image_version_no=excluded.image_version_no,
+                    planning_request_no=excluded.planning_request_no, planning_reentry_state=excluded.planning_reentry_state,
                     source_updated_at=excluded.source_updated_at, creator_name=excluded.creator_name, synced_at=excluded.synced_at
                 """,
                 (
@@ -824,6 +844,7 @@ def upsert_source_products(
                     item.get("product_name", ""), item.get("brand_name", ""), item.get("season_year", ""), item.get("supplier", ""),
                     item.get("supplier_code", ""), item.get("supplier_style_code", ""), category_suggestion, category_suggestion, actual_cost,
                     tax_included_price, item.get("image_url", ""), "pending", "active", int(item.get("source_version_no") or 1), int(item.get("image_version_no") or 1),
+                    int(item.get("planning_request_no") or 0), str(item.get("planning_reentry_state") or "initial"),
                     item.get("updated_at", ""), item.get("creator_name", ""), now,
                 ),
             )
@@ -831,42 +852,83 @@ def upsert_source_products(
 
 
 def upsert_source_image_updates(db_path: str | Path, items: list[dict]) -> int:
-    """Apply image-only updates to existing source rows without reopening work."""
+    """Refresh known source data without reopening or changing planning work."""
     updated = 0
     now = utc_now()
     with get_connection(db_path) as connection:
+        category_options = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM category_options WHERE enabled = 1 ORDER BY sort_order, id"
+            ).fetchall()
+        ]
         for item in items:
-            if not _source_item_has_image(item):
-                continue
             source_id = int(item.get("id") or 0)
             if source_id <= 0:
                 continue
             existing = connection.execute(
-                "SELECT image_url, image_version_no, source_version_no FROM source_products WHERE id = ?",
+                "SELECT * FROM source_products WHERE id = ?",
                 (source_id,),
             ).fetchone()
             if not existing:
                 continue
+            existing = dict(existing)
             incoming_version = int(item.get("image_version_no") or 1)
             current_version = int(existing["image_version_no"] or 1)
-            incoming_image = str(item.get("image_url") or "").strip()
+            incoming_image = str(item.get("image_url", existing.get("image_url")) or "").strip()
             incoming_source_version = int(item.get("source_version_no") or 1)
             image_changed = (
                 incoming_version > current_version
                 or incoming_image != str(existing["image_url"] or "").strip()
             )
-            if (
-                not image_changed
-                and incoming_source_version == int(existing["source_version_no"] or 1)
-            ):
-                continue
+            merged = {
+                key: item.get(key, existing.get(key))
+                for key in (
+                    "style_code", "style_color", "color_name", "product_name", "brand_name",
+                    "season_year", "supplier", "supplier_code", "supplier_style_code",
+                    "status", "lifecycle_status", "updated_at", "creator_name",
+                )
+            }
+            normalized_cost = source_tax_included_cost_value(item) if "tax_included_price" in item else None
+            if normalized_cost is None:
+                normalized_cost = source_tax_included_cost_value(existing)
+            category_suggestion = infer_category(str(merged.get("product_name") or ""), category_options)
             connection.execute(
-                "UPDATE source_products SET image_url = ?, image_version_no = ?, source_version_no = ?, source_updated_at = ?, synced_at = ? WHERE id = ?",
+                """
+                UPDATE source_products
+                SET style_code = ?, style_color = ?, color_name = ?, product_name = ?, brand_name = ?,
+                    season_year = ?, supplier = ?, supplier_code = ?, supplier_style_code = ?,
+                    category = CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM pricing_records WHERE source_product_id = source_products.id
+                    ) THEN ? ELSE category END,
+                    category_suggestion = ?, actual_cost = ?, tax_included_price = ?,
+                    image_url = ?, status = ?, lifecycle_status = ?, source_version_no = ?, image_version_no = ?,
+                    planning_request_no = ?, planning_reentry_state = ?, source_updated_at = ?, creator_name = ?, synced_at = ?
+                WHERE id = ?
+                """,
                 (
+                    str(merged.get("style_code") or ""),
+                    str(merged.get("style_color") or ""),
+                    str(merged.get("color_name") or ""),
+                    str(merged.get("product_name") or ""),
+                    str(merged.get("brand_name") or ""),
+                    str(merged.get("season_year") or ""),
+                    str(merged.get("supplier") or ""),
+                    str(merged.get("supplier_code") or ""),
+                    str(merged.get("supplier_style_code") or ""),
+                    category_suggestion,
+                    category_suggestion,
+                    normalized_cost,
+                    normalized_cost,
                     incoming_image,
-                    max(incoming_version, current_version + 1) if image_changed else max(incoming_version, current_version),
+                    str(merged.get("status") or existing.get("status") or ""),
+                    str(merged.get("lifecycle_status") or existing.get("lifecycle_status") or ""),
                     incoming_source_version,
-                    item.get("updated_at", ""),
+                    max(incoming_version, current_version + 1) if image_changed else max(incoming_version, current_version),
+                    int(item.get("planning_request_no", existing.get("planning_request_no")) or 0),
+                    str(item.get("planning_reentry_state", existing.get("planning_reentry_state")) or "initial"),
+                    str(merged.get("updated_at") or ""),
+                    str(merged.get("creator_name") or ""),
                     now,
                     source_id,
                 ),
@@ -877,15 +939,10 @@ def upsert_source_image_updates(db_path: str | Path, items: list[dict]) -> int:
 
 
 def _pricing_record_can_follow_source(record: dict, source: dict) -> bool:
-    """Whether a source version bump leaves the frozen pricing inputs intact."""
+    """Whether an active pricing snapshot can follow a silent source update."""
     source_cost = source_tax_included_cost_value(source)
     record_cost = source_cost_value({"actual_cost": record.get("cost")})
-    if source_cost is None or record_cost is None or source_cost != record_cost:
-        return False
-    for key in ("season_year", "style_code", "product_name", "supplier"):
-        if str(source.get(key) or "").strip() != str(record.get(key) or "").strip():
-            return False
-    return True
+    return bool(source_cost is not None and record_cost is not None and source_cost == record_cost)
 
 
 def rebase_pricing_record_source_versions(
@@ -894,11 +951,11 @@ def rebase_pricing_record_source_versions(
 ) -> int:
     """Rebind active pricing rows after a safe, non-pricing source update.
 
-    Catalog metadata edits can increment its source version without changing
-    the pricing inputs. Keeping the frozen pricing row on the old version made
-    a successful re-sync unable to reach publication. Only active, unpublished
-    rows with identical pricing inputs are rebased; cost or identity changes
-    remain a real conflict and continue to require a new pricing cycle.
+    Images, names, seasons and suppliers may change after the first estimate
+    without invalidating the operator's decision. The pricing row remains a
+    frozen calculation snapshot while its source version follows the latest
+    catalog row. A changed cost is the only source update that requires an
+    explicit planner decision before the record can advance.
     """
     rebased = 0
     seen_ids: set[int] = set()
@@ -929,102 +986,6 @@ def rebase_pricing_record_source_versions(
     return rebased
 
 
-def restart_pricing_for_changed_sources(
-    db_path: str | Path,
-    items: list[dict] | tuple[dict, ...],
-) -> int:
-    """Start a fresh review when a frozen pricing input changed upstream."""
-    restarted = 0
-    seen_ids: set[int] = set()
-    for incoming in items:
-        source_id = int(incoming.get("id") or 0)
-        if source_id <= 0 or source_id in seen_ids:
-            continue
-        seen_ids.add(source_id)
-        source = get_source_product(db_path, source_id)
-        if not source:
-            continue
-        with get_connection(db_path) as connection:
-            latest_row = connection.execute(
-                "SELECT * FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
-                (source_id,),
-            ).fetchone()
-        if not latest_row or latest_row["status"] not in {"suggested", "review_pending", "confirmed", "conflict"}:
-            continue
-        latest = dict(latest_row)
-        if _pricing_record_can_follow_source(latest, source):
-            continue
-
-        category = resolve_product_category(db_path, source)
-        cost = source_cost_value(source)
-        calculation = calculate_pricing(
-            db_path,
-            source.get("season_year", ""),
-            category,
-            source.get("supplier", ""),
-            cost,
-        )
-        source_version = int(source.get("source_version_no") or 1)
-        publication_id = f"PC-{source_id}-REFRESH-V{source_version}-{secrets.token_hex(4).upper()}"
-        now = utc_now()
-        with get_connection(db_path) as connection:
-            current_row = connection.execute(
-                "SELECT * FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
-                (source_id,),
-            ).fetchone()
-            if (
-                not current_row
-                or current_row["status"] not in {"suggested", "review_pending", "confirmed", "conflict"}
-                or _pricing_record_can_follow_source(dict(current_row), source)
-            ):
-                continue
-            connection.execute(
-                """
-                UPDATE pricing_records
-                SET status = 'superseded',
-                    error_message = '藏宝阁含税成本或定价来源资料已变化，已生成新的审核周期。'
-                WHERE source_product_id = ?
-                  AND status IN ('suggested', 'review_pending', 'confirmed', 'conflict')
-                """,
-                (source_id,),
-            )
-            connection.execute(
-                "UPDATE source_products SET category = ?, status = 'pending', lifecycle_status = 'active', synced_at = ? WHERE id = ?",
-                (category, now, source_id),
-            )
-            connection.execute(
-                """
-                INSERT INTO pricing_records (
-                    publication_id, source_product_id, source_version_no,
-                    season_year, style_code, product_name, supplier, category,
-                    channel, cost, fixed_multiplier, supplier_coefficient,
-                    raw_price, calculated_price, launch_price, status,
-                    operator_name, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)
-                """,
-                (
-                    publication_id,
-                    source_id,
-                    source_version,
-                    source.get("season_year", ""),
-                    source.get("style_code", ""),
-                    source.get("product_name", ""),
-                    source.get("supplier", ""),
-                    category,
-                    cost,
-                    calculation["fixed_multiplier"],
-                    calculation["supplier_coefficient"],
-                    calculation["raw_price"],
-                    calculation["calculated_price"],
-                    calculation["calculated_price"],
-                    "藏宝阁来源资料变更",
-                    now,
-                ),
-            )
-        restarted += 1
-    return restarted
-
-
 def synchronize_source_products(
     db_path: str | Path,
     items: list[dict],
@@ -1039,7 +1000,7 @@ def synchronize_source_products(
     rejected_incoming_ids = incoming_ids - strict_ids
     explicit_withdrawn_ids = {int(product_id) for product_id in withdrawn_ids}
     synced = upsert_source_products(db_path, eligible_items, require_image=True, require_cost=True)
-    pricing_restarted = restart_pricing_for_changed_sources(db_path, eligible_items)
+    image_updated = upsert_source_image_updates(db_path, list(image_updates))
     revisions_started = 0
     # A recalled, already-published style is allowed back into planning only
     # after B explicitly approves it. At the first sync after that approval,
@@ -1052,16 +1013,22 @@ def synchronize_source_products(
         source_id = int(item.get("id") or 0)
         if source_id <= 0:
             continue
+        request_no = int(item.get("planning_request_no") or 0)
         with get_connection(db_path) as connection:
             latest = connection.execute(
-                "SELECT status FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                "SELECT status, planning_request_no FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
                 (source_id,),
             ).fetchone()
-        if not latest or latest["status"] != "published":
+        if (
+            not latest
+            or latest["status"] != "published"
+            or int(latest["planning_request_no"] or 0) >= request_no
+        ):
             continue
-        start_pricing_revision(db_path, source_id, "商品部召回重走企划")
+        reason = str(item.get("planning_reentry_reason") or "")
+        operator = "商品部发起二次企划" if reason == "manual_revision" else "商品部确认重回企划"
+        start_pricing_revision(db_path, source_id, operator)
         revisions_started += 1
-    image_updated = upsert_source_image_updates(db_path, list(image_updates))
     rebased = rebase_pricing_record_source_versions(
         db_path,
         [*eligible_items, *list(image_updates)],
@@ -1122,8 +1089,6 @@ def synchronize_source_products(
         result["rebased"] = rebased
     if revisions_started:
         result["revisions_started"] = revisions_started
-    if pricing_restarted:
-        result["pricing_restarted"] = pricing_restarted
     return result
 
 
@@ -1442,16 +1407,17 @@ def create_pricing_records(db_path: str | Path, products: list[dict], operator_n
                 float(cost),
                 calculation,
                 int(product.get("source_version_no") or 1),
+                int(product.get("planning_request_no") or 0),
             )
         )
 
     now = utc_now()
     created = []
     with get_connection(db_path) as connection:
-        for product, category, cost, calculation, source_version_no in prepared:
+        for product, category, cost, calculation, source_version_no, planning_request_no in prepared:
             existing = connection.execute(
-                "SELECT * FROM pricing_records WHERE source_product_id = ? AND source_version_no = ? ORDER BY created_at DESC, id DESC LIMIT 1",
-                (int(product["id"]), source_version_no),
+                "SELECT * FROM pricing_records WHERE source_product_id = ? AND planning_request_no = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (int(product["id"]), planning_request_no),
             ).fetchone()
             connection.execute("UPDATE source_products SET category = ? WHERE id = ?", (category, int(product["id"])))
             if existing and existing["status"] in {"suggested", "review_pending", "confirmed", "published"}:
@@ -1460,11 +1426,12 @@ def create_pricing_records(db_path: str | Path, products: list[dict], operator_n
             publication_id = f"PC-{product['id']}-V{source_version_no}-{secrets.token_hex(4).upper()}"
             launch = calculation["calculated_price"]
             connection.execute(
-                "INSERT INTO pricing_records (publication_id, source_product_id, source_version_no, season_year, style_code, product_name, supplier, category, channel, cost, fixed_multiplier, supplier_coefficient, raw_price, calculated_price, launch_price, status, operator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)",
+                "INSERT INTO pricing_records (publication_id, source_product_id, source_version_no, planning_request_no, season_year, style_code, product_name, supplier, category, channel, cost, fixed_multiplier, supplier_coefficient, raw_price, calculated_price, launch_price, status, operator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)",
                 (
                     publication_id,
                     product["id"],
                     source_version_no,
+                    planning_request_no,
                     product.get("season_year", ""),
                     product.get("style_code", ""),
                     product.get("product_name", ""),
@@ -1518,6 +1485,9 @@ def start_pricing_revision(db_path: str | Path, source_product_id: int, operator
         raise LookupError("同步商品不存在。")
     if not _source_item_has_image(source):
         raise ValueError("当前商品没有图片，不能发起企划修订。")
+    if str(source.get("planning_reentry_state") or "initial") != "approved":
+        raise ValueError("请先在藏宝阁由商品部明确发起二次企划。")
+    planning_request_no = int(source.get("planning_request_no") or 0)
     with get_connection(db_path) as connection:
         latest = connection.execute(
             "SELECT * FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
@@ -1525,6 +1495,8 @@ def start_pricing_revision(db_path: str | Path, source_product_id: int, operator
         ).fetchone()
         if not latest or latest["status"] != "published":
             raise ValueError("只有已回传的商品才能发起新的企划修订。")
+        if int(latest["planning_request_no"] or 0) >= planning_request_no:
+            raise ValueError("当前企划请求已经处理，无需重复发起。")
         active_revision = connection.execute(
             "SELECT * FROM pricing_records WHERE source_product_id = ? AND status IN ('suggested', 'review_pending', 'confirmed', 'conflict') ORDER BY created_at DESC, id DESC LIMIT 1",
             (int(source_product_id),),
@@ -1541,23 +1513,25 @@ def start_pricing_revision(db_path: str | Path, source_product_id: int, operator
     )
     now = utc_now()
     source_version = int(source.get("source_version_no") or 1)
-    publication_id = f"PC-{int(source_product_id)}-REV-V{source_version}-{secrets.token_hex(4).upper()}"
+    publication_id = f"PC-{int(source_product_id)}-R{planning_request_no}-V{source_version}-{secrets.token_hex(4).upper()}"
     with get_connection(db_path) as connection:
         connection.execute(
             "UPDATE source_products SET status = 'pending', lifecycle_status = 'active', category = ?, synced_at = ? WHERE id = ?",
             (category, now, int(source_product_id)),
         )
         connection.execute(
-            "INSERT INTO pricing_records (publication_id, source_product_id, source_version_no, season_year, style_code, product_name, supplier, category, channel, cost, fixed_multiplier, supplier_coefficient, raw_price, calculated_price, launch_price, status, operator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)",
+            "INSERT INTO pricing_records (publication_id, source_product_id, source_version_no, planning_request_no, season_year, style_code, product_name, supplier, category, channel, cost, fixed_multiplier, supplier_coefficient, raw_price, calculated_price, launch_price, status, operator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)",
             (
                 publication_id,
                 int(source_product_id),
                 source_version,
+                planning_request_no,
                 source.get("season_year", ""),
                 source.get("style_code", ""),
                 source.get("product_name", ""),
                 source.get("supplier", ""),
                 category,
+                str(latest["channel"] or ""),
                 source.get("actual_cost"),
                 calculation["fixed_multiplier"],
                 calculation["supplier_coefficient"],
@@ -1570,6 +1544,120 @@ def start_pricing_revision(db_path: str | Path, source_product_id: int, operator
         )
         row = connection.execute("SELECT * FROM pricing_records WHERE publication_id = ?", (publication_id,)).fetchone()
     return dict(row)
+
+
+def restart_pricing_after_cost_change(
+    db_path: str | Path,
+    record_id: int,
+    decision: str,
+    operator_name: str,
+) -> dict:
+    """Create a new initial-review snapshot only after a planner handles a changed cost."""
+    clean_decision = str(decision or "").strip().lower()
+    if clean_decision not in {"recalculate", "keep_price"}:
+        raise ValueError("成本变动处理方式不正确。")
+    with get_connection(db_path) as connection:
+        row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (int(record_id),)).fetchone()
+        if not row:
+            raise LookupError("定价记录不存在。")
+        record = dict(row)
+        if record["status"] not in {"suggested", "review_pending", "confirmed", "conflict"}:
+            raise ValueError("只有首次回传前的进行中资料可以处理成本变动。")
+        source_row = connection.execute(
+            "SELECT * FROM source_products WHERE id = ?",
+            (int(record["source_product_id"]),),
+        ).fetchone()
+        if not source_row:
+            raise LookupError("对应的藏宝阁来源资料不存在。")
+        source = dict(source_row)
+    current_cost = source_cost_value(source)
+    snapshot_cost = source_cost_value({"actual_cost": record.get("cost")})
+    if current_cost is None:
+        raise ValueError("藏宝阁当前没有有效的含税成本。")
+    if snapshot_cost == current_cost:
+        raise ValueError("当前含税成本与测算快照一致，无需重新处理。")
+    enabled_categories = {
+        str(item.get("name") or "").strip()
+        for item in list_category_options(db_path, enabled_only=True)
+    }
+    category = str(record.get("category") or "").strip()
+    if category not in enabled_categories:
+        category = resolve_product_category(db_path, source)
+    calculation = calculate_pricing(
+        db_path,
+        source.get("season_year", ""),
+        category,
+        source.get("supplier", ""),
+        current_cost,
+    )
+    launch_price = (
+        calculation["calculated_price"]
+        if clean_decision == "recalculate"
+        else validated_launch_price(record.get("launch_price"))
+    )
+    now = utc_now()
+    source_version = int(source.get("source_version_no") or 1)
+    planning_request_no = int(source.get("planning_request_no") or 0)
+    publication_id = (
+        f"PC-{int(record['source_product_id'])}-COST-R{planning_request_no}-"
+        f"V{source_version}-{secrets.token_hex(4).upper()}"
+    )
+    with get_connection(db_path) as connection:
+        current = connection.execute(
+            "SELECT * FROM pricing_records WHERE id = ?",
+            (int(record_id),),
+        ).fetchone()
+        if not current or current["status"] not in {"suggested", "review_pending", "confirmed", "conflict"}:
+            raise ValueError("当前记录状态已经变化，请刷新页面后再处理。")
+        connection.execute(
+            """
+            UPDATE pricing_records
+            SET status = 'superseded',
+                error_message = '藏宝阁含税成本已变化，商品部已建立新的初审与复核周期。'
+            WHERE source_product_id = ?
+              AND status IN ('suggested', 'review_pending', 'confirmed', 'conflict')
+            """,
+            (int(record["source_product_id"]),),
+        )
+        connection.execute(
+            """
+            INSERT INTO pricing_records (
+                publication_id, source_product_id, source_version_no, planning_request_no,
+                season_year, style_code, product_name, supplier, category, channel,
+                cost, fixed_multiplier, supplier_coefficient, raw_price,
+                calculated_price, launch_price, status, operator_name, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'suggested', ?, ?)
+            """,
+            (
+                publication_id,
+                int(record["source_product_id"]),
+                source_version,
+                planning_request_no,
+                str(source.get("season_year") or ""),
+                str(source.get("style_code") or ""),
+                str(source.get("product_name") or ""),
+                str(source.get("supplier") or ""),
+                category,
+                str(record.get("channel") or ""),
+                current_cost,
+                calculation["fixed_multiplier"],
+                calculation["supplier_coefficient"],
+                calculation["raw_price"],
+                calculation["calculated_price"],
+                launch_price,
+                operator_name,
+                now,
+            ),
+        )
+        connection.execute(
+            "UPDATE source_products SET category = ?, status = 'pending', lifecycle_status = 'active', synced_at = ? WHERE id = ?",
+            (category, now, int(record["source_product_id"])),
+        )
+        created = connection.execute(
+            "SELECT * FROM pricing_records WHERE publication_id = ?",
+            (publication_id,),
+        ).fetchone()
+    return dict(created)
 
 
 def list_pricing_records(db_path: str | Path, *, season_year: str = "", status: str = "") -> list[dict]:
@@ -1834,6 +1922,19 @@ def validated_launch_price(value) -> int:
     return int(price)
 
 
+def ensure_pricing_record_cost_current(connection: sqlite3.Connection, record: dict | sqlite3.Row) -> None:
+    source = connection.execute(
+        "SELECT actual_cost, tax_included_price FROM source_products WHERE id = ?",
+        (int(record["source_product_id"]),),
+    ).fetchone()
+    if not source:
+        raise LookupError("对应的藏宝阁来源资料不存在。")
+    source_cost = source_cost_value(dict(source))
+    record_cost = source_cost_value({"actual_cost": record["cost"]})
+    if source_cost is None or record_cost is None or source_cost != record_cost:
+        raise ValueError("藏宝阁含税成本有变动，请先由商品部初审人员选择重新测算或保留原上新价。")
+
+
 def recalculate_pricing_record(db_path: str | Path, record_id: int, category: str, operator_name: str) -> dict:
     clean_category = validate_category_option(db_path, category)
     with get_connection(db_path) as connection:
@@ -1842,6 +1943,7 @@ def recalculate_pricing_record(db_path: str | Path, record_id: int, category: st
             raise LookupError("定价记录不存在。")
         if row["status"] not in {"suggested", "conflict"}:
             raise ValueError("当前定价记录不在商品部初审阶段。")
+        ensure_pricing_record_cost_current(connection, row)
     calculation = calculate_pricing(
         db_path,
         row["season_year"],
@@ -1887,6 +1989,7 @@ def submit_pricing_for_review(
             raise LookupError("定价记录不存在。")
         if row["status"] not in {"suggested", "conflict"}:
             raise ValueError("当前定价记录不在商品部初审阶段。")
+        ensure_pricing_record_cost_current(connection, row)
     clean_category = validate_category_option(db_path, category if category is not None else row["category"])
     clean_channel = validate_channel_option(db_path, channel if channel is not None else row["channel"])
     calculation = calculate_pricing(
@@ -1954,12 +2057,19 @@ def save_review_price(
             raise LookupError("定价记录不存在。")
         if row["status"] != "review_pending":
             raise ValueError("当前定价记录不在企划管理员复核阶段。")
+        ensure_pricing_record_cost_current(connection, row)
         clean_channel = validate_channel_option(db_path, channel)
         style_code = str(row["style_code"] or "").strip()
         if style_code:
             # Price and channel are defined at style level. Keep the workflow
             # boundary intact by synchronizing only sibling colors that are
             # currently waiting for the same administrator review.
+            sibling_rows = connection.execute(
+                "SELECT * FROM pricing_records WHERE TRIM(style_code) = ? AND season_year = ? AND status = 'review_pending'",
+                (style_code, row["season_year"]),
+            ).fetchall()
+            for sibling in sibling_rows:
+                ensure_pricing_record_cost_current(connection, sibling)
             updated_count = connection.execute(
                 """
                 UPDATE pricing_records
@@ -1993,6 +2103,7 @@ def approve_pricing_record(
             raise LookupError("定价记录不存在。")
         if row["status"] != "review_pending":
             raise ValueError("当前定价记录不在企划管理员复核阶段。")
+        ensure_pricing_record_cost_current(connection, row)
         clean_channel = validate_channel_option(db_path, channel)
         if price != validated_launch_price(row["launch_price"]) or clean_channel != row["channel"]:
             raise ValueError("复核上新价或渠道已修改，请先点击“修改保存”，再进行复核通过。")
@@ -2000,6 +2111,12 @@ def approve_pricing_record(
         if style_code:
             # Approval follows the same style-level rule as review saving:
             # approve all sibling colors still waiting for this review.
+            sibling_rows = connection.execute(
+                "SELECT * FROM pricing_records WHERE TRIM(style_code) = ? AND season_year = ? AND status = 'review_pending'",
+                (style_code, row["season_year"]),
+            ).fetchall()
+            for sibling in sibling_rows:
+                ensure_pricing_record_cost_current(connection, sibling)
             updated_count = connection.execute(
                 """
                 UPDATE pricing_records

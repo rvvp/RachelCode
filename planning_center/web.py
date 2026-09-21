@@ -111,6 +111,8 @@ class PlanningApplication:
                 return self.handle_confirm(start_response, user, self.path_id(path, "/pricing/", "/confirm"))
             if path.startswith("/pricing/") and path.endswith("/recalculate") and method == "POST":
                 return self.handle_recalculate(environ, start_response, user, self.path_id(path, "/pricing/", "/recalculate"))
+            if path.startswith("/pricing/") and path.endswith("/cost-change") and method == "POST":
+                return self.handle_cost_change(environ, start_response, user, self.path_id(path, "/pricing/", "/cost-change"))
             if path.startswith("/pricing/") and path.endswith("/revise") and method == "POST":
                 return self.handle_revision(start_response, user, self.path_id(path, "/pricing/", "/revise"))
             if path.startswith("/pricing/") and path.endswith("/reopen") and method == "POST":
@@ -377,8 +379,6 @@ class PlanningApplication:
             cleanup.append(f"同时对齐 {int(result['rebased'])} 条未回传定价的来源版本")
         if result.get("revisions_started"):
             cleanup.append(f"其中 {int(result['revisions_started'])} 条召回资料已生成新的待初审周期")
-        if result.get("pricing_restarted"):
-            cleanup.append(f"另有 {int(result['pricing_restarted'])} 条因含税成本或来源资料变化重新进入待初审")
         if cleanup:
             message += "；".join(cleanup) + "。"
         return message
@@ -503,8 +503,11 @@ class PlanningApplication:
             eligibility_gate_version = int(payload.get("eligibility_gate_version") or 0)
         except (TypeError, ValueError):
             eligibility_gate_version = 0
-        if eligibility_gate_version < 2:
+        if eligibility_gate_version < 3:
             raise ValueError("藏宝阁同步准入协议版本无效，已停止同步。")
+        required_source_fields = payload.get("required_source_fields")
+        if required_source_fields != ["season_year", "style_code", "style_color", "product_name", "supplier"]:
+            raise ValueError("藏宝阁同步接口未声明完整的必填来源字段，已停止同步。")
         items = payload.get("items") or []
         withdrawn_ids = payload.get("withdrawn_ids") or []
         image_updates = payload.get("image_updates") or []
@@ -593,15 +596,24 @@ class PlanningApplication:
 
     def handle_revision(self, start_response, user, source_product_id: int):
         self.require_catalog_operator(user)
-        record = db.start_pricing_revision(
-            self.db_path,
-            source_product_id,
-            user.get("display_name", "商品部企划员"),
+        raise ValueError(
+            "二次企划必须先在藏宝阁由商品部明确发起，再同步到商品企划中心。"
         )
+
+    def handle_cost_change(self, environ, start_response, user, record_id: int):
+        self.require_catalog_operator(user)
+        form = self.parse_form(environ)
+        record = db.restart_pricing_after_cost_change(
+            self.db_path,
+            record_id,
+            form.get("decision", ""),
+            user.get("display_name", "商品部初审人员"),
+        )
+        action = "按最新成本重新测算" if form.get("decision") == "recalculate" else "保留原上新价"
         return self.redirect(
             start_response,
-            "/workbench?notice="
-            + self.q(f"{record['style_code'] or record['product_name']} 已发起新的企划审核周期。")
+            "/workbench?status=suggested&notice="
+            + self.q(f"{record['style_code'] or record['product_name']} 已{action}并重新进入待初审。")
             + f"#pricing-row-{int(record['source_product_id'])}",
         )
 
@@ -922,7 +934,11 @@ class PlanningApplication:
                 for item in db.list_published_source_products(self.db_path, season_year=season)
                 if int(item["id"]) not in known_product_ids
             )
-        records = db.list_latest_pricing_records(self.db_path, season_year=season)
+        # Season and supplier changes are silently synchronized source data.
+        # Pricing rows keep their original calculation snapshot, so match the
+        # latest record by source id instead of requiring the snapshot season
+        # to equal the source's current season.
+        records = db.list_latest_pricing_records(self.db_path)
         latest_records: dict[int, dict] = {}
         for record in records:
             latest_records.setdefault(int(record["source_product_id"]), record)
@@ -960,6 +976,14 @@ class PlanningApplication:
     @staticmethod
     def has_valid_source_cost(item: dict) -> bool:
         return db.has_valid_source_cost(item)
+
+    @staticmethod
+    def record_has_cost_change(item: dict, record: dict | None) -> bool:
+        if not record or str(record.get("status") or "") not in {"suggested", "review_pending", "confirmed", "conflict"}:
+            return False
+        source_cost = db.source_cost_value(item)
+        record_cost = db.source_cost_value({"actual_cost": record.get("cost")})
+        return bool(source_cost is not None and record_cost is not None and source_cost != record_cost)
 
     def handle_pricing_batch(self, environ, start_response, user):
         form = self.parse_form_values(environ)
@@ -1044,8 +1068,10 @@ class PlanningApplication:
             allowed_statuses = action_statuses.get(action, set())
             records = [
                 record
-                for _, record, workflow_status in entries
-                if record and workflow_status in allowed_statuses
+                for item, record, workflow_status in entries
+                if record
+                and workflow_status in allowed_statuses
+                and not self.record_has_cost_change(item, record)
             ]
             if not records:
                 raise ValueError("当前筛选范围没有可执行该批量操作的资料。")
@@ -1239,46 +1265,23 @@ class PlanningApplication:
             record_cost = None
         if source_cost is None or record_cost is None or source_cost != record_cost:
             raise ValueError("回传前请重新同步并确认藏宝阁含税成本未发生变化。")
-        source_snapshot_fields = {
-            "season_year": "年份季节",
-            "style_code": "款号",
-            "product_name": "商品名称",
-            "supplier": "供应商",
-        }
-        changed_source_fields = [
-            label
-            for key, label in source_snapshot_fields.items()
-            if str(source.get(key) or "").strip() != str(record.get(key) or "").strip()
-        ]
-        if changed_source_fields:
-            raise ValueError(
-                "回传前二次校验失败："
-                + "、".join(changed_source_fields)
-                + "与测算时来源资料不一致，请重新同步后处理。"
-            )
         category = db.validate_category_option(self.db_path, record.get("category", ""))
         channel = db.validate_channel_option(self.db_path, record.get("channel", ""))
         launch_price = db.validated_launch_price(record.get("launch_price"))
-        prior_publications = [
-            item
-            for item in db.list_pricing_records(self.db_path)
-            if int(item.get("source_product_id") or 0) == int(record["source_product_id"])
-            and item.get("status") == "published"
-        ]
         payload = {
             "publication_id": record["publication_id"],
+            "source_product_id": int(record["source_product_id"]),
             "source_version_no": record["source_version_no"],
+            "source_style_code": str(source.get("style_code") or ""),
+            "source_style_color": str(source.get("style_color") or ""),
+            "source_cost": source_cost,
+            "planning_request_no": int(record.get("planning_request_no") or 0),
             "category": category,
             "launch_channel": channel,
             "launch_price": launch_price,
             "fixed_multiplier": record["fixed_multiplier"],
             "supplier_coefficient": record["supplier_coefficient"],
             "raw_price": record["raw_price"],
-            # A previously published/received catalog item is a revision of the
-            # same product, never a new catalog style.
-            "revision": bool(prior_publications)
-            or source.get("status") in {"published", "received"}
-            or source.get("lifecycle_status") == "withdrawn",
             "operator_name": user.get("display_name", "商品企划中心"),
         }
         request = Request(
@@ -1464,7 +1467,7 @@ class PlanningApplication:
         confirmed = counts["confirmed"]
         published = counts["published"]
         catalog_sync_action = (
-            "<form class='catalog-sync-form' method='post' action='/sync'><button class='primary' type='submit'>立即同步藏宝阁</button><small class='sync-condition-note'>同步条件：A/B协作中、有效资料、已上传图片、含税价为大于 0 的有效数字；召回款须已确认重回企划</small></form>"
+            "<form class='catalog-sync-form' method='post' action='/sync'><button class='primary' type='submit'>立即同步藏宝阁</button><small class='sync-condition-note'>同步条件：A/B协作中、正常有效、已有图片和有效含税成本，并具备年份季节、款号、款色、商品名称、供应商；二次企划须由商品部明确发起</small></form>"
             if user.get("role") == "planner"
             else "<small class='review-note'>同步与回传由商品部初审人员执行</small>"
         )
@@ -1532,12 +1535,13 @@ class PlanningApplication:
         <section class='panel system-rule-section' id='second-planning'>
           <div class='system-rule-title'><span>04</span><div><div class='eyebrow'>REVISION</div><h2>二次企划的人工入口</h2></div></div>
           <div class='system-rule-scenarios'>
-            <article><strong>A/B协作中需要修改</strong><p>条目已经完成过企划回传但仍在“A/B协作中”时，由商品部选择“维持原企划”或“发起二次企划”，系统不自动生成新流程。</p></article>
-            <article><strong>运营阶段召回</strong><p>“待运营接收”或“已接收”的条目先召回到“A/B协作中”，再由商品部在“召回款重新判断”中选择“批量重回企划”或“批量不回企划”。</p></article>
+            <article><strong>A/B协作中需要修改</strong><p>条目已经完成过企划回传但仍在“A/B协作中”时，由商品部在藏宝阁主动“发起二次企划”；未发起时系统维持原结果，不自动生成新流程。</p></article>
+            <article><strong>运营阶段召回</strong><p>“待运营接收”或“已接收”的条目先召回到“A/B协作中”，再由商品部在“重回企划判断”中选择“批量重回企划”或“批量不回企划”。</p></article>
           </div>
           <ul class='system-rule-list'>
             <li>二次企划的目的，是修改上新价格、上新渠道或品类中的至少一项。</li>
-            <li>进入二次企划后使用藏宝阁最新有效资料和最新含税成本；同一商品同一时间只允许一个进行中的企划批次。</li>
+            <li>藏宝阁为每次人工发起分配递增的企划请求批次号；企划中心按“内部商品 ID + 批次号”幂等建单，同一商品同一时间只允许一个进行中的企划批次。</li>
+            <li>进入二次企划后使用藏宝阁最新有效资料和最新含税成本。</li>
             <li>新批次完成回传后覆盖藏宝阁主资料中的三个企划字段，旧批次保留在历史记录中，不覆盖、不删除。</li>
           </ul>
         </section>
@@ -1617,9 +1621,9 @@ class PlanningApplication:
                 and workflow_status == "waiting"
                 and self.has_valid_source_cost(item)
             ),
-            "submit-review": sum(1 for _, record, workflow_status in filtered_products if record and workflow_status in {"suggested", "conflict"}),
-            "approve": sum(1 for _, record, workflow_status in filtered_products if record and workflow_status == "review_pending"),
-            "publish": sum(1 for _, record, workflow_status in filtered_products if record and workflow_status == "confirmed"),
+            "submit-review": sum(1 for item, record, workflow_status in filtered_products if record and workflow_status in {"suggested", "conflict"} and not self.record_has_cost_change(item, record)),
+            "approve": sum(1 for item, record, workflow_status in filtered_products if record and workflow_status == "review_pending" and not self.record_has_cost_change(item, record)),
+            "publish": sum(1 for item, record, workflow_status in filtered_products if record and workflow_status == "confirmed" and not self.record_has_cost_change(item, record)),
         }
         exportable_count = sum(1 for _, record, _ in filtered_products if record)
         filtered_selectable_count = sum(
@@ -1650,7 +1654,7 @@ class PlanningApplication:
         toolbar_message = notice or sync_message
         seasons = sorted({item.get("season_year", "") for item in db.list_source_products(self.db_path) if item.get("season_year")}, reverse=True)
         catalog_sync_action = (
-            "<form class='catalog-sync-form' method='post' action='/sync'><button class='primary' type='submit'>同步藏宝阁</button><small class='sync-condition-note'>同步条件：A/B协作中、有效资料、已上传图片、含税价为大于 0 的有效数字；召回款须已确认重回企划</small></form>"
+            "<form class='catalog-sync-form' method='post' action='/sync'><button class='primary' type='submit'>同步藏宝阁</button><small class='sync-condition-note'>同步条件：A/B协作中、正常有效、已有图片和有效含税成本，并具备年份季节、款号、款色、商品名称、供应商；二次企划须由商品部明确发起</small></form>"
             if user.get("role") == "planner"
             else "<span class='review-note'>同步与回传由商品部初审人员执行</span>"
         )
@@ -1751,6 +1755,7 @@ class PlanningApplication:
         rows = []
         for item, record, workflow_status in page_products:
             cost = item.get("actual_cost")
+            cost_changed = self.record_has_cost_change(item, record)
             can_price = user.get("role") == "planner" and self.has_valid_source_cost(item)
             source_status_label = {"pending": "A/B协作中", "published": "待运营接收", "received": "已接收"}.get(item.get("status"), item.get("status") or "未知")
             image_url = str(item.get("image_url") or "").strip()
@@ -1785,7 +1790,7 @@ class PlanningApplication:
             selection_cell = "<span class='muted'>—</span>"
             if not record:
                 category_value = str(item.get("category_suggestion") or item.get("category") or "")
-                if user.get("role") == "planner":
+                if user.get("role") == "planner" and not cost_changed:
                     selection_cell = (
                         f"<input class='pricing-batch-checkbox' type='checkbox' name='suggest_ids' value='{item['id']}' data-export-record-id='' form='pricing-batch-form' aria-label='选择 {html.escape(item.get('style_code') or item.get('product_name') or str(item['id']), quote=True)} 批量测算上新价' {' ' if can_price else 'disabled'}>"
                     )
@@ -1819,17 +1824,30 @@ class PlanningApplication:
                 price_cell = f"<span class='price final-price'>{price_value}</span><small class='calculated-price'>测算价{calculated_price_value}</small><small>{html.escape(record['publication_id'])}</small>"
                 status_cell = f"<span class='status status-{status_class}'>{html.escape(status_label)}</span>"
                 controls = ""
-                if user.get("role") == "planner":
+                if user.get("role") == "planner" and not cost_changed:
                     if record_status in {"suggested", "conflict"}:
                         selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='submit_review_ids' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 进行批量初审'>"
                     elif record_status == "confirmed":
                         selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='publish_ids' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 批量回传藏宝阁'>"
                     elif record_status in {"review_pending", "published"}:
                         selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='export_ids' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 导出定价资料'>"
-                elif user.get("role") == "admin":
+                elif user.get("role") == "admin" and not cost_changed:
                     selection_name = "approve_ids" if record_status == "review_pending" else "export_ids"
                     selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='{selection_name}' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 导出定价资料'>"
-                if record_status in {"suggested", "conflict"} and user.get("role") == "planner":
+                if cost_changed and user.get("role") == "planner":
+                    snapshot_cost = float(record.get("cost") or 0)
+                    controls = f"""
+                    <div class='cost-change-controls'>
+                      <strong>含税成本有变动</strong>
+                      <small>测算时 {snapshot_cost:g}，当前 {float(cost):g}。请先决定如何重新进入初审。</small>
+                      <form class='table-action-form' method='post' action='/pricing/{record['id']}/cost-change'>
+                        <button class='primary' type='submit' name='decision' value='recalculate'>按新成本重新测算</button>
+                        <button type='submit' name='decision' value='keep_price'>保留原上新价</button>
+                      </form>
+                    </div>"""
+                elif cost_changed:
+                    controls = "<span class='review-note cost-change-review-note'>含税成本有变动，等待商品部初审人员处理后重新提交复核。</span>"
+                elif record_status in {"suggested", "conflict"} and user.get("role") == "planner":
                     category_cell = f"""
                     <div class='category-review-control'>
                       <strong class='category-current' data-category-current='{record['id']}'>{html.escape(record['category'] or '品类待匹配')}</strong>
@@ -1864,13 +1882,18 @@ class PlanningApplication:
                 elif record_status == "confirmed" and user.get("role") == "admin":
                     controls = "<span class='review-note'>复核已通过，待商品部回传</span>"
                 elif record_status == "published" and user.get("role") == "planner":
-                    controls = f"<span class='review-note'>已完成回传</span><form class='table-action-form' method='post' action='/pricing/{int(record['source_product_id'])}/revise'><button type='submit'>发起同款修订</button></form>"
+                    controls = "<span class='review-note'>已完成回传；如需修改价格、渠道或品类，请先在藏宝阁发起二次企划。</span>"
                 elif record_status == "published":
                     controls = "<span class='review-note'>已完成回传</span>"
                 else:
                     controls = "<span class='review-note'>等待下一处理环节</span>"
                 action_cell = controls
             workflow_cell = f"<div class='workflow-status'>{status_cell}</div><div class='workflow-actions'>{action_cell}</div>"
+            cost_change_label = (
+                f"<small class='cost-change-label'>有变动 · 测算时 {float(record.get('cost') or 0):g}</small>"
+                if cost_changed and record
+                else ""
+            )
             rows.append(f"""
               <tr id='pricing-row-{int(item['id'])}'>
                 <td class='pricing-select-cell'>{selection_cell}</td>
@@ -1880,7 +1903,7 @@ class PlanningApplication:
                 <td>{html.escape(item.get('style_color') or item.get('color_name') or '未提供')}</td>
                 <td>{html.escape(item.get('product_name') or '未提供')}</td>
                 <td>{html.escape(item.get('supplier') or '未提供')}</td>
-                <td><strong class='cost-value'>{html.escape(f"{float(cost):g}" if cost is not None else '未提供')}</strong></td>
+                <td><strong class='cost-value'>{html.escape(f"{float(cost):g}" if cost is not None else '未提供')}</strong>{cost_change_label}</td>
                 <td><span class='status status-source'>{html.escape(source_status_label)}</span></td>
                 <td class='pricing-category-cell'>{category_cell}</td>
                 <td class='pricing-rule-cell'>{rule_cell}</td>
@@ -2737,6 +2760,7 @@ class PlanningApplication:
         :root{--ink:#202421;--muted:#6c756e;--line:#dde3dc;--paper:#f6f8f5;--card:#fff;--accent:#b5572a;--deep:#315447;--soft:#eaf0eb}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif}a{color:inherit;text-decoration:none}button,.button{border:1px solid #cbd5ce;background:#fff;color:var(--ink);border-radius:4px;padding:9px 14px;font:inherit;cursor:pointer}button:hover,.button:hover{border-color:var(--accent);color:var(--accent)}button.primary,.button.primary{background:var(--deep);border-color:var(--deep);color:#fff}button:disabled{cursor:not-allowed;opacity:.45}.app-shell{width:100%;min-width:0;min-height:100vh}header{width:100%;height:72px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 34px;gap:30px;position:sticky;top:0;z-index:3}.brand{display:flex;align-items:center;gap:10px;min-width:230px}.brand>span{display:grid;place-items:center;width:34px;height:34px;background:var(--deep);color:#fff;font-weight:700;letter-spacing:.08em;border-radius:3px}.brand strong{display:block;font-size:15px}.brand small{display:block;color:var(--muted);font-size:10px;letter-spacing:.08em;text-transform:uppercase}nav{display:flex;gap:4px;flex:1;min-width:0}nav a{padding:9px 12px;color:var(--muted);border-bottom:2px solid transparent}nav a.active,nav a:hover{color:var(--deep);border-bottom-color:var(--accent)}.user{display:flex;align-items:center;gap:13px;color:var(--muted);white-space:nowrap}.user button{padding:5px 9px}.main{width:100%;min-width:0;max-width:1320px;margin:0 auto;padding:38px 34px 60px}.hero,.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;margin-bottom:25px}.hero h1,.page-heading h1{font-family:Georgia,'Times New Roman',serif;font-weight:500;font-size:42px;line-height:1.15;margin:5px 0 10px;letter-spacing:0}.hero p,.page-heading p{margin:0;color:var(--muted);max-width:680px}.eyebrow{color:var(--accent);font-size:11px;letter-spacing:.14em;font-weight:700}.hero-note{background:var(--deep);color:#fff;padding:18px 22px;min-width:190px}.hero-note span,.hero-note small{display:block;opacity:.7;font-size:12px}.hero-note strong{display:block;font-size:21px;margin:4px 0}.metrics{display:grid;grid-template-columns:repeat(3,1fr);background:#fff;border:1px solid var(--line);margin-bottom:24px}.metrics>a,.metrics>div{padding:20px 24px;border-right:1px solid var(--line)}.metrics>*:last-child{border-right:0}.metrics span,.metrics small{display:block;color:var(--muted)}.metrics strong{display:block;font:34px Georgia,serif;margin:4px 0}.split{display:grid;grid-template-columns:1.45fr 1fr;gap:24px}.panel{min-width:0;background:var(--card);border:1px solid var(--line);padding:24px;margin-bottom:24px}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:18px}.panel h2{font-size:20px;font-weight:600;margin:2px 0}.hint,.count,.muted,.meta{color:var(--muted)}.count{font-size:13px}.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.quick-grid a{border:1px solid var(--line);padding:17px;min-height:126px;display:flex;flex-direction:column;gap:3px}.quick-grid a:hover{border-color:var(--accent);background:#fffaf7}.quick-grid b{color:var(--accent);font:23px Georgia,serif}.quick-grid small{color:var(--muted);font-size:12px}.notice-panel{background:#f0f5f1}.notice-panel p{color:#53645a}.page-heading form{margin-bottom:4px}.filter-bar{background:#fff;border:1px solid var(--line);padding:14px 18px;margin-bottom:24px}.filter-bar form{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}.filter-bar label,.rule-form label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.filter-bar input,.filter-bar select{min-width:190px}input,select{border:1px solid #cfd8d1;background:#fff;padding:9px 10px;border-radius:3px;color:var(--ink);font:inherit;min-width:0}table{width:100%;border-collapse:collapse}th{text-align:left;color:var(--muted);font-size:12px;font-weight:500;background:#f7f9f7}th,td{padding:12px 11px;border-bottom:1px solid var(--line);vertical-align:middle}tbody tr:last-child td{border-bottom:0}td strong{display:block}td small{display:block;color:var(--muted);font-size:11px}.table-wrap{width:100%;max-width:100%;overflow:auto}.inline-form{display:flex;gap:6px;min-width:205px}.inline-form input{width:120px}.inline-form button{padding:7px 10px;white-space:nowrap}.status{display:inline-block;border-radius:3px;padding:3px 7px;background:var(--soft);color:var(--deep);font-size:12px}.status-confirmed{background:#fff1e7;color:#98431d}.status-published{background:#e5f2e9;color:#2d6b42}.status-conflict,.error-text{background:#fff0ef;color:#a23f35}.price{font:20px Georgia,serif;color:var(--deep)}.actions{display:flex;gap:5px;white-space:nowrap}.actions button{padding:6px 9px;font-size:12px}.empty{text-align:center;color:var(--muted);padding:30px!important}.alert{padding:11px 14px;border:1px solid;margin:0 0 20px}.alert.success{background:#edf7ef;border-color:#c8e2cd;color:#2f6741}.alert.error{background:#fff1ef;border-color:#efc9c2;color:#9b3e32}.rule-form{display:grid;grid-template-columns:1fr 1fr .7fr 1.2fr auto;gap:7px;margin-bottom:20px}.band-row{margin:19px 0}.band-label{display:flex;justify-content:space-between;gap:15px;margin-bottom:6px}.band-label span{font-weight:600}.band-label strong{color:var(--muted);font-size:13px;font-weight:500}.bar{height:11px;background:#edf1ed}.bar i{display:block;height:100%;background:var(--accent)}.settings dl{display:grid;grid-template-columns:180px 1fr;border-top:1px solid var(--line)}.settings dt,.settings dd{padding:13px 0;margin:0;border-bottom:1px solid var(--line)}.settings dt{color:var(--muted)}footer{max-width:1320px;margin:0 auto;padding:0 34px 25px;color:#909890;font-size:12px}.login-body{min-height:100vh;display:grid;place-items:center;background:#eef2ee}.login{width:min(430px,calc(100% - 36px));background:#fff;border:1px solid var(--line);padding:38px}.login-mark{color:var(--accent);font-size:12px;letter-spacing:.12em;font-weight:700}.login h1{font:36px Georgia,serif;margin:15px 0 8px}.login form{margin-top:25px}.login label{display:block;color:var(--muted);font-size:12px;margin:14px 0}.login input{width:100%;margin-top:5px}.login button{width:100%;margin-top:12px}.button{display:inline-block}.login .button{margin-top:18px} @media(max-width:900px){header{padding:0 18px;gap:16px}.brand{min-width:auto}.brand small,nav a{font-size:12px}nav{overflow:auto}.user>span{display:none}.main{padding:28px 18px 45px}.hero,.page-heading{align-items:flex-start;flex-direction:column}.hero h1,.page-heading h1{font-size:35px}.split{grid-template-columns:1fr}.rule-form{grid-template-columns:1fr 1fr}.rule-form button{grid-column:span 2}.quick-grid{grid-template-columns:1fr 1fr}}@media(max-width:620px){header{height:auto;min-height:66px;flex-wrap:wrap;padding:12px 15px}nav{order:3;flex:0 0 100%;width:100%;max-width:100%;overflow-x:auto}.metrics{grid-template-columns:1fr}.metrics>*{border-right:0;border-bottom:1px solid var(--line)}.metrics>*:last-child{border-bottom:0}.quick-grid{grid-template-columns:1fr}.rule-form{grid-template-columns:1fr}.rule-form button{grid-column:auto}.filter-bar form{align-items:stretch;flex-direction:column}.filter-bar label,.filter-bar input,.filter-bar select,.filter-bar button{width:100%}.filter-bar input,.filter-bar select{min-width:0}.panel{padding:18px}.main{padding-left:13px;padding-right:13px}.hero h1,.page-heading h1{font-size:30px}.actions{flex-direction:column}.settings dl{grid-template-columns:1fr}.settings dt{border-bottom:0;padding-bottom:3px}.settings dd{padding-top:0}.login{padding:28px 22px}}
         .pricing-board{padding:0;overflow:hidden}.pricing-board>.panel-head{padding:22px 24px 16px;margin-bottom:0}.pricing-board>.panel-head h2{margin-bottom:3px}.pricing-board>.panel-head p{margin:0}.pricing-batch-toolbar{display:flex;align-items:center;gap:10px;min-height:58px;padding:10px 24px;border-top:1px solid var(--line);background:#f7f9f7}.pricing-batch-toolbar>label{display:flex;align-items:center;gap:7px;font-weight:600;white-space:nowrap}.pricing-batch-toolbar input,.pricing-select-cell input{width:16px;height:16px;margin:0;accent-color:var(--deep)}.pricing-batch-toolbar>span{color:var(--muted);font-size:12px;white-space:nowrap}.pricing-batch-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-left:auto}.pricing-batch-actions button{padding:7px 11px;font-size:12px;white-space:nowrap}.pricing-excel-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:10px;min-height:52px;padding:8px 24px;border-top:1px solid var(--line);background:#fff}.pricing-excel-toolbar>form{display:flex;align-items:center;gap:8px;margin:0}.pricing-excel-file{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;white-space:nowrap}.pricing-excel-file input{width:min(280px,28vw);padding:5px 7px}.pricing-excel-toolbar .disabled{pointer-events:none;opacity:.48}.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.pricing-table-wrap{position:relative;overflow-x:auto}.pricing-table{min-width:1454px}.pricing-table tr[id]{scroll-margin-top:92px}.pricing-table th{white-space:nowrap}.pricing-table th,.pricing-table td{padding:12px 10px}.pricing-table tbody tr:hover{background:#fbfcfb}.pricing-table tbody tr:hover .pricing-select-cell{background:#fbfcfb}.pricing-table td{min-width:92px}.pricing-table .pricing-select-cell{position:sticky;left:0;z-index:1;min-width:44px;width:44px;text-align:center;padding-left:8px;padding-right:8px;background:#fff;box-shadow:1px 0 0 var(--line)}.pricing-table thead .pricing-select-cell{z-index:2;background:#f7f9f7}.pricing-table td:nth-child(2){min-width:105px}.pricing-table td:nth-child(3){min-width:88px}.pricing-table td:nth-child(4){min-width:92px}.pricing-table td:nth-child(5){min-width:78px}.pricing-table td:nth-child(6){min-width:130px}.pricing-table td:nth-child(7){min-width:110px}.pricing-table td:nth-child(8){min-width:88px}.pricing-table td:nth-child(9){min-width:112px}.pricing-table td:nth-child(10){min-width:235px}.pricing-table td:nth-child(11){min-width:112px}.pricing-table td:nth-child(12){min-width:130px}.pricing-table td:nth-child(13){min-width:270px}.pricing-table .image-cell img,.pricing-table .product-image-empty{width:56px;height:56px}.product-image-zoom{display:block;width:56px;height:56px;padding:0;border:0;background:transparent;cursor:zoom-in}.product-image-zoom:hover{border:0;color:inherit}.product-image-zoom:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.product-image-zoom img{display:block;object-fit:cover;border:1px solid var(--line)}.product-image-dialog{width:min(960px,calc(100vw - 40px));max-width:none;height:min(860px,calc(100vh - 40px));max-height:none;padding:0;border:1px solid #cbd5ce;border-radius:6px;background:#fff;color:var(--ink);box-shadow:0 24px 70px rgba(20,31,25,.28)}.product-image-dialog::backdrop{background:rgba(20,28,23,.72)}.product-image-dialog-frame{height:100%;display:grid;grid-template-rows:auto minmax(0,1fr)}.product-image-dialog-head{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:14px 16px 13px 20px;border-bottom:1px solid var(--line)}.product-image-dialog-head span{display:block;color:var(--accent);font-size:10px;font-weight:700;letter-spacing:.12em}.product-image-dialog-head strong{display:block;max-width:min(720px,calc(100vw - 140px));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.product-image-dialog-close{display:grid;place-items:center;width:36px;height:36px;padding:0;border-radius:4px;font-size:25px;line-height:1}.product-image-dialog-canvas{min-width:0;min-height:0;display:grid;place-items:center;padding:18px;background:#eef1ee;overflow:auto}.product-image-dialog-canvas img{display:block;max-width:100%;max-height:calc(100vh - 150px);width:auto;height:auto;object-fit:contain}.pricing-table .pricing-match-cell>small{margin-top:3px}.pricing-table .price-cell small{margin-top:3px}.pricing-table .pricing-action-cell{vertical-align:middle}.pricing-table .pricing-action-cell form{margin:0 0 7px}.pricing-table .pricing-action-cell>form:only-child{margin-bottom:0}.pricing-table .pricing-action-cell label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap}.pricing-table .pricing-action-cell input{width:110px;padding:7px 8px}.pricing-table .pricing-action-cell button{padding:7px 9px;font-size:12px;white-space:nowrap}.pricing-table .pricing-action-cell small{max-width:245px}.pricing-table .pricing-calc-form{display:flex;align-items:end;gap:6px;flex-wrap:wrap}.pricing-table .pricing-calc-form label{display:flex;flex-direction:column;align-items:stretch;gap:3px;color:var(--muted);font-size:12px;white-space:normal}.pricing-table .pricing-calc-form input{width:116px}.pricing-table .review-controls{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap}.pricing-table .review-controls>span{width:100%}.pricing-table .review-approval-form{display:grid;grid-template-columns:max-content max-content;align-items:end;gap:7px 9px}.pricing-table .review-approval-form select{width:110px;padding:7px 8px}.pricing-table .review-approval-form button{width:auto;min-width:0}.pricing-table .review-approve-button{grid-column:2;justify-self:end}.pricing-table .prepublish-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.pricing-table .prepublish-controls form{margin:0}
         .rule-form.option-rule-form{grid-template-columns:1fr 1.4fr .55fr 1.2fr auto}.pricing-table{min-width:1690px}.pricing-table td:nth-child(10){min-width:170px}.pricing-table td:nth-child(11){min-width:180px}.pricing-table td:nth-child(12){min-width:135px}.pricing-table td:nth-child(13){min-width:112px}.pricing-table td:nth-child(14){min-width:130px}.pricing-table td:nth-child(15){min-width:270px}.pricing-table .pricing-category-cell select,.pricing-table .pricing-channel-cell select,.pricing-table .pricing-calc-form select{width:145px;padding:7px 8px}.pricing-table .category-review-control{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.pricing-table .category-review-control select[hidden]{display:none}.pricing-table .category-edit-button{padding:5px 8px;font-size:12px}.pricing-table .cell-field{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:12px}.pricing-table .pricing-rule-cell .rule-summary{display:block;white-space:nowrap}.pricing-table .pricing-rule-cell .recalculate-button{display:block;margin-top:8px;white-space:nowrap}.pricing-table .pricing-category-cell small,.pricing-table .pricing-rule-cell small{margin-top:4px}
+        .cost-change-label{display:block;margin-top:5px;padding:3px 5px;background:#fff1e7;color:#98431d;font-size:11px;font-weight:700}.cost-change-controls{display:grid;gap:7px}.cost-change-controls>strong{color:#98431d}.cost-change-controls>small,.cost-change-review-note{color:#98431d}.cost-change-controls form{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.cost-change-controls form button{margin:0}
         @media(max-width:900px){.rule-form.option-rule-form{grid-template-columns:1fr 1fr}.rule-form.option-rule-form .form-actions{grid-column:span 2}}
         @media(max-width:620px){.rule-form.option-rule-form{grid-template-columns:1fr}.rule-form.option-rule-form .form-actions{grid-column:auto}.pricing-board>.panel-head{padding:18px 18px 0;align-items:flex-start}.pricing-batch-toolbar{align-items:flex-start;flex-wrap:wrap;padding:10px 18px}.pricing-batch-actions{width:100%;justify-content:flex-start;margin-left:0;overflow-x:auto}.pricing-excel-toolbar,.pricing-excel-toolbar>form{align-items:stretch;flex-direction:column}.pricing-excel-toolbar{padding:10px 18px}.pricing-excel-toolbar>a,.pricing-excel-toolbar button{width:100%}.pricing-excel-file{align-items:stretch;flex-direction:column}.pricing-excel-file input{width:100%}.pricing-table{min-width:1690px}.pricing-table th,.pricing-table td{padding:10px 9px}.pricing-table .pricing-action-cell input{width:102px}.pricing-table .pricing-action-cell button{font-size:11px;padding:6px 8px}}
         .pricing-table .pricing-image-cell{position:sticky;left:44px;z-index:1;min-width:78px;width:78px;padding-left:10px;padding-right:10px;background:#fff;box-shadow:1px 0 0 var(--line)}.pricing-table thead th:nth-child(2){position:sticky;left:44px;z-index:3;min-width:78px;width:78px;background:#f7f9f7;box-shadow:1px 0 0 var(--line)}.pricing-table tbody tr:hover .pricing-image-cell{background:#fbfcfb}.pricing-table td:nth-child(2){min-width:78px;width:78px}.pricing-table td:nth-child(3){min-width:105px}.pricing-table td:nth-child(4){min-width:88px}.pricing-table td:nth-child(5){min-width:92px}.pricing-table td:nth-child(6){min-width:130px}.pricing-table td:nth-child(7){min-width:110px}.pricing-table td:nth-child(8){min-width:88px}.pricing-table td:nth-child(9){min-width:112px}.pricing-table td:nth-child(10){min-width:170px}.pricing-table td:nth-child(11){min-width:180px}.pricing-table td:nth-child(12){min-width:112px}.pricing-table td:nth-child(13){min-width:135px}.pricing-table td:nth-child(14){min-width:270px}.pricing-table .pricing-workflow-cell{vertical-align:middle}.pricing-table .workflow-status{margin-bottom:8px}.pricing-table .workflow-actions form{margin:0 0 7px}.pricing-table .workflow-actions>form:only-child{margin-bottom:0}.pricing-table .workflow-actions label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap}.pricing-table .workflow-actions input{width:110px;padding:7px 8px}.pricing-table .workflow-actions button{padding:7px 9px;font-size:12px;white-space:nowrap}.pricing-table .workflow-actions small{max-width:245px}

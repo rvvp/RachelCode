@@ -509,6 +509,8 @@ class CatalogApplication:
                     return self.handle_status_change(environ, start_response, user, product_id)
                 if len(parts) == 3 and parts[2] == "planning-reentry" and method == "POST":
                     return self.handle_planning_reentry_decision(environ, start_response, user, product_id)
+                if len(parts) == 3 and parts[2] == "planning-revision" and method == "POST":
+                    return self.handle_planning_revision_request(environ, start_response, user, product_id)
                 if len(parts) == 3 and parts[2] == "lifecycle" and method == "POST":
                     return self.handle_lifecycle_change(environ, start_response, user, product_id)
                 if len(parts) == 3 and parts[2] == "logs" and method == "GET":
@@ -1714,7 +1716,8 @@ class CatalogApplication:
                 "workflow_gate_label": "A/B协作中",
                 "image_gate": True,
                 "cost_gate": True,
-                "eligibility_gate_version": 2,
+                "required_source_fields": ["season_year", "style_code", "style_color", "product_name", "supplier"],
+                "eligibility_gate_version": 3,
                 "count": len(products),
                 "items": products,
                 "image_updates": image_updates,
@@ -2027,6 +2030,35 @@ class CatalogApplication:
             f"/products/{product_id}?notice=" + self.urlencode_message(notice),
         )
 
+    def handle_planning_revision_request(self, environ, start_response, user, product_id: int):
+        if is_department_monitor(user) or (user.get("department") != "B" and not is_admin(user)):
+            return self.html_response(
+                start_response,
+                self.render_message_page("权限不足", "只有商品部人员可以发起二次企划。", user),
+                status="403 Forbidden",
+            )
+        product = db.get_product(self.db_path, product_id)
+        if not product or not can_see_product(user, product):
+            return self.html_response(
+                start_response,
+                self.render_message_page("记录不存在", "没有找到这条商品资料或当前账号不能处理它。", user),
+                status="404 Not Found",
+            )
+        try:
+            with db.get_connection(self.db_path) as connection:
+                request_no = db.request_planning_revision(connection, product_id, int(user["id"]))
+        except (LookupError, ValueError) as error:
+            return self.html_response(
+                start_response,
+                self.render_message_page("无法发起二次企划", str(error), user),
+                status="400 Bad Request",
+            )
+        return self.redirect(
+            start_response,
+            f"/products/{product_id}?notice="
+            + self.urlencode_message(f"已发起第 {request_no} 次企划修订，等待商品企划中心同步。"),
+        )
+
     def handle_lifecycle_change(self, environ, start_response, user, product_id: int):
         product = db.get_product(self.db_path, product_id)
         if not product:
@@ -2300,6 +2332,19 @@ class CatalogApplication:
                         continue
                     updated += 1
                     continue
+                if action == "request_planning_revision_selected":
+                    if is_department_monitor(user) or (user.get("department") != "B" and not is_admin(user)):
+                        skipped += 1
+                        self.append_bulk_skip_reason(skip_reasons, product, "只有商品部人员可以发起二次企划。")
+                        continue
+                    try:
+                        db.request_planning_revision(connection, product_id, int(user["id"]))
+                    except (LookupError, ValueError) as error:
+                        skipped += 1
+                        self.append_bulk_skip_reason(skip_reasons, product, str(error))
+                        continue
+                    updated += 1
+                    continue
                 if action == "complete_to_c_selected":
                     allowed = dict(available_status_actions(user, product))
                     if "published" not in allowed:
@@ -2446,6 +2491,8 @@ class CatalogApplication:
             action_label = "批量重回企划"
         elif action == "skip_planning_selected":
             action_label = "批量不回企划"
+        elif action == "request_planning_revision_selected":
+            action_label = "批量发起二次企划"
         elif action == "complete_to_c_selected":
             action_label = "批量提交运营部"
         elif action == "receive_selected":
@@ -10394,13 +10441,27 @@ class CatalogApplication:
                 and product.get("status") == "pending"
                 and str(product.get("planning_reentry_state") or "initial") == "decision_pending"
             ):
+                reentry_reason = str(product.get("planning_reentry_reason") or "")
+                reentry_title = "含税成本变动后重回企划" if reentry_reason == "cost_change" else "召回后重回企划"
                 planning_reentry_action_markup = (
                     f'<button class="table-action-recall" type="submit" name="decision" value="approve" '
                     f'formaction="/products/{product["id"]}/planning-reentry" formmethod="post" '
-                    f'title="确认这次召回需要重新进入商品企划中心">提交企划</button>'
+                    f'title="{reentry_title}">提交企划</button>'
                     f'<button class="table-action-disabled" type="submit" name="decision" value="skip" '
                     f'formaction="/products/{product["id"]}/planning-reentry" formmethod="post" '
-                    f'title="确认这次召回不需要重新定价、品类和渠道">无需重走</button>'
+                    f'title="确认本次变动不需要重新定价、品类和渠道">无需重走</button>'
+                )
+            elif (
+                not is_department_monitor(user)
+                and (user.get("department") == "B" or is_admin(user))
+                and product.get("status") == "pending"
+                and bool(product.get("has_planning_publication"))
+                and str(product.get("planning_reentry_state") or "initial") in {"initial", "not_required"}
+            ):
+                planning_reentry_action_markup = (
+                    f'<button class="table-action-recall" type="submit" '
+                    f'formaction="/products/{product["id"]}/planning-revision" formmethod="post" '
+                    f'title="上新价格、上新渠道或品类需要修改时，发起新的企划审核批次">二次企划</button>'
                 )
             if planning_reentry_action_markup:
                 actions.append(planning_reentry_action_markup)
@@ -10490,7 +10551,12 @@ class CatalogApplication:
             if revision_badge:
                 version_parts.append(revision_badge)
             if str(product.get("planning_reentry_state") or "initial") == "decision_pending":
-                version_parts.append('<span class="pill" style="background:rgba(178,92,46,0.13); color:#8a4324;">待判定是否重走企划</span>')
+                reason_label = (
+                    "成本变动待判断"
+                    if str(product.get("planning_reentry_reason") or "") == "cost_change"
+                    else "召回后待判断"
+                )
+                version_parts.append(f'<span class="pill" style="background:rgba(178,92,46,0.13); color:#8a4324;">{reason_label}</span>')
             if tax_price_changed:
                 version_parts.append('<span class="pill tax-price-change-badge">含税价已修改</span>')
             rows.append(
@@ -10622,7 +10688,7 @@ class CatalogApplication:
             <div class="stats products-stats-row">
               <div class="stat-card"><span>近7天新增</span><strong>{b_dashboard_stats.get('recent_submitted_to_b', 0)}</strong></div>
               <div class="stat-card"><span>A/B协作中</span><strong>{b_dashboard_stats.get('pending_completion', 0)}</strong></div>
-              <a class="stat-card stat-card-link" href="/products?marker=planning_reentry#products-list"><span>召回款重新判断</span><strong>{b_dashboard_stats.get('planning_reentry_pending', 0)}</strong><small>商品部人工判断是否重新定价</small></a>
+              <a class="stat-card stat-card-link" href="/products?marker=planning_reentry#products-list"><span>重回企划判断</span><strong>{b_dashboard_stats.get('planning_reentry_pending', 0)}</strong><small>召回或成本变动后由商品部判断</small></a>
               <div class="stat-card"><span>待运营接收</span><strong>{b_dashboard_stats.get('awaiting_receipt', 0)}</strong></div>
               <div class="stat-card"><span>近7天退回</span><strong>{b_dashboard_stats.get('recent_returned_to_a', 0)}</strong></div>
               <a class="stat-card stat-card-link" href="/products?status=workflow_restart#products-list"><span>待商品部重新提交</span><strong>{b_dashboard_stats.get('restart_required', 0)}</strong><small>点击查看需重新流转款式</small></a>
@@ -10693,7 +10759,7 @@ class CatalogApplication:
                 <option value="">全部资料标记</option>
                 <option value="completion_ready" {"selected" if marker_filter == "completion_ready" else ""}>资料完成Y</option>
                 <option value="tax_price_modified" {"selected" if marker_filter == "tax_price_modified" else ""}>含税价修改</option>
-                <option value="planning_reentry" {"selected" if marker_filter == "planning_reentry" else ""}>召回款重新判断</option>
+                <option value="planning_reentry" {"selected" if marker_filter == "planning_reentry" else ""}>重回企划判断</option>
               </select>
             """
             if b_dashboard_view
@@ -12540,11 +12606,15 @@ class CatalogApplication:
             <button type="submit" name="bulk_action" value="submit_to_planning_selected"
               form="products-bulk-form" formmethod="post" formaction="/products/bulk"
               class="ghost-button products-bulk-planning-button"
-              title="仅处理已召回且待判断的资料；确认后下次同步进入商品企划中心">批量重回企划</button>
+              title="处理召回或成本变动后待判断的资料；确认后下次同步进入商品企划中心">批量重回企划</button>
             <button type="submit" name="bulk_action" value="skip_planning_selected"
               form="products-bulk-form" formmethod="post" formaction="/products/bulk"
               class="ghost-button products-bulk-planning-button"
-              title="仅处理已召回且待判断的资料；确认本次不再进入商品企划中心">批量不回企划</button>
+              title="处理召回或成本变动后待判断的资料；确认本次不再进入商品企划中心">批量不回企划</button>
+            <button type="submit" name="bulk_action" value="request_planning_revision_selected"
+              form="products-bulk-form" formmethod="post" formaction="/products/bulk"
+              class="ghost-button products-bulk-planning-button"
+              title="仅处理已完成过企划回传、仍处于 A/B 协作中的资料">批量发起二次企划</button>
         """
         if user.get("department") == "B":
             return f"""
@@ -12801,10 +12871,17 @@ class CatalogApplication:
             and product.get("status") == "pending"
             and str(product.get("planning_reentry_state") or "initial") == "decision_pending"
         ):
+            reentry_reason = str(product.get("planning_reentry_reason") or "")
+            if reentry_reason == "cost_change":
+                reentry_heading = "含税成本变动后的企划判定"
+                reentry_description = "这条资料已完成过企划回传，当前含税成本发生变化。请由商品部判断是否需要按最新成本重新进入企划；未确认前不会自动生成新企划。"
+            else:
+                reentry_heading = "召回后的商品企划判定"
+                reentry_description = "这条资料从运营阶段召回到 A/B 协作。请由商品部判断是否需要重新进入企划；未确认前不会自动生成新企划。"
             planning_reentry_block = f"""
             <section class="panel" style="margin-top:18px;">
-              <h2>召回后的商品企划判定</h2>
-              <p class="meta">这条资料是从已完成流程召回的。请由商品部判断是否需要重新进入商品企划中心；未确认前不会同步到企划中心。</p>
+              <h2>{reentry_heading}</h2>
+              <p class="meta">{reentry_description}</p>
               <div class="tools" style="margin-bottom:0;">
                 <form method="post" action="/products/{product['id']}/planning-reentry" style="display:inline-flex; gap:10px;">
                   <input type="hidden" name="decision" value="approve">
@@ -12815,6 +12892,22 @@ class CatalogApplication:
                   <button class="ghost-button" type="submit">本次无需重走企划</button>
                 </form>
               </div>
+            </section>
+            """
+        elif (
+            not is_department_monitor(user)
+            and (user.get("department") == "B" or is_admin(user))
+            and product.get("status") == "pending"
+            and bool(product.get("has_planning_publication"))
+            and str(product.get("planning_reentry_state") or "initial") in {"initial", "not_required"}
+        ):
+            planning_reentry_block = f"""
+            <section class="panel" style="margin-top:18px;">
+              <h2>二次企划</h2>
+              <p class="meta">如需修改上新价格、上新渠道或品类，请从这里发起新的企划批次。未主动发起时，系统保留当前企划结果，不会重复同步。</p>
+              <form method="post" action="/products/{product['id']}/planning-revision">
+                <button type="submit">发起二次企划</button>
+              </form>
             </section>
             """
         status_cards = []

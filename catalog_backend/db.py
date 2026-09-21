@@ -82,7 +82,12 @@ EMPTY_DATE_MARKERS = {
 PLANNING_PUBLICATION_PAYLOAD_KEYS = frozenset(
     {
         "publication_id",
+        "source_product_id",
         "source_version_no",
+        "source_style_code",
+        "source_style_color",
+        "source_cost",
+        "planning_request_no",
         "category",
         "launch_channel",
         "launch_price",
@@ -91,7 +96,6 @@ PLANNING_PUBLICATION_PAYLOAD_KEYS = frozenset(
         "raw_price",
         "operator_name",
         "published_at",
-        "revision",
     }
 )
 PLANNING_PRODUCT_MUTABLE_FIELD_KEYS = frozenset(
@@ -274,6 +278,8 @@ def _init_db_unlocked(
                 c_release_no INTEGER NOT NULL DEFAULT 0,
                 c_published_version_no INTEGER,
                 planning_reentry_state TEXT NOT NULL DEFAULT 'initial',
+                planning_reentry_reason TEXT NOT NULL DEFAULT '',
+                planning_request_no INTEGER NOT NULL DEFAULT 0,
                 workflow_restart_required INTEGER NOT NULL DEFAULT 0,
                 workflow_restart_fields_json TEXT NOT NULL DEFAULT '[]',
                 workflow_restart_started_by INTEGER,
@@ -331,6 +337,12 @@ def _init_db_unlocked(
         if "planning_reentry_state" not in existing_columns:
             connection.execute("ALTER TABLE products ADD COLUMN planning_reentry_state TEXT NOT NULL DEFAULT 'initial'")
             existing_columns.add("planning_reentry_state")
+        if "planning_reentry_reason" not in existing_columns:
+            connection.execute("ALTER TABLE products ADD COLUMN planning_reentry_reason TEXT NOT NULL DEFAULT ''")
+            existing_columns.add("planning_reentry_reason")
+        if "planning_request_no" not in existing_columns:
+            connection.execute("ALTER TABLE products ADD COLUMN planning_request_no INTEGER NOT NULL DEFAULT 0")
+            existing_columns.add("planning_request_no")
         if "workflow_restart_required" not in existing_columns:
             connection.execute("ALTER TABLE products ADD COLUMN workflow_restart_required INTEGER NOT NULL DEFAULT 0")
             existing_columns.add("workflow_restart_required")
@@ -570,6 +582,30 @@ def _init_db_unlocked(
                 """,
                 ("migration_planning_reentry_gate_v1", utc_now()),
             )
+        # Releases before planning request batches could already contain an
+        # approved re-entry row whose new counter was added with the default
+        # value 0. Treat that existing approval as batch 1 exactly once so it
+        # remains eligible for planning-center synchronization after upgrade.
+        planning_request_migration = connection.execute(
+            "SELECT 1 FROM app_settings WHERE setting_key = ?",
+            ("migration_planning_request_no_v1",),
+        ).fetchone()
+        if not planning_request_migration:
+            connection.execute(
+                """
+                UPDATE products
+                SET planning_request_no = 1
+                WHERE planning_reentry_state = 'approved'
+                  AND COALESCE(planning_request_no, 0) = 0
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                VALUES (?, '1', ?)
+                """,
+                ("migration_planning_request_no_v1", utc_now()),
+            )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS login_attempts (
@@ -609,6 +645,10 @@ def _init_db_unlocked(
                 fixed_multiplier REAL,
                 supplier_coefficient REAL,
                 raw_price REAL,
+                source_cost REAL,
+                planning_request_no INTEGER NOT NULL DEFAULT 0,
+                source_style_code TEXT NOT NULL DEFAULT '',
+                source_style_color TEXT NOT NULL DEFAULT '',
                 operator_name TEXT NOT NULL DEFAULT '',
                 published_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'published',
@@ -622,6 +662,14 @@ def _init_db_unlocked(
         }
         if "launch_channel" not in planning_publication_columns:
             connection.execute("ALTER TABLE planning_publications ADD COLUMN launch_channel TEXT NOT NULL DEFAULT ''")
+        if "source_cost" not in planning_publication_columns:
+            connection.execute("ALTER TABLE planning_publications ADD COLUMN source_cost REAL")
+        if "planning_request_no" not in planning_publication_columns:
+            connection.execute("ALTER TABLE planning_publications ADD COLUMN planning_request_no INTEGER NOT NULL DEFAULT 0")
+        if "source_style_code" not in planning_publication_columns:
+            connection.execute("ALTER TABLE planning_publications ADD COLUMN source_style_code TEXT NOT NULL DEFAULT ''")
+        if "source_style_color" not in planning_publication_columns:
+            connection.execute("ALTER TABLE planning_publications ADD COLUMN source_style_color TEXT NOT NULL DEFAULT ''")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_planning_publications_product ON planning_publications(product_id, published_at DESC)"
         )
@@ -2729,7 +2777,11 @@ def update_product(
             actor_user_id,
             timestamp,
         )
-    if prices_differ_for_history(before_product.get("tax_included_price"), payload.get("tax_included_price")):
+    tax_cost_changed = prices_differ_for_history(
+        before_product.get("tax_included_price"),
+        payload.get("tax_included_price"),
+    )
+    if tax_cost_changed:
         record_product_price_history(
             connection,
             product_id,
@@ -2740,6 +2792,24 @@ def update_product(
             created_by=actor_user_id,
             note="含税价调整",
         )
+    planning_judgement_started = False
+    if (
+        tax_cost_changed
+        and before_product.get("status") == "pending"
+        and str(before_product.get("planning_reentry_state") or "initial") in {"initial", "not_required"}
+        and product_has_planning_publication(connection, product_id)
+    ):
+        connection.execute(
+            """
+            UPDATE products
+            SET planning_reentry_state = 'decision_pending',
+                planning_reentry_reason = 'cost_change',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (timestamp, product_id),
+        )
+        planning_judgement_started = True
     if image_only_change:
         details = "仅替换图片，图片版本已更新；业务资料版本、已有判断和流程状态保持不变。"
     elif before_product.get("status") == "pending":
@@ -2751,8 +2821,10 @@ def update_product(
         details = "更新了非重新流转字段，资料版本已更新，运营部无需重新接收。"
     else:
         details = "更新了当前负责的商品资料字段。"
-    if prices_differ_for_history(before_product.get("tax_included_price"), payload.get("tax_included_price")):
+    if tax_cost_changed:
         details += " 含税价已调整，具体变更请查看含税价历史。"
+    if planning_judgement_started:
+        details += " 该款已经完成过企划回传，现已进入是否重回企划的人工判断。"
     log_product_action(
         connection,
         product_id,
@@ -2869,7 +2941,8 @@ def change_product_status(
         """
         SELECT status, completed_to_c_at, c_release_no, current_version_no,
                c_published_version_no, workflow_restart_required,
-               received_by, received_at, planning_reentry_state
+               received_by, received_at, planning_reentry_state,
+               planning_reentry_reason, planning_request_no
         FROM products
         WHERE id = ?
         """,
@@ -2891,6 +2964,7 @@ def change_product_status(
     c_published_version_no = current_row["c_published_version_no"] if current_row else None
     workflow_restart_required = int(current_row["workflow_restart_required"] or 0) if current_row else 0
     planning_reentry_state = str(current_row["planning_reentry_state"] or "initial") if current_row else "initial"
+    planning_reentry_reason = str(current_row["planning_reentry_reason"] or "") if current_row else ""
     revision_flag = 0 if revision_flag_override is None else int(revision_flag_override)
     if current_row["status"] == "received" and status == "pending":
         create_c_recall_notices(
@@ -2902,8 +2976,10 @@ def change_product_status(
         )
     if status == "pending" and current_row["status"] in {"published", "received"}:
         planning_reentry_state = "decision_pending"
+        planning_reentry_reason = "recall"
     elif status == "published":
         planning_reentry_state = "initial"
+        planning_reentry_reason = ""
     if status == "published":
         if not current_completed_to_c_at:
             completed_to_c_at = timestamp
@@ -2927,7 +3003,7 @@ def change_product_status(
         UPDATE products
         SET status = ?, revision_flag = ?, last_reviewed_by = ?, last_reviewed_at = ?,
             completed_to_c_at = ?, c_release_no = ?, c_published_version_no = ?,
-            planning_reentry_state = ?, workflow_restart_required = ?, workflow_restart_fields_json = '[]',
+            planning_reentry_state = ?, planning_reentry_reason = ?, workflow_restart_required = ?, workflow_restart_fields_json = '[]',
             workflow_restart_started_by = NULL, workflow_restart_started_at = NULL,
             received_by = ?, received_at = ?, updated_at = ?
         WHERE id = ?
@@ -2941,6 +3017,7 @@ def change_product_status(
             c_release_no,
             c_published_version_no,
             planning_reentry_state,
+            planning_reentry_reason,
             workflow_restart_required,
             received_by,
             received_at,
@@ -2959,11 +3036,11 @@ def decide_planning_reentry(
     decision: str,
     actor_user_id: int,
 ) -> str:
-    """Record B's manual decision for a recalled product.
+    """Record B's manual decision for a recalled or cost-changed product.
 
-    A recalled product remains in the catalog's A/B collaboration state, but
-    only an explicit approval makes it eligible for the planning-center API.
-    The skip decision is persisted so a routine re-sync cannot reopen it.
+    The product remains in the catalog's A/B collaboration state, but only an
+    explicit approval makes it eligible for the planning-center API. The skip
+    decision is persisted so a routine re-sync cannot reopen it.
     """
     state_by_decision = {
         "approve": ("approved", "提交商品企划中心重新定价"),
@@ -2974,23 +3051,24 @@ def decide_planning_reentry(
         raise ValueError("商品企划重走判定无效。")
     next_state, action_label = state_by_decision[clean_decision]
     row = connection.execute(
-        "SELECT status, planning_reentry_state FROM products WHERE id = ?",
+        "SELECT status, planning_reentry_state, planning_request_no FROM products WHERE id = ?",
         (product_id,),
     ).fetchone()
     if not row:
         raise LookupError("商品资料不存在。")
     if row["status"] != "pending":
-        raise ValueError("只有处于 A/B 协作中的召回资料才能判定是否重走商品企划。")
+        raise ValueError("只有处于 A/B 协作中的资料才能判定是否重走商品企划。")
     if str(row["planning_reentry_state"] or "initial") != "decision_pending":
         raise ValueError("当前资料不在待判定是否重走商品企划节点。")
+    next_request_no = int(row["planning_request_no"] or 0) + (1 if clean_decision == "approve" else 0)
     connection.execute(
-        "UPDATE products SET planning_reentry_state = ?, updated_at = ? WHERE id = ?",
-        (next_state, utc_now(), product_id),
+        "UPDATE products SET planning_reentry_state = ?, planning_request_no = ?, updated_at = ? WHERE id = ?",
+        (next_state, next_request_no, utc_now(), product_id),
     )
     details = (
-        "商品部确认本次召回需要重新进入商品企划中心，资料将在下一次同步时进入定价、品类和渠道流程。"
+        "商品部确认本次变动需要重新进入商品企划中心，资料将在下一次同步时进入定价、品类和渠道流程。"
         if clean_decision == "approve"
-        else "商品部确认本次召回不涉及定价、品类或渠道，资料不重新进入商品企划中心。"
+        else "商品部确认本次变动不涉及定价、品类或渠道，资料不重新进入商品企划中心。"
     )
     log_product_action(
         connection,
@@ -3001,6 +3079,52 @@ def decide_planning_reentry(
         details,
     )
     return next_state
+
+
+def request_planning_revision(
+    connection: sqlite3.Connection,
+    product_id: int,
+    actor_user_id: int,
+) -> int:
+    """Explicitly open a new planning request for an already-published A/B item."""
+    row = connection.execute(
+        "SELECT * FROM products WHERE id = ?",
+        (int(product_id),),
+    ).fetchone()
+    if not row:
+        raise LookupError("商品资料不存在。")
+    if row["lifecycle_status"] != "active" or row["status"] != "pending":
+        raise ValueError("只有处于 A/B 协作中的正常资料才能发起二次企划。")
+    if not product_has_planning_publication(connection, product_id):
+        raise ValueError("当前资料尚未完成首次企划，不能发起二次企划。")
+    missing_fields = planning_source_missing_fields(dict(row))
+    if missing_fields:
+        raise ValueError("发起二次企划前请先补齐：" + "、".join(missing_fields) + "。")
+    current_state = str(row["planning_reentry_state"] or "initial")
+    if current_state == "approved":
+        return int(row["planning_request_no"] or 0)
+    if current_state == "decision_pending":
+        raise ValueError("当前资料正在等待是否重回企划的人工判断，请使用对应的判断按钮。")
+    next_request_no = int(row["planning_request_no"] or 0) + 1
+    timestamp = utc_now()
+    connection.execute(
+        """
+        UPDATE products
+        SET planning_reentry_state = 'approved', planning_reentry_reason = 'manual_revision',
+            planning_request_no = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (next_request_no, timestamp, int(product_id)),
+    )
+    log_product_action(
+        connection,
+        product_id,
+        actor_user_id,
+        "planning_revision:request",
+        "发起二次企划",
+        f"商品部在 A/B 协作阶段发起第 {next_request_no} 次企划修订，等待商品企划中心同步。",
+    )
+    return next_request_no
 
 
 def change_product_lifecycle(
@@ -3067,7 +3191,10 @@ def get_product_from_connection(connection: sqlite3.Connection, product_id: int)
     row = connection.execute(
         """
         SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
-               reviewer.display_name AS reviewer_name
+               reviewer.display_name AS reviewer_name,
+               EXISTS (
+                   SELECT 1 FROM planning_publications pp WHERE pp.product_id = p.id
+               ) AS has_planning_publication
         FROM products p
         JOIN users u ON u.id = p.created_by
         LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
@@ -3162,13 +3289,27 @@ def _planning_source_query() -> str:
         LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
         WHERE p.lifecycle_status = 'active'
           AND p.status = 'pending'
-          AND COALESCE(p.planning_reentry_state, 'initial') IN ('initial', 'approved')
+          AND (
+              COALESCE(p.planning_reentry_state, 'initial') = 'approved'
+              OR (
+                  COALESCE(p.planning_reentry_state, 'initial') = 'initial'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM planning_publications pp
+                      WHERE pp.product_id = p.id
+                  )
+              )
+          )
           AND (
               TRIM(COALESCE(p.image_url, '')) != ''
               OR TRIM(COALESCE(p.image_gallery_json, '')) NOT IN ('', '[]')
           )
           AND typeof(p.tax_included_price) IN ('integer', 'real')
           AND p.tax_included_price > 0
+          AND TRIM(COALESCE(p.season_year, '')) != ''
+          AND TRIM(COALESCE(p.style_code, '')) != ''
+          AND TRIM(COALESCE(p.style_color, '')) != ''
+          AND TRIM(COALESCE(p.product_name, '')) != ''
+          AND TRIM(COALESCE(p.supplier, '')) != ''
     """
 
 
@@ -3181,6 +3322,44 @@ def has_valid_tax_included_price(value) -> bool:
     return normalized.is_finite() and normalized > 0
 
 
+PLANNING_REQUIRED_SOURCE_FIELDS = (
+    "season_year",
+    "style_code",
+    "style_color",
+    "product_name",
+    "supplier",
+)
+
+
+def planning_source_missing_fields(product: dict) -> list[str]:
+    labels = {
+        "season_year": "年份季节",
+        "style_code": "款号",
+        "style_color": "款色",
+        "product_name": "商品名称",
+        "supplier": "供应商",
+    }
+    missing = [
+        labels[key]
+        for key in PLANNING_REQUIRED_SOURCE_FIELDS
+        if not str(product.get(key) or "").strip()
+    ]
+    if not product_has_image(product):
+        missing.append("图片")
+    if not has_valid_tax_included_price(product.get("tax_included_price")):
+        missing.append("有效含税成本")
+    return missing
+
+
+def product_has_planning_publication(connection: sqlite3.Connection, product_id: int) -> bool:
+    return bool(
+        connection.execute(
+            "SELECT 1 FROM planning_publications WHERE product_id = ? LIMIT 1",
+            (int(product_id),),
+        ).fetchone()
+    )
+
+
 def list_planning_source_products(db_path: str | Path, product_id: int | None = None) -> list[dict]:
     query = _planning_source_query()
     params: list[object] = []
@@ -3190,7 +3369,7 @@ def list_planning_source_products(db_path: str | Path, product_id: int | None = 
     query += " ORDER BY p.updated_at DESC, p.id DESC"
     with get_connection(db_path) as connection:
         rows = connection.execute(query, params).fetchall()
-    return [dict(row) for row in rows if has_valid_tax_included_price(row["tax_included_price"])]
+    return [dict(row) for row in rows if not planning_source_missing_fields(dict(row))]
 
 
 def _planning_image_url(product: dict) -> str:
@@ -3233,6 +3412,8 @@ def _planning_product_payload(product: dict) -> dict:
         "source_version_no": int(product.get("current_version_no") or 1),
         "image_version_no": int(product.get("image_version_no") or 1),
         "planning_reentry_state": str(product.get("planning_reentry_state") or "initial"),
+        "planning_reentry_reason": str(product.get("planning_reentry_reason") or ""),
+        "planning_request_no": int(product.get("planning_request_no") or 0),
         "updated_at": product.get("updated_at") or "",
         "created_at": product.get("created_at") or "",
         "creator_name": product.get("creator_name") or "",
@@ -3292,15 +3473,30 @@ def planning_withdrawn_source_ids(
                     id_chunk,
                 ).fetchall()
             )
+    publication_ids: set[int] = set()
+    with get_connection(db_path) as connection:
+        for index in range(0, len(ids), 800):
+            id_chunk = ids[index : index + 800]
+            placeholders = ", ".join("?" for _ in id_chunk)
+            publication_ids.update(
+                int(row["product_id"])
+                for row in connection.execute(
+                    f"SELECT DISTINCT product_id FROM planning_publications WHERE product_id IN ({placeholders})",
+                    id_chunk,
+                ).fetchall()
+            )
     withdrawn = []
     for row in rows:
         product = dict(row)
+        reentry_state = str(product.get("planning_reentry_state") or "initial")
         eligible = (
             product.get("lifecycle_status") == "active"
             and product.get("status") == "pending"
-            and str(product.get("planning_reentry_state") or "initial") in {"initial", "approved"}
-            and product_has_image(product)
-            and has_valid_tax_included_price(product.get("tax_included_price"))
+            and (
+                reentry_state == "approved"
+                or (reentry_state == "initial" and int(product["id"]) not in publication_ids)
+            )
+            and not planning_source_missing_fields(product)
         )
         if not eligible:
             withdrawn.append(int(product["id"]))
@@ -3323,21 +3519,9 @@ def publish_planning_price(
     product = row_to_dict(product_row)
     if not product:
         raise LookupError("商品资料不存在。")
-    if product.get("lifecycle_status") != "active":
-        raise ValueError("只有正常商品才能接收商品企划回传。")
-    if not product_has_image(product):
-        raise ValueError("回传前必须先在藏宝阁上传图片。")
-    if not has_valid_tax_included_price(product.get("tax_included_price")):
-        raise ValueError("回传前藏宝阁必须提供有效的含税采购成本。")
-    is_initial_publication = product.get("status") == "pending"
-    is_revision_publication = product.get("status") in {"published", "received"}
-    if not is_initial_publication and not is_revision_publication:
-        raise ValueError("当前商品不在可接收商品企划回传的流程状态；初次回传仅支持状态为“A/B协作中”的资料。")
-    if is_initial_publication:
-        if str(product.get("planning_reentry_state") or "initial") not in {"initial", "approved"}:
-            raise ValueError("当前召回资料尚未由商品部确认是否重走商品企划，暂不能接收企划回传。")
-    elif not payload.get("revision"):
-        raise ValueError("已完成资料只能通过商品企划中心发起修订后回传；初次回传仅支持状态为“A/B协作中”的资料。")
+    payload_product_id = int(payload.get("source_product_id") or 0)
+    if payload_product_id != int(product_id):
+        raise ValueError("回传二次校验失败：来源商品 ID 与回传目标不一致。")
     publication_id = str(payload.get("publication_id") or "").strip()
     if not publication_id:
         raise ValueError("回传必须包含企划定价记录号。")
@@ -3349,10 +3533,42 @@ def publish_planning_price(
         if int(duplicate["product_id"]) != int(product_id):
             raise ValueError("企划定价记录号已被其他商品使用。")
         return {"status": "already_published", "product_id": product_id, "publication_id": publication_id}
+    if product.get("lifecycle_status") != "active":
+        raise ValueError("只有正常商品才能接收商品企划回传。")
+    if not product_has_image(product):
+        raise ValueError("回传前必须先在藏宝阁上传图片。")
+    if not has_valid_tax_included_price(product.get("tax_included_price")):
+        raise ValueError("回传前藏宝阁必须提供有效的含税采购成本。")
+    has_prior_publication = product_has_planning_publication(connection, product_id)
+    if product.get("status") != "pending":
+        raise ValueError("商品企划回传只支持处于“A/B协作中”的资料；运营阶段资料须先召回并由商品部发起二次企划。")
+    reentry_state = str(product.get("planning_reentry_state") or "initial")
+    if has_prior_publication and reentry_state != "approved":
+        raise ValueError("当前资料尚未由商品部明确发起二次企划，不能接收新的企划回传。")
+    if not has_prior_publication and reentry_state != "initial":
+        raise ValueError("当前召回资料尚未由商品部确认是否重走商品企划，暂不能接收企划回传。")
     expected_version = int(payload.get("source_version_no") or 0)
     current_version = int(product.get("current_version_no") or 1)
     if expected_version != current_version:
         error = ValueError(f"商品资料已发生变化，请重新同步后定价。当前版本为 V{current_version}。")
+        error.code = "version_conflict"
+        raise error
+    expected_request_no = int(payload.get("planning_request_no") or 0)
+    current_request_no = int(product.get("planning_request_no") or 0)
+    if expected_request_no != current_request_no:
+        error = ValueError(
+            f"企划批次已发生变化，请重新同步后处理。当前企划请求批次为 {current_request_no}。"
+        )
+        error.code = "version_conflict"
+        raise error
+    if str(payload.get("source_style_code") or "").strip() != str(product.get("style_code") or "").strip():
+        raise ValueError("回传二次校验失败：款号与藏宝阁当前资料不一致。")
+    if str(payload.get("source_style_color") or "").strip() != str(product.get("style_color") or "").strip():
+        raise ValueError("回传二次校验失败：款色与藏宝阁当前资料不一致。")
+    if not has_valid_tax_included_price(payload.get("source_cost")):
+        raise ValueError("回传二次校验失败：缺少有效的测算成本快照。")
+    if Decimal(str(payload.get("source_cost"))) != Decimal(str(product.get("tax_included_price"))):
+        error = ValueError("藏宝阁含税成本已发生变化，请重新同步后由商品部确认是否重新测算。")
         error.code = "version_conflict"
         raise error
     category = str(payload.get("category") or "").strip()
@@ -3400,7 +3616,7 @@ def publish_planning_price(
         UPDATE products
         SET category = ?, launch_channel = ?,
             launch_price = ?, current_version_no = ?, revision_flag = 0,
-            planning_reentry_state = 'initial',
+            planning_reentry_state = 'initial', planning_reentry_reason = '',
             last_reviewed_by = ?, last_reviewed_at = ?, updated_at = ?
         WHERE id = ?
         """,
@@ -3443,8 +3659,9 @@ def publish_planning_price(
         """
         INSERT INTO planning_publications (
             product_id, publication_id, source_version_no, category, launch_channel, launch_price,
-            fixed_multiplier, supplier_coefficient, raw_price, operator_name, published_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            fixed_multiplier, supplier_coefficient, raw_price, source_cost, planning_request_no,
+            source_style_code, source_style_color, operator_name, published_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             product_id,
@@ -3456,6 +3673,10 @@ def publish_planning_price(
             payload.get("fixed_multiplier"),
             payload.get("supplier_coefficient"),
             payload.get("raw_price"),
+            float(Decimal(str(payload.get("source_cost")))),
+            expected_request_no,
+            str(product.get("style_code") or ""),
+            str(product.get("style_color") or ""),
             operator_name,
             str(payload.get("published_at") or timestamp),
         ),
@@ -3479,6 +3700,7 @@ def publish_planning_price(
         "product_id": product_id,
         "publication_id": publication_id,
         "source_version_no": expected_version,
+        "planning_request_no": expected_request_no,
         "current_version_no": next_version,
         "category": category,
         "launch_channel": launch_channel or product.get("launch_channel", ""),
@@ -4010,7 +4232,10 @@ def list_products(
         rows = connection.execute(
             """
             SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
-                   reviewer.display_name AS reviewer_name
+                   reviewer.display_name AS reviewer_name,
+                   EXISTS (
+                       SELECT 1 FROM planning_publications pp WHERE pp.product_id = p.id
+                   ) AS has_planning_publication
             FROM products p
             JOIN users u ON u.id = p.created_by
             LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by

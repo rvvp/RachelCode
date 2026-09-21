@@ -66,6 +66,53 @@ class PlanningCenterTests(unittest.TestCase):
         ).encode("utf-8") + workbook_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
         return body, f"multipart/form-data; boundary={boundary}"
 
+    def planning_publication_payload(self, source: dict, **overrides) -> dict:
+        payload = {
+            "publication_id": f"PC-TEST-{source['id']}",
+            "source_product_id": int(source["id"]),
+            "source_version_no": int(source.get("source_version_no") or source.get("current_version_no") or 1),
+            "source_style_code": str(source.get("style_code") or ""),
+            "source_style_color": str(source.get("style_color") or ""),
+            "source_cost": source.get("tax_included_price"),
+            "planning_request_no": int(source.get("planning_request_no") or 0),
+            "category": "连衣裙",
+            "launch_channel": "唯品",
+            "launch_price": 599,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_legacy_approved_reentry_gets_one_idempotent_request_batch(self):
+        product = next(item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending")
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            connection.execute(
+                """
+                UPDATE products
+                SET planning_reentry_state = 'approved', planning_request_no = 0
+                WHERE id = ?
+                """,
+                (product["id"],),
+            )
+            connection.execute(
+                "DELETE FROM app_settings WHERE setting_key = ?",
+                ("migration_planning_request_no_v1",),
+            )
+
+        init_catalog_db(self.catalog_db_path)
+        migrated = catalog_db.get_product(self.catalog_db_path, product["id"])
+        self.assertEqual(migrated["planning_reentry_state"], "approved")
+        self.assertEqual(migrated["planning_request_no"], 1)
+
+        init_catalog_db(self.catalog_db_path)
+        migrated_again = catalog_db.get_product(self.catalog_db_path, product["id"])
+        self.assertEqual(migrated_again["planning_request_no"], 1)
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            marker_count = connection.execute(
+                "SELECT COUNT(*) FROM app_settings WHERE setting_key = ?",
+                ("migration_planning_request_no_v1",),
+            ).fetchone()[0]
+        self.assertEqual(marker_count, 1)
+
     def test_internal_api_requires_token_and_publishes_with_version_check(self):
         app = CatalogApplication(self.catalog_db_path, Path(self.temp.name) / "uploads", planning_api_token="planning-secret")
         pending_product = next(
@@ -90,7 +137,11 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(payload["workflow_gate_label"], "A/B协作中")
         self.assertTrue(payload["image_gate"])
         self.assertTrue(payload["cost_gate"])
-        self.assertEqual(payload["eligibility_gate_version"], 2)
+        self.assertEqual(payload["eligibility_gate_version"], 3)
+        self.assertEqual(
+            payload["required_source_fields"],
+            ["season_year", "style_code", "style_color", "product_name", "supplier"],
+        )
         self.assertEqual({item["status"] for item in payload["items"]}, {"pending"})
         self.assertEqual({item["lifecycle_status"] for item in payload["items"]}, {"active"})
         self.assertEqual(payload["withdrawn_ids"], [])
@@ -111,17 +162,14 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(refreshed_source["current_version_no"], source["source_version_no"])
         self.assertEqual(refreshed_source["image_version_no"], before_image_version + 1)
         source = catalog_db.planning_source_payloads(self.catalog_db_path, source["id"])[0]
-        publication = {
-            "publication_id": "PC-TEST-001",
-            "source_version_no": source["source_version_no"],
-            "category": "连衣裙",
-            "launch_channel": "唯品",
-            "launch_price": 599,
-            "fixed_multiplier": 4,
-            "supplier_coefficient": 1,
-            "raw_price": 600,
-            "operator_name": "测试企划员",
-        }
+        publication = self.planning_publication_payload(
+            source,
+            publication_id="PC-TEST-001",
+            fixed_multiplier=4,
+            supplier_coefficient=1,
+            raw_price=600,
+            operator_name="测试企划员",
+        )
         protected_before = {
             field.key: refreshed_source.get(field.key)
             for field in catalog_db.PRODUCT_FIELDS
@@ -147,6 +195,29 @@ class PlanningCenterTests(unittest.TestCase):
         unchanged = catalog_db.get_product(self.catalog_db_path, source["id"])
         self.assertEqual(unchanged["style_code"], source["style_code"])
         self.assertEqual(unchanged["tax_included_price"], source["tax_included_price"])
+        callback_tampering = (
+            ("product-id", {"source_product_id": source["id"] + 999}, "400", "来源商品 ID"),
+            ("style-code", {"source_style_code": "FORGED-STYLE"}, "400", "款号"),
+            ("style-color", {"source_style_color": "FORGED-COLOR"}, "400", "款色"),
+            ("cost", {"source_cost": float(source["tax_included_price"]) + 1}, "409", "含税成本"),
+            ("request", {"planning_request_no": 999}, "409", "企划批次"),
+        )
+        for suffix, changes, expected_status, expected_message in callback_tampering:
+            with self.subTest(callback_tampering=suffix):
+                tampered = dict(publication, publication_id=f"PC-TAMPER-{suffix}", **changes)
+                tampered_response = self.wsgi_request(
+                    app,
+                    f"/api/internal/planning/products/{source['id']}/price-publication",
+                    method="POST",
+                    body=json.dumps(tampered).encode(),
+                    content_type="application/json",
+                    authorization="Bearer planning-secret",
+                )
+                self.assertTrue(tampered_response["status"].startswith(expected_status))
+                self.assertIn(expected_message, tampered_response["body"].decode("utf-8"))
+        unchanged_after_tampering = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(unchanged_after_tampering["style_code"], source["style_code"])
+        self.assertEqual(unchanged_after_tampering["tax_included_price"], source["tax_included_price"])
         fractional = self.wsgi_request(
             app,
             f"/api/internal/planning/products/{source['id']}/price-publication",
@@ -157,6 +228,21 @@ class PlanningCenterTests(unittest.TestCase):
         )
         self.assertTrue(fractional["status"].startswith("400"))
         self.assertIn("必须是大于 0 的整数", fractional["body"].decode("utf-8"))
+        stale_version = self.wsgi_request(
+            app,
+            f"/api/internal/planning/products/{source['id']}/price-publication",
+            method="POST",
+            body=json.dumps(
+                dict(
+                    publication,
+                    publication_id="PC-TEST-STALE-VERSION",
+                    source_version_no=int(source["source_version_no"]) + 1,
+                )
+            ).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(stale_version["status"].startswith("409"))
         response = self.wsgi_request(
             app,
             f"/api/internal/planning/products/{source['id']}/price-publication",
@@ -194,7 +280,8 @@ class PlanningCenterTests(unittest.TestCase):
             content_type="application/json",
             authorization="Bearer planning-secret",
         )
-        self.assertTrue(response["status"].startswith("409"))
+        self.assertTrue(response["status"].startswith("400"))
+        self.assertIn("明确发起二次企划", response["body"].decode("utf-8"))
 
         completed_product = next(
             item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "published"
@@ -204,17 +291,16 @@ class PlanningCenterTests(unittest.TestCase):
             f"/api/internal/planning/products/{completed_product['id']}/price-publication",
             method="POST",
             body=json.dumps(
-                dict(
-                    publication,
+                self.planning_publication_payload(
+                    completed_product,
                     publication_id="PC-COMPLETED-001",
-                    source_version_no=completed_product["current_version_no"],
                 )
             ).encode(),
             content_type="application/json",
             authorization="Bearer planning-secret",
         )
         self.assertTrue(rejected_completed["status"].startswith("400"))
-        self.assertIn("已完成资料", rejected_completed["body"].decode("utf-8"))
+        self.assertIn("只支持处于", rejected_completed["body"].decode("utf-8"))
 
     def test_internal_planning_api_accepts_large_known_id_payloads_by_post(self):
         app = CatalogApplication(
@@ -250,7 +336,8 @@ class PlanningCenterTests(unittest.TestCase):
                 "image_gate": True,
                 "cost_gate": True,
                 "workflow_gate_status": "pending",
-                "eligibility_gate_version": 2,
+                "required_source_fields": ["season_year", "style_code", "style_color", "product_name", "supplier"],
+                "eligibility_gate_version": 3,
             }
         ).encode("utf-8")
 
@@ -407,13 +494,11 @@ class PlanningCenterTests(unittest.TestCase):
         source = next(
             item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending"
         )
-        initial = {
-            "publication_id": "PC-REVISION-INITIAL",
-            "source_version_no": source["current_version_no"],
-            "category": "其他",
-            "launch_channel": "唯品",
-            "launch_price": 599,
-        }
+        initial = self.planning_publication_payload(
+            source,
+            publication_id="PC-REVISION-INITIAL",
+            category="其他",
+        )
         response = self.wsgi_request(
             app,
             f"/api/internal/planning/products/{source['id']}/price-publication",
@@ -423,25 +508,29 @@ class PlanningCenterTests(unittest.TestCase):
             authorization="Bearer planning-secret",
         )
         self.assertTrue(response["status"].startswith("200"))
-        b_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["username"] == "b_editor")
-        with catalog_db.get_connection(self.catalog_db_path) as connection:
-            catalog_db.change_product_status(
-                connection,
-                source["id"],
-                "published",
-                b_user["id"],
-                "填写完成，开放给运营部",
-                "测试同款修订回传。",
-            )
-        completed = catalog_db.get_product(self.catalog_db_path, source["id"])
-        revision = dict(
-            initial,
+        first_published = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(first_published["status"], "pending")
+
+        b_cookie = self.login_cookie(app, "b_editor")
+        revision_request = self.wsgi_request(
+            app,
+            f"/products/{source['id']}/planning-revision",
+            method="POST",
+            cookie=b_cookie,
+        )
+        self.assertTrue(revision_request["status"].startswith("302"))
+        requested = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(requested["planning_reentry_state"], "approved")
+        self.assertEqual(requested["planning_reentry_reason"], "manual_revision")
+        self.assertEqual(requested["planning_request_no"], 1)
+
+        revision_source = catalog_db.planning_source_payloads(self.catalog_db_path, source["id"])[0]
+        revision = self.planning_publication_payload(
+            revision_source,
             publication_id="PC-REVISION-SECOND",
-            source_version_no=completed["current_version_no"],
             category="连衣裙",
             launch_channel="天猫",
             launch_price=629,
-            revision=True,
         )
         response = self.wsgi_request(
             app,
@@ -453,31 +542,23 @@ class PlanningCenterTests(unittest.TestCase):
         )
         self.assertTrue(response["status"].startswith("200"))
         updated = catalog_db.get_product(self.catalog_db_path, source["id"])
-        self.assertEqual(updated["status"], "published")
-        self.assertEqual(updated["current_version_no"], completed["current_version_no"] + 1)
+        self.assertEqual(updated["status"], "pending")
+        self.assertEqual(updated["current_version_no"], first_published["current_version_no"] + 1)
         self.assertEqual(updated["category"], "连衣裙")
         self.assertEqual(updated["launch_channel"], "天猫")
         self.assertEqual(updated["launch_price"], 629)
-        self.assertEqual(updated["workflow_restart_required"], 1)
-        self.assertEqual(updated["c_published_version_no"], completed["c_published_version_no"])
-        c_formal = catalog_db.products_for_c_published_versions(self.catalog_db_path, [updated])[0]
-        self.assertEqual(c_formal["launch_channel"], "唯品")
-        self.assertEqual(c_formal["launch_price"], 599)
+        self.assertEqual(updated["planning_reentry_state"], "initial")
+        self.assertEqual(updated["planning_request_no"], 1)
+        self.assertEqual(updated["workflow_restart_required"], 0)
         with catalog_db.get_connection(self.catalog_db_path) as connection:
-            catalog_db.change_product_status(
-                connection,
-                source["id"],
-                "published",
-                b_user["id"],
-                "重新提交给运营部",
-                "测试企划字段触发后的新运营批次。",
-            )
-        republished = catalog_db.get_product(self.catalog_db_path, source["id"])
-        self.assertEqual(republished["workflow_restart_required"], 0)
-        self.assertEqual(republished["c_release_no"], completed["c_release_no"] + 1)
-        c_republished = catalog_db.products_for_c_published_versions(self.catalog_db_path, [republished])[0]
-        self.assertEqual(c_republished["launch_channel"], "天猫")
-        self.assertEqual(c_republished["launch_price"], 629)
+            publications = connection.execute(
+                "SELECT publication_id, planning_request_no FROM planning_publications WHERE product_id = ? ORDER BY id",
+                (source["id"],),
+            ).fetchall()
+        self.assertEqual(
+            [(row["publication_id"], row["planning_request_no"]) for row in publications],
+            [("PC-REVISION-INITIAL", 0), ("PC-REVISION-SECOND", 1)],
+        )
 
     def test_recalled_catalog_product_requires_b_decision_before_planning_sync(self):
         app = CatalogApplication(
@@ -488,13 +569,11 @@ class PlanningCenterTests(unittest.TestCase):
         source = next(
             item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "pending"
         )
-        publication = {
-            "publication_id": "PC-RECALL-GATE-INITIAL",
-            "source_version_no": source["current_version_no"],
-            "category": "其他",
-            "launch_channel": "唯品",
-            "launch_price": 599,
-        }
+        publication = self.planning_publication_payload(
+            source,
+            publication_id="PC-RECALL-GATE-INITIAL",
+            category="其他",
+        )
         response = self.wsgi_request(
             app,
             f"/api/internal/planning/products/{source['id']}/price-publication",
@@ -541,7 +620,7 @@ class PlanningCenterTests(unittest.TestCase):
             cookie=b_cookie,
         )
         decision_page_body = decision_page["body"].decode("utf-8")
-        self.assertIn("召回款重新判断", decision_page_body)
+        self.assertIn("重回企划判断", decision_page_body)
         self.assertIn("批量重回企划", decision_page_body)
         self.assertIn("批量不回企划", decision_page_body)
         self.assertLess(decision_page_body.index("批量召回"), decision_page_body.index("批量重回企划"))
@@ -603,13 +682,11 @@ class PlanningCenterTests(unittest.TestCase):
             f"/api/internal/planning/products/{source['id']}/price-publication",
             method="POST",
             body=json.dumps(
-                {
-                    "publication_id": "PC-RECALL-GATE-SKIPPED",
-                    "source_version_no": skipped["current_version_no"],
-                    "category": "其他",
-                    "launch_channel": "唯品",
-                    "launch_price": 599,
-                }
+                self.planning_publication_payload(
+                    skipped,
+                    publication_id="PC-RECALL-GATE-SKIPPED",
+                    category="其他",
+                )
             ).encode(),
             content_type="application/json",
             authorization="Bearer planning-secret",
@@ -622,6 +699,7 @@ class PlanningCenterTests(unittest.TestCase):
         source = {
             "id": 5910,
             "style_code": "REENTRY-5910",
+            "style_color": "REENTRY-5910-黑",
             "product_name": "召回重走企划测试款",
             "season_year": "2026秋冬",
             "supplier": "召回测试供应商",
@@ -633,6 +711,7 @@ class PlanningCenterTests(unittest.TestCase):
             "lifecycle_status": "active",
             "source_version_no": 1,
             "image_version_no": 1,
+            "planning_request_no": 0,
         }
         planning_db.upsert_source_products(self.planning_db_path, [source])
         published = planning_db.create_pricing_record(self.planning_db_path, source, "首次企划员")
@@ -649,6 +728,8 @@ class PlanningCenterTests(unittest.TestCase):
         approved_reentry = dict(
             source,
             planning_reentry_state="approved",
+            planning_reentry_reason="recall",
+            planning_request_no=1,
             updated_at="2026-09-21T10:00:00Z",
         )
         result = planning_db.synchronize_source_products(self.planning_db_path, [approved_reentry])
@@ -674,6 +755,7 @@ class PlanningCenterTests(unittest.TestCase):
         source = {
             "id": 5911,
             "style_code": "REENTRY-5911",
+            "style_color": "REENTRY-5911-黑",
             "product_name": "未判定召回款",
             "season_year": "2026秋冬",
             "supplier": "召回测试供应商",
@@ -688,6 +770,131 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(result["synced"], 0)
         self.assertEqual(result["rejected"], 1)
         self.assertIsNone(planning_db.get_source_product(self.planning_db_path, source["id"]))
+
+    def test_catalog_cost_change_after_publication_waits_for_b_decision(self):
+        app = CatalogApplication(
+            self.catalog_db_path,
+            Path(self.temp.name) / "uploads",
+            planning_api_token="planning-secret",
+        )
+        source = next(
+            item for item in catalog_db.planning_source_payloads(self.catalog_db_path)
+            if item["status"] == "pending"
+        )
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.publish_planning_price(
+                connection,
+                source["id"],
+                self.planning_publication_payload(
+                    source,
+                    publication_id="PC-COST-DECISION-INITIAL",
+                    category="其他",
+                ),
+                catalog_db.get_or_create_planning_service_user(connection),
+            )
+        a_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["username"] == "a_editor")
+        b_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["username"] == "b_editor")
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.update_product(
+                connection,
+                source["id"],
+                {"tax_included_price": 180},
+                a_user["id"],
+            )
+        changed = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(changed["planning_reentry_state"], "decision_pending")
+        self.assertEqual(changed["planning_reentry_reason"], "cost_change")
+        self.assertEqual(changed["planning_request_no"], 0)
+        blocked_payload = json.loads(
+            self.wsgi_request(
+                app,
+                "/api/internal/planning/products",
+                authorization="Bearer planning-secret",
+            )["body"]
+        )
+        self.assertNotIn(source["id"], {item["id"] for item in blocked_payload["items"]})
+
+        b_cookie = self.login_cookie(app, "b_editor")
+        detail = self.wsgi_request(app, f"/products/{source['id']}", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertIn("含税成本变动后的企划判定", detail)
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.decide_planning_reentry(connection, source["id"], "skip", b_user["id"])
+        skipped = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(skipped["planning_reentry_state"], "not_required")
+        self.assertEqual(skipped["planning_request_no"], 0)
+
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.update_product(
+                connection,
+                source["id"],
+                {"tax_included_price": 190},
+                a_user["id"],
+            )
+            catalog_db.decide_planning_reentry(connection, source["id"], "approve", b_user["id"])
+        approved = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(approved["planning_reentry_state"], "approved")
+        self.assertEqual(approved["planning_request_no"], 1)
+        allowed = catalog_db.planning_source_payloads(self.catalog_db_path, source["id"])
+        self.assertEqual(len(allowed), 1)
+        self.assertEqual(allowed[0]["tax_included_price"], 190)
+        self.assertEqual(allowed[0]["planning_request_no"], 1)
+
+    def test_catalog_ab_product_requires_b_to_start_one_revision_batch(self):
+        app = CatalogApplication(
+            self.catalog_db_path,
+            Path(self.temp.name) / "uploads",
+            planning_api_token="planning-secret",
+        )
+        source = next(item for item in catalog_db.planning_source_payloads(self.catalog_db_path))
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.publish_planning_price(
+                connection,
+                source["id"],
+                self.planning_publication_payload(
+                    source,
+                    publication_id="PC-MANUAL-REVISION-INITIAL",
+                    category="其他",
+                ),
+                catalog_db.get_or_create_planning_service_user(connection),
+            )
+        b_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["username"] == "b_editor")
+        b_cookie = self.login_cookie(app, "b_editor")
+        list_page = self.wsgi_request(app, "/products", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertIn(f'formaction="/products/{source["id"]}/planning-revision"', list_page)
+        self.assertIn("批量发起二次企划", list_page)
+
+        response = self.wsgi_request(
+            app,
+            "/products/bulk",
+            method="POST",
+            body=urlencode(
+                {
+                    "product_ids": str(source["id"]),
+                    "bulk_action": "request_planning_revision_selected",
+                    "return_to": "/products",
+                }
+            ).encode(),
+            cookie=b_cookie,
+        )
+        self.assertTrue(response["status"].startswith("302"))
+        requested = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(requested["planning_reentry_state"], "approved")
+        self.assertEqual(requested["planning_request_no"], 1)
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            self.assertEqual(
+                catalog_db.request_planning_revision(connection, source["id"], int(b_user["id"])),
+                1,
+            )
+        self.assertEqual(catalog_db.get_product(self.catalog_db_path, source["id"])["planning_request_no"], 1)
+
+        a_cookie = self.login_cookie(app, "a_editor")
+        forbidden = self.wsgi_request(
+            app,
+            f"/products/{source['id']}/planning-revision",
+            method="POST",
+            cookie=a_cookie,
+        )
+        self.assertTrue(forbidden["status"].startswith("403"))
 
     def test_configured_planning_channel_is_accepted_by_catalog_callback(self):
         planning_db.save_channel_option(self.planning_db_path, "直播首发", 40)
@@ -704,13 +911,12 @@ class PlanningCenterTests(unittest.TestCase):
             f"/api/internal/planning/products/{source['id']}/price-publication",
             method="POST",
             body=json.dumps(
-                {
-                    "publication_id": "PC-CONFIGURED-CHANNEL",
-                    "source_version_no": source["current_version_no"],
-                    "category": "其他",
-                    "launch_channel": "直播首发",
-                    "launch_price": 599,
-                }
+                self.planning_publication_payload(
+                    source,
+                    publication_id="PC-CONFIGURED-CHANNEL",
+                    category="其他",
+                    launch_channel="直播首发",
+                )
             ).encode(),
             content_type="application/json",
             authorization="Bearer planning-secret",
@@ -860,13 +1066,11 @@ class PlanningCenterTests(unittest.TestCase):
             f"/api/internal/planning/products/{pending['id']}/price-publication",
             method="POST",
             body=json.dumps(
-                {
-                    "publication_id": "PC-COST-GATE-REJECTED",
-                    "source_version_no": pending["current_version_no"],
-                    "category": "其他",
-                    "launch_channel": "唯品",
-                    "launch_price": 599,
-                }
+                self.planning_publication_payload(
+                    {**pending, "tax_included_price": 0},
+                    publication_id="PC-COST-GATE-REJECTED",
+                    category="其他",
+                )
             ).encode(),
             content_type="application/json",
             authorization="Bearer planning-secret",
@@ -891,6 +1095,7 @@ class PlanningCenterTests(unittest.TestCase):
         invalid = {
             "id": 4101,
             "style_code": "COST-GATE-INVALID",
+            "style_color": "COST-GATE-INVALID-黑",
             "product_name": "缺少含税价款",
             "season_year": "2027秋冬",
             "supplier": "成本门槛供应商",
@@ -938,7 +1143,10 @@ class PlanningCenterTests(unittest.TestCase):
         valid = {
             "id": 4300,
             "style_code": "STRICT-SYNC-VALID",
+            "style_color": "STRICT-SYNC-VALID-黑",
             "product_name": "严格同步有效款",
+            "season_year": "2026秋冬",
+            "supplier": "严格同步供应商",
             "actual_cost": 188,
             "tax_included_price": 188,
             "image_url": "https://example.com/images/strict-sync.jpg",
@@ -953,22 +1161,54 @@ class PlanningCenterTests(unittest.TestCase):
             dict(valid, id=4304, style_code="STRICT-SYNC-WRONG-STATUS", status="published"),
             dict(valid, id=4305, style_code="STRICT-SYNC-INACTIVE", lifecycle_status="withdrawn"),
             dict(valid, id=4306, style_code="STRICT-SYNC-RECALL-UNDECIDED", planning_reentry_state="decision_pending"),
+            dict(valid, id=4307, season_year=""),
+            dict(valid, id=4308, style_code=""),
+            dict(valid, id=4309, style_color=""),
+            dict(valid, id=4310, product_name=""),
+            dict(valid, id=4311, supplier=""),
         ]
 
         result = planning_db.synchronize_source_products(self.planning_db_path, candidates)
 
         self.assertEqual(result["synced"], 1)
-        self.assertEqual(result["rejected"], 5)
+        self.assertEqual(result["rejected"], 10)
         self.assertEqual(
             [item["id"] for item in planning_db.list_source_products(self.planning_db_path)],
             [valid["id"]],
         )
+
+    def test_large_strict_sync_is_idempotent_for_one_thousand_items(self):
+        items = [
+            {
+                "id": 10000 + index,
+                "style_code": f"BULK-{index:04d}",
+                "style_color": f"BULK-{index:04d}-黑",
+                "product_name": f"千条同步测试款 {index}",
+                "season_year": "2026秋冬",
+                "supplier": "批量同步供应商",
+                "tax_included_price": 100 + (index % 50),
+                "image_url": f"https://example.com/bulk/{index}.jpg",
+                "status": "pending",
+                "lifecycle_status": "active",
+                "source_version_no": 1,
+            }
+            for index in range(1000)
+        ]
+
+        first = planning_db.synchronize_source_products(self.planning_db_path, items)
+        second = planning_db.synchronize_source_products(self.planning_db_path, items)
+
+        self.assertEqual(first, {"synced": 1000, "removed": 0, "withdrawn": 0})
+        self.assertEqual(second, {"synced": 1000, "removed": 0, "withdrawn": 0})
+        self.assertEqual(len(planning_db.list_source_products(self.planning_db_path)), 1000)
+        self.assertEqual(planning_db.list_pricing_records(self.planning_db_path), [])
 
     def test_resync_rebases_active_pricing_record_when_only_source_version_changed(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
         source = {
             "id": 4390,
             "style_code": "REBASE-4390",
+            "style_color": "REBASE-4390-黑",
             "product_name": "版本对齐测试款",
             "season_year": "2026秋冬",
             "supplier": "对齐供应商",
@@ -989,20 +1229,37 @@ class PlanningCenterTests(unittest.TestCase):
                 (record["id"],),
             )
 
-        refreshed = dict(source, source_version_no=2, updated_at="2026-09-21T10:00:00Z")
+        refreshed = dict(
+            source,
+            source_version_no=2,
+            image_version_no=2,
+            image_url="https://example.com/rebase-professional.jpg",
+            product_name="静默更新后的商品名称",
+            season_year="2027春夏",
+            supplier="静默更新后的供应商",
+            updated_at="2026-09-21T10:00:00Z",
+        )
         result = planning_db.synchronize_source_products(self.planning_db_path, [refreshed])
 
         self.assertEqual(result["rebased"], 1)
-        self.assertEqual(
-            planning_db.get_pricing_record(self.planning_db_path, record["id"])["source_version_no"],
-            2,
-        )
+        unchanged_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+        self.assertEqual(unchanged_record["source_version_no"], 2)
+        self.assertEqual(unchanged_record["status"], "confirmed")
+        self.assertEqual(unchanged_record["product_name"], source["product_name"])
+        self.assertEqual(unchanged_record["season_year"], source["season_year"])
+        self.assertEqual(unchanged_record["supplier"], source["supplier"])
+        current_source = planning_db.get_source_product(self.planning_db_path, source["id"])
+        self.assertEqual(current_source["product_name"], refreshed["product_name"])
+        self.assertEqual(current_source["season_year"], refreshed["season_year"])
+        self.assertEqual(current_source["supplier"], refreshed["supplier"])
+        self.assertEqual(current_source["image_url"], refreshed["image_url"])
 
-    def test_resync_restarts_review_when_source_cost_changed(self):
+    def test_resync_marks_cost_change_until_planner_recalculates(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
         source = {
             "id": 4391,
             "style_code": "REBASE-4391",
+            "style_color": "REBASE-4391-黑",
             "product_name": "成本变化测试款",
             "season_year": "2026秋冬",
             "supplier": "对齐供应商",
@@ -1023,21 +1280,47 @@ class PlanningCenterTests(unittest.TestCase):
                 (record["id"],),
             )
 
-        # Catalog data can expose a corrected cost before its source version
-        # changes. This is the production failure mode that previously left a
-        # stale, confirmed pricing row blocking publication.
+        # Synchronization updates the authoritative source cost but must not
+        # silently discard an operator's review decision.
         refreshed = dict(source, actual_cost=180, tax_included_price=180)
         result = planning_db.synchronize_source_products(self.planning_db_path, [refreshed])
 
         self.assertNotIn("rebased", result)
-        self.assertEqual(result["pricing_restarted"], 1)
-        records = planning_db.list_pricing_records(self.planning_db_path)
-        self.assertEqual(len(records), 2)
-        replacement, superseded = records
-        self.assertEqual(superseded["id"], record["id"])
+        unchanged = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+        self.assertEqual(unchanged["status"], "confirmed")
+        self.assertEqual(unchanged["cost"], 150)
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_page = self.wsgi_request(
+            app,
+            "/workbench?status=confirmed",
+            cookie=self.login_cookie(app, "planner"),
+        )["body"].decode("utf-8")
+        self.assertIn("按新成本重新测算", planner_page)
+        self.assertIn("保留原上新价", planner_page)
+        self.assertNotIn(f"name='publish_ids' value='{record['id']}'", planner_page)
+        admin_page = self.wsgi_request(
+            app,
+            "/workbench?status=confirmed",
+            cookie=self.login_cookie(app, "planning_admin"),
+        )["body"].decode("utf-8")
+        self.assertIn("等待商品部初审人员处理", admin_page)
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            current_record = connection.execute(
+                "SELECT * FROM pricing_records WHERE id = ?",
+                (record["id"],),
+            ).fetchone()
+            with self.assertRaisesRegex(ValueError, "含税成本有变动"):
+                planning_db.ensure_pricing_record_cost_current(connection, current_record)
+
+        replacement = planning_db.restart_pricing_after_cost_change(
+            self.planning_db_path,
+            record["id"],
+            "recalculate",
+            "商品部初审员",
+        )
+        superseded = planning_db.get_pricing_record(self.planning_db_path, record["id"])
         self.assertEqual(superseded["status"], "superseded")
-        self.assertEqual(superseded["source_version_no"], 1)
-        self.assertIn("已生成新的审核周期", superseded["error_message"])
+        self.assertIn("含税成本已变化", superseded["error_message"])
         self.assertEqual(replacement["status"], "suggested")
         self.assertEqual(replacement["source_version_no"], 1)
         self.assertEqual(replacement["cost"], 180)
@@ -1046,8 +1329,52 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(replacement["launch_price"], 719)
 
         second_result = planning_db.synchronize_source_products(self.planning_db_path, [refreshed])
-        self.assertNotIn("pricing_restarted", second_result)
         self.assertEqual(len(planning_db.list_pricing_records(self.planning_db_path)), 2)
+
+    def test_cost_change_can_keep_existing_launch_price_for_new_review_cycle(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        source = {
+            "id": 4395,
+            "style_code": "KEEP-4395",
+            "style_color": "KEEP-4395-黑",
+            "product_name": "成本变化保留原价测试款",
+            "season_year": "2026秋冬",
+            "supplier": "保留原价供应商",
+            "category": "其他",
+            "actual_cost": 150,
+            "tax_included_price": 150,
+            "image_url": "https://example.com/keep-price.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+        record = planning_db.create_pricing_record(self.planning_db_path, source, "商品部初审员")
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                "UPDATE pricing_records SET launch_price = 639, status = 'review_pending' WHERE id = ?",
+                (record["id"],),
+            )
+        planning_db.synchronize_source_products(
+            self.planning_db_path,
+            [dict(source, actual_cost=180, tax_included_price=180)],
+        )
+
+        replacement = planning_db.restart_pricing_after_cost_change(
+            self.planning_db_path,
+            record["id"],
+            "keep_price",
+            "商品部初审员",
+        )
+
+        self.assertEqual(replacement["status"], "suggested")
+        self.assertEqual(replacement["cost"], 180)
+        self.assertEqual(replacement["calculated_price"], 719)
+        self.assertEqual(replacement["launch_price"], 639)
+        self.assertEqual(
+            planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"],
+            "superseded",
+        )
 
     def test_image_only_resync_rebases_active_pricing_record_version(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
@@ -1185,16 +1512,18 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(failed_record["status"], "conflict")
         self.assertIn("含税成本未发生变化", failed_record["error_message"])
 
-    def test_planning_revision_reuses_same_source_and_is_visible_in_published_filter(self):
+    def test_planning_revision_must_be_requested_in_catalog_and_reuses_same_source(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
         source = {
             "id": 901,
             "style_code": "REV-901",
+            "style_color": "REV-901-黑",
             "product_name": "修订测试毛衣",
             "season_year": "2026秋冬",
             "supplier": "修订供应商",
             "category": "其他",
             "actual_cost": 150,
+            "tax_included_price": 150,
             "image_url": "https://example.com/images/rev-901.jpg",
             "status": "pending",
             "lifecycle_status": "active",
@@ -1215,8 +1544,8 @@ class PlanningCenterTests(unittest.TestCase):
         app = PlanningApplication(self.planning_db_path, "http://catalog.test")
         planner_cookie = self.login_cookie(app, "planner")
         page = self.wsgi_request(app, "/workbench?status=published", cookie=planner_cookie)["body"].decode("utf-8")
-        self.assertIn("发起同款修订", page)
-        self.assertIn(f"action='/pricing/{source['id']}/revise'", page)
+        self.assertNotIn("发起同款修订", page)
+        self.assertIn("请先在藏宝阁发起二次企划", page)
 
         response = self.wsgi_request(
             app,
@@ -1224,17 +1553,30 @@ class PlanningCenterTests(unittest.TestCase):
             method="POST",
             cookie=planner_cookie,
         )
-        self.assertTrue(response["status"].startswith("302"))
+        self.assertTrue(response["status"].startswith("400"))
+        self.assertIn("必须先在藏宝阁", response["body"].decode("utf-8"))
+        self.assertEqual(len(planning_db.list_pricing_records(self.planning_db_path)), 1)
+
+        approved = dict(
+            source,
+            status="pending",
+            lifecycle_status="active",
+            planning_reentry_state="approved",
+            planning_reentry_reason="manual_revision",
+            planning_request_no=1,
+        )
+        sync_result = planning_db.synchronize_source_products(self.planning_db_path, [approved])
+        self.assertEqual(sync_result["revisions_started"], 1)
         records = planning_db.list_pricing_records(self.planning_db_path)
         self.assertEqual(len(records), 2)
         self.assertEqual({record["source_product_id"] for record in records}, {source["id"]})
         self.assertEqual(planning_db.get_source_product(self.planning_db_path, source["id"])["lifecycle_status"], "active")
-        sync_result = planning_db.synchronize_source_products(
+        withdrawn_result = planning_db.synchronize_source_products(
             self.planning_db_path,
             [],
             withdrawn_ids=[source["id"]],
         )
-        self.assertEqual(sync_result, {"synced": 0, "removed": 0, "withdrawn": 0})
+        self.assertEqual(withdrawn_result, {"synced": 0, "removed": 0, "withdrawn": 0})
         self.assertEqual(planning_db.get_source_product(self.planning_db_path, source["id"])["lifecycle_status"], "active")
 
     def test_planning_image_proxy_uses_internal_catalog_endpoint(self):
@@ -1914,7 +2256,7 @@ class PlanningCenterTests(unittest.TestCase):
         login = self.wsgi_request(app, "/login", method="POST", body=urlencode({"username": "planner", "password": "demo123"}).encode())
         self.assertTrue(login["status"].startswith("302"))
         cookie = dict(login["headers"])["Set-Cookie"].split(";", 1)[0]
-        source = {"id": 9, "style_code": "M009", "product_name": "测试款", "season_year": "2026秋", "supplier": "供应商", "category": "其他", "actual_cost": 150, "tax_included_price": 150, "image_url": "https://example.com/images/m009.jpg", "status": "pending", "lifecycle_status": "active", "source_version_no": 1, "updated_at": "", "creator_name": "跟单员"}
+        source = {"id": 9, "style_code": "M009", "style_color": "M009-黑", "product_name": "测试款", "season_year": "2026秋", "supplier": "供应商", "category": "其他", "actual_cost": 150, "tax_included_price": 150, "image_url": "https://example.com/images/m009.jpg", "status": "pending", "lifecycle_status": "active", "source_version_no": 1, "updated_at": "", "creator_name": "跟单员"}
         withdrawn_source = dict(source, id=10, style_code="M010", product_name="误同步的已完成款")
         planning_db.upsert_source_products(self.planning_db_path, [withdrawn_source])
         with patch.object(app, "fetch_catalog_products", return_value={"source": "cangbaoge", "items": [source]}):
@@ -1931,7 +2273,8 @@ class PlanningCenterTests(unittest.TestCase):
             "workflow_gate_status": "pending",
             "image_gate": True,
             "cost_gate": True,
-            "eligibility_gate_version": 2,
+            "required_source_fields": ["season_year", "style_code", "style_color", "product_name", "supplier"],
+            "eligibility_gate_version": 3,
         }
         with patch.object(app, "fetch_catalog_products", return_value=catalog_payload):
             response = self.wsgi_request(app, "/sync", method="POST", cookie=cookie)
@@ -1967,7 +2310,8 @@ class PlanningCenterTests(unittest.TestCase):
             "workflow_gate_status": "pending",
             "image_gate": True,
             "cost_gate": True,
-            "eligibility_gate_version": 2,
+            "required_source_fields": ["season_year", "style_code", "style_color", "product_name", "supplier"],
+            "eligibility_gate_version": 3,
         }
 
         def delayed_fetch(*args, **kwargs):
@@ -2063,6 +2407,7 @@ class PlanningCenterTests(unittest.TestCase):
         pending = {
             "id": 201,
             "style_code": "SYNC-201",
+            "style_color": "SYNC-201-黑",
             "product_name": "A/B协作中的针织款",
             "season_year": "2026秋冬",
             "supplier": "同步供应商",
@@ -3053,7 +3398,8 @@ class PlanningCenterTests(unittest.TestCase):
                 "workflow_gate_status": "pending",
                 "image_gate": True,
                 "cost_gate": True,
-                "eligibility_gate_version": 2,
+                "required_source_fields": ["season_year", "style_code", "style_color", "product_name", "supplier"],
+                "eligibility_gate_version": 3,
             },
         ):
             self.wsgi_request(app, "/sync", method="POST", cookie=planner_cookie)
@@ -3844,11 +4190,16 @@ class PlanningCenterTests(unittest.TestCase):
         product = {
             "id": 35,
             "style_code": "M035",
+            "style_color": "M035-黑",
             "product_name": "默认测算价",
             "season_year": "2026秋冬",
             "supplier": "供应商",
             "category": "其他",
             "actual_cost": 150,
+            "tax_included_price": 150,
+            "image_url": "https://example.com/m035.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
             "source_version_no": 1,
         }
         planning_db.upsert_source_products(self.planning_db_path, [product])
