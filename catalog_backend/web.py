@@ -338,6 +338,8 @@ class CatalogApplication:
                 if product_id_text.isdigit():
                     return self.handle_planning_publication_api(environ, start_response, int(product_id_text))
                 return self.json_error_response(start_response, "not_found", "商品编号格式不正确。", "404 Not Found")
+            if path == "/api/internal/planning/style-publications" and method == "POST":
+                return self.handle_planning_style_publications_api(environ, start_response)
             if not user:
                 return self.redirect(start_response, "/login")
             if path == "/profile/password":
@@ -1830,6 +1832,33 @@ class CatalogApplication:
                 result = db.publish_planning_price(connection, product_id, payload, actor_id)
             if result.get("status") == "already_published":
                 return self.json_response(start_response, result, "200 OK")
+            return self.json_response(start_response, result, "200 OK")
+        except LookupError as error:
+            return self.json_error_response(start_response, "not_found", str(error), "404 Not Found")
+        except ValueError as error:
+            code = getattr(error, "code", "invalid_request")
+            status = "409 Conflict" if code == "version_conflict" else "400 Bad Request"
+            return self.json_error_response(start_response, code, str(error), status)
+
+    def handle_planning_style_publications_api(self, environ, start_response):
+        if not self.planning_api_token:
+            return self.json_error_response(start_response, "not_configured", "商品企划内部接口尚未配置 Token。", "503 Service Unavailable")
+        if not self.planning_api_authorized(environ):
+            return self.json_error_response(start_response, "unauthorized", "需要有效的商品企划内部 Token。", "401 Unauthorized")
+        try:
+            body = self.parse_json_body(environ)
+            style_code = str(body.get("style_code") or "").strip()
+            publications = body.get("publications")
+            if not isinstance(publications, list):
+                raise ValueError("整款回传必须提供款色资料列表。")
+            with db.get_connection(self.db_path) as connection:
+                actor_id = db.get_or_create_planning_service_user(connection)
+                result = db.publish_planning_style(
+                    connection,
+                    style_code,
+                    publications,
+                    actor_id,
+                )
             return self.json_response(start_response, result, "200 OK")
         except LookupError as error:
             return self.json_error_response(start_response, "not_found", str(error), "404 Not Found")

@@ -379,6 +379,10 @@ class PlanningApplication:
             cleanup.append(f"同时对齐 {int(result['rebased'])} 条未回传定价的来源版本")
         if result.get("revisions_started"):
             cleanup.append(f"其中 {int(result['revisions_started'])} 条召回资料已生成新的待初审周期")
+        if result.get("publications_acknowledged"):
+            cleanup.append(f"修复 {int(result['publications_acknowledged'])} 条已由藏宝阁接收的历史回传状态")
+        if result.get("publication_requests_rebased"):
+            cleanup.append(f"放行 {int(result['publication_requests_rebased'])} 条已批准企划批次的历史待回传资料")
         if cleanup:
             message += "；".join(cleanup) + "。"
         return message
@@ -1209,25 +1213,23 @@ class PlanningApplication:
             if record["status"] not in {"confirmed", "conflict"}:
                 raise ValueError(f"{record['style_code'] or record['product_name']} 尚未完成复核。")
         published = []
-        failed = []
+        failed_styles = []
+        handled_style_keys = set()
         for record in records:
+            style_code = str(record.get("style_code") or "").strip()
+            style_key = style_code or f"record:{int(record['id'])}"
+            if style_key in handled_style_keys:
+                continue
+            handled_style_keys.add(style_key)
             try:
-                updated = self.publish_pricing_record(record, user)
+                published.extend(self.publish_pricing_style(record, user))
             except (LookupError, ValueError) as error:
-                updated = db.mark_record_published(
-                    self.db_path,
-                    record["id"],
-                    {"status": "failed", "message": str(error)},
-                )
-            if updated["status"] == "published":
-                published.append(updated)
-            else:
-                failed.append(updated)
-        query = {"notice": f"已批量回传 {len(published)} 款上新定价。"}
+                failed_styles.append((style_code or record["product_name"], str(error)))
+        query = {"notice": f"已批量回传 {len(published)} 个款色，均按款号整款提交。"}
         if search_filter:
             query["search"] = search_filter
-        if failed:
-            query["error"] = f"有 {len(failed)} 款回传失败，请查看版本冲突状态后重新处理。"
+        if failed_styles:
+            query["error"] = f"有 {len(failed_styles)} 个款号整款回传失败，已保持全部待回传状态。"
         return self.redirect(start_response, "/workbench?" + urlencode(query))
 
     def handle_publish(self, start_response, user, record_id: int):
@@ -1238,19 +1240,21 @@ class PlanningApplication:
         if record["status"] not in {"confirmed", "conflict"}:
             raise ValueError("请先完成复核后再回传。")
         try:
-            updated = self.publish_pricing_record(record, user)
-        except ValueError as error:
+            updated_records = self.publish_pricing_style(record, user)
+        except (LookupError, ValueError) as error:
             return self.redirect(
                 start_response,
                 "/workbench?status=confirmed&error="
                 + self.q(str(error))
                 + f"#pricing-row-{int(record['source_product_id'])}",
             )
-        if updated["status"] == "published":
-            return self.redirect(start_response, "/workbench?notice=" + self.q("上新价格已发布回藏宝阁。"))
-        return self.redirect(start_response, "/workbench?error=" + self.q(updated.get("error_message") or "回传失败，请重新同步后处理。"))
+        return self.redirect(
+            start_response,
+            "/workbench?notice="
+            + self.q(f"{record['style_code']} 已整款回传藏宝阁，共 {len(updated_records)} 个款色。"),
+        )
 
-    def publish_pricing_record(self, record: dict, user: dict) -> dict:
+    def pricing_publication_payload(self, record: dict, user: dict) -> dict:
         if not self.catalog_api_token:
             raise ValueError("尚未配置藏宝阁内部 Token。")
         source = db.get_source_product(self.db_path, int(record["source_product_id"])) or {}
@@ -1268,14 +1272,25 @@ class PlanningApplication:
         category = db.validate_category_option(self.db_path, record.get("category", ""))
         channel = db.validate_channel_option(self.db_path, record.get("channel", ""))
         launch_price = db.validated_launch_price(record.get("launch_price"))
-        payload = {
+        source_request_no = int(source.get("planning_request_no") or 0)
+        record_request_no = int(record.get("planning_request_no") or 0)
+        effective_request_no = record_request_no
+        if (
+            str(source.get("planning_reentry_state") or "initial") == "approved"
+            and source_request_no > record_request_no
+        ):
+            # Compatibility for reviewed records stranded by the former
+            # per-color callback. Catalog approval is still required; this
+            # only binds the reviewed row to that already-approved batch.
+            effective_request_no = source_request_no
+        return {
             "publication_id": record["publication_id"],
             "source_product_id": int(record["source_product_id"]),
             "source_version_no": record["source_version_no"],
             "source_style_code": str(source.get("style_code") or ""),
             "source_style_color": str(source.get("style_color") or ""),
             "source_cost": source_cost,
-            "planning_request_no": int(record.get("planning_request_no") or 0),
+            "planning_request_no": effective_request_no,
             "category": category,
             "launch_channel": channel,
             "launch_price": launch_price,
@@ -1284,9 +1299,50 @@ class PlanningApplication:
             "raw_price": record["raw_price"],
             "operator_name": user.get("display_name", "商品企划中心"),
         }
+
+    def publish_pricing_style(self, record: dict, user: dict) -> list[dict]:
+        style_code = str(record.get("style_code") or "").strip()
+        if not style_code:
+            raise ValueError("当前资料缺少款号，不能执行整款回传。")
+        style_records = db.list_latest_style_pricing_records(self.db_path, style_code)
+        source_count = db.count_style_source_products(self.db_path, style_code)
+        if len(style_records) != source_count:
+            raise ValueError("同款仍有款色尚未生成定价记录，请先完成全部款色的测算、初审和复核。")
+        unfinished = [
+            item
+            for item in style_records
+            if str(item.get("status") or "") not in {"confirmed", "conflict", "published"}
+        ]
+        if unfinished:
+            raise ValueError(f"同款仍有 {len(unfinished)} 个款色尚未完成复核，整款暂不回传。")
+        pending_records = [
+            item
+            for item in style_records
+            if str(item.get("status") or "") in {"confirmed", "conflict"}
+        ]
+        if not pending_records:
+            return []
+        style_values = {
+            (
+                str(item.get("category") or "").strip(),
+                str(item.get("channel") or "").strip(),
+                db.validated_launch_price(item.get("launch_price")),
+            )
+            for item in pending_records
+        }
+        if len(style_values) != 1:
+            raise ValueError("同款各颜色的品类、渠道或上新价不一致，请先统一复核结果后再整款回传。")
+        try:
+            payloads = [self.pricing_publication_payload(item, user) for item in pending_records]
+        except (LookupError, ValueError) as error:
+            db.mark_style_publish_failed(self.db_path, pending_records, str(error))
+            raise
         request = Request(
-            f"{self.catalog_api_url}/api/internal/planning/products/{record['source_product_id']}/price-publication",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            f"{self.catalog_api_url}/api/internal/planning/style-publications",
+            data=json.dumps(
+                {"style_code": style_code, "publications": payloads},
+                ensure_ascii=False,
+            ).encode("utf-8"),
             headers={"Authorization": f"Bearer {self.catalog_api_token}", "Content-Type": "application/json", "Accept": "application/json"},
             method="POST",
         )
@@ -1298,18 +1354,42 @@ class PlanningApplication:
                 error_payload = json.loads(error.read().decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 error_payload = {}
-            result = {
-                "status": "conflict" if error.code == 409 else "failed",
-                "message": error_payload.get("message") or f"回传藏宝阁失败：HTTP {error.code}",
-            }
+            message = error_payload.get("message") or f"回传藏宝阁失败：HTTP {error.code}"
+            db.mark_style_publish_failed(self.db_path, pending_records, message)
+            raise ValueError(message)
         except Exception as error:
-            result = {"status": "failed", "message": f"回传藏宝阁失败：{error}"}
-        if isinstance(result, dict) and result.get("error"):
-            result = {"status": "conflict" if result.get("error") == "version_conflict" else "failed", "message": result.get("message", "回传失败")}
-        return db.mark_record_published(
-            self.db_path,
-            record["id"],
-            result if isinstance(result, dict) else {"status": "failed", "message": "返回内容异常"},
+            message = f"回传藏宝阁失败：{error}"
+            db.mark_style_publish_failed(self.db_path, pending_records, message)
+            raise ValueError(message)
+        response_results = result.get("results") if isinstance(result, dict) else None
+        if not isinstance(response_results, list):
+            if len(pending_records) == 1 and isinstance(result, dict) and result.get("status") in {"published", "already_published"}:
+                response_results = [{**result, "source_product_id": int(pending_records[0]["source_product_id"])}]
+            else:
+                message = "藏宝阁整款回传返回内容不完整。"
+                db.mark_style_publish_failed(self.db_path, pending_records, message)
+                raise ValueError(message)
+        results_by_source_id = {
+            int(item.get("source_product_id") or item.get("product_id") or 0): item
+            for item in response_results
+            if isinstance(item, dict)
+        }
+        try:
+            return db.mark_style_records_published(
+                self.db_path,
+                pending_records,
+                results_by_source_id,
+            )
+        except ValueError as error:
+            db.mark_style_publish_failed(self.db_path, pending_records, str(error))
+            raise
+
+    def publish_pricing_record(self, record: dict, user: dict) -> dict:
+        """Backward-compatible wrapper; publication is now always style-atomic."""
+        updated = self.publish_pricing_style(record, user)
+        return next(
+            (item for item in updated if int(item["id"]) == int(record["id"])),
+            record,
         )
 
     def handle_category_option(self, environ, start_response, user):
@@ -1518,7 +1598,7 @@ class PlanningApplication:
           <ul class='system-rule-list'>
             <li><strong>商品部初审人员：</strong>同步资料、测算价格、确认或修改价格/品类/渠道、提交复核、复核前撤回，以及复核通过后的人工回传。</li>
             <li><strong>企划管理员：</strong>复核上新价格和上新渠道，可先保存修改再复核通过；不负责与藏宝阁之间的传输动作。</li>
-            <li><strong>同款多款色：</strong>价格和渠道按款号统一，页面保存和复核通过时同步处理同款号的全部款色；Excel 导入导出仍按款色逐行核对。</li>
+            <li><strong>同款多款色：</strong>价格和渠道按款号统一，页面保存和复核通过时同步处理同款号的全部款色；回传时也按款号整款提交，全部款色要么同时成功、要么全部不写入。Excel 导入导出仍按款色逐行核对。</li>
           </ul>
         </section>
         <section class='panel system-rule-section' id='source-changes'>
@@ -1555,6 +1635,7 @@ class PlanningApplication:
           <ul class='system-rule-list'>
             <li>系统以藏宝阁内部商品 ID 作为稳定主键，款号、款色用于展示和回传前的二次核对，不使用名称文本代替主键。</li>
             <li>回传时校验来源版本和当前企划批次，使用唯一回传记录号保证重复点击不会重复写入。</li>
+            <li>同款号所有颜色使用一个事务回传；任一颜色缺少资料、尚未复核或校验失败时，藏宝阁不会写入该款任何新结果。</li>
             <li>发现来源版本、商品身份或批次不一致时停止回传，保留当前资料并显示明确错误，不用旧资料覆盖藏宝阁新资料。</li>
           </ul>
         </section>
@@ -1878,7 +1959,7 @@ class PlanningApplication:
                 elif record_status == "review_pending" and user.get("role") == "planner":
                     controls = f"<form class='table-action-form' method='post' action='/pricing/{record['id']}/withdraw-review' onsubmit=\"return confirm('确认撤回该款式的复核申请吗？撤回后可修改并再次提交。');\"><button type='submit'>撤回</button></form>"
                 elif record_status == "confirmed" and user.get("role") == "planner":
-                    controls = f"<div class='prepublish-controls'><form class='table-action-form' method='post' action='/pricing/{record['id']}/reopen'><button type='submit'>修改</button></form><form class='table-action-form' method='post' action='/pricing/{record['id']}/publish'><button class='primary' type='submit'>回传藏宝阁</button></form></div>"
+                    controls = f"<div class='prepublish-controls'><form class='table-action-form' method='post' action='/pricing/{record['id']}/reopen'><button type='submit'>修改</button></form><form class='table-action-form' method='post' action='/pricing/{record['id']}/publish'><button class='primary' type='submit' title='自动提交同款号全部已复核款色'>整款回传藏宝阁</button></form></div>"
                 elif record_status == "confirmed" and user.get("role") == "admin":
                     controls = "<span class='review-note'>复核已通过，待商品部回传</span>"
                 elif record_status == "published" and user.get("role") == "planner":

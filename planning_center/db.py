@@ -986,6 +986,79 @@ def rebase_pricing_record_source_versions(
     return rebased
 
 
+def reconcile_catalog_publication_state(
+    db_path: str | Path,
+    items: list[dict] | tuple[dict, ...],
+) -> dict[str, int]:
+    """Repair legacy half-finished callbacks without reopening reviewed work."""
+    acknowledged = 0
+    request_rebased = 0
+    seen_ids: set[int] = set()
+    with get_connection(db_path) as connection:
+        for source in items:
+            source_id = int(source.get("id") or 0)
+            if source_id <= 0 or source_id in seen_ids:
+                continue
+            seen_ids.add(source_id)
+            row = connection.execute(
+                "SELECT * FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (source_id,),
+            ).fetchone()
+            if not row or str(row["status"] or "") not in {"confirmed", "conflict"}:
+                continue
+            record = dict(row)
+            source_request_no = int(source.get("planning_request_no") or 0)
+            publication_request_no = int(source.get("planning_last_publication_request_no") or 0)
+            publication_id = str(source.get("planning_last_publication_id") or "").strip()
+            publication_matches = bool(
+                publication_id
+                and publication_request_no == source_request_no
+                and (
+                    publication_id == str(record.get("publication_id") or "").strip()
+                    or (
+                        str(source.get("planning_last_publication_category") or "").strip()
+                        == str(record.get("category") or "").strip()
+                        and str(source.get("planning_last_publication_channel") or "").strip()
+                        == str(record.get("channel") or "").strip()
+                        and positive_decimal_value(source.get("planning_last_publication_price"))
+                        == positive_decimal_value(record.get("launch_price"))
+                    )
+                )
+            )
+            if publication_matches:
+                connection.execute(
+                    """
+                    UPDATE pricing_records
+                    SET status = 'published', planning_request_no = ?,
+                        published_at = COALESCE(published_at, ?), error_message = ''
+                    WHERE id = ?
+                    """,
+                    (publication_request_no, utc_now(), int(record["id"])),
+                )
+                acknowledged += 1
+                continue
+            if (
+                str(source.get("planning_reentry_state") or "initial") == "approved"
+                and source_request_no > int(record.get("planning_request_no") or 0)
+                and _pricing_record_can_follow_source(record, source)
+            ):
+                connection.execute(
+                    """
+                    UPDATE pricing_records
+                    SET status = 'confirmed', planning_request_no = ?,
+                        source_version_no = ?, error_message = ''
+                    WHERE id = ?
+                    """,
+                    (
+                        source_request_no,
+                        int(source.get("source_version_no") or record.get("source_version_no") or 1),
+                        int(record["id"]),
+                    ),
+                )
+                request_rebased += 1
+    return {"acknowledged": acknowledged, "request_rebased": request_rebased}
+
+
 def synchronize_source_products(
     db_path: str | Path,
     items: list[dict],
@@ -1030,6 +1103,10 @@ def synchronize_source_products(
         start_pricing_revision(db_path, source_id, operator)
         revisions_started += 1
     rebased = rebase_pricing_record_source_versions(
+        db_path,
+        [*eligible_items, *list(image_updates)],
+    )
+    publication_reconciliation = reconcile_catalog_publication_state(
         db_path,
         [*eligible_items, *list(image_updates)],
     )
@@ -1089,6 +1166,10 @@ def synchronize_source_products(
         result["rebased"] = rebased
     if revisions_started:
         result["revisions_started"] = revisions_started
+    if publication_reconciliation["acknowledged"]:
+        result["publications_acknowledged"] = publication_reconciliation["acknowledged"]
+    if publication_reconciliation["request_rebased"]:
+        result["publication_requests_rebased"] = publication_reconciliation["request_rebased"]
     return result
 
 
@@ -1753,6 +1834,39 @@ def get_pricing_record(db_path: str | Path, record_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+def list_latest_style_pricing_records(db_path: str | Path, style_code: str) -> list[dict]:
+    clean_style_code = str(style_code or "").strip()
+    if not clean_style_code:
+        return []
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT pr.*
+            FROM source_products sp
+            JOIN pricing_records pr ON pr.id = (
+                SELECT candidate.id
+                FROM pricing_records candidate
+                WHERE candidate.source_product_id = sp.id
+                ORDER BY candidate.created_at DESC, candidate.id DESC
+                LIMIT 1
+            )
+            WHERE TRIM(sp.style_code) = ?
+            ORDER BY sp.id
+            """,
+            (clean_style_code,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def count_style_source_products(db_path: str | Path, style_code: str) -> int:
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM source_products WHERE TRIM(style_code) = ?",
+            (str(style_code or "").strip(),),
+        ).fetchone()
+    return int(row[0] or 0)
+
+
 def import_initial_review_edits(db_path: str | Path, rows: list[dict], operator_name: str) -> int:
     """Validate and atomically save Excel edits without advancing the workflow."""
     if not rows:
@@ -2144,6 +2258,61 @@ def mark_record_published(db_path: str | Path, record_id: int, result: dict) -> 
             connection.execute("UPDATE pricing_records SET status = 'conflict', error_message = ? WHERE id = ?", (result.get("message") or "回传失败", record_id))
         row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
     return dict(row)
+
+
+def mark_style_records_published(
+    db_path: str | Path,
+    records: list[dict],
+    results_by_source_id: dict[int, dict],
+) -> list[dict]:
+    updated = []
+    with get_connection(db_path) as connection:
+        for record in records:
+            source_id = int(record["source_product_id"])
+            result = results_by_source_id.get(source_id)
+            if not result or result.get("status") not in {"published", "already_published"}:
+                raise ValueError("藏宝阁整款回传结果不完整，企划中心未更新任何款色状态。")
+        for record in records:
+            source_id = int(record["source_product_id"])
+            result = results_by_source_id[source_id]
+            connection.execute(
+                """
+                UPDATE pricing_records
+                SET status = 'published', planning_request_no = ?,
+                    published_at = ?, error_message = ''
+                WHERE id = ?
+                """,
+                (
+                    int(result.get("planning_request_no", record.get("planning_request_no")) or 0),
+                    result.get("published_at") or utc_now(),
+                    int(record["id"]),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM pricing_records WHERE id = ?",
+                (int(record["id"]),),
+            ).fetchone()
+            updated.append(dict(row))
+    return updated
+
+
+def mark_style_publish_failed(db_path: str | Path, records: list[dict], message: str) -> None:
+    record_ids = sorted({int(record["id"]) for record in records})
+    if not record_ids:
+        return
+    with get_connection(db_path) as connection:
+        for index in range(0, len(record_ids), 800):
+            chunk = record_ids[index : index + 800]
+            placeholders = ", ".join("?" for _ in chunk)
+            connection.execute(
+                f"""
+                UPDATE pricing_records
+                SET status = 'confirmed', error_message = ?
+                WHERE id IN ({placeholders})
+                  AND status IN ('confirmed', 'conflict')
+                """,
+                [str(message or "整款回传失败。"), *chunk],
+            )
 
 
 def pricing_stats(db_path: str | Path, season_year: str = "", category: str = "") -> list[dict]:

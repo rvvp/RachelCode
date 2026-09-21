@@ -280,8 +280,8 @@ class PlanningCenterTests(unittest.TestCase):
             content_type="application/json",
             authorization="Bearer planning-secret",
         )
-        self.assertTrue(response["status"].startswith("400"))
-        self.assertIn("明确发起二次企划", response["body"].decode("utf-8"))
+        self.assertTrue(response["status"].startswith("200"))
+        self.assertEqual(json.loads(response["body"])["status"], "already_published")
 
         completed_product = next(
             item for item in catalog_db.list_products(self.catalog_db_path) if item["status"] == "published"
@@ -323,6 +323,237 @@ class PlanningCenterTests(unittest.TestCase):
         payload = json.loads(response["body"].decode("utf-8"))
         self.assertEqual(payload["source"], "cangbaoge")
         self.assertTrue(any(item["id"] == product["id"] for item in payload["image_updates"]))
+
+    def test_catalog_style_publication_is_atomic_across_all_colors(self):
+        app = CatalogApplication(
+            self.catalog_db_path,
+            Path(self.temp.name) / "uploads",
+            planning_api_token="planning-secret",
+        )
+        a_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["department"] == "A")
+        product_ids = []
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            for color in ("ATOMIC-黑", "ATOMIC-白"):
+                product_id = catalog_db.create_product(
+                    connection,
+                    {
+                        "season_year": "2026秋冬",
+                        "style_code": "ATOMIC-STYLE",
+                        "style_color": color,
+                        "product_name": "整款原子回传测试",
+                        "supplier": "原子回传供应商",
+                        "tax_included_price": 150,
+                        "image_url": f"https://example.com/{color}.jpg",
+                    },
+                    int(a_user["id"]),
+                    "A",
+                )
+                connection.execute("UPDATE products SET status = 'pending' WHERE id = ?", (product_id,))
+                product_ids.append(product_id)
+        sources = [catalog_db.planning_source_payloads(self.catalog_db_path, product_id)[0] for product_id in product_ids]
+        publications = [
+            self.planning_publication_payload(
+                source,
+                publication_id=f"PC-ATOMIC-{source['id']}",
+                category="其他",
+                launch_channel="天猫",
+                launch_price=599,
+            )
+            for source in sources
+        ]
+
+        incomplete = self.wsgi_request(
+            app,
+            "/api/internal/planning/style-publications",
+            method="POST",
+            body=json.dumps({"style_code": "ATOMIC-STYLE", "publications": publications[:1]}).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(incomplete["status"].startswith("400"))
+        self.assertIn("未纳入回传", incomplete["body"].decode("utf-8"))
+
+        inconsistent = self.wsgi_request(
+            app,
+            "/api/internal/planning/style-publications",
+            method="POST",
+            body=json.dumps(
+                {
+                    "style_code": "ATOMIC-STYLE",
+                    "publications": [publications[0], dict(publications[1], launch_price=609)],
+                }
+            ).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(inconsistent["status"].startswith("400"))
+        self.assertIn("同款各颜色", inconsistent["body"].decode("utf-8"))
+
+        invalid_publications = [dict(publications[0]), dict(publications[1], source_cost=151)]
+        failed = self.wsgi_request(
+            app,
+            "/api/internal/planning/style-publications",
+            method="POST",
+            body=json.dumps({"style_code": "ATOMIC-STYLE", "publications": invalid_publications}).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(failed["status"].startswith("409"))
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            publication_count = connection.execute(
+                "SELECT COUNT(*) FROM planning_publications WHERE product_id IN (?, ?)",
+                product_ids,
+            ).fetchone()[0]
+        self.assertEqual(publication_count, 0)
+        self.assertTrue(all(catalog_db.get_product(self.catalog_db_path, product_id)["launch_price"] in (None, 0) for product_id in product_ids))
+
+        published = self.wsgi_request(
+            app,
+            "/api/internal/planning/style-publications",
+            method="POST",
+            body=json.dumps({"style_code": "ATOMIC-STYLE", "publications": publications}).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(published["status"].startswith("200"))
+        published_payload = json.loads(published["body"])
+        self.assertEqual(published_payload["count"], 2)
+        self.assertEqual({item["status"] for item in published_payload["results"]}, {"published"})
+        self.assertTrue(all(catalog_db.get_product(self.catalog_db_path, product_id)["launch_price"] == 599 for product_id in product_ids))
+
+    def test_single_publish_submits_every_color_of_style_once(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        sources = [
+            {
+                "id": product_id,
+                "style_code": "STYLE-ALL-COLORS",
+                "style_color": color,
+                "product_name": "同款全部颜色回传",
+                "season_year": "2026秋冬",
+                "supplier": "同款供应商",
+                "category": "其他",
+                "actual_cost": 150,
+                "tax_included_price": 150,
+                "image_url": f"https://example.com/{color}.jpg",
+                "status": "pending",
+                "lifecycle_status": "active",
+                "source_version_no": 1,
+                "planning_request_no": 0,
+                "planning_reentry_state": "initial",
+            }
+            for product_id, color in ((8601, "黑"), (8602, "白"), (8603, "红"))
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, sources)
+        records = [planning_db.create_pricing_record(self.planning_db_path, source, "商品部企划员") for source in sources]
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                "UPDATE pricing_records SET status = 'confirmed', category = '其他', channel = '天猫', launch_price = 599 WHERE style_code = ?",
+                ("STYLE-ALL-COLORS",),
+            )
+        records = [planning_db.get_pricing_record(self.planning_db_path, record["id"]) for record in records]
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test", "planning-secret")
+        planner_cookie = self.login_cookie(app, "planner")
+        response_body = json.dumps(
+            {
+                "status": "published",
+                "style_code": "STYLE-ALL-COLORS",
+                "count": 3,
+                "results": [
+                    {
+                        "status": "published",
+                        "source_product_id": int(record["source_product_id"]),
+                        "planning_request_no": 0,
+                    }
+                    for record in records
+                ],
+            }
+        ).encode("utf-8")
+        with patch("planning_center.web.urlopen", return_value=io.BytesIO(response_body)) as mocked_urlopen:
+            response = self.wsgi_request(
+                app,
+                f"/pricing/{records[0]['id']}/publish",
+                method="POST",
+                cookie=planner_cookie,
+            )
+
+        self.assertTrue(response["status"].startswith("302"))
+        self.assertEqual(mocked_urlopen.call_count, 1)
+        request = mocked_urlopen.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/api/internal/planning/style-publications"))
+        request_payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(request_payload["style_code"], "STYLE-ALL-COLORS")
+        self.assertEqual({item["source_product_id"] for item in request_payload["publications"]}, {8601, 8602, 8603})
+        self.assertEqual(
+            {planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"] for record in records},
+            {"published"},
+        )
+
+    def test_sync_repairs_legacy_partial_publication_states(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        approved_source = {
+            "id": 8701,
+            "style_code": "LEGACY-BATCH",
+            "style_color": "LEGACY-BATCH-黑",
+            "product_name": "旧批次待回传",
+            "season_year": "2026秋冬",
+            "supplier": "历史兼容供应商",
+            "category": "其他",
+            "actual_cost": 150,
+            "tax_included_price": 150,
+            "image_url": "https://example.com/legacy-batch.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 1,
+            "planning_request_no": 0,
+            "planning_reentry_state": "initial",
+        }
+        acknowledged_source = dict(
+            approved_source,
+            id=8702,
+            style_code="LEGACY-ACK",
+            style_color="LEGACY-ACK-红",
+            product_name="已写入未确认",
+            image_url="https://example.com/legacy-ack.jpg",
+        )
+        planning_db.upsert_source_products(self.planning_db_path, [approved_source, acknowledged_source])
+        approved_record = planning_db.create_pricing_record(self.planning_db_path, approved_source, "商品部企划员")
+        acknowledged_record = planning_db.create_pricing_record(self.planning_db_path, acknowledged_source, "商品部企划员")
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute(
+                "UPDATE pricing_records SET status = 'conflict', channel = '天猫', launch_price = 599 WHERE id IN (?, ?)",
+                (approved_record["id"], acknowledged_record["id"]),
+            )
+
+        approved_sync = dict(
+            approved_source,
+            source_version_no=2,
+            planning_request_no=1,
+            planning_reentry_state="approved",
+            planning_reentry_reason="manual_revision",
+        )
+        acknowledged_sync = dict(
+            acknowledged_source,
+            source_version_no=2,
+            planning_last_publication_id="CATALOG-LEGACY-ACK",
+            planning_last_publication_request_no=0,
+            planning_last_publication_category="其他",
+            planning_last_publication_channel="天猫",
+            planning_last_publication_price=599,
+        )
+        result = planning_db.synchronize_source_products(
+            self.planning_db_path,
+            [approved_sync],
+            image_updates=[acknowledged_sync],
+        )
+
+        repaired_batch = planning_db.get_pricing_record(self.planning_db_path, approved_record["id"])
+        repaired_ack = planning_db.get_pricing_record(self.planning_db_path, acknowledged_record["id"])
+        self.assertEqual(repaired_batch["status"], "confirmed")
+        self.assertEqual(repaired_batch["planning_request_no"], 1)
+        self.assertEqual(repaired_batch["source_version_no"], 2)
+        self.assertEqual(repaired_ack["status"], "published")
+        self.assertEqual(result["publication_requests_rebased"], 1)
+        self.assertEqual(result["publications_acknowledged"], 1)
 
     def test_planning_sync_uses_json_post_for_large_source_history(self):
         app = PlanningApplication(self.planning_db_path, "http://catalog.test", "planning-secret")
@@ -1507,9 +1738,9 @@ class PlanningCenterTests(unittest.TestCase):
 
         self.assertTrue(response["status"].startswith("302"))
         location = unquote(dict(response["headers"])["Location"]).replace("+", " ")
-        self.assertIn("有 1 款回传失败", location)
+        self.assertIn("有 1 个款号整款回传失败", location)
         failed_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
-        self.assertEqual(failed_record["status"], "conflict")
+        self.assertEqual(failed_record["status"], "confirmed")
         self.assertIn("含税成本未发生变化", failed_record["error_message"])
 
     def test_planning_revision_must_be_requested_in_catalog_and_reuses_same_source(self):
@@ -3663,7 +3894,10 @@ class PlanningCenterTests(unittest.TestCase):
                 cookie=planner_cookie,
             )
         self.assertTrue(published["status"].startswith("302"))
-        publication_payload = json.loads(mocked_urlopen.call_args.args[0].data.decode("utf-8"))
+        style_payload = json.loads(mocked_urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(style_payload["style_code"], "M031")
+        self.assertEqual(len(style_payload["publications"]), 1)
+        publication_payload = style_payload["publications"][0]
         self.assertEqual(publication_payload["operator_name"], "商品部企划员")
         self.assertEqual(publication_payload["launch_channel"], "唯品")
         product_field_keys = {field.key for field in catalog_db.PRODUCT_FIELDS}

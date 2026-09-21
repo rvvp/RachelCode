@@ -3283,10 +3283,22 @@ def products_for_c_published_versions(db_path: str | Path, products: list[dict])
 def _planning_source_query() -> str:
     return """
         SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
-               reviewer.display_name AS reviewer_name
+               reviewer.display_name AS reviewer_name,
+               latest_planning.publication_id AS planning_last_publication_id,
+               latest_planning.planning_request_no AS planning_last_publication_request_no,
+               latest_planning.category AS planning_last_publication_category,
+               latest_planning.launch_channel AS planning_last_publication_channel,
+               latest_planning.launch_price AS planning_last_publication_price
         FROM products p
         JOIN users u ON u.id = p.created_by
         LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
+        LEFT JOIN planning_publications latest_planning ON latest_planning.id = (
+            SELECT pp.id
+            FROM planning_publications pp
+            WHERE pp.product_id = p.id
+            ORDER BY pp.id DESC
+            LIMIT 1
+        )
         WHERE p.lifecycle_status = 'active'
           AND p.status = 'pending'
           AND (
@@ -3414,6 +3426,11 @@ def _planning_product_payload(product: dict) -> dict:
         "planning_reentry_state": str(product.get("planning_reentry_state") or "initial"),
         "planning_reentry_reason": str(product.get("planning_reentry_reason") or ""),
         "planning_request_no": int(product.get("planning_request_no") or 0),
+        "planning_last_publication_id": str(product.get("planning_last_publication_id") or ""),
+        "planning_last_publication_request_no": int(product.get("planning_last_publication_request_no") or 0),
+        "planning_last_publication_category": str(product.get("planning_last_publication_category") or ""),
+        "planning_last_publication_channel": str(product.get("planning_last_publication_channel") or ""),
+        "planning_last_publication_price": product.get("planning_last_publication_price"),
         "updated_at": product.get("updated_at") or "",
         "created_at": product.get("created_at") or "",
         "creator_name": product.get("creator_name") or "",
@@ -3432,10 +3449,22 @@ def planning_source_image_payloads(db_path: str | Path, product_ids: list[int] |
     placeholders = ", ".join("?" for _ in ids)
     query = f"""
         SELECT p.*, u.display_name AS creator_name, u.username AS creator_username,
-               reviewer.display_name AS reviewer_name
+               reviewer.display_name AS reviewer_name,
+               latest_planning.publication_id AS planning_last_publication_id,
+               latest_planning.planning_request_no AS planning_last_publication_request_no,
+               latest_planning.category AS planning_last_publication_category,
+               latest_planning.launch_channel AS planning_last_publication_channel,
+               latest_planning.launch_price AS planning_last_publication_price
         FROM products p
         JOIN users u ON u.id = p.created_by
         LEFT JOIN users reviewer ON reviewer.id = p.last_reviewed_by
+        LEFT JOIN planning_publications latest_planning ON latest_planning.id = (
+            SELECT pp.id
+            FROM planning_publications pp
+            WHERE pp.product_id = p.id
+            ORDER BY pp.id DESC
+            LIMIT 1
+        )
         WHERE p.id IN ({placeholders})
           AND (
               p.lifecycle_status IN ('active', 'withdrawn')
@@ -3503,6 +3532,54 @@ def planning_withdrawn_source_ids(
     return withdrawn
 
 
+def validated_planning_publication_values(payload: dict) -> tuple[str, str, int]:
+    category = str(payload.get("category") or "").strip()
+    if not category:
+        raise ValueError("回传必须包含品类。")
+    launch_channel = str(payload.get("launch_channel") or "").strip()
+    if not launch_channel:
+        raise ValueError("回传必须包含规则中有效的上新渠道。")
+    launch_channel = normalize_launch_channel(launch_channel) or launch_channel
+    try:
+        launch_price_value = Decimal(str(payload.get("launch_price")).strip())
+    except (InvalidOperation, AttributeError, TypeError, ValueError):
+        raise ValueError("回传上新价格必须是数字。")
+    if (
+        not launch_price_value.is_finite()
+        or launch_price_value <= 0
+        or launch_price_value != launch_price_value.to_integral_value()
+    ):
+        raise ValueError("回传上新价格必须是大于 0 的整数。")
+    return category, launch_channel, int(launch_price_value)
+
+
+def planning_publication_matches_payload(publication: dict, payload: dict) -> bool:
+    try:
+        category, launch_channel, launch_price = validated_planning_publication_values(payload)
+        payload_cost = Decimal(str(payload.get("source_cost")))
+        publication_cost = Decimal(str(publication.get("source_cost")))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return bool(
+        str(publication.get("category") or "").strip() == category
+        and (normalize_launch_channel(str(publication.get("launch_channel") or "").strip()) or str(publication.get("launch_channel") or "").strip()) == launch_channel
+        and int(Decimal(str(publication.get("launch_price")))) == launch_price
+        and publication_cost == payload_cost
+        and str(publication.get("source_style_code") or "").strip() == str(payload.get("source_style_code") or "").strip()
+        and str(publication.get("source_style_color") or "").strip() == str(payload.get("source_style_color") or "").strip()
+    )
+
+
+def already_published_result(publication: dict, product_id: int) -> dict:
+    return {
+        "status": "already_published",
+        "product_id": int(product_id),
+        "publication_id": str(publication.get("publication_id") or ""),
+        "planning_request_no": int(publication.get("planning_request_no") or 0),
+        "published_at": str(publication.get("published_at") or ""),
+    }
+
+
 def publish_planning_price(
     connection: sqlite3.Connection,
     product_id: int,
@@ -3526,13 +3603,30 @@ def publish_planning_price(
     if not publication_id:
         raise ValueError("回传必须包含企划定价记录号。")
     duplicate = connection.execute(
-        "SELECT product_id FROM planning_publications WHERE publication_id = ? LIMIT 1",
+        "SELECT * FROM planning_publications WHERE publication_id = ? LIMIT 1",
         (publication_id,),
     ).fetchone()
     if duplicate:
         if int(duplicate["product_id"]) != int(product_id):
             raise ValueError("企划定价记录号已被其他商品使用。")
-        return {"status": "already_published", "product_id": product_id, "publication_id": publication_id}
+        return already_published_result(dict(duplicate), product_id)
+    expected_request_no = int(payload.get("planning_request_no") or 0)
+    acknowledged = connection.execute(
+        """
+        SELECT *
+        FROM planning_publications
+        WHERE product_id = ? AND planning_request_no = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (int(product_id), expected_request_no),
+    ).fetchone()
+    if acknowledged and planning_publication_matches_payload(dict(acknowledged), payload):
+        # The catalog transaction may have committed while the planning center
+        # lost the HTTP response. Match the immutable source identity and all
+        # three planning values so that a retry repairs the acknowledgement
+        # without opening an unnecessary second planning cycle.
+        return already_published_result(dict(acknowledged), product_id)
     if product.get("lifecycle_status") != "active":
         raise ValueError("只有正常商品才能接收商品企划回传。")
     if not product_has_image(product):
@@ -3553,7 +3647,6 @@ def publish_planning_price(
         error = ValueError(f"商品资料已发生变化，请重新同步后定价。当前版本为 V{current_version}。")
         error.code = "version_conflict"
         raise error
-    expected_request_no = int(payload.get("planning_request_no") or 0)
     current_request_no = int(product.get("planning_request_no") or 0)
     if expected_request_no != current_request_no:
         error = ValueError(
@@ -3571,27 +3664,7 @@ def publish_planning_price(
         error = ValueError("藏宝阁含税成本已发生变化，请重新同步后由商品部确认是否重新测算。")
         error.code = "version_conflict"
         raise error
-    category = str(payload.get("category") or "").strip()
-    if not category:
-        raise ValueError("回传必须包含品类。")
-    launch_channel = str(payload.get("launch_channel") or "").strip()
-    if not launch_channel:
-        raise ValueError("回传必须包含规则中有效的上新渠道。")
-    # The planning center owns the configurable channel vocabulary. Keep the
-    # catalog's legacy aliases normalized, while allowing a newly configured
-    # planning option to pass through the trusted internal API unchanged.
-    launch_channel = normalize_launch_channel(launch_channel) or launch_channel
-    try:
-        launch_price_value = Decimal(str(payload.get("launch_price")).strip())
-    except (InvalidOperation, AttributeError, TypeError, ValueError):
-        raise ValueError("回传上新价格必须是数字。")
-    if (
-        not launch_price_value.is_finite()
-        or launch_price_value <= 0
-        or launch_price_value != launch_price_value.to_integral_value()
-    ):
-        raise ValueError("回传上新价格必须是大于 0 的整数。")
-    launch_price = int(launch_price_value)
+    category, launch_channel, launch_price = validated_planning_publication_values(payload)
     protected_before = {
         key: normalize_diff_value(product.get(key))
         for key in PLANNING_PRODUCT_PROTECTED_FIELD_KEYS
@@ -3706,6 +3779,105 @@ def publish_planning_price(
         "launch_channel": launch_channel or product.get("launch_channel", ""),
         "launch_price": launch_price,
         "published_at": str(payload.get("published_at") or timestamp),
+    }
+
+
+def publish_planning_style(
+    connection: sqlite3.Connection,
+    style_code: str,
+    publications: list[dict],
+    actor_user_id: int,
+) -> dict:
+    """Publish every outstanding color of one style in a single transaction."""
+    clean_style_code = str(style_code or "").strip()
+    if not clean_style_code:
+        raise ValueError("整款回传必须包含款号。")
+    if not publications or len(publications) > 500:
+        raise ValueError("整款回传的款色数量必须在 1 到 500 之间。")
+    if any(not isinstance(item, dict) for item in publications):
+        raise ValueError("整款回传的款色资料格式不正确。")
+
+    payloads_by_id: dict[int, dict] = {}
+    for payload in publications:
+        product_id = int(payload.get("source_product_id") or 0)
+        if product_id <= 0:
+            raise ValueError("整款回传包含无效的来源商品 ID。")
+        if product_id in payloads_by_id:
+            raise ValueError("整款回传不能包含重复款色。")
+        if str(payload.get("source_style_code") or "").strip() != clean_style_code:
+            raise ValueError("整款回传的款号与款色资料不一致。")
+        payloads_by_id[product_id] = payload
+
+    style_rows = connection.execute(
+        """
+        SELECT *
+        FROM products
+        WHERE lifecycle_status = 'active'
+          AND status = 'pending'
+          AND TRIM(style_code) = ?
+        ORDER BY id
+        """,
+        (clean_style_code,),
+    ).fetchall()
+    if not style_rows:
+        raise LookupError("藏宝阁中没有处于 A/B 协作中的同款资料。")
+    style_products = {int(row["id"]): dict(row) for row in style_rows}
+    unexpected_ids = sorted(set(payloads_by_id) - set(style_products))
+    if unexpected_ids:
+        raise ValueError("整款回传包含不属于当前款号或不在 A/B 协作中的款色。")
+
+    payload_values = {
+        validated_planning_publication_values(payload)
+        for payload in payloads_by_id.values()
+    }
+    if len(payload_values) != 1:
+        raise ValueError("同款各颜色的品类、上新渠道或上新价格不一致，整款未写入。")
+    target_category, target_channel, target_price = next(iter(payload_values))
+
+    required_ids: set[int] = set()
+    for product_id, product in style_products.items():
+        missing_fields = planning_source_missing_fields(product)
+        if missing_fields:
+            color_label = str(product.get("style_color") or product_id)
+            raise ValueError(f"同款款色 {color_label} 尚未满足企划回传条件：{'、'.join(missing_fields)}。")
+        current_request_no = int(product.get("planning_request_no") or 0)
+        current_publication = connection.execute(
+            "SELECT * FROM planning_publications WHERE product_id = ? AND planning_request_no = ? ORDER BY id DESC LIMIT 1",
+            (product_id, current_request_no),
+        ).fetchone()
+        if current_publication:
+            publication_channel = normalize_launch_channel(str(current_publication["launch_channel"] or "").strip()) or str(current_publication["launch_channel"] or "").strip()
+            if (
+                str(current_publication["category"] or "").strip() != target_category
+                or publication_channel != target_channel
+                or int(Decimal(str(current_publication["launch_price"]))) != target_price
+            ):
+                color_label = str(product.get("style_color") or product_id)
+                raise ValueError(f"同款已回传款色 {color_label} 的品类、渠道或上新价与本次不一致，整款未写入。")
+            continue
+        has_prior_publication = product_has_planning_publication(connection, product_id)
+        reentry_state = str(product.get("planning_reentry_state") or "initial")
+        if has_prior_publication and reentry_state != "approved":
+            color_label = str(product.get("style_color") or product_id)
+            raise ValueError(f"同款款色 {color_label} 尚未由商品部明确发起二次企划。")
+        if not has_prior_publication and reentry_state not in {"initial", "approved"}:
+            color_label = str(product.get("style_color") or product_id)
+            raise ValueError(f"同款款色 {color_label} 尚未完成是否重回企划的人工判断。")
+        required_ids.add(product_id)
+
+    missing_payload_ids = sorted(required_ids - set(payloads_by_id))
+    if missing_payload_ids:
+        colors = [str(style_products[product_id].get("style_color") or product_id) for product_id in missing_payload_ids]
+        raise ValueError("同款仍有未完成复核或未纳入回传的款色：" + "、".join(colors) + "。")
+
+    results = []
+    for product_id, payload in payloads_by_id.items():
+        results.append(publish_planning_price(connection, product_id, payload, actor_user_id))
+    return {
+        "status": "published",
+        "style_code": clean_style_code,
+        "count": len(results),
+        "results": results,
     }
 
 
