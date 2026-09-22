@@ -1131,6 +1131,132 @@ class PlanningCenterTests(unittest.TestCase):
         )
         self.assertTrue(forbidden["status"].startswith("403"))
 
+    def test_only_b_department_can_see_or_use_planning_connection_actions(self):
+        app = CatalogApplication(
+            self.catalog_db_path,
+            Path(self.temp.name) / "uploads",
+            planning_api_token="planning-secret",
+        )
+        source = next(item for item in catalog_db.planning_source_payloads(self.catalog_db_path))
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.publish_planning_price(
+                connection,
+                source["id"],
+                self.planning_publication_payload(
+                    source,
+                    publication_id="PC-B-ONLY-INITIAL",
+                    category="其他",
+                ),
+                catalog_db.get_or_create_planning_service_user(connection),
+            )
+            b_user = next(
+                user
+                for user in catalog_db.list_users(self.catalog_db_path)
+                if user["username"] == "b_editor"
+            )
+            catalog_db.change_product_status(
+                connection,
+                source["id"],
+                "published",
+                b_user["id"],
+                "确认资料齐全，提交运营部",
+                "回归测试发布。",
+            )
+            catalog_db.change_product_status(
+                connection,
+                source["id"],
+                "pending",
+                b_user["id"],
+                "召回到 A/B 协作",
+                "回归测试召回。",
+            )
+
+        catalog_db.create_user(
+            self.catalog_db_path,
+            "executive_test",
+            "管理层测试",
+            "EXECUTIVE",
+            "demo123",
+            must_change_password=False,
+        )
+        catalog_db.create_user(
+            self.catalog_db_path,
+            "design_test",
+            "美工部测试",
+            "DESIGN",
+            "demo123",
+            must_change_password=False,
+        )
+
+        b_page = self.wsgi_request(
+            app,
+            "/products?marker=planning_reentry",
+            cookie=self.login_cookie(app, "b_editor"),
+        )["body"].decode("utf-8")
+        self.assertIn('value="submit_to_planning_selected"', b_page)
+        self.assertIn('value="skip_planning_selected"', b_page)
+        self.assertIn('value="request_planning_revision_selected"', b_page)
+        self.assertIn(f'formaction="/products/{source["id"]}/planning-reentry"', b_page)
+
+        planning_bulk_actions = (
+            "submit_to_planning_selected",
+            "skip_planning_selected",
+            "request_planning_revision_selected",
+        )
+        for username in (
+            "a_editor",
+            "c_viewer",
+            "admin_reviewer",
+            "executive_test",
+            "design_test",
+        ):
+            with self.subTest(username=username):
+                cookie = self.login_cookie(app, username)
+                list_page = self.wsgi_request(app, "/products", cookie=cookie)["body"].decode("utf-8")
+                self.assertNotIn('value="submit_to_planning_selected"', list_page)
+                self.assertNotIn('value="skip_planning_selected"', list_page)
+                self.assertNotIn('value="request_planning_revision_selected"', list_page)
+                self.assertNotIn(f'formaction="/products/{source["id"]}/planning-reentry"', list_page)
+                self.assertNotIn(f'formaction="/products/{source["id"]}/planning-revision"', list_page)
+
+                detail_page = self.wsgi_request(
+                    app,
+                    f"/products/{source['id']}",
+                    cookie=cookie,
+                )["body"].decode("utf-8")
+                self.assertNotIn(f'action="/products/{source["id"]}/planning-reentry"', detail_page)
+                self.assertNotIn(f'action="/products/{source["id"]}/planning-revision"', detail_page)
+
+                for endpoint in ("planning-reentry", "planning-revision"):
+                    response = self.wsgi_request(
+                        app,
+                        f"/products/{source['id']}/{endpoint}",
+                        method="POST",
+                        body=urlencode({"decision": "approve"}).encode(),
+                        cookie=cookie,
+                    )
+                    self.assertTrue(response["status"].startswith("403"))
+
+                for action in planning_bulk_actions:
+                    response = self.wsgi_request(
+                        app,
+                        "/products/bulk",
+                        method="POST",
+                        body=urlencode(
+                            {
+                                "product_ids": str(source["id"]),
+                                "bulk_action": action,
+                                "return_to": "/products",
+                            }
+                        ).encode(),
+                        cookie=cookie,
+                    )
+                    self.assertTrue(response["status"].startswith("403"))
+
+        unchanged = catalog_db.get_product(self.catalog_db_path, source["id"])
+        self.assertEqual(unchanged["planning_reentry_state"], "decision_pending")
+        self.assertEqual(unchanged["planning_request_no"], 0)
+
     def test_configured_planning_channel_is_accepted_by_catalog_callback(self):
         planning_db.save_channel_option(self.planning_db_path, "直播首发", 40)
         app = CatalogApplication(

@@ -2020,7 +2020,7 @@ class CatalogApplication:
         )
 
     def handle_planning_reentry_decision(self, environ, start_response, user, product_id: int):
-        if is_department_monitor(user) or (user.get("department") != "B" and not is_admin(user)):
+        if is_department_monitor(user) or user.get("department") != "B":
             return self.html_response(
                 start_response,
                 self.render_message_page("权限不足", "只有商品部人员可以判定是否重新进入商品企划中心。", user),
@@ -2060,7 +2060,7 @@ class CatalogApplication:
         )
 
     def handle_planning_revision_request(self, environ, start_response, user, product_id: int):
-        if is_department_monitor(user) or (user.get("department") != "B" and not is_admin(user)):
+        if is_department_monitor(user) or user.get("department") != "B":
             return self.html_response(
                 start_response,
                 self.render_message_page("权限不足", "只有商品部人员可以发起二次企划。", user),
@@ -2300,6 +2300,17 @@ class CatalogApplication:
         else:
             product_ids = self.collect_numeric_values(form, "product_ids")
         action = form.get("bulk_action", "").strip()
+        planning_actions = {
+            "submit_to_planning_selected",
+            "skip_planning_selected",
+            "request_planning_revision_selected",
+        }
+        if action in planning_actions and (is_department_monitor(user) or user.get("department") != "B"):
+            return self.html_response(
+                start_response,
+                self.render_message_page("权限不足", "只有商品部人员可以连接商品企划中心。", user),
+                status="403 Forbidden",
+            )
         if not product_ids:
             return self.redirect(
                 start_response,
@@ -2344,10 +2355,6 @@ class CatalogApplication:
                     updated += 1
                     continue
                 if action in {"submit_to_planning_selected", "skip_planning_selected"}:
-                    if is_department_monitor(user) or (user.get("department") != "B" and not is_admin(user)):
-                        skipped += 1
-                        self.append_bulk_skip_reason(skip_reasons, product, "只有商品部人员可以判定是否重走商品企划。")
-                        continue
                     if product.get("status") != "pending" or str(product.get("planning_reentry_state") or "initial") != "decision_pending":
                         skipped += 1
                         self.append_bulk_skip_reason(skip_reasons, product, "资料不在待判定是否重走商品企划节点。")
@@ -2362,10 +2369,6 @@ class CatalogApplication:
                     updated += 1
                     continue
                 if action == "request_planning_revision_selected":
-                    if is_department_monitor(user) or (user.get("department") != "B" and not is_admin(user)):
-                        skipped += 1
-                        self.append_bulk_skip_reason(skip_reasons, product, "只有商品部人员可以发起二次企划。")
-                        continue
                     try:
                         db.request_planning_revision(connection, product_id, int(user["id"]))
                     except (LookupError, ValueError) as error:
@@ -3255,7 +3258,7 @@ class CatalogApplication:
         supplier_filter = str(query.get("supplier", "")).strip() if supplier_search_enabled else ""
         season_year_search_enabled = user.get("department") == "A"
         season_year_filter = str(query.get("season_year", "")).strip() if season_year_search_enabled else ""
-        b_dashboard_view = user.get("department") == "B" or is_admin(user)
+        b_dashboard_view = user.get("department") == "B" and not is_department_monitor(user)
         department_filter = str(query.get("department", "")).strip()
         if not is_admin(user):
             department_filter = ""
@@ -3409,7 +3412,7 @@ class CatalogApplication:
             supplier = str(query.get("supplier", "")).strip()
         requested_status = str(query.get("status", "")).strip()
         requested_marker = str(query.get("marker", "")).strip()
-        marker_filter_allowed = user.get("department") == "B" or is_admin(user)
+        marker_filter_allowed = user.get("department") == "B" and not is_department_monitor(user)
         if requested_status == "tax_price_modified" and marker_filter_allowed:
             requested_status = ""
             requested_marker = "tax_price_modified"
@@ -10436,7 +10439,7 @@ class CatalogApplication:
         recent_stats = db.recent_activity_stats(self.db_path, days=7)
         b_dashboard_stats = (
             db.b_workflow_stats(self.db_path, days=7)
-            if user.get("department") == "B" or is_admin(user)
+            if user.get("department") == "B" and not is_department_monitor(user)
             else {}
         )
         c_receipt_stats = (
@@ -10492,7 +10495,7 @@ class CatalogApplication:
             planning_reentry_action_markup = ""
             if (
                 not is_department_monitor(user)
-                and (user.get("department") == "B" or is_admin(user))
+                and user.get("department") == "B"
                 and product.get("status") == "pending"
                 and str(product.get("planning_reentry_state") or "initial") == "decision_pending"
             ):
@@ -10508,7 +10511,7 @@ class CatalogApplication:
                 )
             elif (
                 not is_department_monitor(user)
-                and (user.get("department") == "B" or is_admin(user))
+                and user.get("department") == "B"
                 and product.get("status") == "pending"
                 and bool(product.get("has_planning_publication"))
                 and str(product.get("planning_reentry_state") or "initial") in {"initial", "not_required"}
@@ -10727,7 +10730,7 @@ class CatalogApplication:
             </div>
             """
             insights_grid_class += " products-insights-single"
-        elif user["department"] in {"A", "EXECUTIVE"}:
+        elif user["department"] in {"A", "EXECUTIVE"} or is_admin(user):
             stats_markup = f"""
             <div class="stats products-stats-row">
               <div class="stat-card"><span>总资料数</span><strong>{stats.get('A', 0) + stats.get('B', 0) + stats.get('C', 0)}</strong></div>
@@ -10738,7 +10741,7 @@ class CatalogApplication:
             </div>
             """
             insights_grid_class += " products-insights-single"
-        elif user["department"] == "B" or is_admin(user):
+        elif user["department"] == "B":
             stats_markup = f"""
             <div class="stats products-stats-row">
               <div class="stat-card"><span>近7天新增</span><strong>{b_dashboard_stats.get('recent_submitted_to_b', 0)}</strong></div>
@@ -12687,7 +12690,6 @@ class CatalogApplication:
         return f"""
           <div class="products-bulk-lifecycle-actions">
             {recall_button}
-            {planning_reentry_buttons}
             <button type="submit" name="bulk_action" value="delete_selected"
               form="products-bulk-form" formmethod="post" formaction="/products/bulk"
               class="ghost-button products-bulk-delete-button"
@@ -12928,7 +12930,7 @@ class CatalogApplication:
         planning_reentry_block = ""
         if (
             not is_department_monitor(user)
-            and (user.get("department") == "B" or is_admin(user))
+            and user.get("department") == "B"
             and product.get("status") == "pending"
             and str(product.get("planning_reentry_state") or "initial") == "decision_pending"
         ):
@@ -12957,7 +12959,7 @@ class CatalogApplication:
             """
         elif (
             not is_department_monitor(user)
-            and (user.get("department") == "B" or is_admin(user))
+            and user.get("department") == "B"
             and product.get("status") == "pending"
             and bool(product.get("has_planning_publication"))
             and str(product.get("planning_reentry_state") or "initial") in {"initial", "not_required"}
