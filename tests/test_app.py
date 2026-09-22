@@ -3241,7 +3241,7 @@ class CatalogAppTests(unittest.TestCase):
     def test_admin_must_assign_operating_channel_for_c_account(self):
         cookie = self.login("admin_reviewer", "demo123")
         users_page = self.request("/users", cookie=cookie)["body"].decode("utf-8")
-        self.assertIn('<option value="all" >全渠道（天猫/唯品/同款）</option>', users_page)
+        self.assertIn('<option value="all" >全渠道（天猫/天猫官/天猫奥/唯品/同款）</option>', users_page)
         incomplete_response = self.request(
             "/users",
             method="POST",
@@ -3304,7 +3304,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("all_channel_operator", managed_users_page)
         self.assertIn("全渠道", managed_users_page)
         edit_page = self.request(f"/users/{all_channel_user['id']}/edit", cookie=cookie)["body"].decode("utf-8")
-        self.assertIn('<option value="all" selected>全渠道（天猫/唯品/同款）</option>', edit_page)
+        self.assertIn('<option value="all" selected>全渠道（天猫/天猫官/天猫奥/唯品/同款）</option>', edit_page)
 
         all_channel_cookie = self.login("all_channel_operator", "demo123")
         billing_page = self.request(
@@ -3333,7 +3333,8 @@ class CatalogAppTests(unittest.TestCase):
         with db.get_connection(self.db_path) as connection:
             connection.execute("UPDATE products SET lifecycle_status = 'archived'")
             product_ids = []
-            for index, channel in enumerate(("天猫", "唯品", "同款"), start=1):
+            launch_channels = ("天猫", "天猫官", "天猫奥", "唯品", "同款")
+            for index, channel in enumerate(launch_channels, start=1):
                 product_id = db.create_product(
                     connection,
                     self.a_complete_fields_payload(
@@ -3398,29 +3399,33 @@ class CatalogAppTests(unittest.TestCase):
 
         all_channel_cookie = self.login("all_channel_c", "demo123")
         list_body = self.request("/products", cookie=all_channel_cookie)["body"].decode("utf-8")
-        for channel in ("天猫", "唯品", "同款"):
+        for channel in launch_channels:
             self.assertIn(f"全渠道测试-{channel}", list_body)
         self.assertNotIn("全渠道测试-其他渠道", list_body)
 
         tmall_body = self.request("/products", cookie=self.login("c_viewer", "demo123"))["body"].decode("utf-8")
         self.assertIn("全渠道测试-天猫", tmall_body)
+        self.assertIn("全渠道测试-天猫官", tmall_body)
+        self.assertIn("全渠道测试-天猫奥", tmall_body)
         self.assertIn("全渠道测试-同款", tmall_body)
         self.assertNotIn("全渠道测试-唯品", tmall_body)
         vip_body = self.request("/products", cookie=vip_cookie)["body"].decode("utf-8")
         self.assertIn("全渠道测试-唯品", vip_body)
         self.assertIn("全渠道测试-同款", vip_body)
         self.assertNotIn("全渠道测试-天猫", vip_body)
+        self.assertNotIn("全渠道测试-天猫官", vip_body)
+        self.assertNotIn("全渠道测试-天猫奥", vip_body)
 
         api_response = self.request("/api/products", cookie=all_channel_cookie)
         api_payload = json.loads(api_response["body"].decode("utf-8"))
-        self.assertEqual(api_payload["count"], 3)
+        self.assertEqual(api_payload["count"], 5)
         self.assertEqual(
             {item["product_name"] for item in api_payload["items"]},
-            {"全渠道测试-天猫", "全渠道测试-唯品", "全渠道测试-同款"},
+            {f"全渠道测试-{channel}" for channel in launch_channels},
         )
         self.assertEqual(
             db.c_user_receipt_stats(self.db_path, users["all_channel_c"]),
-            {"total": 3, "received": 0, "pending": 3, "recent_created": 3},
+            {"total": 5, "received": 0, "pending": 5, "recent_created": 5},
         )
 
         single_receive_response = self.request(
@@ -3461,7 +3466,7 @@ class CatalogAppTests(unittest.TestCase):
             cookie=all_channel_cookie,
         )
         self.assertTrue(receive_response["status"].startswith("302"))
-        self.assertIn("成功 2 条", unquote_plus(dict(receive_response["headers"])["Location"]))
+        self.assertIn("成功 4 条", unquote_plus(dict(receive_response["headers"])["Location"]))
         self.assertIn(
             "资料全局状态保持不变",
             unquote_plus(dict(receive_response["headers"])["Location"]),
@@ -3479,25 +3484,27 @@ class CatalogAppTests(unittest.TestCase):
             )
         self.assertEqual(
             db.c_user_receipt_stats(self.db_path, users["all_channel_c"]),
-            {"total": 3, "received": 3, "pending": 0, "recent_created": 3},
+            {"total": 5, "received": 5, "pending": 0, "recent_created": 5},
         )
 
         pending_body = self.request("/products?status=published", cookie=all_channel_cookie)["body"].decode("utf-8")
         self.assertNotIn("全渠道测试-", pending_body)
         received_body = self.request("/products?status=received", cookie=all_channel_cookie)["body"].decode("utf-8")
-        for channel in ("天猫", "唯品", "同款"):
+        for channel in launch_channels:
             self.assertIn(f"全渠道测试-{channel}", received_body)
 
         tmall_receive_response = self.request(
-            f"/products/{product_ids[2]}/status",
+            f"/products/{product_ids[4]}/status",
             method="POST",
             body=urlencode({"status": "received"}).encode("utf-8"),
             cookie=self.login("c_viewer", "demo123"),
         )
         self.assertTrue(tmall_receive_response["status"].startswith("302"))
-        self.assertEqual(db.get_product(self.db_path, product_ids[2])["status"], "received")
+        self.assertEqual(db.get_product(self.db_path, product_ids[4])["status"], "received")
         self.assertEqual(db.get_product(self.db_path, product_ids[0])["status"], "published")
         self.assertEqual(db.get_product(self.db_path, product_ids[1])["status"], "published")
+        self.assertEqual(db.get_product(self.db_path, product_ids[2])["status"], "published")
+        self.assertEqual(db.get_product(self.db_path, product_ids[3])["status"], "published")
 
         export_response = self.request("/export.xlsx", cookie=all_channel_cookie)
         self.assertTrue(export_response["status"].startswith("200"))
@@ -3508,7 +3515,7 @@ class CatalogAppTests(unittest.TestCase):
             for cell in row
             if cell.value is not None
         }
-        for channel in ("天猫", "唯品", "同款"):
+        for channel in launch_channels:
             self.assertIn(f"全渠道测试-{channel}", exported_values)
 
     def test_c_account_separates_product_channel_from_multi_platform_bill_permissions(self):
@@ -7981,7 +7988,8 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("不符合条件的条目自动跳过", rules_body)
         self.assertIn("任意一个账号接收所属渠道资料后", rules_body)
         self.assertIn("不需等待同类别其他账号逐一接收", rules_body)
-        self.assertIn("“同款”由任意天猫类或唯品类账号接收后", rules_body)
+        self.assertIn("天猫类覆盖天猫、天猫官、天猫奥和同款", rules_body)
+        self.assertIn("唯品类覆盖唯品和同款", rules_body)
         self.assertIn("全渠道账号可记录个人接收，但不参与全局状态判断", rules_body)
         self.assertIn("“待运营接收”资料召回时不提醒运营部", rules_body)
         self.assertIn("系统只提醒实际接收过该批次的运营账号", rules_body)

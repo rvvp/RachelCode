@@ -1257,8 +1257,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(unchanged["planning_reentry_state"], "decision_pending")
         self.assertEqual(unchanged["planning_request_no"], 0)
 
-    def test_configured_planning_channel_is_accepted_by_catalog_callback(self):
-        planning_db.save_channel_option(self.planning_db_path, "直播首发", 40)
+    def test_tmall_official_channel_is_accepted_by_catalog_callback(self):
         app = CatalogApplication(
             self.catalog_db_path,
             Path(self.temp.name) / "uploads",
@@ -1274,16 +1273,35 @@ class PlanningCenterTests(unittest.TestCase):
             body=json.dumps(
                 self.planning_publication_payload(
                     source,
-                    publication_id="PC-CONFIGURED-CHANNEL",
+                    publication_id="PC-TMALL-OFFICIAL-CHANNEL",
                     category="其他",
-                    launch_channel="直播首发",
+                    launch_channel="天猫官",
                 )
             ).encode(),
             content_type="application/json",
             authorization="Bearer planning-secret",
         )
         self.assertTrue(response["status"].startswith("200"))
-        self.assertEqual(catalog_db.get_product(self.catalog_db_path, source["id"])["launch_channel"], "直播首发")
+        self.assertEqual(catalog_db.get_product(self.catalog_db_path, source["id"])["launch_channel"], "天猫官")
+
+    def test_existing_planning_database_adds_five_standard_channels_in_business_order(self):
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("DELETE FROM channel_options WHERE name IN ('天猫官', '天猫奥')")
+            connection.execute("UPDATE channel_options SET sort_order = 20 WHERE name = '唯品'")
+            connection.execute("UPDATE channel_options SET sort_order = 30 WHERE name = '同款'")
+
+        planning_db.init_db(self.planning_db_path)
+
+        channels = planning_db.list_channel_options(self.planning_db_path, enabled_only=True)
+        self.assertEqual(
+            [item["name"] for item in channels[:5]],
+            ["天猫", "天猫官", "天猫奥", "唯品", "同款"],
+        )
+        planning_db.init_db(self.planning_db_path)
+        self.assertEqual(
+            [item["name"] for item in planning_db.list_channel_options(self.planning_db_path, enabled_only=True)[:5]],
+            ["天猫", "天猫官", "天猫奥", "唯品", "同款"],
+        )
 
     def test_catalog_image_gate_and_image_only_refresh_preserve_workflow(self):
         catalog_app = CatalogApplication(

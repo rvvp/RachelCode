@@ -417,10 +417,22 @@ def _init_db_unlocked(
         connection.execute(
             """
             UPDATE products
+            SET launch_channel = CASE TRIM(COALESCE(launch_channel, ''))
+                WHEN '天猫官方旗舰店' THEN '天猫官'
+                WHEN '天猫官方奥莱旗舰店' THEN '天猫奥'
+                WHEN '同款商品' THEN '同款'
+                ELSE launch_channel
+            END
+            WHERE TRIM(COALESCE(launch_channel, '')) IN ('天猫官方旗舰店', '天猫官方奥莱旗舰店', '同款商品')
+            """
+        )
+        connection.execute(
+            """
+            UPDATE products
             SET c_release_no = 1
             WHERE c_release_no = 0
               AND status IN ('published', 'received')
-              AND TRIM(COALESCE(launch_channel, '')) IN ('天猫', '唯品', '同款', '天猫/京东/抖音', '天猫、京东、抖音')
+              AND TRIM(COALESCE(launch_channel, '')) IN ('天猫', '天猫官', '天猫奥', '唯品', '同款', '天猫/京东/抖音', '天猫、京东、抖音')
             """
         )
         connection.execute(
@@ -3539,7 +3551,9 @@ def validated_planning_publication_values(payload: dict) -> tuple[str, str, int]
     launch_channel = str(payload.get("launch_channel") or "").strip()
     if not launch_channel:
         raise ValueError("回传必须包含规则中有效的上新渠道。")
-    launch_channel = normalize_launch_channel(launch_channel) or launch_channel
+    launch_channel = normalize_launch_channel(launch_channel)
+    if not launch_channel:
+        raise ValueError("回传上新渠道必须是天猫、天猫官、天猫奥、唯品或同款。")
     try:
         launch_price_value = Decimal(str(payload.get("launch_price")).strip())
     except (InvalidOperation, AttributeError, TypeError, ValueError):

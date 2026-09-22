@@ -64,8 +64,11 @@ BILLING_PLATFORM_OPTIONS = (
     ("miniprogram", "小程序"),
 )
 BILLING_PLATFORM_LABELS = dict(BILLING_PLATFORM_OPTIONS)
-LAUNCH_CHANNEL_OPTIONS = ("天猫", "唯品", "同款")
+LAUNCH_CHANNEL_OPTIONS = ("天猫", "天猫官", "天猫奥", "唯品", "同款")
 LAUNCH_CHANNEL_ALIASES = {
+    "天猫官方旗舰店": "天猫官",
+    "天猫官方奥莱旗舰店": "天猫奥",
+    "同款商品": "同款",
     "天猫/京东/抖音": "天猫",
     "天猫、京东、抖音": "天猫",
     "天猫,京东,抖音": "天猫",
@@ -99,6 +102,16 @@ def operating_channel_label(channel: str | None) -> str:
     return C_OPERATING_CHANNELS.get(str(channel or "").strip(), "未分配")
 
 
+def operating_channel_scope_label(channel: str | None) -> str:
+    """Return the product launch channels visible to an operating account."""
+    scopes = {
+        "tmall": "天猫、天猫官、天猫奥和同款",
+        "vip": "唯品和同款",
+        "all": "天猫、天猫官、天猫奥、唯品和同款",
+    }
+    return scopes.get(str(channel or "").strip(), "当前归属渠道")
+
+
 def normalize_launch_channel(value) -> str:
     clean_value = "" if value is None else str(value).strip()
     clean_value = clean_value.replace("／", "/").replace("，", ",")
@@ -118,9 +131,9 @@ def c_user_can_see_launch_channel(user: dict | None, launch_channel) -> bool:
         return normalized_channel in LAUNCH_CHANNEL_OPTIONS
     if normalized_channel == "同款":
         return True
-    return (normalized_channel == "天猫" and operating_channel == "tmall") or (
-        normalized_channel == "唯品" and operating_channel == "vip"
-    )
+    if operating_channel == "tmall":
+        return normalized_channel in {"天猫", "天猫官", "天猫奥"}
+    return normalized_channel == "唯品" and operating_channel == "vip"
 
 
 def c_visible_launch_channels(user: dict | None) -> tuple[str, ...]:
@@ -129,7 +142,7 @@ def c_visible_launch_channels(user: dict | None) -> tuple[str, ...]:
     if user.get("operating_channel") == "all":
         return LAUNCH_CHANNEL_OPTIONS
     if user.get("operating_channel") == "tmall":
-        return ("天猫", "同款")
+        return ("天猫", "天猫官", "天猫奥", "同款")
     if user.get("operating_channel") == "vip":
         return ("唯品", "同款")
     return ()

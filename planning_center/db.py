@@ -22,6 +22,13 @@ DRESS_PRICING_CATEGORY = "连衣裙"
 NON_DRESS_PRICING_CATEGORY = "非连衣裙品类"
 CATEGORY_FALLBACK_OPTION = "其他"
 LEGACY_CATEGORY_FALLBACK_OPTION = "其他品类"
+STANDARD_CHANNEL_OPTIONS = (
+    ("天猫", 10),
+    ("天猫官", 20),
+    ("天猫奥", 30),
+    ("唯品", 40),
+    ("同款", 50),
+)
 LEGACY_DEFAULT_CATEGORY_OPTIONS = {
     "毛衣": ("针织衫,毛衣,针织上衣", 20),
     "衬衫": ("衬衫,衬衣", 30),
@@ -311,11 +318,23 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
                     "INSERT OR IGNORE INTO category_options (name, keywords, pricing_group, sort_order, note, updated_at) VALUES (?, ?, ?, 500, '', ?)",
                     (name, name, "dress" if name == "连衣裙" else "other", utc_now()),
                 )
-        if connection.execute("SELECT COUNT(*) FROM channel_options").fetchone()[0] == 0:
+        # Keep the five business channels available on existing deployments as
+        # well as fresh databases. Reorder them once when expanding an older
+        # three-channel database, while preserving later administrator changes,
+        # custom options, and historical records.
+        existing_channels = {
+            str(row["name"] or "").strip()
+            for row in connection.execute("SELECT name FROM channel_options").fetchall()
+        }
+        if any(name not in existing_channels for name, _ in STANDARD_CHANNEL_OPTIONS):
             now = utc_now()
             connection.executemany(
-                "INSERT INTO channel_options (name, sort_order, note, updated_at) VALUES (?, ?, ?, ?)",
-                [("天猫", 10, "", now), ("唯品", 20, "", now), ("同款", 30, "", now)],
+                "INSERT OR IGNORE INTO channel_options (name, sort_order, note, updated_at) VALUES (?, ?, '', ?)",
+                [(name, sort_order, now) for name, sort_order in STANDARD_CHANNEL_OPTIONS],
+            )
+            connection.executemany(
+                "UPDATE channel_options SET sort_order = ?, updated_at = ? WHERE name = ?",
+                [(sort_order, now, name) for name, sort_order in STANDARD_CHANNEL_OPTIONS],
             )
 
 

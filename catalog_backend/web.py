@@ -94,6 +94,7 @@ from catalog_backend.policies import (
     normalize_launch_channel,
     normalize_billing_platform_codes,
     operating_channel_label,
+    operating_channel_scope_label,
     platform_bill_platform_codes_for_user,
     status_label,
     visible_fields_for_department,
@@ -10460,14 +10461,14 @@ class CatalogApplication:
         c_note = ""
         if user["department"] == "C":
             if is_department_monitor(user):
-                c_note = '<div class="warning">管理员正在查看运营部汇总视图：已合并天猫、唯品及同款资料，仅用于查看接收进度。</div>'
+                c_note = '<div class="warning">管理员正在查看运营部汇总视图：已合并天猫、天猫官、天猫奥、唯品及同款资料，仅用于查看接收进度。</div>'
             elif user.get("operating_channel") not in C_OPERATING_CHANNELS:
                 c_note = '<div class="warning">当前运营账号尚未设置运营归属，暂不显示商品资料。请由管理员在账号管理中设置为天猫类、唯品类或全渠道。</div>'
             elif user.get("operating_channel") == "all":
-                c_note = '<div class="warning">当前账号归属全渠道：可查看并记录接收天猫、唯品和同款资料，但不参与全局“已接收”状态判断；账单权限仍以账号管理中的账单属性为准。</div>'
+                c_note = '<div class="warning">当前账号归属全渠道：可查看并记录接收天猫、天猫官、天猫奥、唯品和同款资料，但不参与全局“已接收”状态判断；账单权限仍以账号管理中的账单属性为准。</div>'
             else:
                 c_note = (
-                    f'<div class="warning">当前账号归属{html.escape(operating_channel_label(user.get("operating_channel")))}：只能查看本归属渠道及同款资料，页面、Excel 导出和 JSON 接口均不会返回其他渠道内容。</div>'
+                    f'<div class="warning">当前账号归属{html.escape(operating_channel_label(user.get("operating_channel")))}：可查看{html.escape(operating_channel_scope_label(user.get("operating_channel")))}资料，页面、Excel 导出和 JSON 接口均不会返回其他渠道内容。</div>'
                 )
         rows = []
         for product in products:
@@ -10828,6 +10829,8 @@ class CatalogApplication:
               <select name="channel" aria-label="上新渠道">
                 <option value="">全部上新渠道</option>
                 <option value="天猫" {"selected" if launch_channel_filter == "天猫" else ""}>天猫</option>
+                <option value="天猫官" {"selected" if launch_channel_filter == "天猫官" else ""}>天猫官</option>
+                <option value="天猫奥" {"selected" if launch_channel_filter == "天猫奥" else ""}>天猫奥</option>
                 <option value="唯品" {"selected" if launch_channel_filter == "唯品" else ""}>唯品</option>
                 <option value="同款" {"selected" if launch_channel_filter == "同款" else ""}>同款</option>
               </select>
@@ -13033,9 +13036,9 @@ class CatalogApplication:
         )
         notice_block = f'<div class="notice">{html.escape(notice)}</div>' if notice else ""
         if user["department"] == "C":
-            workflow_notice = "状态为待运营接收表示资料等待你接收；确认后会更新为已接收。"
+            workflow_notice = "状态为待运营接收表示资料等待你接收；确认后会更新为已接收。天猫账号覆盖天猫、天猫官、天猫奥和同款，唯品账号覆盖唯品和同款。"
         elif user["department"] == "DESIGN":
-            workflow_notice = "美工部全渠道只读视图，可读取天猫、唯品及同款的已发布资料。"
+            workflow_notice = "美工部全渠道只读视图，可读取天猫、天猫官、天猫奥、唯品及同款的已发布资料。"
         else:
             workflow_notice = "状态流转：跟单整理中 -> A/B协作中 -> 待运营接收 -> 已接收"
         owner_label = "跟单部发起资料" if product.get("owner_department") == "A" else department_label(product.get("owner_department"))
@@ -13467,7 +13470,7 @@ class CatalogApplication:
                 <tbody>
                   <tr><th>A 跟单部</th><td>跟单部资料按部门协作：任一 A 账号可补充、修改、导入更新、流转、召回、删除、归档及恢复符合流程条件的 A 部门资料。系统保留原始发起人，并记录每次实际操作账号。</td><td>不能修改商品部或企划中心负责字段；运营阶段不能直接修改触发字段；不能操作其他部门发起的资料。</td></tr>
                   <tr><th>B 商品部</th><td>在 A/B 协作中推进商品资料；当前藏宝阁内直接维护图片，资料完成后提交运营部。发现商品部或企划字段有误时，可从运营阶段召回。</td><td>不能删除或归档；不能修改 A 阶段字段。品类、上新价格、上新渠道由商品企划中心维护并回传。</td></tr>
-                  <tr><th>C 运营部</th><td>按账号渠道属性查看并接收资料。天猫类或唯品类中任意一个账号接收所属渠道资料后，全局状态即更新为“已接收”，不需等待同类别其他账号逐一接收；“同款”由任意天猫类或唯品类账号接收后，即显示“已接收”。全渠道账号可记录个人接收，但不参与全局状态判断；账单属性仍独立授权。</td><td>不能修改资料、删除、归档或召回。</td></tr>
+                  <tr><th>C 运营部</th><td>按账号渠道属性查看并接收资料：天猫类覆盖天猫、天猫官、天猫奥和同款；唯品类覆盖唯品和同款。任意一个账号接收所属渠道资料后，全局状态即更新为“已接收”，不需等待同类别其他账号逐一接收；全渠道账号可记录个人接收，但不参与全局状态判断，并可查看五个渠道；账单属性仍独立授权。</td><td>不能修改资料、删除、归档或召回。</td></tr>
                   <tr><th>总经办 / 美工部</th><td>按各自只读范围查看资料。</td><td>不能上传、修改、删除、归档或召回。</td></tr>
                   <tr><th>管理员</th><td>可查看并监控各部门，维护账号和系统规则，执行必要的流程及生命周期管理。</td><td>管理员操作会写入日志，正式业务仍建议由对应部门完成。</td></tr>
                 </tbody>
@@ -13576,7 +13579,7 @@ class CatalogApplication:
             for code in MANAGEABLE_DEPARTMENTS
         )
         operating_channel_options = "".join(
-            f'<option value="{code}" {"selected" if form_values.get("operating_channel") == code else ""}>{html.escape("全渠道（天猫/唯品/同款）" if code == "all" else label)}</option>'
+            f'<option value="{code}" {"selected" if form_values.get("operating_channel") == code else ""}>{html.escape("全渠道（天猫/天猫官/天猫奥/唯品/同款）" if code == "all" else label)}</option>'
             for code, label in C_OPERATING_CHANNELS.items()
         )
         selected_billing_platforms = set(self.billing_platform_codes_for_user_form(form_values))
@@ -13666,7 +13669,7 @@ class CatalogApplication:
             for code in MANAGEABLE_DEPARTMENTS
         )
         operating_channel_options = "".join(
-            f'<option value="{code}" {"selected" if managed_user.get("operating_channel") == code else ""}>{html.escape("全渠道（天猫/唯品/同款）" if code == "all" else label)}</option>'
+            f'<option value="{code}" {"selected" if managed_user.get("operating_channel") == code else ""}>{html.escape("全渠道（天猫/天猫官/天猫奥/唯品/同款）" if code == "all" else label)}</option>'
             for code, label in C_OPERATING_CHANNELS.items()
         )
         selected_billing_platforms = set(self.billing_platform_codes_for_user_form(managed_user))

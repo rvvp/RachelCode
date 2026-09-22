@@ -77,7 +77,7 @@ PRODUCT_FIELDS: list[FieldDef] = [
         "价格与供应",
         visible_to_c=True,
         input_type="select",
-        options=("天猫", "唯品", "同款"),
+        options=("天猫", "天猫官", "天猫奥", "唯品", "同款"),
     ),
     FieldDef(
         "completion_flag",
