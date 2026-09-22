@@ -6507,6 +6507,8 @@ class CatalogApplication:
       flex-wrap: wrap;
     }}
     .products-list-control-bar {{
+      position: relative;
+      z-index: 10;
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
       align-items: center;
@@ -6516,6 +6518,7 @@ class CatalogApplication:
       border: 1px solid rgba(94, 67, 40, 0.1);
       border-radius: 14px;
       background: rgba(255, 252, 247, 0.76);
+      overflow: visible;
     }}
     .products-list-page-row {{
       display: flex;

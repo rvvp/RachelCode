@@ -854,6 +854,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("重回企划判断", decision_page_body)
         self.assertIn("批量企划判断", decision_page_body)
         self.assertIn('class="export-menu export-menu-compact products-bulk-planning-menu"', decision_page_body)
+        self.assertIn(".products-list-control-bar {\n      position: relative;\n      z-index: 10;", decision_page_body)
         self.assertIn("批量重回企划", decision_page_body)
         self.assertIn("批量不回企划", decision_page_body)
         self.assertLess(decision_page_body.index("批量召回"), decision_page_body.index("批量重回企划"))
