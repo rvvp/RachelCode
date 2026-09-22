@@ -852,6 +852,8 @@ class PlanningCenterTests(unittest.TestCase):
         )
         decision_page_body = decision_page["body"].decode("utf-8")
         self.assertIn("重回企划判断", decision_page_body)
+        self.assertIn("批量企划判断", decision_page_body)
+        self.assertIn('class="export-menu export-menu-compact products-bulk-planning-menu"', decision_page_body)
         self.assertIn("批量重回企划", decision_page_body)
         self.assertIn("批量不回企划", decision_page_body)
         self.assertLess(decision_page_body.index("批量召回"), decision_page_body.index("批量重回企划"))
@@ -1092,7 +1094,8 @@ class PlanningCenterTests(unittest.TestCase):
         b_cookie = self.login_cookie(app, "b_editor")
         list_page = self.wsgi_request(app, "/products", cookie=b_cookie)["body"].decode("utf-8")
         self.assertIn(f'formaction="/products/{source["id"]}/planning-revision"', list_page)
-        self.assertIn("批量发起二次企划", list_page)
+        self.assertIn("批量二次企划", list_page)
+        self.assertNotIn("批量发起二次企划", list_page)
 
         response = self.wsgi_request(
             app,

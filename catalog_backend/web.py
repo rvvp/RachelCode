@@ -2521,7 +2521,7 @@ class CatalogApplication:
         elif action == "skip_planning_selected":
             action_label = "批量不回企划"
         elif action == "request_planning_revision_selected":
-            action_label = "批量发起二次企划"
+            action_label = "批量二次企划"
         elif action == "complete_to_c_selected":
             action_label = "批量提交运营部"
         elif action == "receive_selected":
@@ -6610,6 +6610,29 @@ class CatalogApplication:
       justify-content: flex-end;
       gap: 8px;
       flex-wrap: nowrap;
+    }}
+    .products-bulk-planning-menu {{
+      flex: 0 0 auto;
+    }}
+    .products-bulk-planning-menu .export-menu-summary-compact {{
+      min-height: 34px;
+      padding: 7px 14px;
+      border-radius: 11px;
+      font-size: 13px;
+      white-space: nowrap;
+    }}
+    .products-bulk-planning-menu-panel {{
+      right: 0;
+      left: auto;
+      z-index: 20;
+      min-width: 168px;
+    }}
+    .products-bulk-planning-menu-panel .export-menu-item {{
+      min-height: 36px;
+      padding: 8px 12px;
+      border-radius: 11px;
+      font-size: 13px;
+      white-space: nowrap;
     }}
     .pagination-page-current {{
       background: var(--accent);
@@ -12632,18 +12655,24 @@ class CatalogApplication:
               title="仅召回待运营接收或已接收的资料；其他条目会自动跳过">批量召回</button>
         """
         planning_reentry_buttons = """
-            <button type="submit" name="bulk_action" value="submit_to_planning_selected"
-              form="products-bulk-form" formmethod="post" formaction="/products/bulk"
-              class="ghost-button products-bulk-planning-button"
-              title="处理召回或成本变动后待判断的资料；确认后下次同步进入商品企划中心">批量重回企划</button>
-            <button type="submit" name="bulk_action" value="skip_planning_selected"
-              form="products-bulk-form" formmethod="post" formaction="/products/bulk"
-              class="ghost-button products-bulk-planning-button"
-              title="处理召回或成本变动后待判断的资料；确认本次不再进入商品企划中心">批量不回企划</button>
+            <details class="export-menu export-menu-compact products-bulk-planning-menu">
+              <summary class="export-menu-summary export-menu-summary-compact"
+                title="批量处理召回或成本变动后待判断的企划去向">批量企划判断</summary>
+              <div class="export-menu-panel products-bulk-planning-menu-panel">
+                <button type="submit" name="bulk_action" value="submit_to_planning_selected"
+                  form="products-bulk-form" formmethod="post" formaction="/products/bulk"
+                  class="export-menu-item"
+                  title="确认后下次同步进入商品企划中心">批量重回企划</button>
+                <button type="submit" name="bulk_action" value="skip_planning_selected"
+                  form="products-bulk-form" formmethod="post" formaction="/products/bulk"
+                  class="export-menu-item"
+                  title="确认本次不再进入商品企划中心">批量不回企划</button>
+              </div>
+            </details>
             <button type="submit" name="bulk_action" value="request_planning_revision_selected"
               form="products-bulk-form" formmethod="post" formaction="/products/bulk"
               class="ghost-button products-bulk-planning-button"
-              title="仅处理已完成过企划回传、仍处于 A/B 协作中的资料">批量发起二次企划</button>
+              title="仅处理已完成过企划回传、仍处于 A/B 协作中的资料">批量二次企划</button>
         """
         if user.get("department") == "B":
             return f"""
