@@ -2256,6 +2256,7 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("可按实际业务新增任意数量的成本区间", page)
         self.assertIn("规则维护账号", page)
         self.assertIn("<h1>规则</h1>", page)
+        self.assertIn("class='active' href='/rules'>商品规则</a>", page)
         self.assertIn("品类选项", page)
         self.assertIn("渠道选项", page)
         self.assertNotIn("<h1>定价规则</h1>", page)

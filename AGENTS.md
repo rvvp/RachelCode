@@ -2,8 +2,9 @@
 
 ## Release Policy
 
-For Cangbaoge application code, finish each requested change through the
-verified release pipeline unless the user explicitly asks to keep it local:
+For Cangbaoge and Merchandise Planning Center application code, finish each
+requested change through the verified release pipeline unless the user
+explicitly asks to keep it local:
 
 1. Run the relevant local tests and code-format checks successfully.
 2. Commit only application code and tests; never include runtime data.
@@ -14,8 +15,9 @@ verified release pipeline unless the user explicitly asks to keep it local:
 
 Never push to `github` before the public verification passes. A failed local
 test, origin push, deployment, or public verification stops the pipeline and
-leaves GitHub unchanged. For non-Cangbaoge projects or an explicit one-remote
-request, follow the scope given by the user instead of this automatic flow.
+leaves GitHub unchanged. For projects other than Cangbaoge and Merchandise
+Planning Center, or for an explicit one-remote request, follow the scope given
+by the user instead of this automatic flow.
 
 The configured remotes are:
 

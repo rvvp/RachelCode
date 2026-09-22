@@ -2797,7 +2797,7 @@ class PlanningApplication:
         return f"<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{html.escape(title)}</title><style>{self.css()}</style><style>{price_display_css}</style></head><body class='{body_class}'>{content}</body></html>"
 
     def shell(self, title: str, content: str, user: dict, current: str) -> str:
-        nav_items = [("dashboard", "/dashboard", "企划总览"), ("category-planning", "/category-planning", "品类企划"), ("workbench", "/workbench", "上新审核"), ("rules", "/rules", "规则"), ("system-rules", "/system-rules", "系统规则"), ("stats", "/stats", "价格带统计")]
+        nav_items = [("dashboard", "/dashboard", "企划总览"), ("category-planning", "/category-planning", "品类企划"), ("workbench", "/workbench", "上新审核"), ("rules", "/rules", "商品规则"), ("system-rules", "/system-rules", "系统规则"), ("stats", "/stats", "价格带统计")]
         if user.get("role") == "admin":
             nav_items.append(("accounts", "/accounts", "账号管理"))
         nav_items.append(("settings", "/settings", "连接设置"))
