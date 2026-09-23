@@ -38,6 +38,18 @@ LEGACY_DEFAULT_CATEGORY_OPTIONS = {
 }
 
 
+def normalize_season_year(value: str | None) -> str:
+    """Return the canonical season label used across planning records.
+
+    Catalog imports historically allowed a four-digit year followed by the
+    Chinese year marker (for example, ``2026年秋冬``).  The planning center
+    uses the shorter ``2026秋冬`` form.  Restrict the replacement to known
+    season suffixes so unrelated free-form labels remain untouched.
+    """
+    clean = str(value or "").strip()
+    return re.sub(r"^(\d{4})年(?=(?:春夏|秋冬|春|夏|秋|冬)$)", r"\1", clean)
+
+
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -239,6 +251,20 @@ def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dic
             "UPDATE pricing_records SET category = ? WHERE category = ?",
             (CATEGORY_FALLBACK_OPTION, LEGACY_CATEGORY_FALLBACK_OPTION),
         )
+        # Correct the historical season typo in place. This migration is
+        # intentionally idempotent and does not touch record ids, versions,
+        # workflow status, or audit timestamps.
+        for table in ("source_products", "pricing_records"):
+            rows = connection.execute(
+                f"SELECT id, season_year FROM {table} WHERE INSTR(season_year, '年') > 0"
+            ).fetchall()
+            for row in rows:
+                normalized = normalize_season_year(row["season_year"])
+                if normalized != str(row["season_year"] or ""):
+                    connection.execute(
+                        f"UPDATE {table} SET season_year = ? WHERE id = ?",
+                        (normalized, int(row["id"])),
+                    )
         legacy_fallback = connection.execute(
             "SELECT id, note FROM category_options WHERE name = ?",
             (LEGACY_CATEGORY_FALLBACK_OPTION,),
@@ -835,6 +861,7 @@ def upsert_source_products(
         category_options = [dict(row) for row in connection.execute("SELECT * FROM category_options WHERE enabled = 1 ORDER BY sort_order, id").fetchall()]
         for item in eligible_items:
             category_suggestion = infer_category(item.get("product_name", ""), category_options)
+            season_year = normalize_season_year(item.get("season_year"))
             normalized_cost = source_tax_included_cost_value(item)
             if normalized_cost is None and not require_cost:
                 normalized_cost = source_cost_value({"actual_cost": item.get("actual_cost")})
@@ -860,7 +887,7 @@ def upsert_source_products(
                 """,
                 (
                     int(item["id"]), item.get("style_code", ""), item.get("style_color", ""), item.get("color_name", ""),
-                    item.get("product_name", ""), item.get("brand_name", ""), item.get("season_year", ""), item.get("supplier", ""),
+                    item.get("product_name", ""), item.get("brand_name", ""), season_year, item.get("supplier", ""),
                     item.get("supplier_code", ""), item.get("supplier_style_code", ""), category_suggestion, category_suggestion, actual_cost,
                     tax_included_price, item.get("image_url", ""), "pending", "active", int(item.get("source_version_no") or 1), int(item.get("image_version_no") or 1),
                     int(item.get("planning_request_no") or 0), str(item.get("planning_reentry_state") or "initial"),
@@ -912,6 +939,7 @@ def upsert_source_image_updates(db_path: str | Path, items: list[dict]) -> int:
             if normalized_cost is None:
                 normalized_cost = source_tax_included_cost_value(existing)
             category_suggestion = infer_category(str(merged.get("product_name") or ""), category_options)
+            season_year = normalize_season_year(merged.get("season_year"))
             connection.execute(
                 """
                 UPDATE source_products
@@ -931,7 +959,7 @@ def upsert_source_image_updates(db_path: str | Path, items: list[dict]) -> int:
                     str(merged.get("color_name") or ""),
                     str(merged.get("product_name") or ""),
                     str(merged.get("brand_name") or ""),
-                    str(merged.get("season_year") or ""),
+                    season_year,
                     str(merged.get("supplier") or ""),
                     str(merged.get("supplier_code") or ""),
                     str(merged.get("supplier_style_code") or ""),
@@ -2350,7 +2378,9 @@ def list_pricing_statistic_seasons(db_path: str | Path) -> list[str]:
             ORDER BY season_year DESC
             """
         ).fetchall()
-    return [str(row["season_year"]).strip() for row in rows]
+    # Normalize once more at the read boundary for databases upgraded from an
+    # older release that may still contain an unrecognized legacy label.
+    return list(dict.fromkeys(normalize_season_year(row["season_year"]) for row in rows))
 
 
 def pricing_stats_many(
@@ -2358,12 +2388,13 @@ def pricing_stats_many(
     season_year: str = "",
     categories: list[str] | tuple[str, ...] = (),
 ) -> dict[str, list[dict]]:
+    clean_season = normalize_season_year(season_year)
     requested_categories = list(
         dict.fromkeys(str(category or "").strip() for category in categories)
     ) or [""]
     specific_categories = [category for category in requested_categories if category]
     conditions = ["status IN ('confirmed', 'published')", "(? = '' OR season_year = ?)"]
-    params: list[object] = [season_year, season_year]
+    params: list[object] = [clean_season, clean_season]
     if specific_categories and "" not in requested_categories:
         placeholders = ", ".join("?" for _ in specific_categories)
         conditions.append(f"category IN ({placeholders})")

@@ -4824,6 +4824,58 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("@media(max-width:900px){.stats-band-grid{grid-template-columns:1fr}", multi_category_html)
         self.assertIn("summary data-stats-category-summary>已选 3 个品类</summary>", multi_category_html)
 
+    def test_season_typo_is_normalized_for_sync_migration_and_stats(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "", None, 600, 4)
+        source = {
+            "id": 5201,
+            "style_code": "SEASON-TYPO-001",
+            "style_color": "SEASON-TYPO-001-黑",
+            "product_name": "季节规范化测试",
+            "season_year": "2026年秋冬",
+            "supplier": "统计供应商",
+            "tax_included_price": 100,
+            "image_url": "https://example.com/season-typo.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 7,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source], require_image=True, require_cost=True)
+        synced_source = planning_db.get_source_product(self.planning_db_path, source["id"])
+        self.assertEqual(synced_source["season_year"], "2026秋冬")
+        record = planning_db.create_pricing_record(self.planning_db_path, synced_source, "商品部企划员")
+        planning_db.submit_pricing_for_review(
+            self.planning_db_path,
+            record["id"],
+            record["calculated_price"],
+            "商品部企划员",
+            synced_source["category"],
+            "天猫",
+        )
+        planning_db.approve_pricing_record(
+            self.planning_db_path,
+            record["id"],
+            record["calculated_price"],
+            "天猫",
+            "企划管理员",
+        )
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("UPDATE source_products SET season_year = '2026年秋冬' WHERE id = ?", (source["id"],))
+            connection.execute("UPDATE pricing_records SET season_year = '2026年秋冬' WHERE id = ?", (record["id"],))
+
+        # Startup migration repairs existing rows without changing their ids or
+        # workflow state, and is safe to run repeatedly.
+        planning_db.init_db(self.planning_db_path)
+        migrated_source = planning_db.get_source_product(self.planning_db_path, source["id"])
+        migrated_record = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+        self.assertEqual(migrated_source["season_year"], "2026秋冬")
+        self.assertEqual(migrated_record["season_year"], "2026秋冬")
+        self.assertEqual(migrated_record["status"], "confirmed")
+        self.assertEqual(planning_db.list_pricing_statistic_seasons(self.planning_db_path), ["2026秋冬"])
+        stats = planning_db.pricing_stats(self.planning_db_path, "2026秋冬")
+        self.assertEqual(sum(item["count"] for item in stats), 1)
+        planning_db.init_db(self.planning_db_path)
+        self.assertEqual(planning_db.list_pricing_statistic_seasons(self.planning_db_path), ["2026秋冬"])
+
 
 if __name__ == "__main__":
     unittest.main()
