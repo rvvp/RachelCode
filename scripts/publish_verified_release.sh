@@ -63,6 +63,7 @@ for attempt in $(seq 1 "$WAIT_ATTEMPTS"); do
     "$ROOT_DIR/scripts/verify_public_deployment.sh" "$PUBLIC_URL" >/dev/null 2>&1 \
     && CATALOG_RELEASE_COMMIT="$release_commit" \
       CATALOG_RELEASE_GENERATION="$release_generation" \
+      PYTHON_BIN="$PYTHON_BIN" \
       REPLENISH_DEPLOYMENT_CHECK_COUNT=1 \
       REPLENISH_EXPECTED_WORKERS=1 \
       "$ROOT_DIR/scripts/verify_replenishment_deployment.sh" "$REPLENISH_PUBLIC_URL" >/dev/null 2>&1; then
@@ -81,6 +82,7 @@ CATALOG_RELEASE_COMMIT="$release_commit" \
   "$ROOT_DIR/scripts/verify_public_deployment.sh" "$PUBLIC_URL"
 CATALOG_RELEASE_COMMIT="$release_commit" \
   CATALOG_RELEASE_GENERATION="$release_generation" \
+  PYTHON_BIN="$PYTHON_BIN" \
   REPLENISH_DEPLOYMENT_CHECK_COUNT=16 \
   REPLENISH_EXPECTED_WORKERS=1 \
   "$ROOT_DIR/scripts/verify_replenishment_deployment.sh" "$REPLENISH_PUBLIC_URL"

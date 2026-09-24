@@ -122,7 +122,8 @@ done
 run_root systemctl is-active --quiet "$SERVICE_NAME"
 run_root systemctl is-active --quiet "$REPLENISH_SERVICE_NAME"
 CATALOG_DEPLOYMENT_CHECK_COUNT=256 CATALOG_EXPECTED_WORKERS=8 "$ROOT_DIR/scripts/verify_public_deployment.sh" "$LOCAL_URL"
-REPLENISH_DEPLOYMENT_CHECK_COUNT=8 REPLENISH_EXPECTED_WORKERS=1 "$ROOT_DIR/scripts/verify_replenishment_deployment.sh" "$REPLENISH_LOCAL_URL"
+PYTHON_BIN="$VENV_DIR/bin/python" REPLENISH_DEPLOYMENT_CHECK_COUNT=8 REPLENISH_EXPECTED_WORKERS=1 \
+  "$ROOT_DIR/scripts/verify_replenishment_deployment.sh" "$REPLENISH_LOCAL_URL"
 
 if [ -n "$PUBLIC_URL" ]; then
   CATALOG_DEPLOYMENT_CHECK_COUNT=256 CATALOG_EXPECTED_WORKERS=8 "$ROOT_DIR/scripts/verify_public_deployment.sh" "$PUBLIC_URL"
@@ -132,7 +133,7 @@ else
   exit 1
 fi
 
-REPLENISH_DEPLOYMENT_CHECK_COUNT=16 REPLENISH_EXPECTED_WORKERS=1 \
+PYTHON_BIN="$VENV_DIR/bin/python" REPLENISH_DEPLOYMENT_CHECK_COUNT=16 REPLENISH_EXPECTED_WORKERS=1 \
   "$ROOT_DIR/scripts/verify_replenishment_deployment.sh" "$REPLENISH_PUBLIC_URL"
 
 echo "OK 正式服务已重启，藏宝阁与货品监控中心均已加载本次源码。"

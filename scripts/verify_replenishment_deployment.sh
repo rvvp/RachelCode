@@ -5,17 +5,22 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BASE_URL="${1:-${REPLENISH_PUBLIC_URL:-}}"
 CHECK_COUNT="${REPLENISH_DEPLOYMENT_CHECK_COUNT:-8}"
 EXPECTED_WORKERS="${REPLENISH_EXPECTED_WORKERS:-1}"
+PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
 
 if [ -z "$BASE_URL" ]; then
   echo "ERROR 请传入货品监控中心根地址，例如: $0 http://203.205.90.232:8877" >&2
   exit 1
 fi
+[ -x "$PYTHON_BIN" ] || {
+  echo "ERROR 未找到货品监控中心验证所需的项目 Python: $PYTHON_BIN" >&2
+  exit 1
+}
 
 BASE_URL="${BASE_URL%/}"
-EXPECTED_BUILD="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("replenishment_center/release.py")["REPLENISHMENT_BUILD_VERSION"])')"
-EXPECTED_SOURCE="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("replenishment_center/release.py")["REPLENISHMENT_SOURCE_FINGERPRINT"])')"
-EXPECTED_COMMIT="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("replenishment_center/release.py")["REPLENISHMENT_RELEASE_COMMIT"])')"
-EXPECTED_GENERATION="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("replenishment_center/release.py")["REPLENISHMENT_RELEASE_GENERATION"])')"
+EXPECTED_BUILD="$(cd "$ROOT_DIR" && "$PYTHON_BIN" -c 'import runpy; print(runpy.run_path("replenishment_center/release.py")["REPLENISHMENT_BUILD_VERSION"])')"
+EXPECTED_SOURCE="$(cd "$ROOT_DIR" && "$PYTHON_BIN" -c 'import runpy; print(runpy.run_path("replenishment_center/release.py")["REPLENISHMENT_SOURCE_FINGERPRINT"])')"
+EXPECTED_COMMIT="$(cd "$ROOT_DIR" && "$PYTHON_BIN" -c 'import runpy; print(runpy.run_path("replenishment_center/release.py")["REPLENISHMENT_RELEASE_COMMIT"])')"
+EXPECTED_GENERATION="$(cd "$ROOT_DIR" && "$PYTHON_BIN" -c 'import runpy; print(runpy.run_path("replenishment_center/release.py")["REPLENISHMENT_RELEASE_GENERATION"])')"
 
 if [ -z "$EXPECTED_BUILD" ] || [ -z "$EXPECTED_SOURCE" ] || [ "$EXPECTED_COMMIT" = "unknown" ]; then
   echo "ERROR 无法计算货品监控中心待发布代码的版本、提交号或源码指纹。" >&2
@@ -35,7 +40,7 @@ for attempt in $(seq 1 "$CHECK_COUNT"); do
     --header 'Cache-Control: no-cache' --header 'Connection: close' \
     --output "$payload_file" --write-out '%{http_code}' \
     "$BASE_URL/healthz?deployment_check=$(date +%s)-$attempt")"
-  python3 - "$payload_file" "$http_code" "$EXPECTED_BUILD" "$EXPECTED_COMMIT" "$EXPECTED_GENERATION" "$EXPECTED_SOURCE" "$attempt" "$workers_file" <<'PY'
+  "$PYTHON_BIN" - "$payload_file" "$http_code" "$EXPECTED_BUILD" "$EXPECTED_COMMIT" "$EXPECTED_GENERATION" "$EXPECTED_SOURCE" "$attempt" "$workers_file" <<'PY'
 import json
 import sys
 
