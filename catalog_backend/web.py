@@ -6562,8 +6562,24 @@ class CatalogApplication:
     }}
     .products-overview-uniform-pill {{
       justify-content: center;
-      width: 94px;
+      width: 126px;
+      height: 48px;
       min-height: 48px;
+      box-sizing: border-box;
+    }}
+    .products-overview-line-switch .pill {{
+      font-size: 15px;
+      font-weight: 800;
+    }}
+    .products-overview-card .tools > .pill,
+    .products-overview-card .tools > .export-menu,
+    .products-overview-card .tools > .export-menu > .export-menu-summary {{
+      justify-content: center;
+      width: 126px;
+      min-width: 126px;
+      height: 48px;
+      min-height: 48px;
+      box-sizing: border-box;
     }}
     .products-top-grid .products-stats-panel .stats {{
       grid-template-columns: none;

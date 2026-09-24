@@ -4204,7 +4204,9 @@ class CatalogAppTests(unittest.TestCase):
             a_body,
         )
         self.assertEqual(a_body.count('class="pill products-overview-uniform-pill'), 3)
-        self.assertIn("width: 94px;\n      min-height: 48px;", a_body)
+        self.assertIn("width: 126px;\n      height: 48px;\n      min-height: 48px;", a_body)
+        self.assertIn("font-size: 15px;\n      font-weight: 800;", a_body)
+        self.assertIn(".products-overview-card .tools > .export-menu", a_body)
         self.assertIn(".nav-shell {", a_body)
         self.assertIn("top: 12px;\n      z-index: 20;", a_body)
         self.assertIn('data-export-selected="1"', a_body)
