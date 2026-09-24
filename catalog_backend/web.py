@@ -6555,6 +6555,16 @@ class CatalogApplication:
       gap: 10px;
       margin-bottom: 0;
     }}
+    .products-overview-line-switch {{
+      display: flex;
+      gap: 10px;
+      margin-bottom: 10px;
+    }}
+    .products-overview-uniform-pill {{
+      justify-content: center;
+      width: 94px;
+      min-height: 48px;
+    }}
     .products-top-grid .products-stats-panel .stats {{
       grid-template-columns: none;
       grid-auto-flow: column;
@@ -11088,7 +11098,7 @@ class CatalogApplication:
         if user["department"] == "C" and not is_department_monitor(user):
             c_note = ""
         layout_settings_button = (
-            '<a class="pill" href="/settings/list-layout">列表字段设置</a>'
+            '<a class="pill products-overview-uniform-pill" href="/settings/list-layout">列表字段设置</a>'
             if not is_executive_read_only(user) and not is_released_catalog_read_only(user)
             else ""
         )
@@ -11104,7 +11114,7 @@ class CatalogApplication:
             </details>
             """
         product_line_switch = "".join(
-            f'<a class="pill{" active" if option == product_line else ""}" href="/products{"?line=black" if option == "black" else ""}#products-list">{html.escape(PRODUCT_LINE_LABELS[option])}</a>'
+            f'<a class="pill products-overview-uniform-pill{" active" if option == product_line else ""}" href="/products{"?line=black" if option == "black" else ""}#products-list">{html.escape(PRODUCT_LINE_LABELS[option])}</a>'
             for option in PRODUCT_LINE_OPTIONS
         )
         content = f"""
@@ -11113,7 +11123,7 @@ class CatalogApplication:
           <div class="panel products-overview-card{' products-overview-card-spaced' if user['department'] in {'A', 'B'} else ''}">
             <div class="eyebrow">{html.escape(console_eyebrow)}</div>
             <h1>商品资料后台</h1>
-            <div class="product-line-switch" aria-label="选择商品线">{product_line_switch}</div>
+            <div class="product-line-switch products-overview-line-switch" aria-label="选择商品线">{product_line_switch}</div>
             <div class="tools">
               {layout_settings_button}
               {new_button}

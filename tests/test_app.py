@@ -4199,6 +4199,12 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn(".products-overview-card {", a_body)
         self.assertIn("overflow: visible", a_body)
         self.assertIn(".products-overview-card {\n      overflow: visible;\n      z-index: 1;", a_body)
+        self.assertIn(
+            '<div class="product-line-switch products-overview-line-switch" aria-label="选择商品线">',
+            a_body,
+        )
+        self.assertEqual(a_body.count('class="pill products-overview-uniform-pill'), 3)
+        self.assertIn("width: 94px;\n      min-height: 48px;", a_body)
         self.assertIn(".nav-shell {", a_body)
         self.assertIn("top: 12px;\n      z-index: 20;", a_body)
         self.assertIn('data-export-selected="1"', a_body)
