@@ -6571,6 +6571,9 @@ class CatalogApplication:
       font-size: 15px;
       font-weight: 800;
     }}
+    .products-overview-action-label {{
+      font-size: 14px;
+    }}
     .products-overview-card .tools > .pill,
     .products-overview-card .tools > .export-menu,
     .products-overview-card .tools > .export-menu > .export-menu-summary {{
@@ -10899,12 +10902,12 @@ class CatalogApplication:
         line_query_suffix = "?line=black" if product_line == "black" else ""
         line_hidden_input = '<input type="hidden" name="line" value="black">' if product_line == "black" else ""
         new_button = (
-            f'<a class="pill" href="/products/new{line_query_suffix}">新建资料</a>'
+            f'<a class="pill products-overview-action-label" href="/products/new{line_query_suffix}">新建资料</a>'
             if can_create_product(user)
             else ""
         )
         import_button = (
-            f'<a class="pill" href="/import{line_query_suffix}">导入 Excel</a>'
+            f'<a class="pill products-overview-action-label" href="/import{line_query_suffix}">导入 Excel</a>'
             if can_import_product_excel(user)
             else ""
         )
@@ -11114,7 +11117,7 @@ class CatalogApplication:
         if user["department"] == "C" and not is_department_monitor(user):
             c_note = ""
         layout_settings_button = (
-            '<a class="pill products-overview-uniform-pill" href="/settings/list-layout">列表字段设置</a>'
+            '<a class="pill products-overview-uniform-pill products-overview-action-label" href="/settings/list-layout">列表字段设置</a>'
             if not is_executive_read_only(user) and not is_released_catalog_read_only(user)
             else ""
         )
