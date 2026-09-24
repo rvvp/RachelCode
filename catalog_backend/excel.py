@@ -22,6 +22,7 @@ from PIL import ImageOps
 
 from catalog_backend.db import PRODUCT_DATE_FIELD_KEYS, normalize_optional_date_text, normalize_product_data, normalize_value
 from catalog_backend.fields import EXCEL_HEADERS, PRODUCT_FIELDS, PRODUCT_FIELD_MAP
+from catalog_backend.policies import PRODUCT_LINE_LABELS, normalize_product_line
 from catalog_backend.uploads import MAX_IMAGE_BYTES, UPLOAD_COPY_CHUNK_BYTES, formatted_size_limit
 
 
@@ -54,6 +55,7 @@ HEADER_KEY_LOOKUP.update(
     {
         normalize_header("品牌名称"): "brand_name",
         normalize_header("颜色名称"): "color_name",
+        normalize_header("上新折扣"): "launch_price",
         normalize_header("洗涤方式 （英文）"): "washing_method_en",
         normalize_header("洗涤方式（英文）"): "washing_method_en",
     }
@@ -168,6 +170,7 @@ def parse_workbook(file_obj) -> list[dict]:
     raw_headers = list(next(row_iterator, ()))
     normalized_headers = [normalize_header(header) for header in raw_headers]
     material_header = normalize_header("材质")
+    product_line_header = normalize_header("商品线")
     has_material_header = material_header in normalized_headers
     recognized_headers = [
         header for header in normalized_headers
@@ -197,7 +200,17 @@ def parse_workbook(file_obj) -> list[dict]:
             row_payload[field_key] = value
         if not has_content:
             continue
-        products.append(normalize_product_data(row_payload))
+        normalized_product = normalize_product_data(row_payload)
+        if product_line_header in normalized_headers:
+            line_value = raw_values[normalized_headers.index(product_line_header)]
+            clean_line_value = str(line_value or "").strip()
+            if clean_line_value:
+                labels_to_codes = {label: code for code, label in PRODUCT_LINE_LABELS.items()}
+                line_code = labels_to_codes.get(clean_line_value, clean_line_value.lower())
+                if line_code not in PRODUCT_LINE_LABELS:
+                    raise ValueError(f"商品线“{clean_line_value}”无法识别，请使用红标线或黑标线。")
+                normalized_product["product_line"] = line_code
+        products.append(normalized_product)
     workbook.close()
     return products
 
@@ -443,19 +456,33 @@ def workbook_bytes(
     products: list[dict],
     visible_fields,
     image_fetcher: Callable[[str], bytes] | None = None,
+    product_line: str = "",
 ) -> bytes:
+    product_lines = {
+        normalize_product_line(product.get("product_line"))
+        for product in products
+        if product.get("product_line")
+    }
+    normalized_line = normalize_product_line(product_line) if product_line else (
+        next(iter(product_lines)) if len(product_lines) == 1 else "red"
+    )
+    if len(product_lines) > 1:
+        raise ValueError("导出 Excel 不能混合红标线和黑标线资料。")
     include_completion_flag = any(field.key == "completion_flag" for field in visible_fields)
     export_fields = [
         field for field in visible_fields
         if field.key != "completion_flag" and field.key not in CATALOG_EXPORT_HIDDEN_FIELD_KEYS
     ]
-    headers = ["历时天数"]
+    headers = ["商品线", "历时天数"]
     if include_completion_flag:
         headers.append("资料完成")
-    headers.extend(field.excel_header for field in export_fields)
-    start_index = 2
+    headers.extend(
+        "上新折扣" if field.key == "launch_price" and normalized_line == "black" else field.excel_header
+        for field in export_fields
+    )
+    start_index = 3
     if include_completion_flag:
-        start_index = 3
+        start_index = 4
 
     if image_fetcher is None:
         workbook = Workbook(write_only=True)
@@ -474,7 +501,7 @@ def workbook_bytes(
             header_cells.append(cell)
         worksheet.append(header_cells)
         for product in products:
-            row = [product.get("elapsed_days_label", "")]
+            row = [PRODUCT_LINE_LABELS[normalized_line], product.get("elapsed_days_label", "")]
             if include_completion_flag:
                 row.append(product.get("completion_flag", ""))
             row.extend(product.get(field.key) for field in export_fields)
@@ -499,7 +526,7 @@ def workbook_bytes(
         None,
     )
     for product in products:
-        row = [product.get("elapsed_days_label", "")]
+        row = [PRODUCT_LINE_LABELS[normalized_line], product.get("elapsed_days_label", "")]
         if include_completion_flag:
             row.append(product.get("completion_flag", ""))
         row.extend(product.get(field.key) for field in export_fields)

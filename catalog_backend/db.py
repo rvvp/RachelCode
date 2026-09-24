@@ -17,6 +17,8 @@ from catalog_backend.policies import (
     B_CATALOG_PROTECTED_FIELD_KEYS,
     B_PLANNING_MANAGED_FIELD_KEYS,
     B_STAGE_FIELD_KEYS,
+    BLACK_LINE_BLANK_FIELD_KEYS,
+    normalize_product_line,
     WORKFLOW_RESTART_FIELD_KEYS,
     c_visible_launch_channels,
     normalize_launch_channel,
@@ -265,6 +267,7 @@ def _init_db_unlocked(
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 {product_columns},
+                product_line TEXT NOT NULL DEFAULT 'red',
                 owner_department TEXT NOT NULL,
                 created_by INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'draft',
@@ -304,6 +307,13 @@ def _init_db_unlocked(
                 continue
             connection.execute(f"ALTER TABLE products ADD COLUMN {field.key} {field.storage_type}")
             existing_columns.add(field.key)
+        if "product_line" not in existing_columns:
+            connection.execute("ALTER TABLE products ADD COLUMN product_line TEXT NOT NULL DEFAULT 'red'")
+            existing_columns.add("product_line")
+        connection.execute(
+            "UPDATE products SET product_line = 'red' WHERE TRIM(COALESCE(product_line, '')) NOT IN ('red', 'black')"
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_products_product_line ON products(product_line)")
         if "status" not in existing_columns:
             connection.execute("ALTER TABLE products ADD COLUMN status TEXT NOT NULL DEFAULT 'draft'")
             existing_columns.add("status")
@@ -618,6 +628,20 @@ def _init_db_unlocked(
                 """,
                 ("migration_planning_request_no_v1", utc_now()),
             )
+        # Black-line products are catalog-only. Keep this repair idempotent so
+        # an old or malformed planning state can never reopen the planning path.
+        connection.execute(
+            """
+            UPDATE products
+            SET planning_reentry_state = 'not_required',
+                planning_reentry_reason = ''
+            WHERE product_line = 'black'
+              AND (
+                  COALESCE(planning_reentry_state, 'initial') != 'not_required'
+                  OR COALESCE(planning_reentry_reason, '') != ''
+              )
+            """
+        )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS login_attempts (
@@ -2363,7 +2387,7 @@ def parsed_size_tokens(size_range: str | None) -> set[str]:
 
 
 def completion_required_field_keys(product: dict) -> list[str]:
-    return [
+    required = [
         "image_url",
         "style_color",
         "style_code",
@@ -2382,6 +2406,23 @@ def completion_required_field_keys(product: dict) -> list[str]:
         "safety_category",
         "standard_code",
     ]
+    if normalize_product_line(product.get("product_line")) == "black":
+        required.remove("tax_included_price")
+    return required
+
+
+def validate_product_line_values(product_line: str, payload: dict) -> None:
+    if normalize_product_line(product_line) != "black":
+        return
+    raw_discount = payload.get("launch_price")
+    if not has_meaningful_value(raw_discount):
+        return
+    try:
+        discount = Decimal(str(raw_discount).strip())
+    except (InvalidOperation, AttributeError, TypeError, ValueError) as error:
+        raise ValueError("黑标线上新折扣必须是大于 0 的数字，最多保留两位小数。") from error
+    if not discount.is_finite() or discount <= 0 or discount != discount.quantize(Decimal("0.01")):
+        raise ValueError("黑标线上新折扣必须是大于 0 的数字，最多保留两位小数。")
 
 
 def completion_missing_field_keys(product: dict, excluded_keys=None) -> list[str]:
@@ -2446,6 +2487,7 @@ def product_snapshot_from_payload(payload: dict, product: dict | None = None) ->
     if product:
         snapshot["status"] = product.get("status")
         snapshot["lifecycle_status"] = product.get("lifecycle_status")
+        snapshot["product_line"] = normalize_product_line(product.get("product_line"))
         snapshot["completed_to_c_at"] = product.get("completed_to_c_at")
         snapshot["owner_department"] = product.get("owner_department")
         snapshot["created_by"] = product.get("created_by")
@@ -2457,11 +2499,19 @@ def create_product(
     raw_values: dict,
     created_by: int,
     owner_department: str,
+    *,
+    product_line: str = "red",
 ) -> int:
     payload = normalize_product_data(raw_values)
+    product_line = normalize_product_line(product_line)
+    if product_line == "black":
+        for field_key in BLACK_LINE_BLANK_FIELD_KEYS:
+            payload[field_key] = None
+    validate_product_line_values(product_line, payload)
     timestamp = utc_now()
     columns = [field.key for field in PRODUCT_FIELDS] + [
         "image_gallery_json",
+        "product_line",
         "owner_department",
         "created_by",
         "status",
@@ -2472,7 +2522,7 @@ def create_product(
     ]
     values = [payload[field.key] for field in PRODUCT_FIELDS]
     values.append(payload["image_gallery_json"])
-    values.extend([owner_department, created_by, "draft", "active", 0, timestamp, timestamp])
+    values.extend([product_line, owner_department, created_by, "draft", "active", 0, timestamp, timestamp])
     placeholders = ", ".join("?" for _ in columns)
     connection.execute(
         f"INSERT INTO products ({', '.join(columns)}) VALUES ({placeholders})",
@@ -2488,6 +2538,7 @@ def create_product(
             {
                 "status": "draft",
                 "lifecycle_status": "active",
+                "product_line": product_line,
                 "owner_department": owner_department,
                 "created_by": created_by,
             },
@@ -2628,6 +2679,7 @@ def update_product(
         before_product = dict(before_product)
     if not before_product:
         raise LookupError("商品资料不存在。")
+    product_line = normalize_product_line(before_product.get("product_line"))
     requested_payload = normalize_product_data({**before_product, **raw_values})
     actor_department = ""
     actor_username = ""
@@ -2646,7 +2698,11 @@ def update_product(
         elif actor_department == "A":
             allowed_field_keys = set(A_STAGE_FIELD_KEYS)
         elif actor_department == "B":
-            allowed_field_keys = set(B_CATALOG_EDITABLE_FIELD_KEYS)
+            allowed_field_keys = set(
+                B_CATALOG_EDITABLE_FIELD_KEYS
+                if product_line == "red"
+                else B_CATALOG_EDITABLE_FIELD_KEYS | B_PLANNING_MANAGED_FIELD_KEYS
+            )
         else:
             allowed_field_keys = set()
         if actor_department == "A" and before_product.get("owner_department") != "A":
@@ -2658,7 +2714,7 @@ def update_product(
             != normalize_diff_value(requested_payload.get(field.key))
         }
         forbidden_planning_changes = requested_changes & B_PLANNING_MANAGED_FIELD_KEYS
-        if forbidden_planning_changes and actor_username != "planning_service":
+        if product_line == "red" and forbidden_planning_changes and actor_username != "planning_service":
             labels = {
                 "category": "品类",
                 "launch_price": "上新价格",
@@ -2666,6 +2722,19 @@ def update_product(
             }
             changed_labels = "、".join(labels.get(key, key) for key in sorted(forbidden_planning_changes))
             raise PermissionError(f"{changed_labels}只能由商品企划中心维护并回传，藏宝阁不允许人工修改。")
+        if product_line == "black":
+            invalid_black_changes = {
+                key
+                for key in BLACK_LINE_BLANK_FIELD_KEYS
+                if normalize_diff_value(before_product.get(key))
+                != normalize_diff_value(requested_payload.get(key))
+                and normalize_diff_value(requested_payload.get(key)) not in (None, "")
+            }
+            if invalid_black_changes:
+                changed_labels = "、".join(
+                    PRODUCT_FIELD_MAP[key].label for key in sorted(invalid_black_changes)
+                )
+                raise PermissionError(f"黑标线资料的{changed_labels}必须保持空白。")
         if "image_url" in requested_changes and actor_department != "B":
             raise PermissionError("图片只能由商品部在藏宝阁维护，其他账号不能直接修改。")
         forbidden_changes = requested_changes - allowed_field_keys
@@ -2694,6 +2763,10 @@ def update_product(
     if "image_url" in allowed_field_keys and "image_gallery_json" in raw_values:
         merged_values["image_gallery_json"] = raw_values.get("image_gallery_json")
     payload = normalize_product_data(merged_values)
+    if product_line == "black":
+        for field_key in BLACK_LINE_BLANK_FIELD_KEYS:
+            payload[field_key] = None
+    validate_product_line_values(product_line, payload)
     diff_items = build_product_diff(before_product, payload)
     image_changed = (
         normalize_diff_value(before_product.get("image_url"))
@@ -2951,7 +3024,7 @@ def change_product_status(
 ) -> None:
     current_row = connection.execute(
         """
-        SELECT status, completed_to_c_at, c_release_no, current_version_no,
+        SELECT product_line, status, completed_to_c_at, c_release_no, current_version_no,
                c_published_version_no, workflow_restart_required,
                received_by, received_at, planning_reentry_state,
                planning_reentry_reason, planning_request_no
@@ -2962,8 +3035,10 @@ def change_product_status(
     ).fetchone()
     if not current_row:
         raise LookupError("商品资料不存在。")
+    product_line = normalize_product_line(current_row["product_line"])
     if (
         status == "published"
+        and product_line == "red"
         and str(current_row["planning_reentry_state"] or "initial") == "approved"
     ):
         raise ValueError("当前资料已由商品部标记为需要重走商品企划，请等待企划中心回传后再提交运营部。")
@@ -2986,10 +3061,13 @@ def change_product_status(
             c_release_no,
             timestamp,
         )
-    if status == "pending" and current_row["status"] in {"published", "received"}:
+    if product_line == "red" and status == "pending" and current_row["status"] in {"published", "received"}:
         planning_reentry_state = "decision_pending"
         planning_reentry_reason = "recall"
-    elif status == "published":
+    elif status == "pending" and product_line == "black":
+        planning_reentry_state = "not_required"
+        planning_reentry_reason = ""
+    elif status == "published" and product_line == "red":
         planning_reentry_state = "initial"
         planning_reentry_reason = ""
     if status == "published":
@@ -3063,11 +3141,13 @@ def decide_planning_reentry(
         raise ValueError("商品企划重走判定无效。")
     next_state, action_label = state_by_decision[clean_decision]
     row = connection.execute(
-        "SELECT status, planning_reentry_state, planning_request_no FROM products WHERE id = ?",
+        "SELECT product_line, status, planning_reentry_state, planning_request_no FROM products WHERE id = ?",
         (product_id,),
     ).fetchone()
     if not row:
         raise LookupError("商品资料不存在。")
+    if normalize_product_line(row["product_line"]) != "red":
+        raise ValueError("黑标线资料不进入商品企划中心，无需进行企划重走判定。")
     if row["status"] != "pending":
         raise ValueError("只有处于 A/B 协作中的资料才能判定是否重走商品企划。")
     if str(row["planning_reentry_state"] or "initial") != "decision_pending":
@@ -3105,6 +3185,8 @@ def request_planning_revision(
     ).fetchone()
     if not row:
         raise LookupError("商品资料不存在。")
+    if normalize_product_line(row["product_line"]) != "red":
+        raise ValueError("黑标线资料不进入商品企划中心，不能发起二次企划。")
     if row["lifecycle_status"] != "active" or row["status"] != "pending":
         raise ValueError("只有处于 A/B 协作中的正常资料才能发起二次企划。")
     if not product_has_planning_publication(connection, product_id):
@@ -3312,6 +3394,7 @@ def _planning_source_query() -> str:
             LIMIT 1
         )
         WHERE p.lifecycle_status = 'active'
+          AND p.product_line = 'red'
           AND p.status = 'pending'
           AND (
               COALESCE(p.planning_reentry_state, 'initial') = 'approved'
@@ -3433,6 +3516,7 @@ def _planning_product_payload(product: dict) -> dict:
         "tax_included_price": product.get("tax_included_price"),
         "status": product.get("status") or "",
         "lifecycle_status": product.get("lifecycle_status") or "",
+        "product_line": normalize_product_line(product.get("product_line")),
         "source_version_no": int(product.get("current_version_no") or 1),
         "image_version_no": int(product.get("image_version_no") or 1),
         "planning_reentry_state": str(product.get("planning_reentry_state") or "initial"),
@@ -3478,6 +3562,7 @@ def planning_source_image_payloads(db_path: str | Path, product_ids: list[int] |
             LIMIT 1
         )
         WHERE p.id IN ({placeholders})
+          AND p.product_line = 'red'
           AND (
               p.lifecycle_status IN ('active', 'withdrawn')
               OR EXISTS (
@@ -3610,6 +3695,8 @@ def publish_planning_price(
     product = row_to_dict(product_row)
     if not product:
         raise LookupError("商品资料不存在。")
+    if normalize_product_line(product.get("product_line")) != "red":
+        raise ValueError("黑标线资料不进入商品企划中心，请直接在藏宝阁完成维护。")
     payload_product_id = int(payload.get("source_product_id") or 0)
     if payload_product_id != int(product_id):
         raise ValueError("回传二次校验失败：来源商品 ID 与回传目标不一致。")
@@ -3827,6 +3914,7 @@ def publish_planning_style(
         SELECT *
         FROM products
         WHERE lifecycle_status = 'active'
+          AND product_line = 'red'
           AND status = 'pending'
           AND TRIM(style_code) = ?
         ORDER BY id
@@ -4199,14 +4287,18 @@ class DepartmentProductImportIndex:
 def build_department_product_import_index(
     connection: sqlite3.Connection,
     owner_department: str,
+    product_line: str = "",
 ) -> DepartmentProductImportIndex:
+    normalized_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     rows = connection.execute(
         """
         SELECT *
         FROM products
         WHERE lifecycle_status = 'active'
+          AND (? = '' OR product_line = ?)
         ORDER BY id DESC
-        """
+        """,
+        (normalized_line, normalized_line),
     ).fetchall()
     return DepartmentProductImportIndex([row_to_dict(row) for row in rows], owner_department)
 
@@ -4232,11 +4324,13 @@ def save_or_update_owned_product_in_connection(
     created_by: int,
     owner_department: str,
     *,
+    product_line: str = "red",
     actor_context: dict | None = None,
     import_index: DepartmentProductImportIndex | None = None,
 ) -> tuple[str, int]:
     if owner_department != "A":
         raise ValueError("只有 A 部门可以通过导入创建或更新主体资料。")
+    product_line = normalize_product_line(product_line)
     if import_index is None:
         matching_candidates = find_matching_department_products(
             connection,
@@ -4253,14 +4347,18 @@ def save_or_update_owned_product_in_connection(
             f"款色“{str(raw_values.get('style_color') or '').strip()}”匹配到多条跟单部资料，已停止该行导入，请先清理重复资料。"
         )
     existing = matching_candidates[0] if matching_candidates else None
+    if existing and normalize_product_line(existing.get("product_line")) != product_line:
+        raise ValueError("该款色属于另一条商品线，不能在当前商品线导入。")
     style_color = str(raw_values.get("style_color") or "").strip()
     if style_color and not existing:
-        existing_style_color_products = (
-            import_index.active_style_color_products(style_color)
-            if import_index is not None
-            else find_active_products_by_style_color(connection, style_color)
-        )
+        existing_style_color_products = find_active_products_by_style_color(connection, style_color)
         if existing_style_color_products:
+            existing_line = normalize_product_line(existing_style_color_products[0].get("product_line"))
+            if existing_line != product_line:
+                raise ValueError(
+                    f"款色“{style_color}”已属于{('黑标线' if existing_line == 'black' else '红标线')}，"
+                    "不能在另一条商品线重复创建。"
+                )
             raise PermissionError(
                 f"款色“{style_color}”已存在，但不属于跟单部可维护资料，不能新建重复条目。"
             )
@@ -4275,11 +4373,20 @@ def save_or_update_owned_product_in_connection(
             for key in sorted(protected_import_changes)
             if key in PRODUCT_FIELD_MAP
         )
+        field_boundary = (
+            "黑标线的图片、品类、上新折扣和上新渠道由商品部在藏宝阁维护。"
+            if product_line == "black"
+            else "图片由商品部维护；品类、上新价格和上新渠道只能由商品企划中心维护并回传。"
+        )
         raise PermissionError(
-            f"当前账号不能通过 Excel 导入或修改这些商品部字段：{labels}。"
-            "品类、上新价格和上新渠道只能由商品企划中心维护并回传。"
+            f"当前账号不能通过 Excel 导入或修改这些商品部字段：{labels}。{field_boundary}"
         )
     sanitized_values = dict(raw_values)
+    if product_line == "black":
+        for field_key in BLACK_LINE_BLANK_FIELD_KEYS:
+            if has_meaningful_value(sanitized_values.get(field_key)):
+                raise PermissionError(f"黑标线资料的{PRODUCT_FIELD_MAP[field_key].label}必须保持空白。")
+            sanitized_values[field_key] = None
     for field in PRODUCT_FIELDS:
         if existing:
             # Full exports are also used as partial update sheets. Empty
@@ -4311,7 +4418,13 @@ def save_or_update_owned_product_in_connection(
         or not has_meaningful_value(raw_values.get("product_name"))
     ):
         raise ValueError("未找到对应款色，且缺少款号或商品名称，不能作为新资料创建。")
-    product_id = create_product(connection, sanitized_values, created_by, owner_department)
+    product_id = create_product(
+        connection,
+        sanitized_values,
+        created_by,
+        owner_department,
+        product_line=product_line,
+    )
     if import_index is not None:
         import_index.add(
             {
@@ -4319,6 +4432,7 @@ def save_or_update_owned_product_in_connection(
                 "id": product_id,
                 "created_by": created_by,
                 "owner_department": owner_department,
+                "product_line": product_line,
                 "status": "draft",
                 "lifecycle_status": "active",
             }
@@ -4388,14 +4502,20 @@ def find_active_products_by_style_color(
     return [row_to_dict(row) for row in rows]
 
 
-def list_active_products_for_import(connection: sqlite3.Connection) -> list[dict]:
+def list_active_products_for_import(
+    connection: sqlite3.Connection,
+    product_line: str = "",
+) -> list[dict]:
+    normalized_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     rows = connection.execute(
         """
         SELECT *
         FROM products
         WHERE lifecycle_status = 'active'
+          AND (? = '' OR product_line = ?)
         ORDER BY id DESC
-        """
+        """,
+        (normalized_line, normalized_line),
     ).fetchall()
     return [row_to_dict(row) for row in rows]
 
@@ -4409,11 +4529,13 @@ def list_products(
     supplier: str = "",
     tax_price_changed: str = "",
     season_year: str = "",
+    product_line: str = "",
 ) -> list[dict]:
     like_query = f"%{query.strip()}%"
     supplier_query = f"%{supplier.strip()}%"
     season_year_query = f"%{season_year.strip()}%"
     tax_price_filter = "modified" if str(tax_price_changed or "").strip() == "modified" else ""
+    product_line_filter = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     with get_connection(db_path) as connection:
         rows = connection.execute(
             """
@@ -4436,6 +4558,7 @@ def list_products(
             AND (? = '' OR p.lifecycle_status = ?)
             AND (? = '' OR COALESCE(p.supplier, '') LIKE ?)
             AND (? = '' OR COALESCE(p.season_year, '') LIKE ?)
+            AND (? = '' OR p.product_line = ?)
             AND (
                 ? = ''
                 OR EXISTS (
@@ -4477,6 +4600,8 @@ def list_products(
                 supplier_query,
                 season_year.strip(),
                 season_year_query,
+                product_line_filter,
+                product_line_filter,
                 tax_price_filter,
                 tax_price_filter,
             ),
@@ -4484,10 +4609,17 @@ def list_products(
         return [dict(row) for row in rows]
 
 
-def department_stats(db_path: str | Path) -> dict[str, int]:
+def department_stats(db_path: str | Path, product_line: str = "") -> dict[str, int]:
+    product_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     with get_connection(db_path) as connection:
         rows = connection.execute(
-            "SELECT owner_department, COUNT(*) AS total FROM products GROUP BY owner_department"
+            """
+            SELECT owner_department, COUNT(*) AS total
+            FROM products
+            WHERE (? = '' OR product_line = ?)
+            GROUP BY owner_department
+            """,
+            (product_line, product_line),
         ).fetchall()
     stats = {"A": 0, "B": 0, "C": 0}
     for row in rows:
@@ -4495,10 +4627,17 @@ def department_stats(db_path: str | Path) -> dict[str, int]:
     return stats
 
 
-def status_stats(db_path: str | Path) -> dict[str, int]:
+def status_stats(db_path: str | Path, product_line: str = "") -> dict[str, int]:
+    product_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     with get_connection(db_path) as connection:
         rows = connection.execute(
-            "SELECT status, COUNT(*) AS total FROM products GROUP BY status"
+            """
+            SELECT status, COUNT(*) AS total
+            FROM products
+            WHERE (? = '' OR product_line = ?)
+            GROUP BY status
+            """,
+            (product_line, product_line),
         ).fetchall()
     stats = {"draft": 0, "pending": 0, "published": 0, "received": 0}
     for row in rows:
@@ -4506,9 +4645,10 @@ def status_stats(db_path: str | Path) -> dict[str, int]:
     return stats
 
 
-def b_workflow_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
+def b_workflow_stats(db_path: str | Path, days: int = 7, product_line: str = "") -> dict[str, int]:
     """Return the current queue and recent handoff activity relevant to B."""
     cutoff = iso_days_ago(days)
+    product_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     with get_connection(db_path) as connection:
         current = connection.execute(
             """
@@ -4520,7 +4660,9 @@ def b_workflow_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
                 COALESCE(SUM(CASE WHEN workflow_restart_required = 1 THEN 1 ELSE 0 END), 0) AS restart_required
             FROM products
             WHERE lifecycle_status = 'active'
-            """
+              AND (? = '' OR product_line = ?)
+            """,
+            (product_line, product_line),
         ).fetchone()
         recent = connection.execute(
             """
@@ -4536,8 +4678,9 @@ def b_workflow_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
             JOIN products product ON product.id = log.product_id
             WHERE log.created_at >= ?
               AND product.lifecycle_status = 'active'
+              AND (? = '' OR product.product_line = ?)
             """,
-            (cutoff,),
+            (cutoff, product_line, product_line),
         ).fetchone()
         recent_tax_price_changes = connection.execute(
             """
@@ -4549,8 +4692,9 @@ def b_workflow_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
               AND price_history.version_no > 1
               AND price_actor.department = 'A'
               AND product.lifecycle_status = 'active'
+              AND (? = '' OR product.product_line = ?)
             """,
-            (cutoff,),
+            (cutoff, product_line, product_line),
         ).fetchone()
     return {
         "completed": int(current["completed"] or 0),
@@ -4564,12 +4708,17 @@ def b_workflow_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
     }
 
 
-def tax_price_change_product_ids(db_path: str | Path, days: int | None = None) -> set[int]:
+def tax_price_change_product_ids(
+    db_path: str | Path,
+    days: int | None = None,
+    product_line: str = "",
+) -> set[int]:
     date_clause = ""
     params: tuple[object, ...] = ()
     if days is not None:
         date_clause = "AND price_history.created_at >= ?"
         params = (iso_days_ago(days),)
+    product_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     with get_connection(db_path) as connection:
         rows = connection.execute(
             f"""
@@ -4582,13 +4731,15 @@ def tax_price_change_product_ids(db_path: str | Path, days: int | None = None) -
               AND price_history.version_no > 1
               AND price_actor.department = 'A'
               AND product.lifecycle_status = 'active'
+              AND (? = '' OR product.product_line = ?)
             """,
-            params,
+            (*params, product_line, product_line),
         ).fetchall()
     return {int(row["product_id"]) for row in rows}
 
 
-def c_receipt_stats(db_path: str | Path) -> dict[str, int]:
+def c_receipt_stats(db_path: str | Path, product_line: str = "") -> dict[str, int]:
+    product_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     with get_connection(db_path) as connection:
         rows = connection.execute(
             """
@@ -4597,8 +4748,11 @@ def c_receipt_stats(db_path: str | Path) -> dict[str, int]:
             WHERE owner_department IN ('A', 'B')
               AND lifecycle_status = 'active'
               AND status IN ('published', 'received')
+              AND (? = '' OR product_line = ?)
             GROUP BY status
             """
+            ,
+            (product_line, product_line),
         ).fetchall()
     stats = {"published": 0, "received": 0}
     for row in rows:
@@ -4606,9 +4760,14 @@ def c_receipt_stats(db_path: str | Path) -> dict[str, int]:
     return stats
 
 
-def c_department_receipt_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
+def c_department_receipt_stats(
+    db_path: str | Path,
+    days: int = 7,
+    product_line: str = "",
+) -> dict[str, int]:
     """Aggregate operating-department receipt progress for administrator monitoring."""
     cutoff = iso_days_ago(days)
+    product_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     with get_connection(db_path) as connection:
         row = connection.execute(
             """
@@ -4621,8 +4780,9 @@ def c_department_receipt_stats(db_path: str | Path, days: int = 7) -> dict[str, 
             WHERE owner_department IN ('A', 'B')
               AND lifecycle_status = 'active'
               AND status IN ('published', 'received')
+              AND (? = '' OR product_line = ?)
             """,
-            (cutoff,),
+            (cutoff, product_line, product_line),
         ).fetchone()
     return {
         "total": int(row["total"] or 0),
@@ -4732,7 +4892,9 @@ def resolve_c_recall_notices(
 def c_active_recall_notices(
     db_path: str | Path,
     recipient_user_id: int | None,
+    product_line: str = "",
 ) -> list[dict]:
+    product_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     with get_connection(db_path) as connection:
         if recipient_user_id is None:
             rows = connection.execute(
@@ -4753,9 +4915,11 @@ def c_active_recall_notices(
                 JOIN products product ON product.id = notice.product_id
                 WHERE notice.resolved_at IS NULL
                   AND product.lifecycle_status = 'active'
+                  AND (? = '' OR product.product_line = ?)
                 GROUP BY notice.product_id, notice.release_no, notice.recalled_at
                 ORDER BY notice.recalled_at DESC, notice.product_id DESC
-                """
+                """,
+                (product_line, product_line),
             ).fetchall()
         else:
             rows = connection.execute(
@@ -4766,9 +4930,10 @@ def c_active_recall_notices(
                 WHERE notice.recipient_user_id = ?
                   AND notice.resolved_at IS NULL
                   AND product.lifecycle_status = 'active'
+                  AND (? = '' OR product.product_line = ?)
                 ORDER BY notice.recalled_at DESC, notice.id DESC
                 """,
-                (recipient_user_id,),
+                (recipient_user_id, product_line, product_line),
             ).fetchall()
     return [dict(row) for row in rows]
 
@@ -4776,18 +4941,20 @@ def c_active_recall_notices(
 def c_active_recall_notice_count(
     db_path: str | Path,
     recipient_user_id: int | None,
+    product_line: str = "",
 ) -> int:
-    return len(c_active_recall_notices(db_path, recipient_user_id))
+    return len(c_active_recall_notices(db_path, recipient_user_id, product_line))
 
 
-def c_user_receipt_stats(db_path: str | Path, user: dict) -> dict[str, int]:
+def c_user_receipt_stats(db_path: str | Path, user: dict, product_line: str = "") -> dict[str, int]:
     visible_channels = c_visible_launch_channels(user)
     if not visible_channels:
         return {"total": 0, "received": 0, "pending": 0, "recent_created": 0}
+    product_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     cutoff = iso_days_ago(7)
     source_products = [
         product
-        for product in list_products(db_path)
+        for product in list_products(db_path, product_line=product_line)
         if product.get("owner_department") in {"A", "B"}
         and product.get("lifecycle_status") == "active"
         and product.get("status") in {"published", "received"}
@@ -4817,10 +4984,17 @@ def c_user_receipt_stats(db_path: str | Path, user: dict) -> dict[str, int]:
     }
 
 
-def lifecycle_stats(db_path: str | Path) -> dict[str, int]:
+def lifecycle_stats(db_path: str | Path, product_line: str = "") -> dict[str, int]:
+    product_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     with get_connection(db_path) as connection:
         rows = connection.execute(
-            "SELECT lifecycle_status, COUNT(*) AS total FROM products GROUP BY lifecycle_status"
+            """
+            SELECT lifecycle_status, COUNT(*) AS total
+            FROM products
+            WHERE (? = '' OR product_line = ?)
+            GROUP BY lifecycle_status
+            """,
+            (product_line, product_line),
         ).fetchall()
     stats = {"active": 0, "archived": 0, "deleted": 0}
     for row in rows:
@@ -4828,19 +5002,35 @@ def lifecycle_stats(db_path: str | Path) -> dict[str, int]:
     return stats
 
 
-def recent_activity_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
+def recent_activity_stats(db_path: str | Path, days: int = 7, product_line: str = "") -> dict[str, int]:
     cutoff = iso_days_ago(days)
+    product_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     with get_connection(db_path) as connection:
         created_count = connection.execute(
-            "SELECT COUNT(*) FROM products WHERE created_at >= ?",
-            (cutoff,),
+            """
+            SELECT COUNT(*) FROM products
+            WHERE created_at >= ?
+              AND (? = '' OR product_line = ?)
+            """,
+            (cutoff, product_line, product_line),
         ).fetchone()[0]
         updated_count = connection.execute(
-            "SELECT COUNT(*) FROM product_logs WHERE created_at >= ?",
-            (cutoff,),
+            """
+            SELECT COUNT(*)
+            FROM product_logs
+            JOIN products ON products.id = product_logs.product_id
+            WHERE product_logs.created_at >= ?
+              AND (? = '' OR products.product_line = ?)
+            """,
+            (cutoff, product_line, product_line),
         ).fetchone()[0]
         pending_count = connection.execute(
-            "SELECT COUNT(*) FROM products WHERE status = 'pending' AND lifecycle_status = 'active'"
+            """
+            SELECT COUNT(*) FROM products
+            WHERE status = 'pending' AND lifecycle_status = 'active'
+              AND (? = '' OR product_line = ?)
+            """,
+            (product_line, product_line),
         ).fetchone()[0]
     return {
         "recent_created": created_count,
@@ -4849,17 +5039,23 @@ def recent_activity_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
     }
 
 
-def recent_department_created_stats(db_path: str | Path, days: int = 7) -> dict[str, int]:
+def recent_department_created_stats(
+    db_path: str | Path,
+    days: int = 7,
+    product_line: str = "",
+) -> dict[str, int]:
     cutoff = iso_days_ago(days)
+    product_line = normalize_product_line(product_line) if str(product_line or "").strip() else ""
     with get_connection(db_path) as connection:
         rows = connection.execute(
             """
             SELECT owner_department, COUNT(*) AS total
             FROM products
             WHERE created_at >= ?
+              AND (? = '' OR product_line = ?)
             GROUP BY owner_department
             """,
-            (cutoff,),
+            (cutoff, product_line, product_line),
         ).fetchall()
     stats = {"A": 0, "B": 0, "C": 0}
     for row in rows:

@@ -21,7 +21,7 @@ from PIL import Image as PillowImage
 from catalog_backend import CatalogApplication, init_db
 from catalog_backend import db
 from catalog_backend.concurrency import FileSlotPool, TaskCapacityError
-from catalog_backend.policies import available_status_actions
+from catalog_backend.policies import BLACK_LINE_BLANK_FIELD_KEYS, available_status_actions
 from catalog_backend.uploads import (
     IMAGE_BACKUP_RETENTION_SECONDS,
     MAX_IMAGE_BYTES,
@@ -4899,6 +4899,236 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(
             self.request("/import/incremental-template.xlsx", cookie=b_cookie)["status"].startswith("403")
         )
+
+    def create_black_line_product(self, **overrides):
+        a_user = next(user for user in db.list_users(self.db_path) if user["username"] == "a_editor")
+        payload = self.a_complete_fields_payload()
+        payload.update(
+            {
+                "style_color": "黑标款色-黑",
+                "style_code": "BL-2601",
+                "product_name": "黑标测试商品",
+                "launch_price": "3.4",
+                "launch_channel": "同款",
+            }
+        )
+        payload.update(overrides)
+        with db.get_connection(self.db_path) as connection:
+            return db.create_product(
+                connection,
+                payload,
+                a_user["id"],
+                "A",
+                product_line="black",
+            )
+
+    def test_black_line_rules_and_red_black_exports_are_isolated(self):
+        black_product_id = self.create_black_line_product()
+        black_product = db.get_product(self.db_path, black_product_id)
+        self.assertEqual(black_product["product_line"], "black")
+        self.assertEqual(black_product["launch_price"], 3.4)
+        self.assertEqual(db.completion_flag(black_product), "Y")
+        for field_key in BLACK_LINE_BLANK_FIELD_KEYS:
+            self.assertIn(black_product.get(field_key), (None, ""), field_key)
+
+        with self.assertRaises(ValueError):
+            self.create_black_line_product(
+                style_code="BL-2602",
+                style_color="黑标款色-白",
+                launch_price="3.456",
+            )
+
+        b_user = next(user for user in db.list_users(self.db_path) if user["username"] == "b_editor")
+        with self.assertRaises(PermissionError):
+            with db.get_connection(self.db_path) as connection:
+                db.update_product(
+                    connection,
+                    black_product_id,
+                    {**black_product, "supplier_style_code": "SHOULD-STAY-BLANK"},
+                    b_user["id"],
+                )
+
+        a_cookie = self.login("a_editor", "demo123")
+        red_body = self.request("/products", cookie=a_cookie)["body"].decode("utf-8")
+        black_body = self.request("/products?line=black", cookie=a_cookie)["body"].decode("utf-8")
+        self.assertIn("褶皱短袖连衣裙", red_body)
+        self.assertNotIn("黑标测试商品", red_body)
+        self.assertIn("黑标测试商品", black_body)
+        self.assertNotIn("褶皱短袖连衣裙", black_body)
+
+        red_product = db.get_product(self.db_path, 1)
+        duplicate_line_workbook = Workbook()
+        duplicate_line_sheet = duplicate_line_workbook.active
+        duplicate_line_sheet.append(["商品线", "商品名称", "款号", "款色"])
+        duplicate_line_sheet.append(
+            ["黑标线", "跨线重复款色", "BLACK-DUPLICATE", red_product["style_color"]]
+        )
+        duplicate_line_buffer = io.BytesIO()
+        duplicate_line_workbook.save(duplicate_line_buffer)
+        duplicate_line_response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "black-cross-line-duplicate.xlsx",
+                duplicate_line_buffer.getvalue(),
+                extra_fields={"product_line": "black"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=a_cookie,
+        )
+        self.assertTrue(duplicate_line_response["status"].startswith("200"))
+        self.assertIn("已属于红标线", duplicate_line_response["body"].decode("utf-8"))
+        self.assertFalse(any(product["style_code"] == "BLACK-DUPLICATE" for product in db.list_products(self.db_path)))
+
+        black_export = self.request("/export.xlsx?line=black", cookie=a_cookie)
+        self.assertTrue(black_export["status"].startswith("200"))
+        black_workbook = load_workbook(io.BytesIO(black_export["body"]), data_only=True)
+        black_headers = [cell.value for cell in black_workbook.active[1]]
+        self.assertIn("商品线", black_headers)
+        self.assertIn("上新折扣", black_headers)
+        self.assertNotIn("上新价格", black_headers)
+        self.assertEqual(black_workbook.active.max_row, 2)
+        self.assertEqual(black_workbook.active.cell(2, 1).value, "黑标线")
+
+        mixed_export = self.request(
+            f"/export.xlsx?mode=selected&selected=1,{black_product_id}",
+            cookie=a_cookie,
+        )
+        self.assertTrue(mixed_export["status"].startswith("400"))
+        self.assertIn("不能混合", mixed_export["body"].decode("utf-8"))
+
+        planning_sources = db.list_planning_source_products(self.db_path, black_product_id)
+        self.assertEqual(planning_sources, [])
+
+        a_user = next(user for user in db.list_users(self.db_path) if user["username"] == "a_editor")
+        c_user = next(user for user in db.list_users(self.db_path) if user["username"] == "c_viewer")
+        with db.get_connection(self.db_path) as connection:
+            db.change_product_status(connection, black_product_id, "pending", a_user["id"], "开启商品部协作", "黑标流程测试")
+            db.change_product_status(connection, black_product_id, "published", b_user["id"], "提交运营部", "黑标流程测试")
+            db.change_product_status(connection, black_product_id, "received", c_user["id"], "接收资料", "黑标流程测试")
+            db.change_product_status(connection, black_product_id, "pending", a_user["id"], "召回资料", "黑标流程测试")
+        recalled_black_product = db.get_product(self.db_path, black_product_id)
+        self.assertEqual(recalled_black_product["status"], "pending")
+        self.assertEqual(recalled_black_product["planning_reentry_state"], "not_required")
+        self.assertEqual(recalled_black_product["planning_reentry_reason"], "")
+
+        with db.get_connection(self.db_path) as connection:
+            with self.assertRaisesRegex(ValueError, "黑标线资料不进入商品企划中心"):
+                db.decide_planning_reentry(connection, black_product_id, "approve", b_user["id"])
+            with self.assertRaisesRegex(ValueError, "黑标线资料不进入商品企划中心"):
+                db.request_planning_revision(connection, black_product_id, b_user["id"])
+
+        b_cookie = self.login("b_editor", "demo123")
+        black_list_body = self.request("/products?line=black", cookie=b_cookie)["body"].decode("utf-8")
+        black_detail_body = self.request(f"/products/{black_product_id}", cookie=b_cookie)["body"].decode("utf-8")
+        for forbidden_label in ("重回企划判断", "批量企划判断", "批量二次企划", "提交企划", "二次企划"):
+            self.assertNotIn(forbidden_label, black_list_body)
+            self.assertNotIn(forbidden_label, black_detail_body)
+        self.assertIn("确认资料齐全，提交运营部", black_detail_body)
+
+        editable_workbook = load_workbook(io.BytesIO(black_export["body"]))
+        editable_sheet = editable_workbook.active
+        editable_headers = [cell.value for cell in editable_sheet[1]]
+        editable_sheet.cell(2, editable_headers.index("图片") + 1).value = "https://example.com/black-new.jpg"
+        editable_sheet.cell(2, editable_headers.index("品类") + 1).value = "黑标外套"
+        editable_sheet.cell(2, editable_headers.index("上新折扣") + 1).value = 4.25
+        editable_sheet.cell(2, editable_headers.index("上新渠道") + 1).value = "天猫"
+        editable_buffer = io.BytesIO()
+        editable_workbook.save(editable_buffer)
+        b_import_response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "black-b-update.xlsx",
+                editable_buffer.getvalue(),
+                extra_fields={"product_line": "black"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=b_cookie,
+        )
+        self.assertTrue(b_import_response["status"].startswith("200"))
+        updated_black_product = db.get_product(self.db_path, black_product_id)
+        self.assertEqual(updated_black_product["image_url"], "https://example.com/black-new.jpg")
+        self.assertEqual(updated_black_product["category"], "黑标外套")
+        self.assertEqual(updated_black_product["launch_price"], 4.25)
+        self.assertEqual(updated_black_product["launch_channel"], "天猫")
+
+        editable_sheet.cell(2, editable_headers.index("供应商") + 1).value = "B 不得修改供应商"
+        forbidden_buffer = io.BytesIO()
+        editable_workbook.save(forbidden_buffer)
+        forbidden_response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "black-b-forbidden.xlsx",
+                forbidden_buffer.getvalue(),
+                extra_fields={"product_line": "black"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=b_cookie,
+        )
+        self.assertTrue(forbidden_response["status"].startswith("200"))
+        self.assertIn("越权修改", forbidden_response["body"].decode("utf-8"))
+        self.assertIn("黑标线商品部只能导入图片、品类、上新折扣和上新渠道", forbidden_response["body"].decode("utf-8"))
+        self.assertNotIn("请回到商品企划中心修改", forbidden_response["body"].decode("utf-8"))
+        self.assertEqual(db.get_product(self.db_path, black_product_id)["supplier"], black_product["supplier"])
+
+    def test_import_rejects_red_and_black_rows_in_one_workbook(self):
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["商品线", "商品名称", "款号", "款色"])
+        worksheet.append(["红标线", "红标导入商品", "RED-IMPORT", "红标导入款色"])
+        worksheet.append(["黑标线", "黑标导入商品", "BLACK-IMPORT", "黑标导入款色"])
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+
+        cookie = self.login("a_editor", "demo123")
+        response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "mixed-product-lines.xlsx",
+                buffer.getvalue(),
+                extra_fields={"product_line": "red"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(response["status"].startswith("400"))
+        self.assertIn("不能混合红标线和黑标线", response["body"].decode("utf-8"))
+        self.assertFalse(any(product["style_code"] == "RED-IMPORT" for product in db.list_products(self.db_path)))
+        self.assertFalse(any(product["style_code"] == "BLACK-IMPORT" for product in db.list_products(self.db_path)))
+
+    def test_black_full_import_requires_explicit_black_line_column(self):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["商品名称", "款号", "款色"])
+        worksheet.append(["未标线商品", "BLACK-NO-LINE", "黑标未标线款色"])
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+
+        cookie = self.login("a_editor", "demo123")
+        response = self.request(
+            "/import",
+            method="POST",
+            body=self.build_multipart(
+                "workbook",
+                "black-without-line.xlsx",
+                buffer.getvalue(),
+                extra_fields={"product_line": "black"},
+            ),
+            content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+            cookie=cookie,
+        )
+        self.assertTrue(response["status"].startswith("400"))
+        self.assertIn("必须包含“商品线”列", response["body"].decode("utf-8"))
+        self.assertFalse(any(product["style_code"] == "BLACK-NO-LINE" for product in db.list_products(self.db_path)))
 
     def test_a_incremental_excel_import_can_fill_multiple_rounds_without_clearing_existing_values(self):
         cookie = self.login("a_editor", "demo123")

@@ -56,6 +56,7 @@ from catalog_backend.policies import (
     A_STAGE_FIELD_KEYS,
     B_CATALOG_EDITABLE_FIELD_KEYS,
     B_STAGE_FIELD_KEYS,
+    BLACK_LINE_BLANK_FIELD_KEYS,
     BILLING_PLATFORM_OPTIONS,
     COLLABORATION_START_FIELD_KEYS,
     C_OPERATING_CHANNELS,
@@ -91,8 +92,11 @@ from catalog_backend.policies import (
     is_released_catalog_read_only,
     lifecycle_label,
     MANAGEABLE_DEPARTMENTS,
+    PRODUCT_LINE_LABELS,
+    PRODUCT_LINE_OPTIONS,
     normalize_launch_channel,
     normalize_billing_platform_codes,
+    normalize_product_line,
     operating_channel_label,
     operating_channel_scope_label,
     platform_bill_platform_codes_for_user,
@@ -442,9 +446,15 @@ class CatalogApplication:
                 return self.handle_logs_center_export(start_response, user, query)
             if path == "/products/new":
                 if method == "GET":
+                    product_line = normalize_product_line(query.get("line"))
                     return self.require_editor(start_response, user) or self.html_response(
                         start_response,
-                        self.render_product_form(user, "/products/new", "新建商品资料", {}),
+                        self.render_product_form(
+                            user,
+                            "/products/new",
+                            "新建商品资料",
+                            {"product_line": product_line},
+                        ),
                     )
                 return self.require_editor(start_response, user) or self.handle_product_create(
                     environ,
@@ -455,7 +465,7 @@ class CatalogApplication:
                 if method == "GET":
                     return self.require_product_importer(start_response, user) or self.html_response(
                         start_response,
-                        self.render_import_page(user),
+                        self.render_import_page(user, product_line=query.get("line", "")),
                     )
                 return self.require_product_importer(start_response, user) or self.handle_import(
                     environ,
@@ -471,7 +481,7 @@ class CatalogApplication:
                 if method == "GET":
                     return self.require_image_importer(start_response, user) or self.html_response(
                         start_response,
-                        self.render_image_import_page(user),
+                        self.render_image_import_page(user, product_line=query.get("line", "")),
                     )
                 return self.require_image_importer(start_response, user) or self.handle_image_import(
                     environ,
@@ -707,6 +717,7 @@ class CatalogApplication:
 
     def handle_product_create(self, environ, start_response, user):
         form, files = self.parse_form(environ)
+        product_line = normalize_product_line(form.get("product_line"))
         self.apply_image_upload(form, files, existing_image_url=None)
         form = self.normalized_form_for_stage(user, None, form)
         errors = self.validate_product_form(form)
@@ -717,7 +728,13 @@ class CatalogApplication:
                 status="400 Bad Request",
             )
         with db.get_connection(self.db_path) as connection:
-            product_id = db.create_product(connection, form, user["id"], "A")
+            product_id = db.create_product(
+                connection,
+                form,
+                user["id"],
+                "A",
+                product_line=product_line,
+            )
         return self.redirect(
             start_response,
             f"/products/{product_id}?notice=" + self.urlencode_message("商品资料已创建。"),
@@ -760,6 +777,11 @@ class CatalogApplication:
                 for key in sorted(submitted_field_changes)
                 if key in PRODUCT_FIELD_MAP
             )
+            permission_guidance = (
+                "请由商品部在藏宝阁处理。"
+                if normalize_product_line(product.get("product_line")) == "black"
+                else "请回到有权限的部门或商品企划中心处理。"
+            )
             return self.html_response(
                 start_response,
                 self.render_product_form(
@@ -767,7 +789,7 @@ class CatalogApplication:
                     f"/products/{product_id}/edit",
                     f"编辑资料 #{product_id}",
                     product,
-                    [f"当前账号不能修改这些字段：{labels}。请回到有权限的部门或商品企划中心处理。"],
+                    [f"当前账号不能修改这些字段：{labels}。{permission_guidance}"],
                 ),
                 status="403 Forbidden",
             )
@@ -845,11 +867,12 @@ class CatalogApplication:
 
     def _handle_import(self, environ, start_response, user):
         form, files = self.parse_form(environ)
+        product_line = normalize_product_line(form.get("product_line"))
         workbook_field = files.get("workbook")
         if workbook_field is None or getattr(workbook_field, "file", None) is None:
             return self.html_response(
                 start_response,
-                self.render_import_page(user, error="请选择一个 Excel 模板文件后再导入。"),
+                self.render_import_page(user, product_line=product_line, error="请选择一个 Excel 模板文件后再导入。"),
                 status="400 Bad Request",
             )
         workbook_field.file.seek(0)
@@ -858,7 +881,7 @@ class CatalogApplication:
             if user.get("department") != "A" or is_department_monitor(user):
                 return self.html_response(
                     start_response,
-                    self.render_import_page(user, error="按款色增量补充仅开放给 A 跟单部账号。"),
+                    self.render_import_page(user, product_line=product_line, error="按款色增量补充仅开放给 A 跟单部账号。"),
                     status="403 Forbidden",
                 )
             try:
@@ -866,12 +889,12 @@ class CatalogApplication:
             except ValueError as error:
                 return self.html_response(
                     start_response,
-                    self.render_import_page(user, error=str(error)),
+                    self.render_import_page(user, product_line=product_line, error=str(error)),
                     status="400 Bad Request",
                 )
             try:
                 with self.import_write_pool.acquire():
-                    return self.handle_a_incremental_import(start_response, user, rows, imported_field_keys)
+                    return self.handle_a_incremental_import(start_response, user, rows, imported_field_keys, product_line)
             except TaskCapacityError:
                 return self.task_capacity_response(start_response, user, "导入")
         try:
@@ -879,13 +902,49 @@ class CatalogApplication:
         except ValueError as error:
             return self.html_response(
                 start_response,
-                self.render_import_page(user, error=str(error)),
+                self.render_import_page(user, product_line=product_line, error=str(error)),
+                status="400 Bad Request",
+            )
+        workbook_product_lines = {
+            normalize_product_line(product.get("product_line"))
+            for product in products
+            if str(product.get("product_line") or "").strip()
+        }
+        if len(workbook_product_lines) > 1:
+            return self.html_response(
+                start_response,
+                self.render_import_page(
+                    user,
+                    product_line=product_line,
+                    error="同一个 Excel 不能混合红标线和黑标线资料，请按商品线拆分后分别导入。",
+                ),
+                status="400 Bad Request",
+            )
+        if product_line == "black" and products and workbook_product_lines != {"black"}:
+            return self.html_response(
+                start_response,
+                self.render_import_page(
+                    user,
+                    product_line=product_line,
+                    error="黑标线完整导入文件必须包含“商品线”列，且每条资料都标记为“黑标线”。",
+                ),
+                status="400 Bad Request",
+            )
+        if workbook_product_lines and product_line not in workbook_product_lines:
+            workbook_line = PRODUCT_LINE_LABELS[next(iter(workbook_product_lines))]
+            return self.html_response(
+                start_response,
+                self.render_import_page(
+                    user,
+                    product_line=product_line,
+                    error=f"当前入口是{PRODUCT_LINE_LABELS[product_line]}，但 Excel 标记为{workbook_line}，请切换到对应商品线后再导入。",
+                ),
                 status="400 Bad Request",
             )
         if user.get("department") == "B":
             try:
                 with self.import_write_pool.acquire():
-                    return self.handle_b_stage_import(start_response, user, products)
+                    return self.handle_b_stage_import(start_response, user, products, product_line)
             except TaskCapacityError:
                 return self.task_capacity_response(start_response, user, "导入")
         created = 0
@@ -897,14 +956,20 @@ class CatalogApplication:
         }
         try:
             with self.import_write_pool.acquire(), db.get_connection(self.db_path) as connection:
-                import_index = db.build_department_product_import_index(connection, user["department"])
+                import_index = db.build_department_product_import_index(
+                    connection,
+                    user["department"],
+                    product_line,
+                )
                 for product in products:
+                    product["product_line"] = product_line
                     try:
                         action, _ = db.save_or_update_owned_product_in_connection(
                             connection,
                             product,
                             user["id"],
                             user["department"],
+                            product_line=product_line,
                             actor_context=actor_context,
                             import_index=import_index,
                         )
@@ -926,7 +991,7 @@ class CatalogApplication:
             if len(blocked) > 3:
                 preview = f"{preview}；另有 {len(blocked) - 3} 条未更新"
             report = f"{report} 以下资料未更新：{preview}"
-        return self.html_response(start_response, self.render_import_page(user, report=report))
+        return self.html_response(start_response, self.render_import_page(user, product_line=product_line, report=report))
 
     def handle_a_incremental_import(
         self,
@@ -934,6 +999,7 @@ class CatalogApplication:
         user,
         rows: list[dict],
         imported_field_keys: tuple[str, ...],
+        product_line: str,
     ):
         allowed_field_keys = set(A_STAGE_FIELD_KEYS)
         forbidden_field_keys = set(imported_field_keys) - allowed_field_keys - {"style_color"}
@@ -943,14 +1009,17 @@ class CatalogApplication:
                 for key in PRODUCT_FIELD_MAP
                 if key in forbidden_field_keys
             )
+            field_boundary = (
+                "图片、品类、上新折扣和上新渠道由商品部在藏宝阁维护；资料完成由系统判断。"
+                if product_line == "black"
+                else "图片由商品部维护；品类、上新价格和上新渠道由商品企划中心维护；资料完成由系统判断。"
+            )
             return self.html_response(
                 start_response,
                 self.render_import_page(
                     user,
-                    error=(
-                        f"增量导入包含非跟单部维护字段：{labels}。"
-                        "图片由商品部维护；品类、上新价格和上新渠道由商品企划中心维护；资料完成由系统判断。"
-                    ),
+                    product_line=product_line,
+                    error=f"增量导入包含非跟单部维护字段：{labels}。{field_boundary}",
                 ),
                 status="400 Bad Request",
             )
@@ -978,7 +1047,7 @@ class CatalogApplication:
         }
         with db.get_connection(self.db_path) as connection:
             products_by_style_key: dict[str, list[dict]] = {}
-            for product in db.list_active_products_for_import(connection):
+            for product in db.list_active_products_for_import(connection, product_line):
                 style_key = self.style_color_match_key(product.get("style_color"))
                 if style_key:
                     products_by_style_key.setdefault(style_key, []).append(product)
@@ -1040,7 +1109,7 @@ class CatalogApplication:
             detail_parts.append(f"权限或流程限制 {len(blocked)} 条：{'；'.join(blocked[:3])}")
         if detail_parts:
             report = f"{report} 另外：{'；'.join(detail_parts)}。"
-        return self.html_response(start_response, self.render_import_page(user, report=report))
+        return self.html_response(start_response, self.render_import_page(user, product_line=product_line, report=report))
 
     def handle_incremental_import_template(self, start_response, user):
         if user.get("department") != "A" or is_department_monitor(user):
@@ -1060,7 +1129,7 @@ class CatalogApplication:
         start_response("200 OK", headers)
         return [body]
 
-    def handle_b_stage_import(self, start_response, user, products: list[dict]):
+    def handle_b_stage_import(self, start_response, user, products: list[dict], product_line: str):
         updated = 0
         unmatched: list[str] = []
         ambiguous: list[str] = []
@@ -1068,7 +1137,7 @@ class CatalogApplication:
         unauthorized: list[tuple[str, set[str]]] = []
         with db.get_connection(self.db_path) as connection:
             products_by_identity: dict[tuple[str, str], list[dict]] = {}
-            for product in db.list_active_products_for_import(connection):
+            for product in db.list_active_products_for_import(connection, product_line):
                 identity_key = (
                     str(product.get("style_code") or "").strip(),
                     str(product.get("product_name") or "").strip(),
@@ -1112,19 +1181,23 @@ class CatalogApplication:
                     for field in PRODUCT_FIELDS
                     if field.key in row
                 }
+                b_importable_fields = set(B_CATALOG_EDITABLE_FIELD_KEYS)
+                if product_line == "black":
+                    b_importable_fields.update({"category", "launch_price", "launch_channel"})
                 protected_import_changes = db.imported_field_changes(
                     product,
                     row,
-                    imported_field_keys - B_CATALOG_EDITABLE_FIELD_KEYS - {"completion_flag"},
+                    imported_field_keys - b_importable_fields - {"completion_flag"},
                 )
                 if protected_import_changes:
                     unauthorized.append((row_label, protected_import_changes))
                     continue
                 updated_payload = {field.key: product.get(field.key) for field in PRODUCT_FIELDS}
                 changed = False
-                # The completion marker is derived from the full record. B-stage
-                # imports only maintain the image field in this application.
-                for field_key in ("image_url",):
+                # The completion marker is derived from the full record. Black
+                # line B imports also maintain the three planning fields here;
+                # red line keeps the existing planning-center boundary.
+                for field_key in sorted(b_importable_fields):
                     value = row.get(field_key)
                     if value in (None, ""):
                         continue
@@ -1154,11 +1227,12 @@ class CatalogApplication:
         if ambiguous:
             detail_parts.append(f"重复匹配 {len(ambiguous)} 条")
         if skipped:
-            detail_parts.append(f"未填写图片而跳过 {len(skipped)} 条")
+            skipped_reason = "未填写图片" if product_line == "red" else "未填写图片、品类、上新折扣或上新渠道"
+            detail_parts.append(f"{skipped_reason}而跳过 {len(skipped)} 条")
         if unauthorized:
             unauthorized_labels = {
                 "category": "品类",
-                "launch_price": "上新价格",
+                "launch_price": "上新折扣" if product_line == "black" else "上新价格",
                 "launch_channel": "上新渠道",
             }
             unauthorized_preview = "；".join(
@@ -1167,13 +1241,18 @@ class CatalogApplication:
             )
             if len(unauthorized) > 3:
                 unauthorized_preview = f"{unauthorized_preview}；另有 {len(unauthorized) - 3} 条"
+            permission_hint = (
+                "黑标线商品部只能导入图片、品类、上新折扣和上新渠道；跟单部字段不能修改。"
+                if product_line == "black"
+                else "商品部在藏宝阁只能导入图片，品类、上新价格和上新渠道请回到商品企划中心修改。"
+            )
             detail_parts.append(
                 f"检测到 {len(unauthorized)} 条越权修改，整行未导入：{unauthorized_preview}。"
-                "商品部在藏宝阁只能导入图片，品类、上新价格和上新渠道请回到商品企划中心修改。"
+                f"{permission_hint}"
             )
         if detail_parts:
             report = f"{report} 另外：{'，'.join(detail_parts)}。"
-        return self.html_response(start_response, self.render_import_page(user, report=report))
+        return self.html_response(start_response, self.render_import_page(user, product_line=product_line, report=report))
 
     def handle_image_import(self, environ, start_response, user):
         try:
@@ -1183,7 +1262,8 @@ class CatalogApplication:
             return self.task_capacity_response(start_response, user, "导入")
 
     def _handle_image_import(self, environ, start_response, user):
-        _, files = self.parse_form(environ)
+        form, files = self.parse_form(environ)
+        product_line = normalize_product_line(form.get("product_line"))
         try:
             mapping_workbook = read_validated_file_upload(
                 files.get("mapping_workbook"),
@@ -1198,7 +1278,7 @@ class CatalogApplication:
         except ValueError as error:
             return self.html_response(
                 start_response,
-                self.render_image_import_page(user, error=str(error)),
+                self.render_image_import_page(user, product_line=product_line, error=str(error)),
                 status="400 Bad Request",
             )
 
@@ -1210,20 +1290,20 @@ class CatalogApplication:
             except ValueError as error:
                 return self.html_response(
                     start_response,
-                    self.render_image_import_page(user, error=str(error)),
+                    self.render_image_import_page(user, product_line=product_line, error=str(error)),
                     status="400 Bad Request",
                 )
             except Exception:
                 return self.html_response(
                     start_response,
-                    self.render_image_import_page(user, error="图片映射 Excel 解析失败，请确认文件可正常打开，并优先使用 xlsx 格式。"),
+                    self.render_image_import_page(user, product_line=product_line, error="图片映射 Excel 解析失败，请确认文件可正常打开，并优先使用 xlsx 格式。"),
                     status="400 Bad Request",
                 )
             upload_payloads = [*embedded_image_payloads, *upload_payloads]
             if not upload_payloads:
                 return self.html_response(
                     start_response,
-                    self.render_image_import_page(user, error="使用传统 Excel 映射导入时，请同时上传对应的 JPG 或 PNG 图片文件；如果图片已嵌入 Excel，请确认使用的是包含 DISPIMG 图片的 xlsx 文件。"),
+                    self.render_image_import_page(user, product_line=product_line, error="使用传统 Excel 映射导入时，请同时上传对应的 JPG 或 PNG 图片文件；如果图片已嵌入 Excel，请确认使用的是包含 DISPIMG 图片的 xlsx 文件。"),
                     status="400 Bad Request",
                 )
             try:
@@ -1233,6 +1313,7 @@ class CatalogApplication:
                         user,
                         mapping_rows,
                         upload_payloads,
+                        product_line=product_line,
                         workbook_name=str(mapping_workbook.get("original_filename") or "").strip(),
                     )
             except TaskCapacityError:
@@ -1241,16 +1322,16 @@ class CatalogApplication:
         if not upload_payloads:
             return self.html_response(
                 start_response,
-                self.render_image_import_page(user, error="请选择至少一张图片后再导入。"),
+                self.render_image_import_page(user, product_line=product_line, error="请选择至少一张图片后再导入。"),
                 status="400 Bad Request",
             )
         try:
             with self.import_write_pool.acquire():
-                return self.handle_image_import_by_filename(start_response, user, upload_payloads)
+                return self.handle_image_import_by_filename(start_response, user, upload_payloads, product_line)
         except TaskCapacityError:
             return self.task_capacity_response(start_response, user, "导入")
 
-    def handle_image_import_by_filename(self, start_response, user, upload_payloads: list[dict]):
+    def handle_image_import_by_filename(self, start_response, user, upload_payloads: list[dict], product_line: str):
         uploads_by_style_color: dict[str, list[tuple[str, dict]]] = {}
         invalid_names: list[str] = []
         for payload in upload_payloads:
@@ -1274,8 +1355,10 @@ class CatalogApplication:
                 SELECT *
                 FROM products
                 WHERE lifecycle_status = 'active'
+                  AND product_line = ?
                 ORDER BY updated_at DESC, id DESC
-                """
+                """,
+                (product_line,),
             ).fetchall()
             products_by_style_color: dict[str, list[dict]] = {}
             for row in rows:
@@ -1316,7 +1399,7 @@ class CatalogApplication:
             "ambiguous_matches": ambiguous_matches,
             "invalid_names": invalid_names,
         }
-        return self.html_response(start_response, self.render_image_import_page(user, report=report))
+        return self.html_response(start_response, self.render_image_import_page(user, product_line=product_line, report=report))
 
     def handle_image_import_by_workbook(
         self,
@@ -1325,6 +1408,7 @@ class CatalogApplication:
         mapping_rows: list[dict],
         upload_payloads: list[dict],
         *,
+        product_line: str,
         workbook_name: str = "",
     ):
         uploads_by_filename: dict[str, list[tuple[str, dict]]] = {}
@@ -1390,8 +1474,10 @@ class CatalogApplication:
                 SELECT *
                 FROM products
                 WHERE lifecycle_status = 'active'
+                  AND product_line = ?
                 ORDER BY updated_at DESC, id DESC
-                """
+                """,
+                (product_line,),
             ).fetchall()
             products_by_style_color: dict[str, list[dict]] = {}
             for row in rows:
@@ -1458,7 +1544,7 @@ class CatalogApplication:
             "duplicate_mapping_rows": duplicate_mapping_rows,
             "invalid_names": [],
         }
-        return self.html_response(start_response, self.render_image_import_page(user, report=report))
+        return self.html_response(start_response, self.render_image_import_page(user, product_line=product_line, report=report))
 
     @staticmethod
     def image_upload_fingerprint(payload: dict) -> str:
@@ -1524,6 +1610,28 @@ class CatalogApplication:
                 "/products?notice=" + self.urlencode_message("请先勾选至少一条资料，再导出勾选资料。"),
             )
         filter_context = self.product_filter_context(user, query)
+        product_line = filter_context["product_line"]
+        if selected_product_ids:
+            with db.get_connection(self.db_path) as connection:
+                selected_rows = connection.execute(
+                    f"SELECT id, product_line FROM products WHERE id IN ({','.join('?' for _ in selected_product_ids)})",
+                    tuple(sorted(selected_product_ids)),
+                ).fetchall()
+            mixed_line_ids = [
+                int(row["id"])
+                for row in selected_rows
+                if normalize_product_line(row["product_line"]) != product_line
+            ]
+            if mixed_line_ids:
+                return self.html_response(
+                    start_response,
+                    self.render_message_page(
+                        "导出范围不一致",
+                        f"本次导出已选择其他商品线资料（{len(mixed_line_ids)} 条）。请切换到对应商品线后单独导出，红标线和黑标线不能混合。",
+                        user,
+                    ),
+                    status="400 Bad Request",
+                )
         visible_products = filter_context["products"]
         if export_filtered_results and not visible_products:
             return self.redirect(
@@ -1548,6 +1656,7 @@ class CatalogApplication:
                     products,
                     visible_fields,
                     image_fetcher=self.fetch_export_image if include_images else None,
+                    product_line=product_line,
                 )
         except TaskCapacityError:
             return self.task_capacity_response(start_response, user, "导出")
@@ -1614,6 +1723,7 @@ class CatalogApplication:
                 query="" if released_read_only_view else query.get("q", ""),
                 department=query.get("department", ""),
                 status=source_status_filter,
+                product_line=normalize_product_line(query.get("line")),
             ),
             api_user,
         )
@@ -2356,6 +2466,14 @@ class CatalogApplication:
                     updated += 1
                     continue
                 if action in {"submit_to_planning_selected", "skip_planning_selected"}:
+                    if normalize_product_line(product.get("product_line")) != "red":
+                        skipped += 1
+                        self.append_bulk_skip_reason(
+                            skip_reasons,
+                            product,
+                            "黑标线资料只在藏宝阁流转，不进入商品企划中心。",
+                        )
+                        continue
                     if product.get("status") != "pending" or str(product.get("planning_reentry_state") or "initial") != "decision_pending":
                         skipped += 1
                         self.append_bulk_skip_reason(skip_reasons, product, "资料不在待判定是否重走商品企划节点。")
@@ -2370,6 +2488,14 @@ class CatalogApplication:
                     updated += 1
                     continue
                 if action == "request_planning_revision_selected":
+                    if normalize_product_line(product.get("product_line")) != "red":
+                        skipped += 1
+                        self.append_bulk_skip_reason(
+                            skip_reasons,
+                            product,
+                            "黑标线资料只在藏宝阁流转，不能发起二次企划。",
+                        )
+                        continue
                     try:
                         db.request_planning_revision(connection, product_id, int(user["id"]))
                     except (LookupError, ValueError) as error:
@@ -3076,12 +3202,14 @@ class CatalogApplication:
             except ValueError:
                 errors.append(f"{PRODUCT_FIELD_MAP[numeric_field].label} 必须是数字。")
                 continue
-            if numeric_field == "launch_price" and (
-                not math.isfinite(numeric_value)
-                or numeric_value <= 0
-                or not numeric_value.is_integer()
-            ):
-                errors.append("上新价格必须是大于 0 的整数，不保留小数位。")
+            if numeric_field == "launch_price":
+                product_line = normalize_product_line(form.get("product_line"))
+                if not math.isfinite(numeric_value) or numeric_value <= 0:
+                    errors.append("上新折扣/上新价格必须是大于 0 的数字。")
+                elif product_line == "black" and round(numeric_value, 2) != numeric_value:
+                    errors.append("黑标线上新折扣最多保留两位小数。")
+                elif product_line == "red" and not numeric_value.is_integer():
+                    errors.append("上新价格必须是大于 0 的整数，不保留小数位。")
         return errors
 
     def apply_image_upload(
@@ -3243,8 +3371,10 @@ class CatalogApplication:
 
     def products_return_path(self, query: dict) -> str:
         params = {}
-        for key in ("q", "supplier", "department", "status", "marker", "channel", "lifecycle_status", "season_year", "page"):
+        for key in ("q", "supplier", "department", "status", "marker", "channel", "lifecycle_status", "season_year", "page", "line"):
             value = str(query.get(key, "")).strip()
+            if key == "line" and normalize_product_line(value) == "red":
+                continue
             if value:
                 params[key] = value
         if not params:
@@ -3254,6 +3384,7 @@ class CatalogApplication:
     def product_filter_context(self, user: dict, query: dict) -> dict:
         """Apply the product-list filters once for both the page and Excel exports."""
         normalized_query = dict(query)
+        product_line = normalize_product_line(query.get("line"))
         keyword = str(query.get("q", "")).strip()
         supplier_search_enabled = user.get("department") in {"A", "EXECUTIVE"} or is_admin(user)
         supplier_filter = str(query.get("supplier", "")).strip() if supplier_search_enabled else ""
@@ -3291,7 +3422,11 @@ class CatalogApplication:
         completion_ready_filter = b_dashboard_view and marker_filter == "completion_ready"
         if completion_ready_filter:
             status_filter = ""
-        planning_reentry_filter = b_dashboard_view and marker_filter == "planning_reentry"
+        planning_reentry_filter = (
+            product_line == "red"
+            and b_dashboard_view
+            and marker_filter == "planning_reentry"
+        )
         if not tax_price_filter and not completion_ready_filter and not planning_reentry_filter and not recall_notice_mode:
             marker_filter = ""
 
@@ -3315,6 +3450,7 @@ class CatalogApplication:
                 supplier_filter,
                 tax_price_filter,
                 season_year_filter,
+                product_line,
             ),
             user,
         )
@@ -3355,7 +3491,11 @@ class CatalogApplication:
         recall_notices = []
         if recall_notice_mode:
             recipient_user_id = None if is_department_monitor(user) else int(user["id"])
-            recall_notices = db.c_active_recall_notices(self.db_path, recipient_user_id)
+            recall_notices = db.c_active_recall_notices(
+                self.db_path,
+                recipient_user_id,
+                product_line,
+            )
             products = []
 
         normalized_query.update(
@@ -3368,6 +3508,7 @@ class CatalogApplication:
                 "channel": launch_channel_filter,
                 "lifecycle_status": lifecycle_filter,
                 "season_year": season_year_filter,
+                "line": product_line if product_line == "black" else "",
             }
         )
         if is_department_monitor(user):
@@ -3380,6 +3521,7 @@ class CatalogApplication:
             "supplier_filter": supplier_filter,
             "season_year_search_enabled": season_year_search_enabled,
             "season_year_filter": season_year_filter,
+            "product_line": product_line,
             "b_dashboard_view": b_dashboard_view,
             "department_filter": department_filter,
             "status_filter": status_filter,
@@ -3438,6 +3580,7 @@ class CatalogApplication:
             supplier,
             tax_price_filter,
             season_year_filter,
+            normalize_product_line(query.get("line")),
         )
         visible_source_products = self.visible_products_for_user(source_products, user)
         visible_source_products = self.filter_products_by_catalog_identifiers(
@@ -4012,6 +4155,7 @@ class CatalogApplication:
         payload = {
             "id": product.get("id"),
             "owner_department": product.get("owner_department"),
+            "product_line": normalize_product_line(product.get("product_line")),
             "creator_name": product.get("creator_name"),
             "creator_username": product.get("creator_username"),
             "created_at": product.get("created_at"),
@@ -4126,6 +4270,11 @@ class CatalogApplication:
                 self.format_list_decimal(payload.get(field.key)),
                 mono=True,
             )
+        if field.key == "launch_price" and normalize_product_line(payload.get("product_line")) == "black":
+            return self.list_value_markup(
+                self.format_list_decimal(payload.get(field.key)).rstrip("0").rstrip("."),
+                mono=True,
+            )
         if field.key in {"tag_price", "launch_price"}:
             return self.list_value_markup(
                 self.format_list_integer(payload.get(field.key)),
@@ -4156,7 +4305,10 @@ class CatalogApplication:
                 preview = f"{preview} 等 {len(missing_labels)} 项"
             return f"开启商品部协作前，请先补齐这些识别字段：{preview}。"
         if target_status == "published":
-            if str(product.get("planning_reentry_state") or "initial") == "approved":
+            if (
+                normalize_product_line(product.get("product_line")) == "red"
+                and str(product.get("planning_reentry_state") or "initial") == "approved"
+            ):
                 return "当前资料已由商品部标记为需要重走商品企划，请等待企划中心回传后再提交运营部。"
             missing_keys = db.completion_missing_field_keys(product)
             if missing_keys:
@@ -4244,16 +4396,19 @@ class CatalogApplication:
             return
         bucket.append(message)
 
-    def export_menu(self, user, compact: bool = False) -> str:
+    def export_menu(self, user, compact: bool = False, product_line: str = "red") -> str:
         summary_class = "export-menu-summary export-menu-summary-compact" if compact else "export-menu-summary"
         menu_class = "export-menu export-menu-compact" if compact else "export-menu"
+        normalized_line = normalize_product_line(product_line)
+        line_prefix = "?line=black" if normalized_line == "black" else ""
+        option_separator = "&amp;" if line_prefix else "?"
         return f"""
         <details class="{menu_class}">
           <summary class="{summary_class}">导出 Excel</summary>
           <div class="export-menu-panel">
-            <a class="export-menu-item" href="/export.xlsx">导出全部资料</a>
-            <a class="export-menu-item" href="/export.xlsx?mode=selected" data-base-href="/export.xlsx?mode=selected" data-export-selected="1">导出勾选资料</a>
-            <a class="export-menu-item" href="/export.xlsx?mode=selected&amp;include_images=1" data-base-href="/export.xlsx?mode=selected&amp;include_images=1" data-export-selected="1">导出勾选含图片</a>
+            <a class="export-menu-item" href="/export.xlsx{line_prefix}">导出全部资料</a>
+            <a class="export-menu-item" href="/export.xlsx{line_prefix}{option_separator}mode=selected" data-base-href="/export.xlsx{line_prefix}{option_separator}mode=selected" data-export-selected="1">导出勾选资料</a>
+            <a class="export-menu-item" href="/export.xlsx{line_prefix}{option_separator}mode=selected&amp;include_images=1" data-base-href="/export.xlsx{line_prefix}{option_separator}mode=selected&amp;include_images=1" data-export-selected="1">导出勾选含图片</a>
           </div>
         </details>
         """
@@ -10279,6 +10434,7 @@ class CatalogApplication:
         console_eyebrow = self.brand_config["brand_console_eyebrow"]
         filter_context = self.product_filter_context(user, query)
         query = filter_context["query"]
+        product_line = filter_context["product_line"]
         keyword = filter_context["keyword"]
         supplier_search_enabled = filter_context["supplier_search_enabled"]
         supplier_filter = filter_context["supplier_filter"]
@@ -10355,10 +10511,10 @@ class CatalogApplication:
             if selection_enabled and page_product_count
             else ""
         )
-        bulk_lifecycle_markup = self.render_bulk_lifecycle_tools(user)
+        bulk_lifecycle_markup = self.render_bulk_lifecycle_tools(user, product_line)
 
         pagination_params = {}
-        for key in ("q", "supplier", "department", "status", "marker", "channel", "lifecycle_status", "season_year", "monitor_department"):
+        for key in ("q", "supplier", "department", "status", "marker", "channel", "lifecycle_status", "season_year", "line", "monitor_department"):
             value = str(query.get(key, "")).strip()
             if value:
                 pagination_params[key] = value
@@ -10433,25 +10589,33 @@ class CatalogApplication:
             # Keep the row marker useful in the default view. The B team can
             # spot any historical price change without opening the filter;
             # the overview card remains scoped to the recent seven-day queue.
-            price_changed_product_ids = db.tax_price_change_product_ids(self.db_path)
-        stats = db.department_stats(self.db_path)
-        workflow_stats = db.status_stats(self.db_path)
-        lifecycle_stats = db.lifecycle_stats(self.db_path)
-        recent_stats = db.recent_activity_stats(self.db_path, days=7)
+            price_changed_product_ids = db.tax_price_change_product_ids(
+                self.db_path,
+                product_line=product_line,
+            )
+        stats = db.department_stats(self.db_path, product_line=product_line)
+        workflow_stats = db.status_stats(self.db_path, product_line=product_line)
+        lifecycle_stats = db.lifecycle_stats(self.db_path, product_line=product_line)
+        recent_stats = db.recent_activity_stats(self.db_path, days=7, product_line=product_line)
         b_dashboard_stats = (
-            db.b_workflow_stats(self.db_path, days=7)
+            db.b_workflow_stats(self.db_path, days=7, product_line=product_line)
             if user.get("department") == "B" and not is_department_monitor(user)
             else {}
         )
         c_receipt_stats = (
-            db.c_department_receipt_stats(self.db_path)
+            db.c_department_receipt_stats(self.db_path, product_line=product_line)
             if user.get("department") == "C" and is_department_monitor(user)
-            else (db.c_user_receipt_stats(self.db_path, user) if user.get("department") == "C" else {})
+            else (
+                db.c_user_receipt_stats(self.db_path, user, product_line=product_line)
+                if user.get("department") == "C"
+                else {}
+            )
         )
         c_recall_notice_count = (
             db.c_active_recall_notice_count(
                 self.db_path,
                 None if is_department_monitor(user) else int(user["id"]),
+                product_line,
             )
             if user.get("department") == "C"
             else 0
@@ -10497,6 +10661,7 @@ class CatalogApplication:
             if (
                 not is_department_monitor(user)
                 and user.get("department") == "B"
+                and normalize_product_line(product.get("product_line")) == "red"
                 and product.get("status") == "pending"
                 and str(product.get("planning_reentry_state") or "initial") == "decision_pending"
             ):
@@ -10513,6 +10678,7 @@ class CatalogApplication:
             elif (
                 not is_department_monitor(user)
                 and user.get("department") == "B"
+                and normalize_product_line(product.get("product_line")) == "red"
                 and product.get("status") == "pending"
                 and bool(product.get("has_planning_publication"))
                 and str(product.get("planning_reentry_state") or "initial") in {"initial", "not_required"}
@@ -10609,7 +10775,10 @@ class CatalogApplication:
             version_parts = [f'<span class="table-version-label">{html.escape(self.version_label(product))}</span>']
             if revision_badge:
                 version_parts.append(revision_badge)
-            if str(product.get("planning_reentry_state") or "initial") == "decision_pending":
+            if (
+                normalize_product_line(product.get("product_line")) == "red"
+                and str(product.get("planning_reentry_state") or "initial") == "decision_pending"
+            ):
                 reason_label = (
                     "成本变动待判断"
                     if str(product.get("planning_reentry_reason") or "") == "cost_change"
@@ -10623,6 +10792,7 @@ class CatalogApplication:
                 <tr class="catalog-row">
                   {selector_cell}
                   <td class="table-id-cell"><a class="table-id-link" href="/products/{product['id']}">#{product['id']}</a></td>
+                  <td class="table-product-line-cell"><span class="pill">{html.escape(PRODUCT_LINE_LABELS[product_line])}</span></td>
                   {"".join(dynamic_cells)}
                   <td class="table-status-cell"><span class="pill">{html.escape(payload.get('status_label', ''))}</span></td>
                   <td class="table-version-cell"><div class="table-version-stack">{''.join(version_parts)}</div></td>
@@ -10633,12 +10803,16 @@ class CatalogApplication:
                 </tr>
                 """
             )
-        dynamic_headers = [f"<th>{html.escape(field.label)}</th>" for field in configured_list_fields]
+        dynamic_headers = [
+            f"<th>{html.escape('上新折扣' if field.key == 'launch_price' and product_line == 'black' else field.label)}</th>"
+            for field in configured_list_fields
+        ]
         selector_header = '<th class="table-select-head"><input type="checkbox" id="toggle-all-products" style="width:auto;"></th>' if selection_enabled else ""
         table_column_keys = []
         if selection_enabled:
             table_column_keys.append("__select__")
         table_column_keys.append("__id__")
+        table_column_keys.append("__product_line__")
         table_column_keys.extend(field.key for field in configured_list_fields)
         table_column_keys.extend(
             [
@@ -10650,10 +10824,11 @@ class CatalogApplication:
                 "__actions__",
             ]
         )
-        table_column_count = 7 + len(configured_list_fields) + (1 if selection_enabled else 0)
+        table_column_count = 8 + len(configured_list_fields) + (1 if selection_enabled else 0)
         table_header_markup = f"""
           {selector_header}
           <th>ID</th>
+          <th>商品线</th>
           {"".join(dynamic_headers)}
           <th>状态</th>
           <th>修改版本</th>
@@ -10695,18 +10870,20 @@ class CatalogApplication:
             ]
             table_column_count = len(table_column_keys)
             empty_list_message = "暂无待处理的召回提醒。"
+        line_query_suffix = "?line=black" if product_line == "black" else ""
+        line_hidden_input = '<input type="hidden" name="line" value="black">' if product_line == "black" else ""
         new_button = (
-            '<a class="pill" href="/products/new">新建资料</a>'
+            f'<a class="pill" href="/products/new{line_query_suffix}">新建资料</a>'
             if can_create_product(user)
             else ""
         )
         import_button = (
-            '<a class="pill" href="/import">导入 Excel</a>'
+            f'<a class="pill" href="/import{line_query_suffix}">导入 Excel</a>'
             if can_import_product_excel(user)
             else ""
         )
         import_image_button = (
-            '<a class="pill" href="/import-images">导入图片</a>'
+            f'<a class="pill" href="/import-images{line_query_suffix}">导入图片</a>'
             if can_import_product_images(user)
             else ""
         )
@@ -10718,7 +10895,7 @@ class CatalogApplication:
               <div class="stat-card"><span>总接收</span><strong>{c_receipt_stats.get('received', 0)}</strong></div>
               <div class="stat-card"><span>近7天新增</span><strong>{c_receipt_stats.get('recent_created', 0)}</strong></div>
               <div class="stat-card"><span>待运营接收</span><strong>{c_receipt_stats.get('pending', 0)}</strong></div>
-              <a class="stat-card stat-card-link" href="/products?marker=recall_notice#products-list"><span>召回提醒</span><strong>{c_recall_notice_count}</strong><small>点击查看召回款式</small></a>
+              <a class="stat-card stat-card-link" href="/products?marker=recall_notice{'&amp;line=black' if product_line == 'black' else ''}#products-list"><span>召回提醒</span><strong>{c_recall_notice_count}</strong><small>点击查看召回款式</small></a>
             </div>
             """
             insights_grid_class += " products-insights-single"
@@ -10743,19 +10920,29 @@ class CatalogApplication:
             """
             insights_grid_class += " products-insights-single"
         elif user["department"] == "B":
+            planning_stat_markup = (
+                f'<a class="stat-card stat-card-link" href="/products?marker=planning_reentry#products-list"><span>重回企划判断</span><strong>{b_dashboard_stats.get("planning_reentry_pending", 0)}</strong><small>召回或成本变动后由商品部判断</small></a>'
+                if product_line == "red"
+                else '<div class="stat-card"><span>商品线流程</span><strong>藏宝阁内完成</strong></div>'
+            )
+            tax_price_stat_markup = (
+                f"""<a class="stat-card stat-card-link" href="/products?marker=tax_price_modified#products-list">
+                  <span>近7天含税价修改</span>
+                  <strong>{b_dashboard_stats.get('recent_tax_price_changes', 0)}</strong>
+                  <small>点击查看变动款式</small>
+                </a>"""
+                if product_line == "red"
+                else ""
+            )
             stats_markup = f"""
             <div class="stats products-stats-row">
               <div class="stat-card"><span>近7天新增</span><strong>{b_dashboard_stats.get('recent_submitted_to_b', 0)}</strong></div>
               <div class="stat-card"><span>A/B协作中</span><strong>{b_dashboard_stats.get('pending_completion', 0)}</strong></div>
-              <a class="stat-card stat-card-link" href="/products?marker=planning_reentry#products-list"><span>重回企划判断</span><strong>{b_dashboard_stats.get('planning_reentry_pending', 0)}</strong><small>召回或成本变动后由商品部判断</small></a>
+              {planning_stat_markup}
               <div class="stat-card"><span>待运营接收</span><strong>{b_dashboard_stats.get('awaiting_receipt', 0)}</strong></div>
               <div class="stat-card"><span>近7天退回</span><strong>{b_dashboard_stats.get('recent_returned_to_a', 0)}</strong></div>
-              <a class="stat-card stat-card-link" href="/products?status=workflow_restart#products-list"><span>待商品部重新提交</span><strong>{b_dashboard_stats.get('restart_required', 0)}</strong><small>点击查看需重新流转款式</small></a>
-              <a class="stat-card stat-card-link" href="/products?marker=tax_price_modified#products-list">
-                <span>近7天含税价修改</span>
-                <strong>{b_dashboard_stats.get('recent_tax_price_changes', 0)}</strong>
-                <small>点击查看变动款式</small>
-              </a>
+              <a class="stat-card stat-card-link" href="/products?status=workflow_restart{'&amp;line=black' if product_line == 'black' else ''}#products-list"><span>待商品部重新提交</span><strong>{b_dashboard_stats.get('restart_required', 0)}</strong><small>点击查看需重新流转款式</small></a>
+              {tax_price_stat_markup}
             </div>
             """
             insights_grid_class += " products-insights-single"
@@ -10812,13 +10999,18 @@ class CatalogApplication:
                 <option value="workflow_restart" {"selected" if status_filter == "workflow_restart" else ""}>待商品部重新提交</option>
               </select>
             """
+        red_marker_options = (
+            f'<option value="tax_price_modified" {"selected" if marker_filter == "tax_price_modified" else ""}>含税价修改</option>'
+            f'<option value="planning_reentry" {"selected" if marker_filter == "planning_reentry" else ""}>重回企划判断</option>'
+            if product_line == "red"
+            else ""
+        )
         marker_filter_markup = (
             f"""
               <select name="marker">
                 <option value="">全部资料标记</option>
                 <option value="completion_ready" {"selected" if marker_filter == "completion_ready" else ""}>资料完成Y</option>
-                <option value="tax_price_modified" {"selected" if marker_filter == "tax_price_modified" else ""}>含税价修改</option>
-                <option value="planning_reentry" {"selected" if marker_filter == "planning_reentry" else ""}>重回企划判断</option>
+                {red_marker_options}
               </select>
             """
             if b_dashboard_view
@@ -10877,20 +11069,21 @@ class CatalogApplication:
             else ""
         )
         marker_filter_note = ""
+        line_query_suffix = "?line=black" if product_line == "black" else ""
         if tax_price_filter == "modified":
             marker_filter_note = (
                 '<div class="notice products-filter-result-note">已展示全部含税价修改资料，按最近一次修改时间倒序排列。'
-                '<a class="pill" href="/products#products-list">清除筛选</a></div>'
+                f'<a class="pill" href="/products{line_query_suffix}#products-list">清除筛选</a></div>'
             )
         elif completion_ready_filter:
             marker_filter_note = (
                 '<div class="notice products-filter-result-note">已展示资料完成为 Y 且等待商品部提交运营部的资料；提交后会自动移出此列表。'
-                '<a class="pill" href="/products#products-list">清除筛选</a></div>'
+                f'<a class="pill" href="/products{line_query_suffix}#products-list">清除筛选</a></div>'
             )
         elif recall_notice_mode:
             marker_filter_note = (
                 '<div class="notice products-filter-result-note">以下资料已从运营阶段召回，等待 A/B 修订并重新提交；重新提交后会自动移出提醒。'
-                '<a class="pill" href="/products#products-list">返回正常资料列表</a></div>'
+                f'<a class="pill" href="/products{line_query_suffix}#products-list">返回正常资料列表</a></div>'
             )
         if user["department"] == "C" and not is_department_monitor(user):
             c_note = ""
@@ -10910,18 +11103,23 @@ class CatalogApplication:
               <p class="table-note">资料提交运营部后，修改以下字段会要求商品部重新确认提交：{html.escape(restart_labels)}。其他字段仅更新版本，不要求运营部重新接收。</p>
             </details>
             """
+        product_line_switch = "".join(
+            f'<a class="pill{" active" if option == product_line else ""}" href="/products{"?line=black" if option == "black" else ""}#products-list">{html.escape(PRODUCT_LINE_LABELS[option])}</a>'
+            for option in PRODUCT_LINE_OPTIONS
+        )
         content = f"""
         {dashboard_open}
         <section class="products-top-grid">
           <div class="panel products-overview-card{' products-overview-card-spaced' if user['department'] in {'A', 'B'} else ''}">
             <div class="eyebrow">{html.escape(console_eyebrow)}</div>
             <h1>商品资料后台</h1>
+            <div class="product-line-switch" aria-label="选择商品线">{product_line_switch}</div>
             <div class="tools">
               {layout_settings_button}
               {new_button}
               {import_button}
               {import_image_button}
-              {'' if recall_notice_mode else self.export_menu(user)}
+              {'' if recall_notice_mode else self.export_menu(user, product_line=product_line)}
               {'<a class="pill" href="/products/review">流转看板</a>' if is_admin(user) else ''}
             </div>
             {workflow_rule_note}
@@ -10934,6 +11132,7 @@ class CatalogApplication:
           {notice_block}
           {c_note}
           <form class="products-filter-form{' products-filter-form-c' if compact_readonly_dashboard else (' products-filter-form-a' if user['department'] == 'A' else '')}" method="get" action="/products#products-list">
+              {line_hidden_input}
               <input class="products-search-field" type="search" name="q" value="{html.escape(keyword)}" placeholder="可输入多个，逗号、空格或换行分隔" aria-label="搜索款号或款色" autocomplete="off">
               {supplier_filter_markup}
               {filter_controls_markup}
@@ -12654,7 +12853,7 @@ class CatalogApplication:
           </div>
         """
 
-    def render_bulk_lifecycle_tools(self, user) -> str:
+    def render_bulk_lifecycle_tools(self, user, product_line: str = "red") -> str:
         if is_department_monitor(user) or (not is_admin(user) and user.get("department") not in {"A", "B"}):
             return ""
         recall_button = """
@@ -12684,6 +12883,12 @@ class CatalogApplication:
               title="仅处理已完成过企划回传、仍处于 A/B 协作中的资料">批量二次企划</button>
         """
         if user.get("department") == "B":
+            if normalize_product_line(product_line) == "black":
+                return f"""
+                  <div class="products-bulk-lifecycle-actions">
+                    {recall_button}
+                  </div>
+                """
             return f"""
               <div class="products-bulk-lifecycle-actions">
                 {recall_button}
@@ -12707,6 +12912,7 @@ class CatalogApplication:
 
     def render_product_form(self, user, action: str, title: str, values: dict, errors: list[str] | None = None) -> str:
         console_eyebrow = self.brand_config["brand_console_eyebrow"]
+        product_line = normalize_product_line(values.get("product_line"))
         editable_keys = self.editable_field_keys_for_request(user, values if values.get("id") else None)
         error_block = ""
         if errors:
@@ -12714,10 +12920,16 @@ class CatalogApplication:
             error_block = f'<ul class="error-list">{items}</ul>'
         sections = []
         for group, fields in FIELDS_BY_GROUP.items():
-            visible_fields = [field for field in fields if field.key in editable_keys and field.key != "size_chart"]
+            visible_fields = [
+                field
+                for field in fields
+                if field.key in editable_keys
+                and field.key != "size_chart"
+                and not (product_line == "black" and field.key in BLACK_LINE_BLANK_FIELD_KEYS)
+            ]
             if not visible_fields:
                 continue
-            inputs = "".join(self.render_input(field, values) for field in visible_fields)
+            inputs = "".join(self.render_input(field, values, product_line=product_line) for field in visible_fields)
             sections.append(f'<section class="panel"><h2>{html.escape(group)}</h2><div class="form-grid">{inputs}</div></section>')
         department = user.get("department")
         if department == "A":
@@ -12725,7 +12937,11 @@ class CatalogApplication:
             mode_title = "跟单部主体资料填写"
             next_action = "开启商品部协作"
         elif department == "B":
-            intro_text = "商品部可在跟单部继续补充主体资料的同时维护图片；系统自动判断资料完成，判定为 Y 后可提交运营部。"
+            intro_text = (
+                "商品部可在跟单部继续补充主体资料的同时维护图片；系统自动判断资料完成，判定为 Y 后可提交运营部。"
+                if product_line == "red"
+                else "黑标线不经过商品企划中心，商品部可在藏宝阁内维护图片、品类、上新折扣和上新渠道；系统自动判断资料完成。"
+            )
             mode_title = "商品部资料补充"
             next_action = "确认齐全后提交运营部"
         else:
@@ -12733,7 +12949,7 @@ class CatalogApplication:
             mode_title = "资料维护"
             next_action = "保存资料"
         planning_readonly = ""
-        if department == "B":
+        if department == "B" and product_line == "red":
             planning_readonly = f"""
             <section class="panel" style="margin-top:18px;">
               <h2>商品企划字段（只读）</h2>
@@ -12745,6 +12961,17 @@ class CatalogApplication:
               </div>
             </section>
             """
+        if values.get("id"):
+            product_line_control = (
+                f'<div class="field"><span>商品线</span><input value="{html.escape(PRODUCT_LINE_LABELS[product_line])}" readonly>'
+                f'<input type="hidden" name="product_line" value="{html.escape(product_line, quote=True)}"></div>'
+            )
+        else:
+            product_line_options = "".join(
+                f'<option value="{option}" {"selected" if option == product_line else ""}>{html.escape(PRODUCT_LINE_LABELS[option])}</option>'
+                for option in PRODUCT_LINE_OPTIONS
+            )
+            product_line_control = f'<label class="field"><span>商品线</span><select name="product_line" onchange="window.location.href=\'/products/new?line=\'+this.value">{product_line_options}</select></label>'
         content = f"""
         <section class="hero">
           <div class="panel">
@@ -12775,6 +13002,9 @@ class CatalogApplication:
           <p class="table-note">{html.escape(intro_text)}</p>
           {error_block}
           <form method="post" action="{html.escape(action)}" enctype="multipart/form-data">
+            <section class="panel" style="margin-top:18px;">
+              <div class="form-grid">{product_line_control}</div>
+            </section>
             {''.join(sections)}
             {planning_readonly}
             <section class="panel" style="margin-top:18px;">
@@ -12791,21 +13021,29 @@ class CatalogApplication:
             content,
             user,
             current_page="products",
-            back_href=f"/products/{values['id']}" if values.get("id") else "/products",
+            back_href=(
+                f"/products/{values['id']}"
+                if values.get("id")
+                else ("/products?line=black" if product_line == "black" else "/products")
+            ),
         )
 
-    def render_input(self, field, values):
+    def render_input(self, field, values, product_line: str | None = None):
         raw_value = values.get(field.key, "")
         value = "" if raw_value is None else str(raw_value)
         if field.key == "launch_price" and raw_value not in (None, ""):
             try:
                 parsed_price = float(raw_value)
-                if math.isfinite(parsed_price) and parsed_price.is_integer():
-                    value = str(int(parsed_price))
+                if math.isfinite(parsed_price):
+                    if normalize_product_line(product_line or values.get("product_line")) == "black":
+                        value = f"{parsed_price:.2f}".rstrip("0").rstrip(".")
+                    elif parsed_price.is_integer():
+                        value = str(int(parsed_price))
             except (TypeError, ValueError):
                 pass
         field_class = "field field-wide" if field.input_type == "textarea" else "field"
-        label = html.escape(field.label)
+        label_text = "上新折扣" if field.key == "launch_price" and normalize_product_line(product_line or values.get("product_line")) == "black" else field.label
+        label = html.escape(label_text)
         placeholder = html.escape(field.placeholder or "")
         if field.key == "image_url":
             gallery_values = self.image_gallery_values(values)
@@ -12934,6 +13172,7 @@ class CatalogApplication:
         if (
             not is_department_monitor(user)
             and user.get("department") == "B"
+            and normalize_product_line(product.get("product_line")) == "red"
             and product.get("status") == "pending"
             and str(product.get("planning_reentry_state") or "initial") == "decision_pending"
         ):
@@ -12963,6 +13202,7 @@ class CatalogApplication:
         elif (
             not is_department_monitor(user)
             and user.get("department") == "B"
+            and normalize_product_line(product.get("product_line")) == "red"
             and product.get("status") == "pending"
             and bool(product.get("has_planning_publication"))
             and str(product.get("planning_reentry_state") or "initial") in {"initial", "not_required"}
@@ -13093,7 +13333,14 @@ class CatalogApplication:
           {lifecycle_block}
         </section>
         """
-        return self.page(f"资料 #{product['id']} - 商品资料后台", content, user, current_page="products", back_href="/products")
+        detail_line_suffix = "?line=black" if normalize_product_line(product.get("product_line")) == "black" else ""
+        return self.page(
+            f"资料 #{product['id']} - 商品资料后台",
+            content,
+            user,
+            current_page="products",
+            back_href=f"/products{detail_line_suffix}",
+        )
 
     def render_product_quick_tools(self, product: dict, payload_json: str, copy_summary: str) -> str:
         gallery_values = self.image_gallery_values(product)
@@ -13173,25 +13420,45 @@ class CatalogApplication:
             )
         return f'<div style="display:flex; gap:14px; flex-wrap:wrap;">{"".join(cards)}</div>'
 
-    def render_import_page(self, user, report: str = "", error: str = "") -> str:
+    def render_import_page(
+        self,
+        user,
+        report: str = "",
+        error: str = "",
+        product_line: str = "red",
+    ) -> str:
+        product_line = normalize_product_line(product_line)
+        product_line_label = PRODUCT_LINE_LABELS[product_line]
         console_eyebrow = self.brand_config["brand_console_eyebrow"]
         report_block = f'<div class="notice">{html.escape(report)}</div>' if report else ""
         error_block = f'<div class="warning">{html.escape(error)}</div>' if error else ""
+        product_line_switch = "".join(
+            f'<a class="pill{" active" if option == product_line else ""}" href="/import?line={option}">{html.escape(PRODUCT_LINE_LABELS[option])}</a>'
+            for option in PRODUCT_LINE_OPTIONS
+        )
         if user.get("department") == "B":
-            page_title = "导入商品部补充 Excel"
-            intro_text = "商品部收到跟单部流转过来的资料后，可以先导出 Excel，在表内补充“图片”，再回到这里导入。品类、上新价格和上新渠道由商品企划中心维护并回传，资料完成由系统自动判断。系统不会新增资料，只会按款号、商品名称以及款色或颜色匹配既有条目。"
+            page_title = f"导入{product_line_label}商品部 Excel"
+            intro_text = (
+                "商品部收到跟单部流转过来的资料后，可以先导出 Excel，在表内补充“图片”，再回到这里导入。"
+                if product_line == "red"
+                else "黑标线商品资料不经过商品企划中心，商品部可在藏宝阁内补充图片、品类、上新折扣和上新渠道。"
+            )
             stat_one = "匹配方式"
             stat_one_value = "既有资料精确匹配"
             stat_two = "更新范围"
-            stat_two_value = "仅图片字段"
+            stat_two_value = "仅图片字段" if product_line == "red" else "图片、品类、折扣、渠道"
             stat_three = "后续动作"
             stat_three_value = "批量流转到运营部"
-            section_title = "导入商品部补充文件"
+            section_title = f"导入{product_line_label}商品部补充文件"
             button_text = "开始导入商品部 Excel"
-            hint_text = "导入后请回到资料列表，勾选对应条目，再使用“批量提交运营部”继续流转。未填写图片的行会跳过，其他字段不会被导入修改。"
+            hint_text = (
+                "导入后请回到资料列表，勾选对应条目，再使用“批量提交运营部”继续流转。未填写图片的行会跳过，其他字段不会被导入修改。"
+                if product_line == "red"
+                else "导入后请回到资料列表，检查资料完成 Y，再使用“批量提交运营部”继续流转。导入文件必须只包含黑标线资料。"
+            )
             incremental_section = ""
         else:
-            page_title = "导入跟单部 Excel"
+            page_title = f"导入{product_line_label}跟单部 Excel"
             intro_text = "保留完整模板导入，并新增按款色增量补充。增量模式只更新 Excel 中实际填写的跟单部字段，不新增资料，也不会用空白单元格清除已有内容。"
             stat_one = "工作表"
             stat_one_value = "首张表"
@@ -13199,9 +13466,13 @@ class CatalogApplication:
             stat_two_value = "完整或款色增量"
             stat_three = "权限边界"
             stat_three_value = "A 字段独立维护"
-            section_title = "完整字段导入"
+            section_title = f"{product_line_label}完整字段导入"
             button_text = "开始完整导入"
-            hint_text = "系统会优先按款色更新跟单部已发起的既有资料；空白单元格保留原内容。只有款色不存在，且款号、商品名称齐全时才会新增资料。原始发起人保持不变，实际导入账号会写入操作日志。"
+            hint_text = (
+                "系统会优先按款色更新跟单部已发起的既有资料；空白单元格保留原内容。只有款色不存在，且款号、商品名称齐全时才会新增资料。原始发起人保持不变，实际导入账号会写入操作日志。"
+                if product_line == "red"
+                else "系统会优先按款色更新黑标线既有资料；黑标线的 7 个空白字段会被系统保持为空，不会和红标线资料混合。"
+            )
             incremental_section = """
             <section class="panel">
               <div class="detail-panel-head">
@@ -13215,6 +13486,7 @@ class CatalogApplication:
               </div>
               <form class="excel-import-form" method="post" action="/import" enctype="multipart/form-data">
                 <input type="hidden" name="import_mode" value="incremental">
+                <input type="hidden" name="product_line" value="{html.escape(product_line, quote=True)}">
                 <div class="form-grid">
                   <label class="field field-wide">
                     <span>选择增量 Excel 文件</span>
@@ -13234,6 +13506,9 @@ class CatalogApplication:
             <div class="eyebrow">{html.escape(console_eyebrow)}</div>
             <h1>{html.escape(page_title)}</h1>
             <p>{html.escape(intro_text)}</p>
+            <div class="product-line-switch" aria-label="选择商品线">
+              {product_line_switch}
+            </div>
           </div>
           <div class="panel">
             <div class="eyebrow">Import Notes</div>
@@ -13252,6 +13527,7 @@ class CatalogApplication:
           {error_block}
           <form class="excel-import-form" method="post" action="/import" enctype="multipart/form-data">
             <input type="hidden" name="import_mode" value="full">
+            <input type="hidden" name="product_line" value="{html.escape(product_line, quote=True)}">
             <div class="form-grid">
               <label class="field field-wide">
                 <span>选择 Excel 文件</span>
@@ -13259,7 +13535,7 @@ class CatalogApplication:
               </label>
             </div>
             <div class="tools" style="margin-top:16px; margin-bottom:0;">
-              <a class="pill" href="/products">返回资料列表</a>
+              <a class="pill" href="/products?line={html.escape(product_line, quote=True)}#products-list">返回资料列表</a>
               <button type="submit" data-idle-label="{html.escape(button_text)}">{html.escape(button_text)}</button>
             </div>
             <div class="notice import-progress" style="margin-top:14px;" hidden>正在上传并处理 Excel，请勿重复提交或关闭页面。</div>
@@ -13287,9 +13563,24 @@ class CatalogApplication:
           }});
         </script>
         """
-        return self.page("导入 Excel - 商品资料后台", content, user, current_page="products", back_href="/products")
+        import_line_suffix = "?line=black" if product_line == "black" else ""
+        return self.page(
+            "导入 Excel - 商品资料后台",
+            content,
+            user,
+            current_page="products",
+            back_href=f"/products{import_line_suffix}",
+        )
 
-    def render_image_import_page(self, user, report: dict | None = None, error: str = "") -> str:
+    def render_image_import_page(
+        self,
+        user,
+        report: dict | None = None,
+        error: str = "",
+        product_line: str = "red",
+    ) -> str:
+        product_line = normalize_product_line(product_line)
+        product_line_label = PRODUCT_LINE_LABELS[product_line]
         console_eyebrow = self.brand_config["brand_console_eyebrow"]
         error_block = f'<div class="warning">{html.escape(error)}</div>' if error else ""
         report_block = ""
@@ -13357,12 +13648,17 @@ class CatalogApplication:
             {stats_markup}
             {''.join(detail_sections)}
             """
+        product_line_switch = "".join(
+            f'<a class="pill{" active" if option == product_line else ""}" href="/import-images?line={option}">{html.escape(PRODUCT_LINE_LABELS[option])}</a>'
+            for option in PRODUCT_LINE_OPTIONS
+        )
         content = f"""
         <section class="hero">
           <div class="panel">
             <div class="eyebrow">{html.escape(console_eyebrow)}</div>
-            <h1>导入图片</h1>
+            <h1>导入{html.escape(product_line_label)}图片</h1>
             <p>支持两种导入方式：一是直接上传多张 JPG、JPEG、PNG、WEBP 或 GIF 图片，系统按文件名去掉扩展名后的“款色”自动匹配；二是上传图片映射 Excel，传统映射表另选图片，WPS/Excel“网址转图片”格式可直接读取表格内嵌图片，按 Excel 指定关系更新资料。同一款号的不同款色可以复用同一张图片。</p>
+            <div class="product-line-switch" aria-label="选择商品线">{product_line_switch}</div>
           </div>
           <div class="panel">
             <div class="stats">
@@ -13379,6 +13675,7 @@ class CatalogApplication:
           {error_block}
           {report_block}
           <form method="post" action="/import-images" enctype="multipart/form-data">
+            <input type="hidden" name="product_line" value="{html.escape(product_line, quote=True)}">
             <div class="form-grid">
               <label class="field field-wide">
                 <span>选择映射 Excel（可选）</span>
@@ -13390,13 +13687,20 @@ class CatalogApplication:
               </label>
             </div>
             <div class="tools" style="margin-top:16px; margin-bottom:0;">
-              <a class="pill" href="/products">返回资料列表</a>
+              <a class="pill" href="/products?line={html.escape(product_line, quote=True)}#products-list">返回资料列表</a>
               <button type="submit">开始导入图片</button>
             </div>
           </form>
         </section>
         """
-        return self.page("导入图片 - 商品资料后台", content, user, current_page="products", back_href="/products")
+        image_import_line_suffix = "?line=black" if product_line == "black" else ""
+        return self.page(
+            "导入图片 - 商品资料后台",
+            content,
+            user,
+            current_page="products",
+            back_href=f"/products{image_import_line_suffix}",
+        )
 
     def render_password_change_page(self, user, errors: list[str] | None = None) -> str:
         console_eyebrow = self.brand_config["brand_console_eyebrow"]
@@ -13462,6 +13766,15 @@ class CatalogApplication:
         </header>
         <section class="panel rules-panel">
           <div class="rule-section">
+            <div class="eyebrow">Product Lines</div>
+            <h2>红标线与黑标线边界</h2>
+            <div class="rule-callouts">
+              <div class="rule-callout"><strong>红标线</strong><span>沿用原有主流程。商品部在藏宝阁维护图片；品类、上新价格和上新渠道由商品企划中心维护并回传，再由商品部提交运营部。</span></div>
+              <div class="rule-callout"><strong>黑标线</strong><span>全程只在藏宝阁内完成。商品部在藏宝阁维护图片、品类、上新折扣和上新渠道；任何列表操作、召回、批量处理、接口或异常状态都不能把黑标资料送入商品企划中心。</span></div>
+              <div class="rule-callout"><strong>导入导出</strong><span>资料列表按商品线分开显示，单次 Excel 只能导入或导出一条商品线。黑标线完整导入文件必须明确标记“商品线=黑标线”，红标线与黑标线不能混合处理。</span></div>
+            </div>
+          </div>
+          <div class="rule-section">
             <div class="eyebrow">Roles</div>
             <h2>各部门操作范围</h2>
             <div class="rules-table-wrap">
@@ -13469,7 +13782,7 @@ class CatalogApplication:
                 <thead><tr><th>角色</th><th>可操作内容</th><th>不可操作内容</th></tr></thead>
                 <tbody>
                   <tr><th>A 跟单部</th><td>跟单部资料按部门协作：任一 A 账号可补充、修改、导入更新、流转、召回、删除、归档及恢复符合流程条件的 A 部门资料。系统保留原始发起人，并记录每次实际操作账号。</td><td>不能修改商品部或企划中心负责字段；运营阶段不能直接修改触发字段；不能操作其他部门发起的资料。</td></tr>
-                  <tr><th>B 商品部</th><td>在 A/B 协作中推进商品资料；当前藏宝阁内直接维护图片，资料完成后提交运营部。发现商品部或企划字段有误时，可从运营阶段召回。</td><td>不能删除或归档；不能修改 A 阶段字段。品类、上新价格、上新渠道由商品企划中心维护并回传。</td></tr>
+                  <tr><th>B 商品部</th><td>在 A/B 协作中推进商品资料并维护图片。红标线的品类、上新价格和上新渠道由商品企划中心回传；黑标线的品类、上新折扣和上新渠道由 B 在藏宝阁维护。资料完成后提交运营部，发现错误时可从运营阶段召回。</td><td>不能删除或归档，也不能修改 A 阶段字段；黑标线不能发起、进入或接收任何商品企划中心流程。</td></tr>
                   <tr><th>C 运营部</th><td>按账号渠道属性查看并接收资料：天猫类覆盖天猫、天猫官、天猫奥和同款；唯品类覆盖唯品和同款。任意一个账号接收所属渠道资料后，全局状态即更新为“已接收”，不需等待同类别其他账号逐一接收；全渠道账号可记录个人接收，但不参与全局状态判断，并可查看五个渠道；账单属性仍独立授权。</td><td>不能修改资料、删除、归档或召回。</td></tr>
                   <tr><th>总经办 / 美工部</th><td>按各自只读范围查看资料。</td><td>不能上传、修改、删除、归档或召回。</td></tr>
                   <tr><th>管理员</th><td>可查看并监控各部门，维护账号和系统规则，执行必要的流程及生命周期管理。</td><td>管理员操作会写入日志，正式业务仍建议由对应部门完成。</td></tr>
@@ -13497,14 +13810,14 @@ class CatalogApplication:
                 <thead><tr><th>操作账号</th><th>可修改内容</th><th>处理规则</th></tr></thead>
                 <tbody>
                   <tr><th>A 跟单部</th><td>可修改 A 阶段负责字段。上方列出的字段属于触发字段。</td><td>处于“待运营接收”或“已接收”时，修改触发字段前必须先使用“召回到 A/B 协作”；非触发字段可直接修改并生成新版本。</td></tr>
-                  <tr><th>B 商品部</th><td>当前藏宝阁直接开放图片维护；品类、上新价格和上新渠道由商品企划中心维护。</td><td>图片采用独立图片版本更新，不自动触发召回。发现商品部或企划字段有误时，B 可主动召回到 A/B 协作，修正后重新提交运营部。</td></tr>
+                  <tr><th>B 商品部</th><td>红标线在藏宝阁维护图片，企划字段由商品企划中心维护；黑标线在藏宝阁维护图片、品类、上新折扣和上新渠道。</td><td>图片采用独立图片版本更新，不自动触发召回。发现 B 负责字段有误时，可主动召回到 A/B 协作；红标线按企划规则处理，黑标线直接在藏宝阁修正并重新提交运营部。</td></tr>
                 </tbody>
               </table>
             </div>
             <div class="rule-callouts">
               <div class="rule-callout"><strong>重要字段</strong><span>A 修改前请先使用“召回到 A/B 协作”；未召回时系统会拒绝保存或导入，避免运营继续使用不完整版本。</span></div>
               <div class="rule-callout"><strong>非触发字段</strong><span>A 修改非触发字段会生成新版本并更新资料，不会要求 C 重新接收。B 当前直接可修改的是图片，图片按独立图片版本更新，不触发业务流程重走。</span></div>
-              <div class="rule-callout"><strong>企划回传</strong><span>商品企划中心回传品类、上新价格或上新渠道等变更时，系统会标记“待商品部重新提交”；B 确认后才生成新的运营版本，C 再接收新版本。</span></div>
+              <div class="rule-callout"><strong>企划回传</strong><span>此规则仅适用于红标线。商品企划中心回传品类、上新价格或上新渠道等变更时，系统会标记“待商品部重新提交”；B 确认后才生成新的运营版本，C 再接收新版本。黑标线无企划回传节点。</span></div>
             </div>
           </div>
           <div class="rule-section">

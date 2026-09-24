@@ -5,6 +5,39 @@ import json
 from catalog_backend.fields import C_VISIBLE_FIELDS, PRODUCT_FIELDS, PRODUCT_FIELD_MAP
 
 
+PRODUCT_LINE_OPTIONS = ("red", "black")
+PRODUCT_LINE_LABELS = {
+    "red": "红标线",
+    "black": "黑标线",
+}
+BLACK_LINE_BLANK_FIELD_KEYS = frozenset(
+    {
+        "supplier_style_code",
+        "tax_included_price",
+        "composition_en",
+        "size_69",
+        "inspection_date",
+        "supply_chain_manager",
+        "shooting_date",
+    }
+)
+
+
+def normalize_product_line(value) -> str:
+    clean_value = str(value or "").strip().lower()
+    return clean_value if clean_value in PRODUCT_LINE_OPTIONS else "red"
+
+
+def product_line_label(value) -> str:
+    return PRODUCT_LINE_LABELS.get(normalize_product_line(value), PRODUCT_LINE_LABELS["red"])
+
+
+def b_editable_field_keys_for_product(product: dict | None) -> frozenset[str]:
+    if normalize_product_line((product or {}).get("product_line")) == "black":
+        return frozenset(B_CATALOG_EDITABLE_FIELD_KEYS | B_PLANNING_MANAGED_FIELD_KEYS)
+    return B_CATALOG_EDITABLE_FIELD_KEYS
+
+
 DEPARTMENT_LABELS = {
     "A": "跟单部",
     "B": "商品部",
@@ -324,9 +357,9 @@ def editable_field_keys_for_user(user: dict | None, product: dict | None = None)
         if not product or product.get("lifecycle_status") != "active":
             return ()
         if product.get("status") in {"pending", "published"}:
-            return tuple(B_CATALOG_EDITABLE_FIELD_KEYS)
+            return tuple(b_editable_field_keys_for_product(product))
         if product.get("status") == "received":
-            return tuple(B_CATALOG_EDITABLE_FIELD_KEYS)
+            return tuple(b_editable_field_keys_for_product(product))
         return ()
     return ()
 
@@ -347,7 +380,10 @@ def available_status_actions(user: dict | None, product: dict | None) -> list[tu
     if user.get("department") == "B":
         actions = []
         if status == "pending":
-            if str(product.get("planning_reentry_state") or "initial") != "approved":
+            if (
+                normalize_product_line(product.get("product_line")) == "black"
+                or str(product.get("planning_reentry_state") or "initial") != "approved"
+            ):
                 actions.append(("published", "确认资料齐全，提交运营部"))
             actions.append(("draft", "退回跟单部补充"))
         if status in {"published", "received"} and can_recall_product(user, product):
@@ -364,7 +400,10 @@ def available_status_actions(user: dict | None, product: dict | None) -> list[tu
         if status in {"published", "received"} and int(product.get("workflow_restart_required") or 0):
             actions.append(("published", "管理员代为重新提交运营部"))
         if status == "pending":
-            if str(product.get("planning_reentry_state") or "initial") != "approved":
+            if (
+                normalize_product_line(product.get("product_line")) == "black"
+                or str(product.get("planning_reentry_state") or "initial") != "approved"
+            ):
                 actions.append(("published", "管理员代为提交运营部"))
             actions.append(("draft", "管理员退回跟单部"))
         if status == "published" and can_recall_product(user, product):
