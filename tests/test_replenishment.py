@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -40,7 +41,15 @@ class ReplenishmentTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def request(self, path="/", method="GET", body=b"", cookie="", content_type="application/x-www-form-urlencoded"):
+    def request(
+        self,
+        path="/",
+        method="GET",
+        body=b"",
+        cookie="",
+        content_type="application/x-www-form-urlencoded",
+        server_software="",
+    ):
         environ = {}
         setup_testing_defaults(environ)
         if "?" in path:
@@ -53,6 +62,8 @@ class ReplenishmentTests(unittest.TestCase):
         environ["wsgi.input"] = io.BytesIO(body)
         if cookie:
             environ["HTTP_COOKIE"] = cookie
+        if server_software:
+            environ["SERVER_SOFTWARE"] = server_software
         captured = {}
 
         def start_response(status, headers):
@@ -90,6 +101,38 @@ class ReplenishmentTests(unittest.TestCase):
         self.assertGreaterEqual(dashboard["critical_styles"], 1)
         self.assertGreaterEqual(dashboard["warning_styles"], 1)
         self.assertGreaterEqual(dashboard["broken_core"], 1)
+
+    def test_healthz_returns_traceable_replenishment_release(self):
+        response = self.request("/healthz")
+        self.assertEqual(response["status"], "200 OK")
+        payload = json.loads(response["body"].decode("utf-8"))
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["application"], "replenishment_center")
+        self.assertEqual(payload["build_version"], "2026.09.24-excel-snapshot-v1")
+        self.assertRegex(payload["release_commit"], r"^[0-9a-f]{40,64}$")
+        self.assertGreater(payload["release_generation"], 0)
+        self.assertRegex(payload["source_fingerprint"], r"^[0-9a-f]{16}$")
+        self.assertTrue(payload["process_started_at"].endswith("Z"))
+        self.assertGreater(payload["worker_pid"], 0)
+        self.assertEqual(payload["runtime_mode"], "development")
+        self.assertTrue(payload["production_runtime_ready"])
+        self.assertTrue(payload["db_exists"])
+        headers = dict(response["headers"])
+        self.assertEqual(headers["X-Replenishment-Commit"], payload["release_commit"])
+        self.assertEqual(headers["X-Replenishment-Source"], payload["source_fingerprint"])
+        self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_healthz_rejects_untraceable_production_runtime(self):
+        with (
+            patch("replenishment_center.web.REPLENISHMENT_RUNTIME_MODE", "production"),
+            patch("replenishment_center.web.REPLENISHMENT_RELEASE_COMMIT", "unknown"),
+        ):
+            response = self.request("/healthz", server_software="WSGIServer/0.2")
+
+        self.assertEqual(response["status"], "503 Service Unavailable")
+        payload = json.loads(response["body"].decode("utf-8"))
+        self.assertEqual(payload["status"], "degraded")
+        self.assertFalse(payload["production_runtime_ready"])
 
     def test_suggestions_are_size_level_and_pack_rounded(self):
         plan = db.list_plans(self.db_path)[0]
@@ -329,6 +372,47 @@ class ReplenishmentTests(unittest.TestCase):
         self.assertIn("连续有销量天数", detail_headers)
         calculation_rows = dict(exported["计算口径"].iter_rows(min_row=2, values_only=True))
         self.assertIn("条件1 或 条件2", calculation_rows["筛选关系"])
+
+    def test_excel_emergency_import_replaces_only_selected_store_snapshot(self):
+        settings = db.get_settings(self.db_path)
+        bnx_store = db.get_store(self.db_path, "VIP-BNX")
+        with db.get_connection(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO skus(store_id, style_code, style_name, color_name, size_name)
+                VALUES (?, 'OLD-MTN', '旧马天奴商品', '黑色', 'M')
+                """,
+                (settings["store_id"],),
+            )
+            connection.execute(
+                """
+                INSERT INTO skus(store_id, style_code, style_name, color_name, size_name)
+                VALUES (?, 'KEEP-BNX', 'BNX商品', '黑色', 'M')
+                """,
+                (bnx_store["id"],),
+            )
+
+        user = db.authenticate(self.db_path, "merch", "demo123")
+        counts = import_data_workbook(self.db_path, io.BytesIO(data_template_bytes()), user["id"])
+        self.assertEqual(counts, {"sku": 1, "sales": 1, "inventory": 1})
+
+        with db.get_connection(self.db_path) as connection:
+            active_mtn = connection.execute(
+                "SELECT style_code, is_demo FROM skus WHERE store_id = ? AND lifecycle = 'active'",
+                (settings["store_id"],),
+            ).fetchall()
+            old_mtn = connection.execute(
+                "SELECT lifecycle FROM skus WHERE store_id = ? AND style_code = 'OLD-MTN'",
+                (settings["store_id"],),
+            ).fetchone()
+            bnx = connection.execute(
+                "SELECT lifecycle FROM skus WHERE store_id = ? AND style_code = 'KEEP-BNX'",
+                (bnx_store["id"],),
+            ).fetchone()
+
+        self.assertEqual([(row["style_code"], row["is_demo"]) for row in active_mtn], [("MTN260701", 0)])
+        self.assertEqual(old_mtn["lifecycle"], "inactive")
+        self.assertEqual(bnx["lifecycle"], "active")
 
     def test_role_specific_web_pages_and_login(self):
         cookie = self.login("merch")

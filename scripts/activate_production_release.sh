@@ -4,11 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVICE_NAME="${CATALOG_SERVICE_NAME:-rachel-catalog}"
 SERVICE_FILE="${CATALOG_SERVICE_FILE:-/etc/systemd/system/${SERVICE_NAME}.service}"
+REPLENISH_SERVICE_NAME="${REPLENISH_SERVICE_NAME:-rachel-replenishment}"
+REPLENISH_SERVICE_FILE="${REPLENISH_SERVICE_FILE:-/etc/systemd/system/${REPLENISH_SERVICE_NAME}.service}"
 LEGACY_VERIFY_NAME="rachel-catalog-post-release-verify"
 LEGACY_VERIFY_SERVICE_FILE="/etc/systemd/system/${LEGACY_VERIFY_NAME}.service"
 LEGACY_VERIFY_TIMER_FILE="/etc/systemd/system/${LEGACY_VERIFY_NAME}.timer"
 LOCAL_URL="${CATALOG_LOCAL_URL:-http://127.0.0.1:8765}"
 PUBLIC_URL="${1:-${CATALOG_PUBLIC_URL:-}}"
+REPLENISH_LOCAL_URL="${REPLENISH_LOCAL_URL:-http://127.0.0.1:8877}"
+REPLENISH_PUBLIC_URL="${REPLENISH_PUBLIC_URL:-http://203.205.90.232:8877}"
 VENV_DIR="${CATALOG_VENV_DIR:-/opt/rachelcode/venv}"
 
 # Direct Git deployments can retain an untracked manifest from an older
@@ -80,12 +84,14 @@ fi
 
 "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check -r "$ROOT_DIR/requirements.txt"
 run_root install -m 0644 "$ROOT_DIR/deploy/systemd/rachel-catalog.service" "$SERVICE_FILE"
+run_root install -m 0644 "$ROOT_DIR/deploy/systemd/rachel-replenishment.service" "$REPLENISH_SERVICE_FILE"
 # Retire the removed delayed-verification mechanism on upgraded servers.
 run_root systemctl disable --now "${LEGACY_VERIFY_NAME}.timer" >/dev/null 2>&1 || true
 run_root systemctl stop "${LEGACY_VERIFY_NAME}.service" >/dev/null 2>&1 || true
 run_root rm -f "$LEGACY_VERIFY_SERVICE_FILE" "$LEGACY_VERIFY_TIMER_FILE"
 run_root systemctl daemon-reload
 run_root systemctl restart "$SERVICE_NAME"
+run_root systemctl restart "$REPLENISH_SERVICE_NAME"
 
 for attempt in $(seq 1 30); do
   if curl --fail --silent --max-time 5 "$LOCAL_URL/healthz" >/dev/null; then
@@ -100,8 +106,23 @@ for attempt in $(seq 1 30); do
   sleep 1
 done
 
+for attempt in $(seq 1 30); do
+  if curl --fail --silent --max-time 5 "$REPLENISH_LOCAL_URL/healthz" >/dev/null; then
+    break
+  fi
+  if [ "$attempt" -eq 30 ]; then
+    echo "ERROR 货品监控中心重启后 30 秒内未通过本机健康检查。" >&2
+    run_root systemctl status "$REPLENISH_SERVICE_NAME" --no-pager || true
+    run_root journalctl -u "$REPLENISH_SERVICE_NAME" -n 80 --no-pager || true
+    exit 1
+  fi
+  sleep 1
+done
+
 run_root systemctl is-active --quiet "$SERVICE_NAME"
+run_root systemctl is-active --quiet "$REPLENISH_SERVICE_NAME"
 CATALOG_DEPLOYMENT_CHECK_COUNT=256 CATALOG_EXPECTED_WORKERS=8 "$ROOT_DIR/scripts/verify_public_deployment.sh" "$LOCAL_URL"
+REPLENISH_DEPLOYMENT_CHECK_COUNT=8 REPLENISH_EXPECTED_WORKERS=1 "$ROOT_DIR/scripts/verify_replenishment_deployment.sh" "$REPLENISH_LOCAL_URL"
 
 if [ -n "$PUBLIC_URL" ]; then
   CATALOG_DEPLOYMENT_CHECK_COUNT=256 CATALOG_EXPECTED_WORKERS=8 "$ROOT_DIR/scripts/verify_public_deployment.sh" "$PUBLIC_URL"
@@ -111,4 +132,7 @@ else
   exit 1
 fi
 
-echo "OK 正式服务已重启，本机与公网均已加载本次源码。"
+REPLENISH_DEPLOYMENT_CHECK_COUNT=16 REPLENISH_EXPECTED_WORKERS=1 \
+  "$ROOT_DIR/scripts/verify_replenishment_deployment.sh" "$REPLENISH_PUBLIC_URL"
+
+echo "OK 正式服务已重启，藏宝阁与货品监控中心均已加载本次源码。"

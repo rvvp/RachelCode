@@ -136,6 +136,7 @@ def catalog_source_fingerprint() -> str:
         root_dir / "scripts" / "activate_production_release.sh",
         root_dir / "scripts" / "publish_verified_release.sh",
         root_dir / "scripts" / "verify_public_deployment.sh",
+        root_dir / "scripts" / "verify_replenishment_deployment.sh",
     ]
     source_paths.extend(sorted((root_dir / "catalog_backend").glob("*.py")))
     source_paths.extend(sorted((root_dir / "catalog_backend" / "assets").glob("**/*")))

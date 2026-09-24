@@ -4,6 +4,7 @@ import cgi
 import html
 import io
 import ipaddress
+import json
 import os
 import secrets
 from collections import Counter
@@ -22,6 +23,14 @@ from replenishment_center.excel import (
     import_data_workbook,
     plan_workbook_bytes,
     pricing_workbook_bytes,
+)
+from replenishment_center.release import (
+    PROCESS_STARTED_AT,
+    REPLENISHMENT_BUILD_VERSION,
+    REPLENISHMENT_RELEASE_COMMIT,
+    REPLENISHMENT_RELEASE_GENERATION,
+    REPLENISHMENT_RUNTIME_MODE,
+    REPLENISHMENT_SOURCE_FINGERPRINT,
 )
 from replenishment_center.tmall import test_configured_connection as test_tmall_connection
 from replenishment_center.vipshop import (
@@ -92,7 +101,7 @@ class ReplenishmentApplication:
                 start_response("204 No Content", [])
                 return [b""]
             if path == "/healthz":
-                return self.text_response(start_response, "ok")
+                return self.handle_healthz(environ, start_response)
             if path == "/oauth/vipshop/callback" and method == "GET":
                 return self.handle_vipshop_oauth_callback(environ, start_response, query)
             if path == "/oauth/vipshop/result" and method == "GET":
@@ -312,6 +321,49 @@ class ReplenishmentApplication:
         headers = [("Location", "/dashboard"), ("Set-Cookie", f"replenishment_session={token}; Path=/; HttpOnly; SameSite=Lax")]
         start_response("302 Found", headers)
         return [b""]
+
+    def handle_healthz(self, environ, start_response):
+        db_exists = Path(self.db_path).exists()
+        server_software = str(environ.get("SERVER_SOFTWARE") or "unknown")
+        production_runtime_ready = (
+            REPLENISHMENT_RUNTIME_MODE != "production"
+            or (
+                "wsgiserver" in server_software.lower()
+                and REPLENISHMENT_RELEASE_COMMIT != "unknown"
+                and REPLENISHMENT_RELEASE_GENERATION > 0
+            )
+        )
+        payload = json.dumps(
+            {
+                "status": "ok" if production_runtime_ready else "degraded",
+                "application": "replenishment_center",
+                "build_version": REPLENISHMENT_BUILD_VERSION,
+                "release_commit": REPLENISHMENT_RELEASE_COMMIT,
+                "release_generation": REPLENISHMENT_RELEASE_GENERATION,
+                "source_fingerprint": REPLENISHMENT_SOURCE_FINGERPRINT,
+                "process_started_at": PROCESS_STARTED_AT,
+                "worker_pid": os.getpid(),
+                "runtime_mode": REPLENISHMENT_RUNTIME_MODE,
+                "server_software": server_software,
+                "production_runtime_ready": production_runtime_ready,
+                "db_exists": db_exists,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8")
+        start_response(
+            "200 OK" if production_runtime_ready else "503 Service Unavailable",
+            [
+                ("Content-Type", "application/json; charset=utf-8"),
+                ("Cache-Control", "no-store"),
+                ("X-Replenishment-Build", REPLENISHMENT_BUILD_VERSION),
+                ("X-Replenishment-Commit", REPLENISHMENT_RELEASE_COMMIT),
+                ("X-Replenishment-Generation", str(REPLENISHMENT_RELEASE_GENERATION)),
+                ("X-Replenishment-Source", REPLENISHMENT_SOURCE_FINGERPRINT),
+                ("Content-Length", str(len(payload))),
+            ],
+        )
+        return [payload]
 
     def handle_logout(self, environ, start_response):
         jar = cookies.SimpleCookie()

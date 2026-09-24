@@ -34,6 +34,8 @@ copy_path() {
 copy_path "app.py"
 copy_path "catalog_wsgi.py"
 copy_path "catalog_backend"
+copy_path "replenishment_app.py"
+copy_path "replenishment_center"
 copy_path "scripts"
 copy_path "deploy"
 copy_path "launchd"

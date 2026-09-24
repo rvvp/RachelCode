@@ -70,6 +70,10 @@ def import_data_workbook(db_path: str | Path, file_obj, user_id: int | None = No
     latest_sale_date = ""
     latest_snapshot = ""
     with db.get_connection(db_path) as connection:
+        connection.execute(
+            "UPDATE skus SET lifecycle = 'inactive' WHERE store_id = ?",
+            (settings["store_id"],),
+        )
         for row_no, row in _rows(workbook["SKU资料"], SKU_HEADERS):
             style_code = _text(row["款号"])
             color_name = _text(row["颜色"])
@@ -83,13 +87,13 @@ def import_data_workbook(db_path: str | Path, file_obj, user_id: int | None = No
                 """
                 INSERT INTO skus(
                     store_id, style_code, style_name, color_name, size_name, category, supplier,
-                    lead_time_days, moq, pack_size, default_size_share, core_size
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    lead_time_days, moq, pack_size, default_size_share, core_size, lifecycle, is_demo
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)
                 ON CONFLICT(store_id, style_code, color_name, size_name) DO UPDATE SET
                     style_name = excluded.style_name, category = excluded.category, supplier = excluded.supplier,
                     lead_time_days = excluded.lead_time_days, moq = excluded.moq,
                     pack_size = excluded.pack_size, default_size_share = excluded.default_size_share,
-                    core_size = excluded.core_size
+                    core_size = excluded.core_size, lifecycle = 'active', is_demo = 0
                 """,
                 (
                     settings["store_id"], style_code, _text(row["款名"]), color_name, size_name,

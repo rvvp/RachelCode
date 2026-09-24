@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PUBLIC_URL="${CATALOG_PUBLIC_URL:-http://203.205.90.232:8765}"
+REPLENISH_PUBLIC_URL="${REPLENISH_PUBLIC_URL:-http://203.205.90.232:8877}"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
 WAIT_ATTEMPTS="${CATALOG_DEPLOY_WAIT_ATTEMPTS:-40}"
 WAIT_SECONDS="${CATALOG_DEPLOY_WAIT_SECONDS:-15}"
@@ -30,7 +31,9 @@ else
 fi
 "$PYTHON_BIN" -m py_compile \
   "$ROOT_DIR"/app.py \
+  "$ROOT_DIR"/replenishment_app.py \
   "$ROOT_DIR"/catalog_backend/*.py \
+  "$ROOT_DIR"/replenishment_center/*.py \
   "$ROOT_DIR"/tests/*.py
 (
   cd "$ROOT_DIR"
@@ -57,7 +60,12 @@ for attempt in $(seq 1 "$WAIT_ATTEMPTS"); do
     CATALOG_RELEASE_GENERATION="$release_generation" \
     CATALOG_DEPLOYMENT_CHECK_COUNT=1 \
     CATALOG_EXPECTED_WORKERS=1 \
-    "$ROOT_DIR/scripts/verify_public_deployment.sh" "$PUBLIC_URL" >/dev/null 2>&1; then
+    "$ROOT_DIR/scripts/verify_public_deployment.sh" "$PUBLIC_URL" >/dev/null 2>&1 \
+    && CATALOG_RELEASE_COMMIT="$release_commit" \
+      CATALOG_RELEASE_GENERATION="$release_generation" \
+      REPLENISH_DEPLOYMENT_CHECK_COUNT=1 \
+      REPLENISH_EXPECTED_WORKERS=1 \
+      "$ROOT_DIR/scripts/verify_replenishment_deployment.sh" "$REPLENISH_PUBLIC_URL" >/dev/null 2>&1; then
     ready=1
     echo "公网已切换到本次提交，第 $attempt 次检查通过。"
     break
@@ -71,6 +79,11 @@ CATALOG_RELEASE_COMMIT="$release_commit" \
   CATALOG_DEPLOYMENT_CHECK_COUNT=256 \
   CATALOG_EXPECTED_WORKERS=8 \
   "$ROOT_DIR/scripts/verify_public_deployment.sh" "$PUBLIC_URL"
+CATALOG_RELEASE_COMMIT="$release_commit" \
+  CATALOG_RELEASE_GENERATION="$release_generation" \
+  REPLENISH_DEPLOYMENT_CHECK_COUNT=16 \
+  REPLENISH_EXPECTED_WORKERS=1 \
+  "$ROOT_DIR/scripts/verify_replenishment_deployment.sh" "$REPLENISH_PUBLIC_URL"
 
 origin_commit="$(git -C "$ROOT_DIR" ls-remote origin refs/heads/main | awk '{print $1}')"
 [ "$origin_commit" = "$release_commit" ] || fail "验收期间 origin/main 已变化，停止 GitHub 备份。"
@@ -86,4 +99,4 @@ git -C "$ROOT_DIR" push github "$release_commit:refs/heads/main"
 github_remote_commit="$(git -C "$ROOT_DIR" ls-remote github refs/heads/main | awk '{print $1}')"
 [ "$github_remote_commit" = "$release_commit" ] || fail "github/main 未指向已验收提交。"
 
-echo "OK 发布闭环完成: origin/main、公网、github/main 均为 $release_commit"
+echo "OK 发布闭环完成: origin/main、藏宝阁、货品监控中心、github/main 均为 $release_commit"
