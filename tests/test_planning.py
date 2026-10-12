@@ -3797,8 +3797,8 @@ class PlanningCenterTests(unittest.TestCase):
         workbench = self.wsgi_request(app, "/workbench", cookie=planner_cookie)["body"].decode("utf-8")
         self.assertEqual(workbench.count("<section class='panel pricing-board'>"), 1)
         self.assertEqual(workbench.count("data-resizable-columns='pricing-v1'"), 1)
-        self.assertEqual(workbench.count("class='column-resize-handle'"), 14)
-        self.assertEqual(workbench.count("role='separator'"), 14)
+        self.assertEqual(workbench.count("class='column-resize-handle'"), 15)
+        self.assertEqual(workbench.count("role='separator'"), 15)
         self.assertIn("['ArrowLeft', 'ArrowRight']", workbench)
         self.assertNotIn("id='pricing-reset-columns'", workbench)
         self.assertNotIn("恢复默认列宽", workbench)
@@ -3824,6 +3824,9 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("data-column-key='rule'>规则计算", workbench)
         self.assertIn("<span class='rule-expression'>4 × 1</span><span class='rule-raw-price'>= 600.0 原始</span>", workbench)
         self.assertIn("data-column-key='price'>上新价", workbench)
+        self.assertIn("data-column-key='actual-multiplier'>实际倍率", workbench)
+        self.assertLess(workbench.index("data-column-key='price'>"), workbench.index("data-column-key='actual-multiplier'>"))
+        self.assertLess(workbench.index("data-column-key='actual-multiplier'>"), workbench.index("data-column-key='channel'>"))
         self.assertIn("data-column-key='channel'>渠道划分", workbench)
         self.assertIn("data-column-key='workflow'>流程状态与操作", workbench)
         self.assertNotIn("<th>定价状态</th>", workbench)
@@ -4823,6 +4826,76 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", multi_category_html)
         self.assertIn("@media(max-width:900px){.stats-band-grid{grid-template-columns:1fr}", multi_category_html)
         self.assertIn("summary data-stats-category-summary>已选 3 个品类</summary>", multi_category_html)
+
+    def test_planning_healthz_identifies_loaded_release_without_login(self):
+        from planning_center.release import PLANNING_RELEASE_COMMIT, PLANNING_RELEASE_GENERATION, PLANNING_SOURCE_FINGERPRINT
+
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        response = self.wsgi_request(app, "/healthz")
+        self.assertTrue(response["status"].startswith("200"))
+        payload = json.loads(response["body"])
+        self.assertEqual(payload["application"], "planning_center")
+        self.assertTrue(payload["db_exists"])
+        self.assertEqual(payload["release_commit"], PLANNING_RELEASE_COMMIT)
+        self.assertEqual(payload["release_generation"], PLANNING_RELEASE_GENERATION)
+        self.assertEqual(payload["source_fingerprint"], PLANNING_SOURCE_FINGERPRINT)
+        self.assertGreater(payload["worker_pid"], 0)
+
+    def test_actual_multiplier_uses_review_price_and_current_tax_cost(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "", None, 700, 4)
+        source = {
+            "id": 5301,
+            "style_code": "ACTUAL-5301",
+            "style_color": "ACTUAL-5301-黑",
+            "product_name": "实际倍率测试款",
+            "season_year": "2026秋冬",
+            "supplier": "测试供应商",
+            "tax_included_price": 150,
+            "image_url": "https://example.com/actual.jpg",
+            "status": "pending",
+            "lifecycle_status": "active",
+            "source_version_no": 1,
+        }
+        planning_db.upsert_source_products(self.planning_db_path, [source])
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        user = planning_db.authenticate_user(self.planning_db_path, "planning_admin", "demo123")
+        waiting_html = app.render_workbench(user, {"status": "waiting"})
+        self.assertIn("title='上新价 ÷ 含税成本'>—</output>", waiting_html)
+
+        source = planning_db.get_source_product(self.planning_db_path, source["id"])
+        record = planning_db.create_pricing_record(self.planning_db_path, source, "初审员")
+        planning_db.submit_pricing_for_review(self.planning_db_path, record["id"], 649, "初审员", "其他", "天猫")
+        review_html = app.render_workbench(user, {"status": "review_pending"})
+        self.assertIn("data-cost='150.0' aria-live='polite' title='上新价 ÷ 含税成本'>4.3</output>", review_html)
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["calculated_price"], 599)
+
+        planning_db.save_review_price(self.planning_db_path, record["id"], 679, "天猫", "企划管理员")
+        saved_html = app.render_workbench(user, {"status": "review_pending"})
+        self.assertIn("title='上新价 ÷ 含税成本'>4.5</output>", saved_html)
+        planning_db.approve_pricing_record(self.planning_db_path, record["id"], 679, "天猫", "企划管理员")
+        confirmed_html = app.render_workbench(user, {"status": "confirmed"})
+        self.assertIn("title='上新价 ÷ 含税成本'>4.5</output>", confirmed_html)
+        app.catalog_api_token = "planning-test-token"
+        payload = app.pricing_publication_payload(planning_db.get_pricing_record(self.planning_db_path, record["id"]), user)
+        self.assertNotIn("actual_multiplier", payload)
+
+        # A silent source refresh can change the displayed current cost without
+        # changing the frozen pricing snapshot used for the original estimate.
+        planning_db.upsert_source_image_updates(self.planning_db_path, [dict(source, tax_included_price=200)])
+        changed_html = app.render_workbench(user, {"status": "confirmed"})
+        self.assertIn("data-cost='200.0' aria-live='polite' title='上新价 ÷ 含税成本'>3.4</output>", changed_html)
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["cost"], 150)
+
+        for price, cost, expected in (
+            (599, 150, "4.0"),
+            (405, 100, "4.1"),
+            (649, "150.5", "4.3"),
+            (649, 0, "—"),
+            (649, None, "—"),
+            ("invalid", 150, "—"),
+        ):
+            with self.subTest(price=price, cost=cost):
+                self.assertEqual(app.actual_multiplier_label(price, cost), expected)
 
     def test_season_typo_is_normalized_for_sync_migration_and_stats(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "", None, 600, 4)

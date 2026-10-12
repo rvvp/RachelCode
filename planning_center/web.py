@@ -5,8 +5,10 @@ import html
 import io
 import json
 import logging
+import os
 import re
 import secrets
+from decimal import ROUND_HALF_UP, localcontext
 from http import cookies
 from pathlib import Path
 from threading import Lock, Thread
@@ -17,6 +19,7 @@ from urllib.request import Request, urlopen
 
 from planning_center import db
 from planning_center.excel import initial_review_workbook_bytes, parse_initial_review_workbook
+from planning_center.release import PLANNING_RELEASE_COMMIT, PLANNING_RELEASE_GENERATION, PLANNING_SOURCE_FINGERPRINT
 from catalog_backend.uploads import detect_image_content_type
 
 SESSIONS: dict[str, int] = {}
@@ -50,7 +53,15 @@ class PlanningApplication:
         user = self.current_user(environ)
         try:
             if path == "/healthz" and method == "GET":
-                return self.json_response(start_response, {"status": "ok", "db_exists": Path(self.db_path).exists()})
+                return self.json_response(start_response, {
+                    "status": "ok",
+                    "application": "planning_center",
+                    "db_exists": Path(self.db_path).exists(),
+                    "release_commit": PLANNING_RELEASE_COMMIT,
+                    "release_generation": PLANNING_RELEASE_GENERATION,
+                    "source_fingerprint": PLANNING_SOURCE_FINGERPRINT,
+                    "worker_pid": os.getpid(),
+                })
             if path == "/login":
                 if method == "GET":
                     return self.html_response(start_response, self.render_login(query.get("error", "")))
@@ -891,6 +902,16 @@ class PlanningApplication:
             start_response,
             "/workbench?status=" + allowed_status + "&notice=" + self.q(notice),
         )
+
+    @staticmethod
+    def actual_multiplier_label(launch_price, cost) -> str:
+        price_value = db.positive_decimal_value(launch_price)
+        cost_value = db.positive_decimal_value(cost)
+        if price_value is None or cost_value is None:
+            return "—"
+        with localcontext() as context:
+            context.rounding = ROUND_HALF_UP
+            return f"{price_value / cost_value:.1f}"
 
     @staticmethod
     def workbench_search_terms(value: str) -> tuple[str, ...]:
@@ -1816,6 +1837,7 @@ class PlanningApplication:
             ("category", "品类", ""),
             ("rule", "规则计算", ""),
             ("price", "上新价", ""),
+            ("actual-multiplier", "实际倍率", ""),
             ("channel", "渠道划分", ""),
             ("workflow", "流程状态与操作", ""),
         ]
@@ -1866,6 +1888,12 @@ class PlanningApplication:
             rule_cell = ""
             channel_cell = "<span class='muted'>初审时选择</span>"
             price_cell = "<span class='muted'>—</span>"
+            multiplier_label = self.actual_multiplier_label(record.get("launch_price") if record else None, cost)
+            multiplier_cell = (
+                f"<output class='actual-multiplier' data-actual-multiplier "
+                f"data-cost='{html.escape(str(cost if cost is not None else ''), quote=True)}' "
+                f"aria-live='polite' title='上新价 ÷ 含税成本'>{multiplier_label}</output>"
+            )
             status_cell = "<span class='status status-waiting'>待计算</span>"
             action_cell = "<span class='review-note'>先匹配品类并生成测算上新价</span>"
             selection_cell = "<span class='muted'>—</span>"
@@ -1989,6 +2017,7 @@ class PlanningApplication:
                 <td class='pricing-category-cell'>{category_cell}</td>
                 <td class='pricing-rule-cell'>{rule_cell}</td>
                 <td class='price-cell'>{price_cell}</td>
+                <td class='actual-multiplier-cell'>{multiplier_cell}</td>
                 <td class='pricing-channel-cell'>{channel_cell}</td>
                 <td class='pricing-workflow-cell'>{workflow_cell}</td>
               </tr>""")
@@ -2081,7 +2110,7 @@ class PlanningApplication:
           <div class='workbench-search-wrap'>{search_form}</div>
           <form class='workbench-filter' method='get' action='/workbench'>{filter_search_hidden}<label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待初审</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待复核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>复核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button class='primary' type='submit'>筛选</button></form>
         </section>
-        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>初审与复核</h2><p class='hint'>来源资料、测算结果和流程操作在同一行展示，每页最多 50 款。</p></div><div class='pricing-board-tools'>{batch_toolbar}</div></div>{pagination_top}{selection_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table' data-resizable-columns='pricing-v1'>{pricing_colgroup}<thead><tr>{pricing_header}</tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="14" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div>{pagination_bottom}</section>
+        <section class='panel pricing-board'><div class='panel-head'><div><div class='eyebrow'>PRICING BOARD</div><h2>初审与复核</h2><p class='hint'>来源资料、测算结果和流程操作在同一行展示，每页最多 50 款。</p></div><div class='pricing-board-tools'>{batch_toolbar}</div></div>{pagination_top}{selection_toolbar}<div class='table-wrap pricing-table-wrap'><table class='pricing-table' data-resizable-columns='pricing-v1'>{pricing_colgroup}<thead><tr>{pricing_header}</tr></thead><tbody>{''.join(rows) if rows else f'<tr><td colspan="{len(pricing_columns)}" class="empty">暂无符合条件的款色。请同步藏宝阁或调整筛选条件。</td></tr>'}</tbody></table></div>{pagination_bottom}</section>
         <dialog id='product-image-dialog' class='product-image-dialog' aria-labelledby='product-image-dialog-title'>
           <div class='product-image-dialog-frame'>
             <div class='product-image-dialog-head'><div><span>STYLE IMAGE</span><strong id='product-image-dialog-title'>款式图片</strong></div><button class='product-image-dialog-close' type='button' aria-label='关闭大图' title='关闭'>&times;</button></div>
@@ -2099,12 +2128,12 @@ class PlanningApplication:
           const defaultColumnWidths = {{
             select: 44, image: 78, season: 105, style: 88, color: 92, product: 130,
             supplier: 110, cost: 88, 'source-status': 112, category: 170, rule: 180,
-            price: 112, channel: 135, workflow: 270
+            price: 112, 'actual-multiplier': 100, channel: 135, workflow: 270
           }};
           const minimumColumnWidths = {{
             select: 44, image: 68, season: 84, style: 72, color: 72, product: 100,
             supplier: 90, cost: 72, 'source-status': 92, category: 130, rule: 150,
-            price: 96, channel: 110, workflow: 220
+            price: 96, 'actual-multiplier': 88, channel: 110, workflow: 220
           }};
           const maximumColumnWidth = 640;
           const readColumnWidths = () => {{
@@ -2377,6 +2406,21 @@ class PlanningApplication:
                 batchForm.appendChild(channelHidden);
               }}
             }}
+          }});
+          document.querySelectorAll('.price-review-form input[name="launch_price"]').forEach((input) => {{
+            const multiplier = input.closest('tr')?.querySelector('[data-actual-multiplier]');
+            if (!multiplier) return;
+            const updateMultiplier = () => {{
+              const price = Number(input.value);
+              const cost = Number(multiplier.dataset.cost);
+              const tenths = price * 10 / cost;
+              multiplier.textContent = input.validity.valid && price > 0 && cost > 0 && Number.isFinite(tenths)
+                ? (Math.round(tenths + Number.EPSILON * Math.abs(tenths)) / 10).toFixed(1)
+                : '—';
+            }};
+            input.addEventListener('input', updateMultiplier);
+            input.addEventListener('change', updateMultiplier);
+            updateMultiplier();
           }});
           document.querySelectorAll('.review-approval-form').forEach((form) => {{
             const input = form.querySelector("input[name='launch_price']");
@@ -2830,6 +2874,7 @@ class PlanningApplication:
 
     def css(self) -> str:
         return """
+        .pricing-table .actual-multiplier{display:block;color:var(--ink);font-size:20px;font-weight:700;line-height:1.2;font-variant-numeric:tabular-nums}
         .system-rules-heading{align-items:center}.system-rules-readonly{flex:0 0 auto;padding:7px 11px;border:1px solid #cbd5ce;background:#fff;color:var(--muted);font-size:12px}.system-rules-intro{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:16px;border:1px solid var(--line);background:#fff}.system-rules-intro>div{min-width:0;padding:20px 22px;border-right:1px solid var(--line)}.system-rules-intro>div:last-child{border-right:0}.system-rules-intro span,.system-rule-title>span{color:var(--accent);font:21px Georgia,serif}.system-rules-intro strong{display:block;margin:3px 0;font-size:16px}.system-rules-intro p{margin:0;color:var(--muted);font-size:12px}.system-rules-index{display:flex;align-items:center;gap:4px;margin-bottom:24px;padding:8px;border:1px solid var(--line);background:#eef2ee;overflow-x:auto}.system-rules-index a{flex:0 0 auto;padding:6px 10px;border:0;color:var(--deep);font-size:12px}.system-rules-index a:hover{border:0;background:#fff;color:var(--accent)}.system-rule-section{scroll-margin-top:92px}.system-rule-title{display:flex;align-items:center;gap:14px;margin-bottom:13px}.system-rule-title h2{margin:1px 0 0}.system-rule-section>p{margin:0 0 17px;color:var(--muted)}.system-rule-chip-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin:4px 0 17px;border-top:1px solid var(--line);border-left:1px solid var(--line)}.system-rule-chip-grid span{padding:12px 14px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);background:#f8faf8;font-weight:600}.system-rule-note{padding:11px 13px;border-left:3px solid var(--accent);background:#fbf5f1;color:#6f6259!important;font-size:12px}.system-rule-flow{display:flex;align-items:center;gap:8px;margin:4px 0 18px;overflow-x:auto}.system-rule-flow span{flex:0 0 auto;padding:8px 11px;border:1px solid #cfdad2;background:#f2f7f3;color:var(--deep);font-weight:600}.system-rule-flow i{color:#9aa49c;font-style:normal}.system-rule-list{display:grid;gap:9px;margin:0;padding-left:20px}.system-rule-list li{padding-left:3px}.system-rule-table{min-width:960px}.system-rule-table td:first-child{white-space:nowrap}.system-rule-table td:last-child{white-space:nowrap}.system-rule-scenarios{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:18px;border:1px solid var(--line)}.system-rule-scenarios article{padding:17px 19px;border-right:1px solid var(--line)}.system-rule-scenarios article:last-child{border-right:0}.system-rule-scenarios p{margin:5px 0 0;color:var(--muted)}.system-rule-publication{display:grid;grid-template-columns:1fr 1fr;margin-bottom:18px;border:1px solid var(--line)}.system-rule-publication>div{padding:17px 19px;border-right:1px solid var(--line)}.system-rule-publication>div:last-child{border-right:0}.system-rule-publication span{display:block;margin-bottom:7px;color:var(--muted);font-size:12px}.system-rule-publication strong{display:inline-block;margin:0 14px 0 0;color:var(--deep)}.system-rule-publication p{margin:0;color:var(--muted)}
         @media(max-width:900px){.system-rules-intro{grid-template-columns:1fr}.system-rules-intro>div{border-right:0;border-bottom:1px solid var(--line)}.system-rules-intro>div:last-child{border-bottom:0}.system-rule-chip-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.system-rule-scenarios,.system-rule-publication{grid-template-columns:1fr}.system-rule-scenarios article,.system-rule-publication>div{border-right:0;border-bottom:1px solid var(--line)}.system-rule-scenarios article:last-child,.system-rule-publication>div:last-child{border-bottom:0}}
         @media(max-width:620px){.system-rules-heading{align-items:flex-start}.system-rule-chip-grid{grid-template-columns:1fr}.system-rule-flow{padding-bottom:4px}.system-rule-section{padding:18px}.system-rule-publication strong{display:block;margin-bottom:4px}}
