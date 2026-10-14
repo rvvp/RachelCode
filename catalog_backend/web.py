@@ -3454,6 +3454,9 @@ class CatalogApplication:
             ),
             user,
         )
+        recall_available_products = (
+            {int(product["id"]): product for product in products} if recall_notice_mode else {}
+        )
         products = self.filter_products_by_catalog_identifiers(products, keyword)
         if user.get("department") == "C":
             if status_filter:
@@ -3533,6 +3536,7 @@ class CatalogApplication:
             "workflow_restart_filter": workflow_restart_filter,
             "recall_notice_mode": recall_notice_mode,
             "recall_notices": recall_notices,
+            "recall_available_products": recall_available_products,
             "lifecycle_filter": lifecycle_filter,
         }
 
@@ -5778,6 +5782,29 @@ class CatalogApplication:
       color: #8b4f1f;
       background: rgba(208, 137, 56, 0.14);
       border: 1px solid rgba(208, 137, 56, 0.18);
+      white-space: nowrap;
+    }}
+    .catalog-table .table-modification-cell {{
+      min-width: 78px;
+      text-align: center;
+      white-space: nowrap;
+    }}
+    .catalog-table .recall-modification-badge {{
+      color: #b42318;
+      font-weight: 800;
+      white-space: nowrap;
+    }}
+    .catalog-table.recall-notice-table {{
+      width: 100%;
+      min-width: 980px;
+      table-layout: auto;
+    }}
+    .recall-notice-table .table-recall-notice-cell {{
+      min-width: 240px;
+    }}
+    .recall-notice-table .table-action-links > * {{
+      flex: 0 0 auto;
+      width: auto;
       white-space: nowrap;
     }}
     .catalog-table .catalog-resizable-head {{
@@ -10625,6 +10652,14 @@ class CatalogApplication:
         </nav>
         """
         configured_list_fields = self.configured_list_layout_fields(user)
+        show_c_modification_column = bool(
+            user.get("department") == "C" and not is_department_monitor(user) and not recall_notice_mode
+        )
+        c_modification_markers = (
+            db.c_recall_modification_markers(self.db_path, int(user["id"]), product_line)
+            if show_c_modification_column
+            else {}
+        )
         price_changed_product_ids = set()
         if b_dashboard_view:
             # Keep the row marker useful in the default view. The B team can
@@ -10813,6 +10848,14 @@ class CatalogApplication:
                 f'<td class="catalog-data-cell">{self.list_layout_cell_markup(field, payload)}</td>'
                 for field in configured_list_fields
             ]
+            modification_cell = ""
+            if show_c_modification_column:
+                recall_no = c_modification_markers.get(int(product.get("id") or 0))
+                modification_cell = (
+                    f'<td class="table-modification-cell"><strong class="recall-modification-badge">修改Y{recall_no}</strong></td>'
+                    if recall_no
+                    else '<td class="table-modification-cell"></td>'
+                )
             version_parts = [f'<span class="table-version-label">{html.escape(self.version_label(product))}</span>']
             if revision_badge:
                 version_parts.append(revision_badge)
@@ -10834,6 +10877,7 @@ class CatalogApplication:
                   {selector_cell}
                   <td class="table-id-cell"><a class="table-id-link" href="/products/{product['id']}">#{product['id']}</a></td>
                   <td class="table-product-line-cell"><span class="pill">{html.escape(PRODUCT_LINE_LABELS[product_line])}</span></td>
+                  {modification_cell}
                   {"".join(dynamic_cells)}
                   <td class="table-status-cell"><span class="pill">{html.escape(payload.get('status_label', ''))}</span></td>
                   <td class="table-version-cell"><div class="table-version-stack">{''.join(version_parts)}</div></td>
@@ -10854,6 +10898,8 @@ class CatalogApplication:
             table_column_keys.append("__select__")
         table_column_keys.append("__id__")
         table_column_keys.append("__product_line__")
+        if show_c_modification_column:
+            table_column_keys.append("__modification__")
         table_column_keys.extend(field.key for field in configured_list_fields)
         table_column_keys.extend(
             [
@@ -10865,11 +10911,17 @@ class CatalogApplication:
                 "__actions__",
             ]
         )
-        table_column_count = 8 + len(configured_list_fields) + (1 if selection_enabled else 0)
+        table_column_count = (
+            8
+            + len(configured_list_fields)
+            + (1 if selection_enabled else 0)
+            + (1 if show_c_modification_column else 0)
+        )
         table_header_markup = f"""
           {selector_header}
           <th>ID</th>
           <th>商品线</th>
+          {"<th>修改</th>" if show_c_modification_column else ""}
           {"".join(dynamic_headers)}
           <th>状态</th>
           <th>修改版本</th>
@@ -10880,19 +10932,31 @@ class CatalogApplication:
         """
         empty_list_message = "暂无符合条件的商品资料。"
         if recall_notice_mode:
-            rows = [
-                f"""
+            rows = []
+            for notice in recall_notices:
+                available_product = filter_context["recall_available_products"].get(int(notice["product_id"]))
+                if available_product:
+                    notice_action = '<span class="pill">待重新接收</span>'
+                    if not is_department_monitor(user):
+                        notice_action += (
+                            f'<button class="table-action-receive" type="submit" name="status" value="received" '
+                            f'formaction="/products/{notice["product_id"]}/status" formmethod="post">接收</button>'
+                        )
+                    notice_action += f'<a href="/products/{notice["product_id"]}">查看新资料</a>'
+                elif notice.get("product_status") in {"published", "received"}:
+                    notice_action = '<span class="pill">资料已重新提交，渠道已调整</span>'
+                else:
+                    notice_action = '<span class="pill">资料已召回，等待重新提交</span>'
+                rows.append(f"""
                 <tr class="catalog-row recall-notice-row">
                   <td>{self.list_value_markup(notice.get('style_code_snapshot'))}</td>
                   <td>{self.list_value_markup(notice.get('style_color_snapshot'))}</td>
                   <td>{self.list_value_markup(notice.get('product_name_snapshot'))}</td>
                   <td>{self.list_value_markup(notice.get('launch_channel_snapshot'))}</td>
                   <td class="table-updated-cell">{self.list_value_markup(self.format_list_timestamp(notice.get('recalled_at')), mono=True)}</td>
-                  <td><span class="pill">资料已召回，等待重新提交</span></td>
+                  <td class="table-recall-notice-cell"><div class="table-action-links">{notice_action}</div></td>
                 </tr>
-                """
-                for notice in recall_notices
-            ]
+                """)
             table_header_markup = """
               <th>款号</th>
               <th>款色</th>
@@ -11123,7 +11187,7 @@ class CatalogApplication:
             )
         elif recall_notice_mode:
             marker_filter_note = (
-                '<div class="notice products-filter-result-note">以下资料已从运营阶段召回，等待 A/B 修订并重新提交；重新提交后会自动移出提醒。'
+                '<div class="notice products-filter-result-note">召回提醒保留至本平台任一账号重新接收新批次；重新接收后提醒关闭，“修改Y”标记保留。'
                 f'<a class="pill" href="/products{line_query_suffix}#products-list">返回正常资料列表</a></div>'
             )
         if user["department"] == "C" and not is_department_monitor(user):
@@ -13849,7 +13913,7 @@ class CatalogApplication:
                     <tr><th>A/B协作中</th><td>A 开启商品部协作后，或从运营阶段召回后。A 与 B 按各自字段权限并行补充；无须 A 全部填完后才让 B 开始。</td></tr>
                     <tr><th>待运营接收</th><td>B 确认资料齐全并提交运营部后，系统建立本次运营批次。A/B 的整体状态在尚无天猫类或唯品类账号接收时显示此状态。</td></tr>
                     <tr><th>已接收</th><td>任意一个天猫类或唯品类账号接收当前批次后，A/B 的整体状态即为“已接收”。同款只需天猫类或唯品类任一方接收，不需等待另一方，也不需等待同类别全部账号接收。全渠道账号的接收只记录个人进度，不改变整体状态。</td></tr>
-                    <tr><th>C 的个人状态</th><td>C 页面按当前账号、本次运营批次显示：本人未接收为“待运营接收”，本人已接收为“已接收”。因此整体已接收时，其他尚未接收的运营账号仍可看到待接收。重新提交会建立新批次，旧批次的个人接收记录不能代替新批次接收。</td></tr>
+                    <tr><th>C 的个人状态</th><td>C 页面保留当前账号、本次运营批次的个人接收进度：本人未接收为“待运营接收”，本人已接收为“已接收”。平台接收判定、召回提醒和“修改”标记则按运营平台属性共享，同平台任一账号接收即代表该平台接收；天猫、唯品和全渠道之间互不代替。重新提交会建立新批次，旧批次记录不能代替新批次接收。</td></tr>
                     <tr><th>待商品部重新提交</th><td>运营阶段的最新资料与上一运营正式版本相比，触发字段发生变动时，A/B 状态栏显示此提示；原主流程节点仍保留。B 重新确认并提交后，提示清除并建立新运营批次。C 已接收账号在修订期间读取上一正式版本，尚未接收账号暂不能接收。</td></tr>
                   </tbody>
                 </table>
@@ -13879,7 +13943,8 @@ class CatalogApplication:
                     <tr><th>删除</th><td>A 跟单部任一账号可删除 A 部门的正常资料，限“跟单整理中”或“A/B协作中”；进入运营阶段必须先召回。可单条删除，或勾选多条后使用“批量删除”。</td><td>资料变为“已删除”，保留记录，从正常列表移出。已删除资料仅管理员可恢复。B/C 无删除权限；管理员可按管理权限删除。</td></tr>
                     <tr><th>归档</th><td>A 跟单部任一账号可批量归档 A 部门“已接收”的正常资料。管理员可归档正常资料；B/C 无归档权限。</td><td>资料变为“已归档”，从正常列表移出，保留原流程状态、版本和日志。A 任一账号可在“已归档”筛选中恢复本部门资料，管理员也可恢复；恢复后回到正常资料类型。</td></tr>
                     <tr><th>召回</th><td>A 跟单部任一账号、B 商品部和管理员可对正常的“待运营接收”或“已接收”资料执行单条或批量召回，无需运营部同意。</td><td>立即回到“A/B协作中”，当前接收标记失效。原始发起人、历史版本、历史接收记录和实际操作账号日志保留；C 的正常列表暂不显示该款。修改后由 B 再次确认并提交，C 接收新批次。</td></tr>
-                    <tr><th>召回提醒</th><td>“待运营接收”资料召回时不提醒运营部；“已接收”资料召回时，系统只提醒实际接收过该批次的运营账号。全渠道账号实际接收过也会收到提醒。</td><td>C 点击“资料概览”的“召回提醒”可查看被召回的款号、款色、商品名称、渠道和召回时间。A/B 重新提交运营部后提醒自动关闭，需接收新批次；资料被删除或归档时提醒也关闭。</td></tr>
+                    <tr><th>修改</th><td>仅为运营部更换上新资料的醒目提示，按“资料 + 运营平台属性”显示。天猫类、唯品类各自独立，同平台任一账号接收过被召回的旧批次，则重新提交后该平台所有账号在“商品线”后的“修改”列看到红色加粗“修改Y1/修改Y2”等；未接收旧批次的平台不新增标记。有效召回按条目统一递增序号，列表保留该平台最近一次相关标记。</td><td>召回到 A/B 协作阶段时，C 正常列表隐藏该款；重新提交后展示新资料及标记。重新接收后“修改Y”仍保留，仅提醒运营部该款已接收资料的修改版本，不作为其他记录用途，不参与流程状态、资料完成、价格或企划判断，也不作为 Excel 导入导出字段。通用业务版本和审计仍使用原有版本、日志记录。</td></tr>
+                    <tr><th>召回提醒</th><td>按“资料 + 运营平台属性”共享待办：平台任一账号实际接收过被召回批次，该平台所有账号都收到提醒；没有接收过旧批次的平台不提醒。唯品账号已接收而天猫账号未接收时，只有唯品账号组提醒。同一款多次召回合并为一条待办。全渠道按自身账号组接收记录提醒，不替代天猫或唯品的接收，不参与整体状态判断。</td><td>召回时立即提醒，无需运营部同意。C 点击“资料概览”的“召回提醒”查看款号、款色、商品名称、渠道和召回时间。A/B 重新提交后，提醒继续保留并显示“待重新接收”；该平台任一账号接收新批次后，该平台所有账号的召回提醒消失，但“修改Y”不消失。其他平台不受影响。资料被删除或归档时待办关闭。</td></tr>
                     <tr><th>批量操作</th><td>支持勾选本页、少量条目或全部筛选结果后操作。</td><td>系统逐条检查账号权限、资料类型和流程状态，不符合条件的条目自动跳过，并反馈处理数量；每条成功操作记录实际操作账号。</td></tr>
                   </tbody>
                 </table>

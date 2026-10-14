@@ -8047,7 +8047,7 @@ class CatalogAppTests(unittest.TestCase):
         )
         self.assertEqual(json.loads(work_name_response["body"])["count"], 1)
 
-    def test_received_recall_notifies_only_actual_c_recipients_until_resubmission(self):
+    def test_received_recall_shares_platform_notices_until_receipt_and_keeps_marker(self):
         second_tmall_id = db.create_user(
             self.db_path,
             "second_tmall_c",
@@ -8065,6 +8065,15 @@ class CatalogAppTests(unittest.TestCase):
             "demo123",
             must_change_password=False,
             operating_channel="all",
+        )
+        vip_user_id = db.create_user(
+            self.db_path,
+            "recall_vip_c",
+            "唯品运营",
+            "C",
+            "demo123",
+            must_change_password=False,
+            operating_channel="vip",
         )
         users = {item["username"]: item for item in db.list_users(self.db_path)}
         a_user = users["a_editor"]
@@ -8107,7 +8116,8 @@ class CatalogAppTests(unittest.TestCase):
         self.assertTrue(recall_response["status"].startswith("302"))
         self.assertEqual(db.c_active_recall_notice_count(self.db_path, c_user["id"]), 1)
         self.assertEqual(db.c_active_recall_notice_count(self.db_path, all_channel_id), 1)
-        self.assertEqual(db.c_active_recall_notice_count(self.db_path, second_tmall_id), 0)
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, second_tmall_id), 1)
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, vip_user_id), 0)
         c_notice = db.c_active_recall_notices(self.db_path, c_user["id"])[0]
         self.assertEqual(c_notice["release_no"], release_no)
         self.assertEqual(c_notice["style_code_snapshot"], "RECALL-001")
@@ -8138,7 +8148,12 @@ class CatalogAppTests(unittest.TestCase):
             "/products?marker=recall_notice",
             cookie=self.login("second_tmall_c", "demo123"),
         )["body"].decode("utf-8")
-        self.assertNotIn("运营召回提醒测试款", second_tmall_list)
+        self.assertIn("运营召回提醒测试款", second_tmall_list)
+        vip_recall_list = self.request(
+            "/products?marker=recall_notice",
+            cookie=self.login("recall_vip_c", "demo123"),
+        )["body"].decode("utf-8")
+        self.assertNotIn("运营召回提醒测试款", vip_recall_list)
 
         with db.get_connection(self.db_path) as connection:
             db.change_product_status(
@@ -8146,18 +8161,51 @@ class CatalogAppTests(unittest.TestCase):
             )
         republished = db.get_product(self.db_path, product_id)
         self.assertEqual(int(republished["c_release_no"]), release_no + 1)
-        self.assertEqual(db.c_active_recall_notice_count(self.db_path, c_user["id"]), 0)
-        self.assertEqual(db.c_active_recall_notice_count(self.db_path, all_channel_id), 0)
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, c_user["id"]), 1)
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, all_channel_id), 1)
         pending_list = self.request("/products?status=published", cookie=c_cookie)["body"].decode("utf-8")
         self.assertIn("运营召回提醒测试款", pending_list)
         self.assertIn(">接收</button>", pending_list)
 
+        c_list = self.request("/products?status=published", cookie=c_cookie)["body"].decode("utf-8")
+        self.assertIn("<th>修改</th>", c_list)
+        self.assertIn("修改Y1", c_list)
+
+        vip_list = self.request(
+            "/products?status=published", cookie=self.login("recall_vip_c", "demo123")
+        )["body"].decode("utf-8")
+        self.assertNotIn("修改Y1", vip_list)
+
+        resubmitted_notices = self.request(
+            "/products?marker=recall_notice&status=received", cookie=c_cookie
+        )["body"].decode("utf-8")
+        self.assertIn("待重新接收", resubmitted_notices)
+        self.assertIn(f'formaction="/products/{product_id}/status"', resubmitted_notices)
+        self.assertIn("查看新资料", resubmitted_notices)
+        self.assertIn("本平台任一账号重新接收新批次", resubmitted_notices)
+        self.assertNotIn("重新提交后会自动移出提醒", resubmitted_notices)
+
+        second_tmall_response = self.request(
+            f"/products/{product_id}/status",
+            method="POST",
+            body=urlencode({"status": "received"}).encode("utf-8"),
+            cookie=self.login("second_tmall_c", "demo123"),
+        )
+        self.assertTrue(second_tmall_response["status"].startswith("302"))
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, c_user["id"]), 0)
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, second_tmall_id), 0)
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, all_channel_id), 1)
+
+        c_list_after_receive = self.request("/products?status=published", cookie=c_cookie)["body"].decode("utf-8")
+        self.assertIn("修改Y1", c_list_after_receive)
+
         with db.get_connection(self.db_path) as connection:
             db.change_product_status(
-                connection, product_id, "pending", a_user["id"], "召回资料", "尚未接收，直接召回。"
+                connection, product_id, "pending", a_user["id"], "召回资料", "第二次接收后召回。"
             )
-        self.assertEqual(db.c_active_recall_notice_count(self.db_path, c_user["id"]), 0)
-        self.assertEqual(db.c_active_recall_notice_count(self.db_path, all_channel_id), 0)
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, c_user["id"]), 1)
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, all_channel_id), 1)
+        self.assertEqual(db.c_recall_modification_markers(self.db_path, c_user["id"])[product_id], 2)
 
     def test_archiving_recalled_product_closes_c_recall_notice(self):
         users = {item["department"]: item for item in db.list_users(self.db_path)}
@@ -8177,6 +8225,260 @@ class CatalogAppTests(unittest.TestCase):
                 connection, source["id"], "archived", users["A"]["id"], "归档资料", "归档关闭提醒测试。"
             )
         self.assertEqual(db.c_active_recall_notice_count(self.db_path, users["C"]["id"]), 0)
+
+    def create_recall_test_product(self, product_line="red"):
+        users = {item["username"]: item for item in db.list_users(self.db_path)}
+        with db.get_connection(self.db_path) as connection:
+            product_id = db.create_product(
+                connection,
+                self.a_complete_fields_payload(
+                    style_code=f"PLATFORM-{product_line}",
+                    style_color=f"PLATFORM-{product_line}-黑",
+                    product_name=f"平台召回测试-{product_line}",
+                    launch_price="3.45" if product_line == "black" else "299",
+                    launch_channel="同款",
+                ),
+                users["a_editor"]["id"],
+                "A",
+                product_line=product_line,
+            )
+            db.change_product_status(
+                connection, product_id, "pending", users["a_editor"]["id"], "开启商品部协作", "测试"
+            )
+            db.change_product_status(
+                connection, product_id, "published", users["b_editor"]["id"], "提交运营部", "测试"
+            )
+        return product_id, users
+
+    def test_c_recall_vip_platform_shares_marker_but_unreceived_tmall_does_not(self):
+        vip_ids = [
+            db.create_user(
+                self.db_path, name, name, "C", "demo123",
+                must_change_password=False, operating_channel="vip",
+            )
+            for name in ("vip_first", "vip_second")
+        ]
+        product_id, users = self.create_recall_test_product()
+        vip_users = {item["username"]: item for item in db.list_users(self.db_path)}
+        product = db.get_product(self.db_path, product_id)
+        with db.get_connection(self.db_path) as connection:
+            self.assertTrue(self.app.record_c_receipt(connection, product, vip_users["vip_first"]))
+            db.change_product_status(
+                connection, product_id, "pending", users["a_editor"]["id"], "召回资料", "修订材质"
+            )
+        for vip_id in vip_ids:
+            self.assertEqual(db.c_active_recall_notice_count(self.db_path, vip_id), 1)
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, users["c_viewer"]["id"]), 0)
+        for username in ("vip_first", "vip_second", "c_viewer"):
+            body = self.request("/products", cookie=self.login(username, "demo123"))["body"].decode()
+            self.assertNotIn(f'href="/products/{product_id}"', body)
+        with db.get_connection(self.db_path) as connection:
+            db.change_product_status(
+                connection, product_id, "published", users["b_editor"]["id"], "重新提交运营部", "测试"
+            )
+        for username in ("vip_first", "vip_second", "c_viewer"):
+            body = self.request("/products", cookie=self.login(username, "demo123"))["body"].decode()
+            self.assertIn(f'href="/products/{product_id}"', body)
+            self.assertEqual("修改Y1" in body, username.startswith("vip_"))
+        vip_cookie = self.login("vip_second", "demo123")
+        response = self.request(
+            "/products/bulk", method="POST", cookie=vip_cookie,
+            body=urlencode({"bulk_action": "receive_selected", "product_ids": product_id}).encode(),
+        )
+        self.assertTrue(response["status"].startswith("302"))
+        for vip_id in vip_ids:
+            self.assertEqual(db.c_active_recall_notice_count(self.db_path, vip_id), 0)
+        body = self.request("/products", cookie=vip_cookie)["body"].decode()
+        self.assertIn("修改Y1", body)
+
+    def test_c_recall_unreceived_batch_has_no_notice_marker_and_stale_receipt_is_rejected(self):
+        product_id, users = self.create_recall_test_product()
+        old_release = db.get_product(self.db_path, product_id)["c_release_no"]
+        with db.get_connection(self.db_path) as connection:
+            db.change_product_status(
+                connection, product_id, "pending", users["a_editor"]["id"], "召回资料", "尚未接收"
+            )
+            self.assertFalse(db.record_c_product_receipt(connection, product_id, users["c_viewer"]["id"], old_release))
+            db.change_product_status(
+                connection, product_id, "published", users["b_editor"]["id"], "重新提交运营部", "测试"
+            )
+            self.assertFalse(db.record_c_product_receipt(connection, product_id, users["c_viewer"]["id"], old_release))
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, users["c_viewer"]["id"]), 0)
+        self.assertNotIn(product_id, db.c_recall_modification_markers(self.db_path, users["c_viewer"]["id"]))
+
+    def test_c_recall_platform_receipt_snapshot_survives_account_channel_change(self):
+        product_id, users = self.create_recall_test_product()
+        full_id = db.create_user(
+            self.db_path, "snapshot_all", "全渠道", "C", "demo123",
+            must_change_password=False, operating_channel="all",
+        )
+        full_user = next(user for user in db.list_users(self.db_path) if user["id"] == full_id)
+        product = db.get_product(self.db_path, product_id)
+        with db.get_connection(self.db_path) as connection:
+            self.assertTrue(self.app.record_c_receipt(connection, product, full_user))
+            connection.execute("UPDATE users SET operating_channel = 'tmall' WHERE id = ?", (full_id,))
+        init_db(self.db_path, seed_demo=False, seed_samples=False)
+        self.assertEqual(db.get_product(self.db_path, product_id)["status"], "published")
+        with db.get_connection(self.db_path) as connection:
+            db.change_product_status(
+                connection, product_id, "pending", users["a_editor"]["id"], "召回资料", "测试"
+            )
+            notice = connection.execute(
+                "SELECT recipient_platform FROM product_c_recall_notices WHERE product_id = ?", (product_id,)
+            ).fetchone()
+        self.assertEqual(notice["recipient_platform"], "all")
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, users["c_viewer"]["id"]), 0)
+
+    def test_c_recall_black_line_and_multiple_platforms_resolve_independently(self):
+        product_id, users = self.create_recall_test_product("black")
+        vip_id = db.create_user(
+            self.db_path, "black_vip", "唯品", "C", "demo123",
+            must_change_password=False, operating_channel="vip",
+        )
+        full_id = db.create_user(
+            self.db_path, "black_all", "全渠道", "C", "demo123",
+            must_change_password=False, operating_channel="all",
+        )
+        product = db.get_product(self.db_path, product_id)
+        old_release = product["c_release_no"]
+        with db.get_connection(self.db_path) as connection:
+            for user_id in (users["c_viewer"]["id"], vip_id, full_id):
+                self.assertTrue(db.record_c_product_receipt(connection, product_id, user_id, old_release))
+            db.change_product_status(
+                connection, product_id, "received", users["c_viewer"]["id"], "接收资料", "测试"
+            )
+            db.change_product_status(
+                connection, product_id, "pending", users["a_editor"]["id"], "召回资料", "测试"
+            )
+            self.assertEqual(db.create_c_recall_notices(connection, product_id, users["a_editor"]["id"], old_release), 0)
+            db.change_product_status(
+                connection, product_id, "published", users["b_editor"]["id"], "重新提交运营部", "测试"
+            )
+            self.assertFalse(db.record_c_product_receipt(connection, product_id, vip_id, old_release))
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, vip_id, "red"), 0)
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, vip_id, "black"), 1)
+        product = db.get_product(self.db_path, product_id)
+        self.assertEqual(product["planning_reentry_state"], "not_required")
+        with db.get_connection(self.db_path) as connection:
+            self.assertTrue(db.record_c_product_receipt(connection, product_id, vip_id, product["c_release_no"]))
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, vip_id), 0)
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, users["c_viewer"]["id"]), 1)
+        self.assertEqual(db.c_active_recall_notice_count(self.db_path, full_id), 1)
+
+    def test_c_recall_marker_is_display_only_not_exported_or_shown_to_other_departments(self):
+        product_id, users = self.create_recall_test_product()
+        product = db.get_product(self.db_path, product_id)
+        with db.get_connection(self.db_path) as connection:
+            self.app.record_c_receipt(connection, product, users["c_viewer"])
+            db.change_product_status(
+                connection, product_id, "pending", users["a_editor"]["id"], "召回资料", "测试"
+            )
+            db.change_product_status(
+                connection, product_id, "published", users["b_editor"]["id"], "重新提交运营部", "测试"
+            )
+        for username in ("a_editor", "b_editor", "admin_reviewer"):
+            body = self.request("/products", cookie=self.login(username, "demo123"))["body"].decode()
+            self.assertNotIn("<th>修改</th>", body)
+            self.assertNotIn("修改Y1", body)
+        cookie = self.login("c_viewer", "demo123")
+        body = self.request("/products", cookie=cookie)["body"].decode()
+        self.assertRegex(body, r"<th>商品线</th>\s*<th>修改</th>")
+        self.assertIn('class="recall-modification-badge">修改Y1</strong>', body)
+        self.assertIn("__modification__", body)
+        exported = self.request(f"/export.xlsx?mode=selected&selected={product_id}", cookie=cookie)
+        self.assertTrue(exported["status"].startswith("200"))
+        workbook = load_workbook(io.BytesIO(exported["body"]))
+        self.assertNotIn("修改", [cell.value for cell in workbook.active[1]])
+        self.assertNotIn("修改Y1", str(list(workbook.active.values)))
+        api = self.request("/api/products", cookie=cookie)
+        self.assertNotIn("修改Y1", api["body"].decode())
+
+    def test_c_recall_legacy_migration_preserves_records_and_only_reopens_unreceived_notices(self):
+        product_id, users = self.create_recall_test_product()
+        second_id = db.create_user(
+            self.db_path, "migration_tmall", "天猫二", "C", "demo123",
+            must_change_password=False, operating_channel="tmall",
+        )
+        with db.get_connection(self.db_path) as connection:
+            for recipient_id in (users["c_viewer"]["id"], second_id):
+                self.assertTrue(db.record_c_product_receipt(connection, product_id, recipient_id, 1))
+            db.change_product_status(
+                connection, product_id, "received", users["c_viewer"]["id"], "接收资料", "测试"
+            )
+            db.change_product_status(
+                connection, product_id, "pending", users["a_editor"]["id"], "召回资料", "测试"
+            )
+            connection.execute(
+                """
+                INSERT INTO product_c_recall_notices (
+                    product_id, recipient_user_id, release_no, recalled_version_no,
+                    recalled_by, recalled_at, style_code_snapshot, style_color_snapshot,
+                    product_name_snapshot, launch_channel_snapshot
+                )
+                SELECT product_id, ?, release_no, recalled_version_no,
+                       recalled_by, recalled_at, style_code_snapshot, style_color_snapshot,
+                       product_name_snapshot, launch_channel_snapshot
+                FROM product_c_recall_notices WHERE product_id = ?
+                """,
+                (second_id, product_id),
+            )
+            db.change_product_status(
+                connection, product_id, "published", users["b_editor"]["id"], "重新提交运营部", "测试"
+            )
+            connection.execute(
+                "UPDATE product_c_recall_notices SET resolved_at = ?, resolved_release_no = 2 WHERE product_id = ?",
+                (db.utc_now(), product_id),
+            )
+        accepted_id, _ = self.create_recall_test_product("black")
+        accepted = db.get_product(self.db_path, accepted_id)
+        with db.get_connection(self.db_path) as connection:
+            self.app.record_c_receipt(connection, accepted, users["c_viewer"])
+            db.change_product_status(
+                connection, accepted_id, "pending", users["a_editor"]["id"], "召回资料", "测试"
+            )
+            db.change_product_status(
+                connection, accepted_id, "published", users["b_editor"]["id"], "重新提交运营部", "测试"
+            )
+            self.assertTrue(db.record_c_product_receipt(connection, accepted_id, users["c_viewer"]["id"], 2))
+            db.change_product_status(
+                connection, accepted_id, "pending", users["a_editor"]["id"], "召回资料", "再次召回"
+            )
+            db.change_product_status(
+                connection, accepted_id, "published", users["b_editor"]["id"], "重新提交运营部", "再次提交"
+            )
+            self.assertTrue(db.record_c_product_receipt(connection, accepted_id, users["c_viewer"]["id"], 3))
+            preserved_tables = (
+                "products", "product_c_receipts", "product_c_recall_notices", "product_logs", "product_versions",
+            )
+            original_counts = tuple(
+                connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in preserved_tables
+            )
+            # Recreate the previous production schema in this isolated fixture.
+            connection.execute("DROP INDEX idx_product_c_receipts_platform")
+            connection.execute("DROP INDEX idx_product_c_recall_notices_platform_active")
+            connection.execute("ALTER TABLE product_c_receipts DROP COLUMN recipient_platform")
+            connection.execute("ALTER TABLE product_c_recall_notices DROP COLUMN recipient_platform")
+            connection.execute("ALTER TABLE product_c_recall_notices DROP COLUMN recall_no")
+        for _ in range(2):
+            init_db(self.db_path, seed_demo=False, seed_samples=False)
+            self.assertEqual(db.c_active_recall_notice_count(self.db_path, users["c_viewer"]["id"]), 1)
+            self.assertEqual(db.c_active_recall_notice_count(self.db_path, second_id), 1)
+            self.assertEqual(db.c_recall_modification_markers(self.db_path, second_id)[accepted_id], 2)
+            with db.get_connection(self.db_path) as connection:
+                counts = tuple(
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in preserved_tables
+                )
+                self.assertEqual(counts, original_counts)
+                reopened = connection.execute(
+                    "SELECT recall_no, recipient_platform, resolved_at FROM product_c_recall_notices WHERE product_id = ?",
+                    (product_id,),
+                ).fetchall()
+                self.assertEqual(
+                    [(row["recall_no"], row["recipient_platform"], row["resolved_at"]) for row in reopened],
+                    [(1, "tmall", None), (1, "tmall", None)],
+                )
 
     def test_a_must_recall_released_product_before_deleting(self):
         with db.get_connection(self.db_path) as connection:
@@ -8279,9 +8581,11 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("天猫类覆盖天猫、天猫官、天猫奥和同款", rules_body)
         self.assertIn("唯品类覆盖唯品和同款", rules_body)
         self.assertIn("全渠道账号可记录个人接收，但不参与全局状态判断", rules_body)
-        self.assertIn("“待运营接收”资料召回时不提醒运营部", rules_body)
-        self.assertIn("系统只提醒实际接收过该批次的运营账号", rules_body)
-        self.assertIn("A/B 重新提交运营部后提醒自动关闭", rules_body)
+        self.assertIn("按“资料 + 运营平台属性”共享待办", rules_body)
+        self.assertIn("没有接收过旧批次的平台不提醒", rules_body)
+        self.assertIn("该平台所有账号的召回提醒消失，但“修改Y”不消失", rules_body)
+        self.assertIn("不作为其他记录用途", rules_body)
+        self.assertNotIn("重新提交运营部后提醒自动关闭", rules_body)
         for username in ("a_editor", "b_editor", "c_viewer", "admin_reviewer"):
             account_cookie = self.login(username, "demo123")
             account_rules = self.request("/rules", cookie=account_cookie)
