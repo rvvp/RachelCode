@@ -1802,8 +1802,10 @@ def list_latest_pricing_records(db_path: str | Path, *, season_year: str = "") -
     with get_connection(db_path) as connection:
         rows = connection.execute(
             """
-            SELECT pr.*
+            SELECT pr.*, sp.style_code AS current_style_code,
+                   sp.season_year AS current_season_year
             FROM pricing_records pr
+            JOIN source_products sp ON sp.id = pr.source_product_id
             WHERE (? = '' OR pr.season_year = ?)
               AND NOT EXISTS (
                   SELECT 1
@@ -1828,7 +1830,7 @@ def list_pricing_export_rows(
     status: str = "",
     record_ids: list[int] | tuple[int, ...] | set[int] = (),
 ) -> list[dict]:
-    base_conditions = ["(? = '' OR pr.season_year = ?)"]
+    base_conditions = ["(? = '' OR sp.season_year = ?)"]
     base_params: list[object] = [season_year, season_year]
     clean_status = str(status or "").strip()
     if clean_status:
@@ -1848,7 +1850,11 @@ def list_pricing_export_rows(
             rows.extend(
                 connection.execute(
                     f"""
-                    SELECT pr.*, sp.style_color, sp.color_name,
+                    SELECT pr.*, sp.style_code AS current_style_code,
+                           sp.style_color AS current_style_color, sp.color_name,
+                           sp.season_year AS current_season_year,
+                           sp.product_name AS current_product_name,
+                           sp.supplier AS current_supplier,
                            sp.source_version_no AS current_source_version_no
                     FROM pricing_records pr
                     JOIN source_products sp ON sp.id = pr.source_product_id
@@ -1858,7 +1864,13 @@ def list_pricing_export_rows(
                     params,
                 ).fetchall()
             )
-    rows.sort(
+    # Source identity and descriptive fields are live catalog data. Keep the
+    # calculation and review snapshots in pricing_records intact for audit.
+    export_rows = [dict(row) for row in rows]
+    for row in export_rows:
+        for field in ("style_code", "style_color", "season_year", "product_name", "supplier"):
+            row[field] = row.pop(f"current_{field}")
+    export_rows.sort(
         key=lambda row: (
             str(row["season_year"] or ""),
             str(row["created_at"] or ""),
@@ -1866,7 +1878,7 @@ def list_pricing_export_rows(
         ),
         reverse=True,
     )
-    return [dict(row) for row in rows]
+    return export_rows
 
 
 def list_initial_review_export_rows(db_path: str | Path, *, season_year: str = "") -> list[dict]:
@@ -1877,7 +1889,16 @@ def list_initial_review_export_rows(db_path: str | Path, *, season_year: str = "
 
 def get_pricing_record(db_path: str | Path, record_id: int) -> dict | None:
     with get_connection(db_path) as connection:
-        row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+        row = connection.execute(
+            """
+            SELECT pr.*, sp.style_code AS current_style_code,
+                   sp.season_year AS current_season_year
+            FROM pricing_records pr
+            JOIN source_products sp ON sp.id = pr.source_product_id
+            WHERE pr.id = ?
+            """,
+            (record_id,),
+        ).fetchone()
     return dict(row) if row else None
 
 
@@ -1912,6 +1933,41 @@ def count_style_source_products(db_path: str | Path, style_code: str) -> int:
             (str(style_code or "").strip(),),
         ).fetchone()
     return int(row[0] or 0)
+
+
+def _current_style_review_records(connection: sqlite3.Connection, record: dict | sqlite3.Row) -> list[sqlite3.Row]:
+    """Find only current review cycles belonging to the source's current style.
+
+    A corrected style code or season must not keep colors grouped by obsolete
+    pricing snapshots or pull unrelated/historical records into a review.
+    """
+    source = connection.execute(
+        "SELECT style_code, season_year FROM source_products WHERE id = ?",
+        (int(record["source_product_id"]),),
+    ).fetchone()
+    if not source:
+        raise LookupError("对应的藏宝阁来源资料不存在。")
+    style_code = str(source["style_code"] or "").strip()
+    if not style_code:
+        return [record]
+    rows = connection.execute(
+        """
+        SELECT pr.*
+        FROM source_products sp
+        JOIN pricing_records pr ON pr.id = (
+            SELECT candidate.id FROM pricing_records candidate
+            WHERE candidate.source_product_id = sp.id
+            ORDER BY candidate.created_at DESC, candidate.id DESC
+            LIMIT 1
+        )
+        WHERE TRIM(sp.style_code) = ? AND sp.season_year = ? AND pr.status = 'review_pending'
+        ORDER BY sp.id
+        """,
+        (style_code, source["season_year"]),
+    ).fetchall()
+    if not any(int(row["id"]) == int(record["id"]) for row in rows):
+        raise ValueError("当前定价记录已被新的流程替代，请刷新后处理最新资料。")
+    return rows
 
 
 def import_initial_review_edits(db_path: str | Path, rows: list[dict], operator_name: str) -> int:
@@ -2220,32 +2276,14 @@ def save_review_price(
             raise ValueError("当前定价记录不在企划管理员复核阶段。")
         ensure_pricing_record_cost_current(connection, row)
         clean_channel = validate_channel_option(db_path, channel)
-        style_code = str(row["style_code"] or "").strip()
-        if style_code:
-            # Price and channel are defined at style level. Keep the workflow
-            # boundary intact by synchronizing only sibling colors that are
-            # currently waiting for the same administrator review.
-            sibling_rows = connection.execute(
-                "SELECT * FROM pricing_records WHERE TRIM(style_code) = ? AND season_year = ? AND status = 'review_pending'",
-                (style_code, row["season_year"]),
-            ).fetchall()
-            for sibling in sibling_rows:
-                ensure_pricing_record_cost_current(connection, sibling)
-            updated_count = connection.execute(
-                """
-                UPDATE pricing_records
-                SET launch_price = ?, channel = ?, operator_name = ?, error_message = ''
-                WHERE TRIM(style_code) = ? AND season_year = ? AND status = 'review_pending'
-                """,
-                (price, clean_channel, operator_name, style_code, row["season_year"]),
-            ).rowcount
-        else:
-            updated_count = connection.execute(
-                "UPDATE pricing_records SET launch_price = ?, channel = ?, operator_name = ?, error_message = '' WHERE id = ?",
-                (price, clean_channel, operator_name, record_id),
-            ).rowcount
-        updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
-    result = dict(updated)
+        sibling_rows = _current_style_review_records(connection, row)
+        for sibling in sibling_rows:
+            ensure_pricing_record_cost_current(connection, sibling)
+        updated_count = connection.executemany(
+            "UPDATE pricing_records SET launch_price = ?, channel = ?, operator_name = ?, error_message = '' WHERE id = ?",
+            [(price, clean_channel, operator_name, int(sibling["id"])) for sibling in sibling_rows],
+        ).rowcount
+    result = get_pricing_record(db_path, record_id)
     result["_style_sync_count"] = int(updated_count or 0)
     return result
 
@@ -2268,31 +2306,15 @@ def approve_pricing_record(
         clean_channel = validate_channel_option(db_path, channel)
         if price != validated_launch_price(row["launch_price"]) or clean_channel != row["channel"]:
             raise ValueError("复核上新价或渠道已修改，请先点击“修改保存”，再进行复核通过。")
-        style_code = str(row["style_code"] or "").strip()
-        if style_code:
-            # Approval follows the same style-level rule as review saving:
-            # approve all sibling colors still waiting for this review.
-            sibling_rows = connection.execute(
-                "SELECT * FROM pricing_records WHERE TRIM(style_code) = ? AND season_year = ? AND status = 'review_pending'",
-                (style_code, row["season_year"]),
-            ).fetchall()
-            for sibling in sibling_rows:
-                ensure_pricing_record_cost_current(connection, sibling)
-            updated_count = connection.execute(
-                """
-                UPDATE pricing_records
-                SET status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = ''
-                WHERE TRIM(style_code) = ? AND season_year = ? AND status = 'review_pending'
-                """,
-                (operator_name, utc_now(), style_code, row["season_year"]),
-            ).rowcount
-        else:
-            updated_count = connection.execute(
-                "UPDATE pricing_records SET status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = '' WHERE id = ?",
-                (operator_name, utc_now(), record_id),
-            ).rowcount
-        updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
-    result = dict(updated)
+        sibling_rows = _current_style_review_records(connection, row)
+        for sibling in sibling_rows:
+            ensure_pricing_record_cost_current(connection, sibling)
+        confirmed_at = utc_now()
+        updated_count = connection.executemany(
+            "UPDATE pricing_records SET status = 'confirmed', operator_name = ?, confirmed_at = ?, error_message = '' WHERE id = ?",
+            [(operator_name, confirmed_at, int(sibling["id"])) for sibling in sibling_rows],
+        ).rowcount
+    result = get_pricing_record(db_path, record_id)
     result["_style_sync_count"] = int(updated_count or 0)
     return result
 

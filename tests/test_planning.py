@@ -1632,6 +1632,199 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(current_source["season_year"], refreshed["season_year"])
         self.assertEqual(current_source["supplier"], refreshed["supplier"])
         self.assertEqual(current_source["image_url"], refreshed["image_url"])
+        exported = planning_db.list_pricing_export_rows(self.planning_db_path, season_year=refreshed["season_year"])
+        self.assertEqual(len(exported), 1)
+        for field in ("season_year", "product_name", "supplier"):
+            self.assertEqual(exported[0][field], refreshed[field])
+
+    def renamed_style_fixture(self):
+        """Two colors were priced before correction, one after correction."""
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        a_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["department"] == "A")
+        product_ids = []
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            for color in ("220", "990", "770"):
+                product_id = catalog_db.create_product(
+                    connection,
+                    {
+                        "season_year": "2026秋冬",
+                        "style_code": "VEAK19SKHH",
+                        "style_color": f"VEAK19SKHH{color}",
+                        "product_name": "半裙",
+                        "supplier": "款号修正供应商",
+                        "tax_included_price": 150,
+                        "image_url": f"https://example.com/{color}.jpg",
+                    },
+                    int(a_user["id"]),
+                    "A",
+                )
+                connection.execute("UPDATE products SET status = 'pending' WHERE id = ?", (product_id,))
+                product_ids.append(product_id)
+        originals = [catalog_db.planning_source_payloads(self.catalog_db_path, product_id)[0] for product_id in product_ids]
+        planning_db.synchronize_source_products(self.planning_db_path, originals)
+        records = [planning_db.create_pricing_record(self.planning_db_path, source, "初审员") for source in originals[:2]]
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            for source, color in zip(originals, ("220", "990", "770")):
+                catalog_db.update_product(
+                    connection,
+                    source["id"],
+                    {"style_code": "VEAK19SKH0", "style_color": f"VEAK19SKH0{color}"},
+                    int(a_user["id"]),
+                )
+        refreshed = [catalog_db.planning_source_payloads(self.catalog_db_path, product_id)[0] for product_id in product_ids]
+        planning_db.synchronize_source_products(self.planning_db_path, refreshed)
+        records.append(planning_db.create_pricing_record(self.planning_db_path, refreshed[2], "初审员"))
+        return refreshed, records
+
+    def test_style_correction_updates_page_and_every_excel_export_without_rewriting_snapshots(self):
+        sources, records = self.renamed_style_fixture()
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planner")
+        page = self.wsgi_request(app, "/workbench?search=VEAK19SKH0", cookie=cookie)
+        self.assertTrue(page["status"].startswith("200"))
+        self.assertIn("VEAK19SKH0", page["body"].decode())
+        for query in (
+            {"search": "VEAK19SKH0", "status": "suggested"},
+            {"selection_scope": "selected", "selected": ",".join(str(record["id"]) for record in records)},
+            {"season_year": "2026秋冬", "status": "suggested"},
+        ):
+            with self.subTest(query=query):
+                exported = self.wsgi_request(app, "/pricing/export.xlsx?" + urlencode(query), cookie=cookie)
+                self.assertTrue(exported["status"].startswith("200"))
+                workbook = load_workbook(io.BytesIO(exported["body"]))
+                sheet = workbook.worksheets[0]
+                self.assertEqual({sheet.cell(row, 6).value for row in range(2, 5)}, {"VEAK19SKH0"})
+                self.assertEqual({sheet.cell(row, 7).value for row in range(2, 5)}, {source["style_color"] for source in sources})
+                self.assertFalse(sheet.protection.sheet)
+        # Import still resolves fixed record/product IDs and accepts only the
+        # three editable fields, regardless of edits to source text columns.
+        for row in range(2, 5):
+            sheet.cell(row, 6).value = "EXCEL-MUST-NOT-RENAME"
+            sheet.cell(row, 7).value = "EXCEL-MUST-NOT-CHANGE-COLOR"
+            sheet.cell(row, 15).value = "其他"
+            sheet.cell(row, 16).value = 609
+            sheet.cell(row, 17).value = "天猫"
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        body, content_type = self.workbook_multipart(buffer.getvalue())
+        imported = self.wsgi_request(app, "/pricing/import", method="POST", body=body, content_type=content_type, cookie=cookie)
+        self.assertTrue(imported["status"].startswith("302"))
+        for source, record in zip(sources, records):
+            current = planning_db.get_source_product(self.planning_db_path, source["id"])
+            self.assertEqual(current["style_code"], "VEAK19SKH0")
+            self.assertEqual(current["style_color"], source["style_color"])
+            saved = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+            self.assertEqual(saved["publication_id"], record["publication_id"])
+            self.assertEqual(saved["style_code"], record["style_code"])
+            self.assertEqual(saved["launch_price"], 609)
+        sheet["D2"] = 1
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        body, content_type = self.workbook_multipart(buffer.getvalue())
+        stale_import = self.wsgi_request(app, "/pricing/import", method="POST", body=body, content_type=content_type, cookie=cookie)
+        self.assertTrue(stale_import["status"].startswith("400"))
+        self.assertIn("来源版本已变化", stale_import["body"].decode())
+
+    def test_style_correction_review_uses_current_siblings_and_keeps_excel_edits_per_color(self):
+        sources, records = self.renamed_style_fixture()
+        unrelated = {**sources[0], "id": 9999, "style_code": "VEAK19SKHH", "style_color": "UNRELATED"}
+        planning_db.upsert_source_products(self.planning_db_path, [unrelated])
+        unrelated_record = planning_db.create_pricing_record(self.planning_db_path, unrelated, "初审员")
+        planning_db.upsert_source_image_updates(self.planning_db_path, [{**unrelated, "style_code": "OTHER-STYLE"}])
+        for record in [*records, unrelated_record]:
+            planning_db.submit_pricing_for_review(self.planning_db_path, record["id"], 599, "初审员", "其他", "天猫")
+        planning_db.import_review_edits(
+            self.planning_db_path,
+            [{**records[0], "record_id": records[0]["id"], "row_number": 2, "source_version_no": sources[0]["source_version_no"], "launch_price": 609, "channel": "唯品"}],
+            "企划管理员",
+        )
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, records[1]["id"])["launch_price"], 599)
+        saved = planning_db.save_review_price(self.planning_db_path, records[0]["id"], 699, "唯品", "企划管理员")
+        self.assertEqual(saved["_style_sync_count"], 3)
+        for record in records:
+            current = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+            self.assertEqual((current["launch_price"], current["channel"]), (699, "唯品"))
+            self.assertEqual(current["style_code"], record["style_code"])
+        untouched = planning_db.get_pricing_record(self.planning_db_path, unrelated_record["id"])
+        self.assertEqual((untouched["launch_price"], untouched["channel"]), (599, "天猫"))
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+        # Batch approval must deduplicate by current style, even though the
+        # third color's original pricing snapshot has a different style code.
+        approved = self.wsgi_request(
+            app,
+            "/pricing/batch",
+            method="POST",
+            body=urlencode({"batch_action": "approve", "selection_scope": "filtered", "status": "review_pending", "search": "VEAK19SKH0"}).encode(),
+            cookie=admin_cookie,
+        )
+        self.assertTrue(approved["status"].startswith("302"), approved["body"].decode())
+        self.assertTrue(all(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"] == "confirmed" for record in records))
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, unrelated_record["id"])["status"], "review_pending")
+
+    def test_style_correction_can_publish_all_colors_to_catalog_by_fixed_source_id(self):
+        sources, records = self.renamed_style_fixture()
+        for record in records:
+            planning_db.submit_pricing_for_review(self.planning_db_path, record["id"], 599, "初审员", "其他", "天猫")
+        planning_db.approve_pricing_record(self.planning_db_path, records[0]["id"], 599, "天猫", "企划管理员")
+        catalog_app = CatalogApplication(self.catalog_db_path, Path(self.temp.name) / "uploads", planning_api_token="planning-secret")
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test", "planning-secret")
+        cookie = self.login_cookie(app, "planner")
+        before = {source["id"]: catalog_db.get_product(self.catalog_db_path, source["id"]) for source in sources}
+
+        def catalog_publication(request, timeout):
+            payload = json.loads(request.data)
+            self.assertEqual(payload["style_code"], "VEAK19SKH0")
+            self.assertEqual({item["source_product_id"] for item in payload["publications"]}, set(before))
+            response = self.wsgi_request(
+                catalog_app,
+                "/api/internal/planning/style-publications",
+                method="POST",
+                body=request.data,
+                content_type="application/json",
+                authorization="Bearer planning-secret",
+            )
+            self.assertTrue(response["status"].startswith("200"), response["body"].decode())
+            return io.BytesIO(response["body"])
+
+        with patch("planning_center.web.urlopen", side_effect=catalog_publication) as mocked_urlopen:
+            published = self.wsgi_request(app, f"/pricing/{records[0]['id']}/publish", method="POST", cookie=cookie)
+        self.assertTrue(published["status"].startswith("302"), published["body"].decode())
+        self.assertEqual(mocked_urlopen.call_count, 1)
+        # A batch selecting all colors must still send one atomic request,
+        # even with a mixture of old/new style snapshots. Catalog retries
+        # are idempotent and must not create duplicate publications.
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("UPDATE pricing_records SET status = 'confirmed'")
+        with patch("planning_center.web.urlopen", side_effect=catalog_publication) as mocked_urlopen:
+            published = self.wsgi_request(
+                app,
+                "/pricing/batch",
+                method="POST",
+                body=urlencode({"batch_action": "publish", "selection_scope": "filtered", "status": "confirmed", "search": "VEAK19SKH0"}).encode(),
+                cookie=cookie,
+            )
+        self.assertTrue(published["status"].startswith("302"), published["body"].decode())
+        self.assertEqual(mocked_urlopen.call_count, 1)
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM planning_publications").fetchone()[0], 3)
+        for source, record in zip(sources, records):
+            after = catalog_db.get_product(self.catalog_db_path, source["id"])
+            self.assertEqual((after["launch_price"], after["launch_channel"], after["category"]), (599, "天猫", "其他"))
+            for field in catalog_db.PRODUCT_FIELDS:
+                if field.key not in catalog_db.PLANNING_PRODUCT_MUTABLE_FIELD_KEYS:
+                    self.assertEqual(after[field.key], before[source["id"]][field.key], field.key)
+            snapshot = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+            self.assertEqual(snapshot["style_code"], record["style_code"])
+            self.assertEqual(snapshot["status"], "published")
+        # Subsequent silent corrections update current exports while the
+        # published calculation snapshots and workflow remain unchanged.
+        updated_sources = [{**source, "style_code": "VEAK19SKH1", "style_color": source["style_color"].replace("SKH0", "SKH1"), "source_version_no": source["source_version_no"] + 2, "status": "published"} for source in sources]
+        planning_db.synchronize_source_products(self.planning_db_path, [], image_updates=updated_sources)
+        exported = planning_db.list_pricing_export_rows(self.planning_db_path, status="published")
+        self.assertEqual({row["style_code"] for row in exported}, {"VEAK19SKH1"})
+        self.assertEqual({row["status"] for row in exported}, {"published"})
+        self.assertEqual(len(planning_db.list_all_source_products(self.planning_db_path)), 3)
 
     def test_resync_marks_cost_change_until_planner_recalculates(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)

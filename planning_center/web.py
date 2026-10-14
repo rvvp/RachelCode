@@ -605,7 +605,7 @@ class PlanningApplication:
         return self.redirect(
             start_response,
             "/workbench?notice="
-            + self.q(f"已生成 {record['style_code'] or record['product_name']} 的测算上新价 {record['calculated_price']:g}。")
+            + self.q(f"已生成 {self.current_pricing_style_code(record) or record['product_name']} 的测算上新价 {record['calculated_price']:g}。")
             + f"#pricing-row-{int(record['source_product_id'])}",
         )
 
@@ -628,7 +628,7 @@ class PlanningApplication:
         return self.redirect(
             start_response,
             "/workbench?status=suggested&notice="
-            + self.q(f"{record['style_code'] or record['product_name']} 已{action}并重新进入待初审。")
+            + self.q(f"{self.current_pricing_style_code(record) or record['product_name']} 已{action}并重新进入待初审。")
             + f"#pricing-row-{int(record['source_product_id'])}",
         )
 
@@ -642,7 +642,7 @@ class PlanningApplication:
         return self.redirect(
             start_response,
             "/workbench?status=suggested&notice="
-            + self.q(f"{record['style_code'] or record['product_name']} 已退回待初审，请重新确认后提交复核。")
+            + self.q(f"{self.current_pricing_style_code(record) or record['product_name']} 已退回待初审，请重新确认后提交复核。")
             + f"#pricing-row-{int(record['source_product_id'])}",
         )
 
@@ -685,7 +685,7 @@ class PlanningApplication:
         return self.redirect(
             start_response,
             "/workbench?notice="
-            + self.q(f"{record['style_code'] or record['product_name']} 已提交企划管理员复核。")
+            + self.q(f"{self.current_pricing_style_code(record) or record['product_name']} 已提交企划管理员复核。")
             + f"#pricing-row-{int(record['source_product_id'])}",
         )
 
@@ -699,7 +699,7 @@ class PlanningApplication:
         return self.redirect(
             start_response,
             "/workbench?status=suggested&notice="
-            + self.q(f"{record['style_code'] or record['product_name']} 已撤回待复核，可修改后再次提交。")
+            + self.q(f"{self.current_pricing_style_code(record) or record['product_name']} 已撤回待复核，可修改后再次提交。")
             + f"#pricing-row-{int(record['source_product_id'])}",
         )
 
@@ -715,7 +715,7 @@ class PlanningApplication:
         return self.redirect(
             start_response,
             "/workbench?notice="
-            + self.q(f"{record['style_code'] or record['product_name']} 已按所选品类重新测算，上新价为 {record['calculated_price']:g}。")
+            + self.q(f"{self.current_pricing_style_code(record) or record['product_name']} 已按所选品类重新测算，上新价为 {record['calculated_price']:g}。")
             + f"#pricing-row-{int(record['source_product_id'])}",
         )
 
@@ -735,7 +735,7 @@ class PlanningApplication:
             start_response,
             self.workbench_redirect_location(
                 form,
-                f"{record['style_code'] or record['product_name']} 的复核上新价与渠道已保存{sync_note}。",
+                f"{self.current_pricing_style_code(record) or record['product_name']} 的复核上新价与渠道已保存{sync_note}。",
                 record,
             ),
         )
@@ -756,7 +756,7 @@ class PlanningApplication:
             start_response,
             self.workbench_redirect_location(
                 form,
-                f"{record['style_code'] or record['product_name']} 已复核通过{sync_note}，可回传藏宝阁。",
+                f"{self.current_pricing_style_code(record) or record['product_name']} 已复核通过{sync_note}，可回传藏宝阁。",
                 record,
             ),
         )
@@ -972,6 +972,15 @@ class PlanningApplication:
             if not self.workbench_item_matches_search(item, search_terms):
                 continue
             record = latest_records.get(int(item["id"]))
+            if record:
+                # The catalog owns the current business identity. Keep the
+                # pricing snapshot's calculation fields, but expose the live
+                # style code to every workbench action and label.
+                record = {
+                    **record,
+                    "current_style_code": str(item.get("style_code") or "").strip(),
+                    "style_code": str(item.get("style_code") or "").strip(),
+                }
             workflow_status = str(record.get("status") if record else "waiting")
             if record and workflow_status in {"suggested", "conflict"}:
                 if str(record.get("category") or "").strip() not in enabled_category_names:
@@ -1201,8 +1210,8 @@ class PlanningApplication:
             approved_style_keys = set()
             approved_count = 0
             for record in records:
-                style_code = str(record.get("style_code") or "").strip()
-                approval_key = (str(record.get("season_year") or ""), style_code) if style_code else ("record", int(record["id"]))
+                style_code = self.current_pricing_style_code(record)
+                approval_key = (str(record.get("current_season_year") or ""), style_code) if style_code else ("record", int(record["id"]))
                 if approval_key in approved_style_keys:
                     continue
                 approved_record = db.approve_pricing_record(
@@ -1237,7 +1246,7 @@ class PlanningApplication:
         failed_styles = []
         handled_style_keys = set()
         for record in records:
-            style_code = str(record.get("style_code") or "").strip()
+            style_code = self.current_pricing_style_code(record)
             style_key = style_code or f"record:{int(record['id'])}"
             if style_key in handled_style_keys:
                 continue
@@ -1272,8 +1281,17 @@ class PlanningApplication:
         return self.redirect(
             start_response,
             "/workbench?notice="
-            + self.q(f"{record['style_code']} 已整款回传藏宝阁，共 {len(updated_records)} 个款色。"),
+            + self.q(f"{self.current_pricing_style_code(record)} 已整款回传藏宝阁，共 {len(updated_records)} 个款色。"),
         )
+
+    def current_pricing_style_code(self, record: dict) -> str:
+        """Use catalog identity for current operations, retaining audit snapshots."""
+        if "current_style_code" in record:
+            return str(record["current_style_code"] or "").strip()
+        source = db.get_source_product(self.db_path, int(record["source_product_id"]))
+        if not source:
+            raise LookupError("对应的藏宝阁来源资料不存在。")
+        return str(source.get("style_code") or "").strip()
 
     def pricing_publication_payload(self, record: dict, user: dict) -> dict:
         if not self.catalog_api_token:
@@ -1322,7 +1340,10 @@ class PlanningApplication:
         }
 
     def publish_pricing_style(self, record: dict, user: dict) -> list[dict]:
-        style_code = str(record.get("style_code") or "").strip()
+        source = db.get_source_product(self.db_path, int(record["source_product_id"]))
+        if not source:
+            raise LookupError("对应的藏宝阁来源资料不存在。")
+        style_code = str(source.get("style_code") or "").strip()
         if not style_code:
             raise ValueError("当前资料缺少款号，不能执行整款回传。")
         style_records = db.list_latest_style_pricing_records(self.db_path, style_code)
