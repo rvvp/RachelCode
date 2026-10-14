@@ -4913,6 +4913,283 @@ class CatalogAppTests(unittest.TestCase):
             self.request("/import/incremental-template.xlsx", cookie=b_cookie)["status"].startswith("403")
         )
 
+    def test_old_for_new_is_optional_visible_to_all_roles_and_exported(self):
+        from catalog_backend.policies import WORKFLOW_RESTART_FIELD_KEYS
+
+        for department, username in (("DESIGN", "old_new_design"), ("EXECUTIVE", "old_new_exec")):
+            db.create_user(self.db_path, username, username, department, "demo123", must_change_password=False)
+        accounts = ("a_editor", "b_editor", "c_viewer", "admin_reviewer", "old_new_design", "old_new_exec")
+        cookies = {username: self.login(username, "demo123") for username in accounts}
+        for product_line in ("red", "black"):
+            with self.subTest(product_line=product_line):
+                product_id, users = self.create_recall_test_product(product_line)
+                product = db.get_product(self.db_path, product_id)
+                self.assertIsNone(product["old_for_new"])
+                self.assertEqual(db.completion_flag(product), "Y")
+                self.assertNotIn("old_for_new", db.completion_required_field_keys(product))
+                self.assertNotIn("old_for_new", WORKFLOW_RESTART_FIELD_KEYS)
+                response = self.request(
+                    f"/products/{product_id}/edit", method="POST",
+                    body=urlencode({"old_for_new": "替换旧款 OLD-001"}).encode("utf-8"),
+                    cookie=cookies["a_editor"],
+                )
+                self.assertTrue(response["status"].startswith("302"))
+                updated = db.get_product(self.db_path, product_id)
+                self.assertEqual(updated["old_for_new"], "替换旧款 OLD-001")
+                self.assertEqual(updated["status"], "published")
+                self.assertEqual(updated["workflow_restart_required"], 0)
+                self.assertEqual(updated["c_release_no"], product["c_release_no"])
+                for username, cookie in cookies.items():
+                    list_body = self.request(f"/products?line={product_line}", cookie=cookie)["body"].decode("utf-8")
+                    self.assertIn("<th>老换新</th>", list_body, username)
+                    self.assertIn("替换旧款 OLD-001", list_body, username)
+                    detail_body = self.request(f"/products/{product_id}", cookie=cookie)["body"].decode("utf-8")
+                    self.assertIn("老换新", detail_body, username)
+                    self.assertIn("替换旧款 OLD-001", detail_body, username)
+                    response = self.request(f"/export.xlsx?line={product_line}", cookie=cookie)
+                    workbook = load_workbook(io.BytesIO(response["body"]), data_only=True)
+                    headers = [cell.value for cell in workbook.active[1]]
+                    self.assertIn("老换新", headers, username)
+                    column = headers.index("老换新")
+                    self.assertIn("替换旧款 OLD-001", [row[column] for row in workbook.active.iter_rows(min_row=2, values_only=True)])
+                logs = db.get_product_logs(self.db_path, product_id)
+                self.assertTrue(any(log["action"] == "update" and log["actor_user_id"] == users["a_editor"]["id"] for log in logs))
+
+        template = self.request("/import/incremental-template.xlsx", cookie=cookies["a_editor"])
+        workbook = load_workbook(io.BytesIO(template["body"]), data_only=True)
+        self.assertIn("老换新", [cell.value for cell in workbook.active[1]])
+        rules_body = self.request("/rules", cookie=cookies["a_editor"])["body"].decode("utf-8")
+        self.assertIn("<h3>老换新</h3>", rules_body)
+        self.assertIn("不参与“资料完成 Y”判断", rules_body)
+        self.assertIn("不以其他账号的个人待接收状态为准", rules_body)
+
+    def test_old_for_new_only_a_can_write_in_both_lines_and_admin_restore_preserves_it(self):
+        from catalog_backend.policies import editable_field_keys_for_user
+
+        for product_line in ("red", "black"):
+            with self.subTest(product_line=product_line):
+                product_id, users = self.create_recall_test_product(product_line)
+                with db.get_connection(self.db_path) as connection:
+                    db.update_product(connection, product_id, {"old_for_new": "A 填写内容"}, users["a_editor"]["id"])
+                product = db.get_product(self.db_path, product_id)
+                for username in ("b_editor", "c_viewer", "admin_reviewer"):
+                    self.assertNotIn("old_for_new", editable_field_keys_for_user(users[username], product))
+                    with self.assertRaises(PermissionError):
+                        with db.get_connection(self.db_path) as connection:
+                            db.update_product(connection, product_id, {"old_for_new": "越权修改"}, users[username]["id"])
+                    cookie = self.login(username, "demo123")
+                    response = self.request(
+                        f"/products/{product_id}/edit", method="POST",
+                        body=urlencode({"old_for_new": "越权修改"}).encode("utf-8"), cookie=cookie,
+                    )
+                    self.assertTrue(response["status"].startswith("403"), username)
+                with db.get_connection(self.db_path) as connection:
+                    db.restore_product_version(connection, product_id, 1, users["admin_reviewer"]["id"])
+                self.assertEqual(db.get_product(self.db_path, product_id)["old_for_new"], "A 填写内容")
+                product = db.get_product(self.db_path, product_id)
+                workbook = Workbook()
+                workbook.active.append(["商品线", "商品名称", "款号", "款色", "老换新"])
+                workbook.active.append([
+                    "黑标线" if product_line == "black" else "红标线",
+                    product["product_name"], product["style_code"], product["style_color"], "B Excel 越权修改",
+                ])
+                buffer = io.BytesIO()
+                workbook.save(buffer)
+                response = self.request(
+                    "/import", method="POST",
+                    body=self.build_multipart("workbook", "unauthorized-old-for-new.xlsx", buffer.getvalue(), extra_fields={"product_line": product_line}),
+                    content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest",
+                    cookie=self.login("b_editor", "demo123"),
+                )
+                self.assertIn("老换新", response["body"].decode("utf-8"))
+                self.assertEqual(db.get_product(self.db_path, product_id), product)
+
+    def test_old_for_new_a_can_create_and_clear_before_receipt(self):
+        cookie = self.login("a_editor", "demo123")
+        users = {item["username"]: item for item in db.list_users(self.db_path)}
+        payload = self.a_complete_fields_payload(old_for_new="替换旧款")
+        for key in ("image_url", "category", "launch_price", "launch_channel"):
+            payload.pop(key, None)
+        response = self.request("/products/new", method="POST", body=urlencode(payload).encode("utf-8"), cookie=cookie)
+        self.assertTrue(response["status"].startswith("302"))
+        product = next(item for item in db.list_products(self.db_path) if item["style_code"] == "TEST-001")
+        self.assertEqual(product["old_for_new"], "替换旧款")
+        for status in ("draft", "pending"):
+            with self.subTest(status=status):
+                with db.get_connection(self.db_path) as connection:
+                    if status == "pending":
+                        db.change_product_status(connection, product["id"], status, users["a_editor"]["id"], "开启商品部协作", "测试")
+                    db.update_product(connection, product["id"], {"old_for_new": "另一旧款"}, users["a_editor"]["id"])
+                response = self.request(
+                    f"/products/{product['id']}/edit", method="POST",
+                    body=urlencode({"old_for_new": ""}).encode("utf-8"), cookie=cookie,
+                )
+                self.assertTrue(response["status"].startswith("302"))
+                self.assertIsNone(db.get_product(self.db_path, product["id"])["old_for_new"])
+
+    def test_old_for_new_excel_full_and_incremental_import_respect_receipt_lock(self):
+        a_cookie = self.login("a_editor", "demo123")
+        for product_line in ("red", "black"):
+            product_id, users = self.create_recall_test_product(product_line)
+            product = db.get_product(self.db_path, product_id)
+            for import_mode in ("full", "incremental"):
+                with self.subTest(product_line=product_line, import_mode=import_mode):
+                    workbook = Workbook()
+                    worksheet = workbook.active
+                    headers = ["款色", "老换新"]
+                    row = [product["style_color"], f"旧款-{import_mode}"]
+                    if import_mode == "full":
+                        headers = ["商品线", "商品名称", "款号", *headers]
+                        row = ["黑标线" if product_line == "black" else "红标线", product["product_name"], product["style_code"], *row]
+                    worksheet.append(headers)
+                    worksheet.append(row)
+                    buffer = io.BytesIO()
+                    workbook.save(buffer)
+                    request_body = self.build_multipart(
+                        "workbook", "old-for-new.xlsx", buffer.getvalue(),
+                        extra_fields={"import_mode": import_mode, "product_line": product_line},
+                    )
+                    response = self.request(
+                        "/import", method="POST", body=request_body,
+                        content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest", cookie=a_cookie,
+                    )
+                    self.assertTrue(response["status"].startswith("200"))
+                    self.assertEqual(db.get_product(self.db_path, product_id)["old_for_new"], f"旧款-{import_mode}")
+                    # Any platform participant receiving sets the overall lock,
+                    # even if other operations accounts have not received it.
+                    with db.get_connection(self.db_path) as connection:
+                        db.change_product_status(connection, product_id, "received", users["c_viewer"]["id"], "接收资料", "测试")
+                    before = db.get_product(self.db_path, product_id)
+                    unchanged_response = self.request(
+                        "/import", method="POST", body=request_body,
+                        content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest", cookie=a_cookie,
+                    )
+                    self.assertTrue(unchanged_response["status"].startswith("200"))
+                    self.assertNotIn("不能补充或修改“老换新”", unchanged_response["body"].decode("utf-8"))
+                    self.assertEqual(db.get_product(self.db_path, product_id), before)
+                    worksheet.cell(2, len(headers)).value = "接收后不允许改"
+                    buffer = io.BytesIO()
+                    workbook.save(buffer)
+                    before = db.get_product(self.db_path, product_id)
+                    count = len(db.list_products(self.db_path))
+                    response = self.request(
+                        "/import", method="POST",
+                        body=self.build_multipart("workbook", "locked.xlsx", buffer.getvalue(), extra_fields={"import_mode": import_mode, "product_line": product_line}),
+                        content_type="multipart/form-data; boundary=----WebKitFormBoundaryCatalogTest", cookie=a_cookie,
+                    )
+                    self.assertIn("不能补充或修改“老换新”", response["body"].decode("utf-8"))
+                    self.assertEqual(db.get_product(self.db_path, product_id), before)
+                    self.assertEqual(len(db.list_products(self.db_path)), count)
+                    with db.get_connection(self.db_path) as connection:
+                        db.change_product_status(connection, product_id, "pending", users["a_editor"]["id"], "召回", "测试")
+                        db.change_product_status(connection, product_id, "published", users["b_editor"]["id"], "重新提交", "测试")
+
+    def test_old_for_new_received_form_is_readonly_and_other_a_fields_keep_their_rules(self):
+        cookie = self.login("a_editor", "demo123")
+        for initial_value in (None, "原老换新内容"):
+            with self.subTest(initial_value=initial_value):
+                product_id, users = self.create_recall_test_product()
+                with db.get_connection(self.db_path) as connection:
+                    db.update_product(connection, product_id, {"old_for_new": initial_value}, users["a_editor"]["id"])
+                    db.change_product_status(connection, product_id, "received", users["c_viewer"]["id"], "接收资料", "测试")
+                before = db.get_product(self.db_path, product_id)
+                form_body = self.request(f"/products/{product_id}/edit", cookie=cookie)["body"].decode("utf-8")
+                self.assertIn("已接收资料不再补充或修改老换新", form_body)
+                self.assertNotIn('name="old_for_new"', form_body)
+                response = self.request(
+                    f"/products/{product_id}/edit", method="POST",
+                    body=urlencode({"old_for_new": "违规补充"}).encode("utf-8"), cookie=cookie,
+                )
+                self.assertTrue(response["status"].startswith("403"))
+                self.assertEqual(db.get_product(self.db_path, product_id), before)
+                with self.assertRaises(PermissionError):
+                    with db.get_connection(self.db_path) as connection:
+                        db.update_product(connection, product_id, {"old_for_new": "违规修改"}, users["a_editor"]["id"])
+                with db.get_connection(self.db_path) as connection:
+                    db.update_product(connection, product_id, {"old_for_new": initial_value, "supplier": "接收后可改的供应商"}, users["a_editor"]["id"])
+                after = db.get_product(self.db_path, product_id)
+                self.assertEqual(after["old_for_new"], initial_value)
+                self.assertEqual(after["supplier"], "接收后可改的供应商")
+                self.assertEqual(after["status"], "received")
+                self.assertEqual(after["workflow_restart_required"], 0)
+
+    def test_old_for_new_lock_uses_global_receipt_not_individual_c_progress(self):
+        product_id, users = self.create_recall_test_product()
+        all_cookie = self.create_c_operator("old_new_all", "全渠道运营", "all")
+        vip_cookie = self.create_c_operator("old_new_vip", "唯品运营", "vip")
+        tmall_cookie = self.login("c_viewer", "demo123")
+        response = self.request(
+            f"/products/{product_id}/status", method="POST",
+            body=urlencode({"status": "received"}).encode("utf-8"), cookie=all_cookie,
+        )
+        self.assertTrue(response["status"].startswith("302"))
+        self.assertEqual(db.get_product(self.db_path, product_id)["status"], "published")
+        with db.get_connection(self.db_path) as connection:
+            db.update_product(connection, product_id, {"old_for_new": "待接收时补充"}, users["a_editor"]["id"])
+        response = self.request(
+            f"/products/{product_id}/status", method="POST",
+            body=urlencode({"status": "received"}).encode("utf-8"), cookie=vip_cookie,
+        )
+        self.assertTrue(response["status"].startswith("302"))
+        self.assertEqual(db.get_product(self.db_path, product_id)["status"], "received")
+        detail_body = self.request(f"/products/{product_id}", cookie=tmall_cookie)["body"].decode("utf-8")
+        self.assertIn("接收资料", detail_body)
+        self.assertIn("待接收时补充", detail_body)
+        with self.assertRaises(PermissionError):
+            with db.get_connection(self.db_path) as connection:
+                db.update_product(connection, product_id, {"old_for_new": "不能因天猫未接收继续改"}, users["a_editor"]["id"])
+
+    def test_old_for_new_receipt_lock_cannot_be_bypassed_with_stale_import_row(self):
+        product_id, users = self.create_recall_test_product()
+        stale_product = db.get_product(self.db_path, product_id)
+        with db.get_connection(self.db_path) as connection:
+            db.change_product_status(connection, product_id, "received", users["c_viewer"]["id"], "接收资料", "测试")
+        before = db.get_product(self.db_path, product_id)
+        with self.assertRaises(PermissionError):
+            with db.get_connection(self.db_path) as connection:
+                db.update_product(connection, product_id, {"old_for_new": "过期页面补充"}, users["a_editor"]["id"], before_product=stale_product)
+        self.assertEqual(db.get_product(self.db_path, product_id), before)
+
+    def test_old_for_new_migration_preserves_runtime_data_and_custom_settings(self):
+        with db.get_connection(self.db_path) as connection:
+            connection.execute("ALTER TABLE products DROP COLUMN old_for_new")
+            connection.execute("DELETE FROM app_settings WHERE setting_key = 'old_for_new_field_visibility_migrated'")
+        for department in ("A", "B", "C"):
+            fields = "style_code,product_name,material" if department == "C" else "style_code,supplier_style_code,product_name,material"
+            db.set_setting(self.db_path, f"list_layout_fields_{department}", fields)
+            db.set_setting(self.db_path, f"list_layout_customized_{department}", "1")
+        db.set_setting(self.db_path, "c_visible_field_keys", "style_code,product_name,material")
+        db.set_setting(self.db_path, "c_field_templates_json", json.dumps({
+            "旧模板": ["style_code", "material"],
+            "现模板": {"field_keys": ["product_name", "material"], "note": "保留元数据"},
+        }, ensure_ascii=False))
+        with db.get_connection(self.db_path) as connection:
+            before_products = [dict(row) for row in connection.execute("SELECT * FROM products ORDER BY id")]
+            before_versions = [dict(row) for row in connection.execute("SELECT * FROM product_versions ORDER BY id")]
+            before_logs = [dict(row) for row in connection.execute("SELECT * FROM product_logs ORDER BY id")]
+        init_db(self.db_path)
+        for department in ("A", "B", "C"):
+            expected = "style_code,old_for_new,product_name,material" if department == "C" else "style_code,supplier_style_code,old_for_new,product_name,material"
+            self.assertEqual(db.get_setting(self.db_path, f"list_layout_fields_{department}"), expected)
+        self.assertEqual(self.app.configured_c_field_keys(), ["style_code", "old_for_new", "product_name", "material"])
+        templates = json.loads(db.get_setting(self.db_path, "c_field_templates_json"))
+        self.assertEqual(templates["旧模板"], ["style_code", "old_for_new", "material"])
+        self.assertEqual(templates["现模板"], {"field_keys": ["product_name", "material", "old_for_new"], "note": "保留元数据"})
+        with db.get_connection(self.db_path) as connection:
+            after_products = [dict(row) for row in connection.execute("SELECT * FROM products ORDER BY id")]
+            self.assertTrue(all(row["old_for_new"] is None for row in after_products))
+            self.assertEqual([{key: value for key, value in row.items() if key != "old_for_new"} for row in after_products], before_products)
+            self.assertEqual([dict(row) for row in connection.execute("SELECT * FROM product_versions ORDER BY id")], before_versions)
+            self.assertEqual([dict(row) for row in connection.execute("SELECT * FROM product_logs ORDER BY id")], before_logs)
+        init_db(self.db_path)
+        self.assertEqual(json.loads(db.get_setting(self.db_path, "c_field_templates_json")), templates)
+        # A hiding a column later must not revoke the C field's availability.
+        db.set_setting(self.db_path, "list_layout_fields_A", "style_code,product_name,material")
+        self.assertIn("old_for_new", self.app.configured_c_field_keys())
+        db.set_setting(self.db_path, "list_layout_fields_C", "style_code,product_name,material")
+        init_db(self.db_path)
+        self.assertEqual(db.get_setting(self.db_path, "list_layout_fields_C"), "style_code,product_name,material")
+
     def create_black_line_product(self, **overrides):
         a_user = next(user for user in db.list_users(self.db_path) if user["username"] == "a_editor")
         payload = self.a_complete_fields_payload()

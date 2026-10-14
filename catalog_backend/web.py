@@ -3862,6 +3862,9 @@ class CatalogApplication:
         source_user = {"department": "A"}
         fields = self.configured_list_layout_fields(source_user)
         available_keys = {field.key for field in fields}
+        if "old_for_new" not in available_keys:
+            fields.append(PRODUCT_FIELD_MAP["old_for_new"])
+            available_keys.add("old_for_new")
         for field_key in CATALOG_EXPORT_FIELD_ORDER:
             if field_key not in B_STAGE_FIELD_KEYS or field_key in available_keys:
                 continue
@@ -13028,13 +13031,29 @@ class CatalogApplication:
             visible_fields = [
                 field
                 for field in fields
-                if field.key in editable_keys
+                if (
+                    field.key in editable_keys
+                    or (
+                        field.key == "old_for_new"
+                        and user.get("department") == "A"
+                        and values.get("status") == "received"
+                    )
+                )
                 and field.key != "size_chart"
                 and not (product_line == "black" and field.key in BLACK_LINE_BLANK_FIELD_KEYS)
             ]
             if not visible_fields:
                 continue
-            inputs = "".join(self.render_input(field, values, product_line=product_line) for field in visible_fields)
+            inputs = "".join(
+                (
+                    '<label class="field"><span>老换新</span>'
+                    f'<input value="{html.escape(str(values.get("old_for_new") or ""), quote=True)}" '
+                    'readonly title="已接收资料不再补充或修改老换新"></label>'
+                    if field.key == "old_for_new" and field.key not in editable_keys
+                    else self.render_input(field, values, product_line=product_line)
+                )
+                for field in visible_fields
+            )
             sections.append(f'<section class="panel"><h2>{html.escape(group)}</h2><div class="form-grid">{inputs}</div></section>')
         department = user.get("department")
         if department == "A":
@@ -13889,6 +13908,10 @@ class CatalogApplication:
           <div class="rule-section">
             <h2>字段定义</h2>
             <div class="rule-subsection">
+              <h3>老换新</h3>
+              <p>红标线和黑标线均可使用，所有部门可查看，仅 A 跟单部按需填写文本；不适用的款式保持空白，不参与“资料完成 Y”判断。可在新款、跟单整理中、A/B协作中及待运营接收时通过网页或 Excel 补充；整体状态已为“已接收”的资料不再补充或修改此字段，不能通过 Excel 或管理员恢复历史版本绕过限制。同一批次任一天猫类或唯品类账号接收后即执行该限制，不以其他账号的个人待接收状态为准。填写本字段不触发召回或重回企划，实际修改照常记录版本和操作账号。</p>
+            </div>
+            <div class="rule-subsection">
               <h3>资料完成</h3>
               <p>由系统自动计算：下列字段全部有内容时显示“Y”，缺少任一项时保持空白。空白、仅空格或未填写不算完成；图片以主图链接或图库中至少一张图片为准。Y 表示必填项已齐全，内容是否正确仍由商品部核对，不会自动提交运营部。</p>
               <div class="rules-table-wrap">
@@ -13997,7 +14020,7 @@ class CatalogApplication:
                   <thead><tr><th>修改情形</th><th>应执行的操作</th><th>系统结果</th></tr></thead>
                   <tbody>
                     <tr><th>A 修改触发字段</th><td>A 负责的触发字段：{html.escape(a_trigger_labels)}。修改前请先使用“召回到 A/B 协作”，再编辑或导入。</td><td>未召回时拒绝保存或导入。召回后回到协作，按商品线完成修改；B 确认并重新提交后，C 接收新批次。</td></tr>
-                    <tr><th>A 修改非触发字段</th><td>例如含税价、供应商、供应商编号、年份季节、大货到仓等 A 字段，可直接编辑或导入。</td><td>生成新业务版本，更新可用资料，流程状态及本批次接收记录保持，C 无需重新接收。含税价另记价格历史；若需重新定价，由 B 按下方企划规则处理。</td></tr>
+                    <tr><th>A 修改非触发字段</th><td>例如含税价、供应商、供应商编号、年份季节、大货到仓等 A 字段，可直接编辑或导入。“老换新”为选填字段，仅接收前可补充或修改，整体状态已为“已接收”时禁止修改。</td><td>生成新业务版本，更新可用资料，流程状态及本批次接收记录保持，C 无需重新接收。含税价另记价格历史；若需重新定价，由 B 按下方企划规则处理。</td></tr>
                     <tr><th>B 修改图片</th><td>红黑标均可直接替换图片，不要求先召回。</td><td>更新图片和独立图片版本，不自动召回、不自动重回企划，也不要求 C 重新接收。</td></tr>
                     <tr><th>B 修改红标企划字段</th><td>品类、上新价格和上新渠道不能在藏宝阁直接改。先召回到协作，再由 B 发起重新企划，在企划中心修改并回传。</td><td>运营阶段直接回传会被拒绝。有效回传后仍处于“A/B协作中”，需 B 再次提交；C 才能接收新批次。</td></tr>
                     <tr><th>B 修改黑标上新折扣或渠道</th><td>可先召回再修改；也可直接在运营阶段保存自己负责字段。</td><td>直接保存时，与上一正式运营版本相比有实际差异就标记“待商品部重新提交”；C 暂继续使用上一正式版本，B 确认并重新提交后才能接收新批次。改回上一正式值且不存在其他触发差异时，提示清除。</td></tr>

@@ -1210,6 +1210,7 @@ def _init_db_unlocked(
         backfill_non_customized_list_layout_defaults(connection)
         backfill_list_layout_virtual_fields(connection)
         backfill_supplier_product_list_layout_fields(connection)
+        backfill_old_for_new_field_visibility(connection)
         backfill_placeholder_product_dates(connection)
         backfill_product_completion_timestamps(connection)
         backfill_current_product_versions(connection)
@@ -1318,6 +1319,68 @@ def backfill_supplier_product_list_layout_fields(connection: sqlite3.Connection)
                 "UPDATE app_settings SET setting_value = ?, updated_at = ? WHERE setting_key = ?",
                 (",".join(values), utc_now(), setting_key),
             )
+
+
+def backfill_old_for_new_field_visibility(connection: sqlite3.Connection) -> None:
+    migration_key = "old_for_new_field_visibility_migrated"
+    if connection.execute(
+        "SELECT 1 FROM app_settings WHERE setting_key = ?", (migration_key,)
+    ).fetchone():
+        return
+
+    def include_field(keys: list[str]) -> list[str]:
+        if "old_for_new" not in keys:
+            for anchor in ("supplier_style_code", "style_code"):
+                if anchor in keys:
+                    keys.insert(keys.index(anchor) + 1, "old_for_new")
+                    break
+            else:
+                keys.append("old_for_new")
+        return keys
+
+    # Extend existing visibility and custom layouts once, preserving all
+    # previous choices. Subsequent field-setting changes stay user-controlled.
+    for setting_key in (
+        "c_visible_field_keys",
+        "list_layout_fields_A",
+        "list_layout_fields_B",
+        "list_layout_fields_C",
+    ):
+        row = connection.execute(
+            "SELECT setting_value FROM app_settings WHERE setting_key = ?", (setting_key,)
+        ).fetchone()
+        if not row or not str(row["setting_value"] or "").strip():
+            continue
+        keys = [key.strip() for key in row["setting_value"].split(",") if key.strip()]
+        updated_value = ",".join(include_field(keys))
+        if updated_value != row["setting_value"]:
+            connection.execute(
+                "UPDATE app_settings SET setting_value = ?, updated_at = ? WHERE setting_key = ?",
+                (updated_value, utc_now(), setting_key),
+            )
+    row = connection.execute(
+        "SELECT setting_value FROM app_settings WHERE setting_key = 'c_field_templates_json'"
+    ).fetchone()
+    try:
+        templates = json.loads(row["setting_value"] or "{}") if row else {}
+    except (TypeError, json.JSONDecodeError):
+        templates = {}
+    if isinstance(templates, dict):
+        changed = False
+        for template in templates.values():
+            keys = template.get("field_keys") if isinstance(template, dict) else template
+            if isinstance(keys, list) and "old_for_new" not in keys:
+                include_field(keys)
+                changed = True
+        if changed:
+            connection.execute(
+                "UPDATE app_settings SET setting_value = ?, updated_at = ? WHERE setting_key = 'c_field_templates_json'",
+                (json.dumps(templates, ensure_ascii=False), utc_now()),
+            )
+    connection.execute(
+        "INSERT INTO app_settings (setting_key, setting_value, updated_at) VALUES (?, '1', ?)",
+        (migration_key, utc_now()),
+    )
 
 
 def backfill_product_completion_timestamps(connection: sqlite3.Connection) -> None:
@@ -1688,6 +1751,7 @@ def seed_default_settings(connection: sqlite3.Connection) -> None:
             "style_color",
             "style_code",
             "supplier_style_code",
+            "old_for_new",
             "color_name",
             "product_name",
             "category",
@@ -1722,6 +1786,7 @@ def seed_default_settings(connection: sqlite3.Connection) -> None:
             "style_color",
             "style_code",
             "supplier_style_code",
+            "old_for_new",
             "color_name",
             "product_name",
             "category",
@@ -2799,6 +2864,8 @@ def update_product(
             if normalize_diff_value(before_product.get(field.key))
             != normalize_diff_value(requested_payload.get(field.key))
         }
+        if "old_for_new" in requested_changes and before_product.get("status") == "received":
+            raise PermissionError("资料已被运营部接收，不能补充或修改“老换新”；仅在接收前按需填写。")
         forbidden_planning_changes = requested_changes & B_PLANNING_MANAGED_FIELD_KEYS
         if product_line == "red" and forbidden_planning_changes and actor_username != "planning_service":
             labels = {
@@ -2877,10 +2944,15 @@ def update_product(
     values.append(payload["image_gallery_json"])
     timestamp = utc_now()
     values.extend([timestamp, product_id])
-    connection.execute(
-        f"UPDATE products SET {assignments}, updated_at = ? WHERE id = ?",
-        values,
+    # Recheck at the write itself: an import may have loaded its row before
+    # an operations account received the current batch.
+    updated = connection.execute(
+        f"""UPDATE products SET {assignments}, updated_at = ?
+        WHERE id = ? AND (status <> 'received' OR COALESCE(old_for_new, '') = COALESCE(?, ''))""",
+        [*values, payload.get("old_for_new")],
     )
+    if not updated.rowcount:
+        raise PermissionError("资料已被运营部接收，不能补充或修改“老换新”；仅在接收前按需填写。")
     if not actor_user_id:
         return
     non_image_diff_items = [item for item in diff_items if item.get("field_key") != "image_url"]
@@ -4130,6 +4202,7 @@ def restore_product_version(
     # outputs. Those values remain owned by the planning center.
     for field_key in B_PLANNING_MANAGED_FIELD_KEYS:
         payload[field_key] = product.get(field_key)
+    payload["old_for_new"] = product.get("old_for_new")
     next_version_no = int(product.get("current_version_no") or 1) + 1
     image_changed = (
         normalize_diff_value(product.get("image_url")) != normalize_diff_value(payload.get("image_url"))

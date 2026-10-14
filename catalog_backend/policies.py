@@ -350,6 +350,8 @@ def editable_field_keys_for_user(user: dict | None, product: dict | None = None)
             return ()
         if product.get("owner_department") != "A":
             return ()
+        if product.get("status") == "received":
+            return tuple(key for key in A_STAGE_FIELD_KEYS if key != "old_for_new")
         if product.get("status") in {"draft", "pending", "published", "received"}:
             return A_STAGE_FIELD_KEYS
         return ()
