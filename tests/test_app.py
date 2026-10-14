@@ -8169,12 +8169,13 @@ class CatalogAppTests(unittest.TestCase):
 
         c_list = self.request("/products?status=published", cookie=c_cookie)["body"].decode("utf-8")
         self.assertIn("<th>修改</th>", c_list)
-        self.assertIn("修改Y1", c_list)
+        self.assertIn("修1", c_list)
+        self.assertNotIn("修改Y", c_list)
 
         vip_list = self.request(
             "/products?status=published", cookie=self.login("recall_vip_c", "demo123")
         )["body"].decode("utf-8")
-        self.assertNotIn("修改Y1", vip_list)
+        self.assertNotIn("修1", vip_list)
 
         resubmitted_notices = self.request(
             "/products?marker=recall_notice&status=received", cookie=c_cookie
@@ -8197,7 +8198,7 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(db.c_active_recall_notice_count(self.db_path, all_channel_id), 1)
 
         c_list_after_receive = self.request("/products?status=published", cookie=c_cookie)["body"].decode("utf-8")
-        self.assertIn("修改Y1", c_list_after_receive)
+        self.assertIn("修1", c_list_after_receive)
 
         with db.get_connection(self.db_path) as connection:
             db.change_product_status(
@@ -8206,6 +8207,22 @@ class CatalogAppTests(unittest.TestCase):
         self.assertEqual(db.c_active_recall_notice_count(self.db_path, c_user["id"]), 1)
         self.assertEqual(db.c_active_recall_notice_count(self.db_path, all_channel_id), 1)
         self.assertEqual(db.c_recall_modification_markers(self.db_path, c_user["id"])[product_id], 2)
+
+        for recall_no in (2, 3):
+            with db.get_connection(self.db_path) as connection:
+                db.change_product_status(
+                    connection, product_id, "published", b_user["id"], "重新提交运营部", "修订完成。"
+                )
+            c_list = self.request("/products", cookie=c_cookie)["body"].decode("utf-8")
+            self.assertIn(f'class="recall-modification-badge">修{recall_no}</strong>', c_list)
+            self.assertNotIn("修改Y", c_list)
+            if recall_no == 2:
+                with db.get_connection(self.db_path) as connection:
+                    product = db.get_product_from_connection(connection, product_id)
+                    self.assertTrue(self.app.record_c_receipt(connection, product, c_user))
+                    db.change_product_status(
+                        connection, product_id, "pending", a_user["id"], "召回资料", "第三次接收后召回。"
+                    )
 
     def test_archiving_recalled_product_closes_c_recall_notice(self):
         users = {item["department"]: item for item in db.list_users(self.db_path)}
@@ -8279,7 +8296,7 @@ class CatalogAppTests(unittest.TestCase):
         for username in ("vip_first", "vip_second", "c_viewer"):
             body = self.request("/products", cookie=self.login(username, "demo123"))["body"].decode()
             self.assertIn(f'href="/products/{product_id}"', body)
-            self.assertEqual("修改Y1" in body, username.startswith("vip_"))
+            self.assertEqual("修1" in body, username.startswith("vip_"))
         vip_cookie = self.login("vip_second", "demo123")
         response = self.request(
             "/products/bulk", method="POST", cookie=vip_cookie,
@@ -8289,7 +8306,7 @@ class CatalogAppTests(unittest.TestCase):
         for vip_id in vip_ids:
             self.assertEqual(db.c_active_recall_notice_count(self.db_path, vip_id), 0)
         body = self.request("/products", cookie=vip_cookie)["body"].decode()
-        self.assertIn("修改Y1", body)
+        self.assertIn("修1", body)
 
     def test_c_recall_unreceived_batch_has_no_notice_marker_and_stale_receipt_is_rejected(self):
         product_id, users = self.create_recall_test_product()
@@ -8379,19 +8396,19 @@ class CatalogAppTests(unittest.TestCase):
         for username in ("a_editor", "b_editor", "admin_reviewer"):
             body = self.request("/products", cookie=self.login(username, "demo123"))["body"].decode()
             self.assertNotIn("<th>修改</th>", body)
-            self.assertNotIn("修改Y1", body)
+            self.assertNotIn("修1", body)
         cookie = self.login("c_viewer", "demo123")
         body = self.request("/products", cookie=cookie)["body"].decode()
         self.assertRegex(body, r"<th>商品线</th>\s*<th>修改</th>")
-        self.assertIn('class="recall-modification-badge">修改Y1</strong>', body)
+        self.assertIn('class="recall-modification-badge">修1</strong>', body)
         self.assertIn("__modification__", body)
         exported = self.request(f"/export.xlsx?mode=selected&selected={product_id}", cookie=cookie)
         self.assertTrue(exported["status"].startswith("200"))
         workbook = load_workbook(io.BytesIO(exported["body"]))
         self.assertNotIn("修改", [cell.value for cell in workbook.active[1]])
-        self.assertNotIn("修改Y1", str(list(workbook.active.values)))
+        self.assertNotIn("修1", str(list(workbook.active.values)))
         api = self.request("/api/products", cookie=cookie)
-        self.assertNotIn("修改Y1", api["body"].decode())
+        self.assertNotIn("修1", api["body"].decode())
 
     def test_c_recall_legacy_migration_preserves_records_and_only_reopens_unreceived_notices(self):
         product_id, users = self.create_recall_test_product()
@@ -8583,7 +8600,9 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn("全渠道账号可记录个人接收，但不参与全局状态判断", rules_body)
         self.assertIn("按“资料 + 运营平台属性”共享待办", rules_body)
         self.assertIn("没有接收过旧批次的平台不提醒", rules_body)
-        self.assertIn("该平台所有账号的召回提醒消失，但“修改Y”不消失", rules_body)
+        self.assertIn("该平台所有账号的召回提醒消失，但修改标记不消失", rules_body)
+        self.assertIn("修1/修2/修3", rules_body)
+        self.assertNotIn("修改Y", rules_body)
         self.assertIn("不作为其他记录用途", rules_body)
         self.assertNotIn("重新提交运营部后提醒自动关闭", rules_body)
         for username in ("a_editor", "b_editor", "c_viewer", "admin_reviewer"):
