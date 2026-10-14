@@ -684,9 +684,11 @@ class PlanningApplication:
         )
         return self.redirect(
             start_response,
-            "/workbench?notice="
-            + self.q(f"{self.current_pricing_style_code(record) or record['product_name']} 已提交企划管理员复核。")
-            + f"#pricing-row-{int(record['source_product_id'])}",
+            self.workbench_redirect_location(
+                form,
+                f"{self.current_pricing_style_code(record) or record['product_name']} 已提交企划管理员复核。",
+                record,
+            ),
         )
 
     def handle_withdraw_review(self, start_response, user, record_id: int):
@@ -714,9 +716,11 @@ class PlanningApplication:
         )
         return self.redirect(
             start_response,
-            "/workbench?notice="
-            + self.q(f"{self.current_pricing_style_code(record) or record['product_name']} 已按所选品类重新测算，上新价为 {record['calculated_price']:g}。")
-            + f"#pricing-row-{int(record['source_product_id'])}",
+            self.workbench_redirect_location(
+                form,
+                f"{self.current_pricing_style_code(record) or record['product_name']} 已按所选品类重新测算，上新价为 {record['calculated_price']:g}。",
+                record,
+            ),
         )
 
     def handle_review_save(self, environ, start_response, user, record_id: int):
@@ -1177,17 +1181,12 @@ class PlanningApplication:
                 )
             return self.redirect(
                 start_response,
-                "/workbench?"
-                + urlencode(
+                self.workbench_redirect_location(
                     {
-                        key: value
-                        for key, value in (
-                            ("status", "review_pending"),
-                            ("search", search_filter),
-                            ("notice", f"已批量提交 {len(pending)} 款上新定价进入复核。"),
-                        )
-                        if value
-                    }
+                        f"return_{key}": (form.get(key) or [""])[0]
+                        for key in ("season_year", "status", "search", "page")
+                    },
+                    f"已批量提交 {len(pending)} 款上新定价进入复核。",
                 ),
             )
 
@@ -1764,7 +1763,7 @@ class PlanningApplication:
         current_page = min(requested_page, total_pages)
         page_start = (current_page - 1) * page_size
         page_products = filtered_products[page_start : page_start + page_size]
-        review_return_context = "".join(
+        workbench_return_context = "".join(
             f"<input type='hidden' name='return_{key}' value='{html.escape(str(value), quote=True)}'>"
             for key, value in (
                 ("season_year", season),
@@ -1794,6 +1793,7 @@ class PlanningApplication:
           <input type='hidden' name='season_year' value='{html.escape(season, quote=True)}'>
           <input type='hidden' name='status' value='{html.escape(status, quote=True)}'>
           <input type='hidden' name='search' value='{html.escape(search, quote=True)}'>
+          <input type='hidden' name='page' value='{current_page}'>
           <div class='pricing-batch-actions'>{batch_buttons}</div>
         </form>"""
         export_params = {
@@ -1989,6 +1989,7 @@ class PlanningApplication:
                     channel_cell = f"<label class='cell-field'>渠道<select id='initial-channel-{record['id']}' class='initial-review-channel' name='channel' form='initial-review-form-{record['id']}' required>{select_options(channel_options, record.get('channel') or '', '请选择渠道')}</select></label>"
                     controls = f"""
                     <form id='initial-review-form-{record['id']}' class='table-action-form price-review-form initial-review-form' method='post' action='/pricing/{record['id']}/submit-review'>
+                      {workbench_return_context}
                       <label>初审上新价<input id='initial-price-{record['id']}' class='initial-review-price' name='launch_price' type='number' min='1' step='1' inputmode='numeric' value='{price_value}' data-calculated-value='{calculated_price_value}' required></label>
                       <button class='primary' type='submit'>确认并提交复核</button>
                     </form>
@@ -1998,7 +1999,7 @@ class PlanningApplication:
                     controls = f"""
                     <div class='review-controls'><span class='review-note'>商品部初审已提交，请进行复核</span>
                       <form class='table-action-form price-review-form review-approval-form' method='post' action='/pricing/{record['id']}/review-save'>
-                        {review_return_context}
+                        {workbench_return_context}
                         <label>复核上新价<input name='launch_price' type='number' min='1' step='1' inputmode='numeric' value='{price_value}' data-saved-value='{price_value}' required></label>
                         <button type='submit'>修改保存</button>
                         <label>复核渠道<select name='channel' data-saved-value='{html.escape(record.get('channel') or '', quote=True)}' required>{select_options(channel_options, record.get('channel') or '', '请选择渠道')}</select></label>

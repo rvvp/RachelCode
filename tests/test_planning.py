@@ -4,10 +4,11 @@ import io
 import json
 import tempfile
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 from threading import Event
 from unittest.mock import patch
-from urllib.parse import unquote, urlencode
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 from wsgiref.util import setup_testing_defaults
 from zipfile import ZipFile
 
@@ -56,6 +57,26 @@ class PlanningCenterTests(unittest.TestCase):
     def login_cookie(self, app, username):
         response = self.wsgi_request(app, "/login", method="POST", body=urlencode({"username": username, "password": "demo123"}).encode())
         return dict(response["headers"])["Set-Cookie"].split(";", 1)[0]
+
+    def hidden_form_values(self, markup: str, form_id: str) -> dict:
+        values = {}
+
+        class FormParser(HTMLParser):
+            active = False
+
+            def handle_starttag(self, tag, attrs):
+                attributes = dict(attrs)
+                if tag == "form":
+                    self.active = attributes.get("id") == form_id
+                elif tag == "input" and self.active and attributes.get("type") == "hidden":
+                    values[attributes["name"]] = attributes.get("value", "")
+
+            def handle_endtag(self, tag):
+                if tag == "form":
+                    self.active = False
+
+        FormParser().feed(markup)
+        return values
 
     def workbook_multipart(self, workbook_bytes: bytes, filename: str = "initial-review.xlsx") -> tuple[bytes, str]:
         boundary = "----PlanningCenterExcelTest"
@@ -2636,6 +2657,114 @@ class PlanningCenterTests(unittest.TestCase):
         self.assertEqual(updated["launch_price"], 629)
         self.assertEqual(planning_db.get_source_product(self.planning_db_path, 64)["category"], "连衣裙")
 
+    def test_initial_review_and_recalculation_preserve_workbench_view(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        products = [
+            {
+                "id": 7000 + index,
+                "style_code": f"VIEW-{index:03d}",
+                "style_color": f"VIEW-{index:03d}-黑",
+                "product_name": "初审返回测试款",
+                "season_year": "2026秋冬",
+                "supplier": "测试供应商",
+                "category": "其他",
+                "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 1,
+            }
+            for index in range(54)
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        planning_db.create_pricing_records(self.planning_db_path, products, "初审员")
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planner")
+        views = (
+            {"season_year": "2026秋冬", "status": "suggested", "search": "VIEW-,黑", "page": "2"},
+            {"search": "VIEW-,黑", "page": "2"},
+            {"page": "2"},
+        )
+        for view in views:
+            with self.subTest(view=view):
+                entries = app.workbench_entries(view.get("season_year", ""), view.get("status", ""), view.get("search", ""))
+                source, record, _ = next(entry for entry in entries[50:] if entry[2] == "suggested")
+                markup = self.wsgi_request(app, "/workbench?" + urlencode(view), cookie=cookie)["body"].decode("utf-8")
+                fields = self.hidden_form_values(markup, f"initial-review-form-{record['id']}")
+                self.assertEqual(fields, {f"return_{key}": value for key, value in view.items()})
+                for action in ("recalculate", "submit-review"):
+                    response = self.wsgi_request(
+                        app,
+                        f"/pricing/{record['id']}/{action}",
+                        method="POST",
+                        body=urlencode({**fields, "launch_price": "639", "category": "其他", "channel": "唯品"}).encode(),
+                        cookie=cookie,
+                    )
+                    self.assertTrue(response["status"].startswith("302"), response["body"])
+                    location = urlsplit(dict(response["headers"])["Location"])
+                    query = parse_qs(location.query)
+                    self.assertEqual(location.path, "/workbench")
+                    self.assertEqual(location.fragment, f"pricing-row-{source['id']}")
+                    self.assertEqual({key: values[0] for key, values in query.items() if key != "notice"}, view)
+                    returned = self.wsgi_request(app, location.path + "?" + location.query, cookie=cookie)
+                    self.assertTrue(returned["status"].startswith("200"))
+                updated = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+                self.assertEqual(updated["status"], "review_pending")
+                self.assertEqual(updated["launch_price"], 639)
+                self.assertEqual(updated["channel"], "唯品")
+
+    def test_batch_initial_review_preserves_selected_and_filtered_workbench_view(self):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        products = [
+            {
+                "id": 7100 + index,
+                "style_code": f"BATCH-VIEW-{index:03d}",
+                "style_color": f"BATCH-VIEW-{index:03d}-黑",
+                "product_name": "批量初审返回测试款",
+                "season_year": "2026秋冬",
+                "supplier": "测试供应商",
+                "category": "其他",
+                "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 1,
+            }
+            for index in range(54)
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        planning_db.create_pricing_records(self.planning_db_path, products, "初审员")
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("UPDATE pricing_records SET channel = '天猫'")
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planner")
+        view = {"season_year": "2026秋冬", "status": "suggested", "search": "BATCH-VIEW-,黑", "page": "2"}
+        for scope in ("selected", "filtered"):
+            with self.subTest(scope=scope):
+                entries = app.workbench_entries(view["season_year"], view["status"], view["search"])
+                record = entries[50][1]
+                markup = self.wsgi_request(app, "/workbench?" + urlencode(view), cookie=cookie)["body"].decode("utf-8")
+                fields = self.hidden_form_values(markup, "pricing-batch-form")
+                self.assertEqual({key: fields[key] for key in view}, view)
+                response = self.wsgi_request(
+                    app,
+                    "/pricing/batch",
+                    method="POST",
+                    body=urlencode({
+                        **fields,
+                        "batch_action": "submit-review",
+                        "selection_scope": scope,
+                        "submit_review_ids": record["id"],
+                        f"launch_price_{record['id']}": "639",
+                        f"category_{record['id']}": "其他",
+                        f"channel_{record['id']}": "唯品",
+                    }).encode(),
+                    cookie=cookie,
+                )
+                self.assertTrue(response["status"].startswith("302"), response["body"])
+                location = urlsplit(dict(response["headers"])["Location"])
+                query = parse_qs(location.query)
+                self.assertEqual({key: values[0] for key, values in query.items() if key != "notice"}, view)
+                returned = self.wsgi_request(app, location.path + "?" + location.query, cookie=cookie)
+                self.assertTrue(returned["status"].startswith("200"))
+        self.assertTrue(all(record["status"] == "review_pending" for record in planning_db.list_pricing_records(self.planning_db_path)))
+
     def test_formal_database_can_bootstrap_first_admin(self):
         formal_path = Path(self.temp.name) / "formal-planning.db"
         planning_db.init_db(
@@ -4644,6 +4773,7 @@ class PlanningCenterTests(unittest.TestCase):
             body=urlencode(
                 [
                     ("batch_action", "submit-review"),
+                    ("status", "suggested"),
                     ("submit_review_ids", str(first["id"])),
                     ("submit_review_ids", str(second["id"])),
                     (f"launch_price_{first['id']}", "609"),
@@ -4657,7 +4787,7 @@ class PlanningCenterTests(unittest.TestCase):
             cookie=planner_cookie,
         )
         self.assertTrue(batch_initial["status"].startswith("302"))
-        self.assertIn("status=review_pending", dict(batch_initial["headers"])["Location"])
+        self.assertIn("status=suggested", dict(batch_initial["headers"])["Location"])
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, first["id"])["launch_price"], 609)
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, second["id"])["launch_price"], 619)
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, first["id"])["channel"], "天猫")
