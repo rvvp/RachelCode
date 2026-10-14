@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread, current_thread
 from unittest.mock import patch
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 from wsgiref.util import setup_testing_defaults
@@ -4476,6 +4476,190 @@ class PlanningCenterTests(unittest.TestCase):
         )
         self.assertTrue(rejected_after_approval["status"].startswith("400"))
         self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "confirmed")
+
+    def pending_review_batch_records(self, count=3):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        products = [
+            {
+                "id": 7200 + index,
+                "style_code": f"WITHDRAW-BATCH-{index:03d}",
+                "style_color": f"WITHDRAW-BATCH-{index:03d}-黑",
+                "product_name": "批量撤回测试款",
+                "season_year": "2026秋冬",
+                "supplier": "测试供应商",
+                "category": "其他",
+                "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 1,
+            }
+            for index in range(count)
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        records = planning_db.create_pricing_records(self.planning_db_path, products, "商品部企划员")
+        return [
+            planning_db.submit_pricing_for_review(self.planning_db_path, record["id"], 639, "商品部企划员", "其他", "唯品")
+            for record in records
+        ]
+
+    def test_selected_batch_withdrawal_preserves_prices_permissions_and_view(self):
+        records = self.pending_review_batch_records()
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        planner_cookie = self.login_cookie(app, "planner")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+        view = {"season_year": "2026秋冬", "status": "review_pending", "search": "WITHDRAW-BATCH-", "page": "2"}
+        page = self.wsgi_request(app, "/workbench?" + urlencode(view), cookie=planner_cookie)["body"].decode("utf-8")
+        self.assertIn("data-label='批量撤回'", page)
+        self.assertEqual(page.count("name='withdraw_review_ids'"), 3)
+        self.assertIn("'withdraw-review': 'withdraw_review_ids'", page)
+        self.assertIn("确认撤回已选的", page)
+        self.assertIn(f"data-export-record-id='{records[0]['id']}'", page)
+        admin_page = self.wsgi_request(app, "/workbench?status=review_pending", cookie=admin_cookie)["body"].decode("utf-8")
+        self.assertNotIn("data-label='批量撤回'", admin_page)
+        self.assertNotIn("name='withdraw_review_ids'", admin_page)
+        fields = {**view, "batch_action": "withdraw-review", "withdraw_review_ids": [records[0]["id"], records[1]["id"], records[0]["id"]]}
+        denied = self.wsgi_request(app, "/pricing/batch", method="POST", body=urlencode(fields, doseq=True).encode(), cookie=admin_cookie)
+        self.assertTrue(denied["status"].startswith("403"))
+        empty = self.wsgi_request(app, "/pricing/batch", method="POST", body=urlencode({"batch_action": "withdraw-review"}).encode(), cookie=planner_cookie)
+        self.assertTrue(empty["status"].startswith("400"))
+        response = self.wsgi_request(app, "/pricing/batch", method="POST", body=urlencode(fields, doseq=True).encode(), cookie=planner_cookie)
+        self.assertTrue(response["status"].startswith("302"), response["body"])
+        location = urlsplit(dict(response["headers"])["Location"])
+        query = parse_qs(location.query)
+        self.assertEqual({key: values[0] for key, values in query.items() if key != "notice"}, view)
+        self.assertIn("已批量撤回 2 个款色", query["notice"][0])
+        unchanged_fields = ("source_product_id", "source_version_no", "publication_id", "category", "cost", "calculated_price", "launch_price", "channel")
+        for index, record in enumerate(records):
+            updated = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+            self.assertEqual(updated["status"], "suggested" if index < 2 else "review_pending")
+            self.assertEqual({key: updated[key] for key in unchanged_fields}, {key: record[key] for key in unchanged_fields})
+        resubmitted = self.wsgi_request(
+            app, f"/pricing/{records[0]['id']}/submit-review", method="POST",
+            body=urlencode({"launch_price": "649", "category": "其他", "channel": "天猫"}).encode(), cookie=planner_cookie,
+        )
+        self.assertTrue(resubmitted["status"].startswith("302"))
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, records[0]["id"])["launch_price"], 649)
+
+    def test_filtered_batch_withdrawal_crosses_pages_and_respects_filters(self):
+        records = self.pending_review_batch_records(54)
+        planning_db.approve_pricing_record(self.planning_db_path, records[0]["id"], 639, "唯品", "企划管理员")
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("UPDATE source_products SET season_year = '2027春夏' WHERE id = ?", (records[1]["source_product_id"],))
+            connection.execute("UPDATE source_products SET style_code = 'OUTSIDE-SEARCH', style_color = 'OUTSIDE-SEARCH-黑' WHERE id = ?", (records[2]["source_product_id"],))
+            connection.execute("UPDATE source_products SET actual_cost = 160 WHERE id = ?", (records[3]["source_product_id"],))
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planner")
+        view = {"season_year": "2026秋冬", "search": "WITHDRAW-BATCH-"}
+        page = self.wsgi_request(app, "/workbench?" + urlencode(view), cookie=cookie)["body"].decode("utf-8")
+        self.assertIn('"withdraw-review": 51', page)
+        self.assertIn("选择全部筛选资料（52）", page)
+        self.assertEqual(page.count("name='withdraw_review_ids'"), 50)
+        response = self.wsgi_request(
+            app, "/pricing/batch", method="POST",
+            body=urlencode({**view, "batch_action": "withdraw-review", "selection_scope": "filtered"}).encode(), cookie=cookie,
+        )
+        self.assertTrue(response["status"].startswith("302"), response["body"])
+        query = parse_qs(urlsplit(dict(response["headers"])["Location"]).query)
+        self.assertEqual({key: values[0] for key, values in query.items() if key != "notice"}, view)
+        self.assertIn("已批量撤回 51 个款色", query["notice"][0])
+        for index, record in enumerate(records):
+            updated = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+            self.assertEqual(updated["status"], "confirmed" if index == 0 else "review_pending" if index < 3 else "suggested")
+            self.assertEqual(updated["launch_price"], 639)
+            self.assertEqual(updated["channel"], "唯品")
+        empty = self.wsgi_request(
+            app, "/pricing/batch", method="POST",
+            body=urlencode({**view, "batch_action": "withdraw-review", "selection_scope": "filtered", "status": "review_pending"}).encode(), cookie=cookie,
+        )
+        self.assertTrue(empty["status"].startswith("400"))
+
+    def test_batch_withdrawal_rejects_invalid_or_approved_selection_atomically(self):
+        records = self.pending_review_batch_records()
+        planning_db.approve_pricing_record(self.planning_db_path, records[1]["id"], 639, "唯品", "企划管理员")
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planner")
+        for invalid_id in (records[1]["id"], 999999):
+            with self.subTest(invalid_id=invalid_id):
+                response = self.wsgi_request(
+                    app, "/pricing/batch", method="POST",
+                    body=urlencode({"batch_action": "withdraw-review", "withdraw_review_ids": [records[0]["id"], invalid_id]}, doseq=True).encode(), cookie=cookie,
+                )
+                self.assertTrue(response["status"].startswith("400"))
+                self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, records[0]["id"])["status"], "review_pending")
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, records[1]["id"])["status"], "confirmed")
+
+    def test_filtered_batch_withdrawal_rechecks_review_completed_after_selection(self):
+        records = self.pending_review_batch_records(2)
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planner")
+        original_entries = app.workbench_entries
+
+        def approve_after_selection(*args, **kwargs):
+            entries = original_entries(*args, **kwargs)
+            planning_db.approve_pricing_record(self.planning_db_path, records[1]["id"], 639, "唯品", "企划管理员")
+            return entries
+
+        with patch.object(app, "workbench_entries", side_effect=approve_after_selection):
+            response = self.wsgi_request(
+                app, "/pricing/batch", method="POST",
+                body=urlencode({"batch_action": "withdraw-review", "selection_scope": "filtered", "status": "review_pending"}).encode(), cookie=cookie,
+            )
+        self.assertTrue(response["status"].startswith("400"))
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, records[0]["id"])["status"], "review_pending")
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, records[1]["id"])["status"], "confirmed")
+
+    def test_batch_withdrawal_serializes_with_review_save_and_approval(self):
+        records = self.pending_review_batch_records(2)
+        original_connection = planning_db.get_connection
+        for action, record in zip((planning_db.save_review_price, planning_db.approve_pricing_record), records):
+            with self.subTest(action=action.__name__):
+                withdrawal_locked = Event()
+                review_started = Event()
+                finish_withdrawal = Event()
+                errors = []
+
+                def traced_connection(path):
+                    connection = original_connection(path)
+
+                    def trace(statement):
+                        if current_thread().name == "withdraw-test" and statement.startswith("SELECT * FROM pricing_records WHERE id"):
+                            withdrawal_locked.set()
+                            finish_withdrawal.wait(5)
+                        elif current_thread().name == "review-test" and statement == "BEGIN IMMEDIATE":
+                            review_started.set()
+
+                    connection.set_trace_callback(trace)
+                    return connection
+
+                def withdraw():
+                    try:
+                        planning_db.withdraw_pricing_records_from_review(self.planning_db_path, [record["id"]], "商品部企划员")
+                    except Exception as error:
+                        errors.append(error)
+
+                def review():
+                    try:
+                        action(self.planning_db_path, record["id"], 639, "唯品", "企划管理员")
+                    except Exception as error:
+                        errors.append(error)
+
+                with patch.object(planning_db, "get_connection", side_effect=traced_connection):
+                    withdrawal_thread = Thread(target=withdraw, name="withdraw-test")
+                    review_thread = Thread(target=review, name="review-test")
+                    withdrawal_thread.start()
+                    try:
+                        self.assertTrue(withdrawal_locked.wait(5))
+                        review_thread.start()
+                        self.assertTrue(review_started.wait(5))
+                    finally:
+                        finish_withdrawal.set()
+                        withdrawal_thread.join(5)
+                        if review_thread.ident is not None:
+                            review_thread.join(5)
+                self.assertFalse(withdrawal_thread.is_alive())
+                self.assertFalse(review_thread.is_alive())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], ValueError)
+                self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "suggested")
 
     def test_confirmed_stage_is_export_only_and_can_reopen_for_new_review(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)

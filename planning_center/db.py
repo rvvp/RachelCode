@@ -2240,24 +2240,40 @@ def submit_pricing_for_review(
 
 
 def withdraw_pricing_from_review(db_path: str | Path, record_id: int, operator_name: str) -> dict:
-    """Return a pending review record to the initial-review stage.
+    return withdraw_pricing_records_from_review(db_path, [record_id], operator_name)[0]
 
-    The status check is performed inside the same transaction as the update so
-    a planner cannot withdraw a record after an administrator has already
-    approved it.
-    """
+
+def withdraw_pricing_records_from_review(db_path: str | Path, record_ids: list[int], operator_name: str) -> list[dict]:
+    """Atomically withdraw pending records without changing their pricing data."""
+    ids = list(dict.fromkeys(int(record_id) for record_id in record_ids))
+    if not ids:
+        raise ValueError("请先勾选要撤回的资料。")
     with get_connection(db_path) as connection:
-        row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
-        if not row:
-            raise LookupError("定价记录不存在。")
-        if row["status"] != "review_pending":
-            raise ValueError("只有待复核的定价记录可以撤回；企划管理员复核后不能撤回。")
-        connection.execute(
+        # Serialize withdrawal with review saves/approvals, and validate the
+        # whole selection before changing any record.
+        connection.execute("BEGIN IMMEDIATE")
+        rows = []
+        for record_id in ids:
+            row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
+            if not row:
+                raise LookupError("定价记录不存在。")
+            if row["status"] != "review_pending":
+                raise ValueError("只有待复核的定价记录可以撤回；企划管理员复核后不能撤回。")
+            latest_id = connection.execute(
+                "SELECT id FROM pricing_records WHERE source_product_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (row["source_product_id"],),
+            ).fetchone()["id"]
+            if int(latest_id) != record_id:
+                raise ValueError("当前定价记录已被新的流程替代，请刷新后处理最新资料。")
+            rows.append(row)
+        connection.executemany(
             "UPDATE pricing_records SET status = 'suggested', operator_name = ?, confirmed_at = NULL, error_message = '' WHERE id = ?",
-            (operator_name, record_id),
+            [(operator_name, record_id) for record_id in ids],
         )
-        updated = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
-    return dict(updated)
+    return [
+        {**dict(row), "status": "suggested", "operator_name": operator_name, "confirmed_at": None, "error_message": ""}
+        for row in rows
+    ]
 
 
 def save_review_price(
@@ -2269,6 +2285,7 @@ def save_review_price(
 ) -> dict:
     price = validated_launch_price(launch_price)
     with get_connection(db_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
         row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
         if not row:
             raise LookupError("定价记录不存在。")
@@ -2297,6 +2314,7 @@ def approve_pricing_record(
 ) -> dict:
     price = validated_launch_price(launch_price)
     with get_connection(db_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
         row = connection.execute("SELECT * FROM pricing_records WHERE id = ?", (record_id,)).fetchone()
         if not row:
             raise LookupError("定价记录不存在。")

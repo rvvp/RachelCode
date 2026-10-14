@@ -1029,6 +1029,7 @@ class PlanningApplication:
         field_names = {
             "suggest": "suggest_ids",
             "submit-review": "submit_review_ids",
+            "withdraw-review": "withdraw_review_ids",
             "approve": "approve_ids",
             "publish": "publish_ids",
         }
@@ -1100,6 +1101,7 @@ class PlanningApplication:
             entries = self.workbench_entries(season, status_filter, search_filter)
             action_statuses = {
                 "submit-review": {"suggested", "conflict"},
+                "withdraw-review": {"review_pending"},
                 "approve": {"review_pending"},
                 "publish": {"confirmed"},
             }
@@ -1109,7 +1111,7 @@ class PlanningApplication:
                 for item, record, workflow_status in entries
                 if record
                 and workflow_status in allowed_statuses
-                and not self.record_has_cost_change(item, record)
+                and (action == "withdraw-review" or not self.record_has_cost_change(item, record))
             ]
             if not records:
                 raise ValueError("当前筛选范围没有可执行该批量操作的资料。")
@@ -1120,6 +1122,23 @@ class PlanningApplication:
                 if not record:
                     raise LookupError(f"定价记录 {record_id} 不存在。")
                 records.append(record)
+
+        if action == "withdraw-review":
+            withdrawn = db.withdraw_pricing_records_from_review(
+                self.db_path,
+                [int(record["id"]) for record in records],
+                user.get("display_name", "商品部企划员"),
+            )
+            return self.redirect(
+                start_response,
+                self.workbench_redirect_location(
+                    {
+                        f"return_{key}": (form.get(key) or [""])[0]
+                        for key in ("season_year", "status", "search", "page")
+                    },
+                    f"已批量撤回 {len(withdrawn)} 个款色至待初审，可修改后再次提交复核。",
+                ),
+            )
 
         if action == "submit-review":
             if selection_scope == "filtered":
@@ -1637,7 +1656,7 @@ class PlanningApplication:
           <div class='system-rule-title'><span>02</span><div><div class='eyebrow'>WORKFLOW</div><h2>上新审核流程与岗位</h2></div></div>
           <div class='system-rule-flow' aria-label='上新审核流程'><span>同步准入</span><i>→</i><span>测算上新价</span><i>→</i><span>商品部初审</span><i>→</i><span>企划管理员复核</span><i>→</i><span>商品部回传</span></div>
           <ul class='system-rule-list'>
-            <li><strong>商品部初审人员：</strong>同步资料、测算价格、确认或修改价格/品类/渠道、提交复核、复核前撤回，以及复核通过后的人工回传。</li>
+            <li><strong>商品部初审人员：</strong>同步资料、测算价格、确认或修改价格/品类/渠道、提交复核、复核前单条或批量撤回，以及复核通过后的人工回传。撤回保留已有价格、品类和渠道。</li>
             <li><strong>企划管理员：</strong>复核上新价格和上新渠道，可先保存修改再复核通过；不负责与藏宝阁之间的传输动作。渠道标准选项为天猫、天猫官、天猫奥、唯品、同款；回传后由藏宝阁按运营账号渠道属性分配可见范围。</li>
             <li><strong>同款多款色：</strong>价格和渠道按款号统一，页面保存和复核通过时同步处理同款号的全部款色；回传时也按款号整款提交，全部款色要么同时成功、要么全部不写入。Excel 导入导出仍按款色逐行核对。</li>
           </ul>
@@ -1744,6 +1763,7 @@ class PlanningApplication:
                 and self.has_valid_source_cost(item)
             ),
             "submit-review": sum(1 for item, record, workflow_status in filtered_products if record and workflow_status in {"suggested", "conflict"} and not self.record_has_cost_change(item, record)),
+            "withdraw-review": sum(1 for _, record, workflow_status in filtered_products if record and workflow_status == "review_pending"),
             "approve": sum(1 for item, record, workflow_status in filtered_products if record and workflow_status == "review_pending" and not self.record_has_cost_change(item, record)),
             "publish": sum(1 for item, record, workflow_status in filtered_products if record and workflow_status == "confirmed" and not self.record_has_cost_change(item, record)),
         }
@@ -1783,6 +1803,7 @@ class PlanningApplication:
         batch_buttons = (
             "<button type='submit' name='batch_action' value='suggest' data-label='批量测算上新价' disabled>批量测算上新价</button>"
             "<button type='submit' name='batch_action' value='submit-review' data-label='批量初审提交' disabled>批量初审提交</button>"
+            "<button type='submit' name='batch_action' value='withdraw-review' data-label='批量撤回' disabled>批量撤回</button>"
             "<button class='primary' type='submit' name='batch_action' value='publish' data-label='批量回传藏宝阁' disabled>批量回传藏宝阁</button>"
             if user.get("role") == "planner"
             else "<button class='primary' type='submit' name='batch_action' value='approve' data-label='批量复核通过' disabled>批量复核通过</button>"
@@ -1954,12 +1975,14 @@ class PlanningApplication:
                 price_cell = f"<span class='price final-price'>{price_value}</span><small class='calculated-price'>测算价{calculated_price_value}</small><small>{html.escape(record['publication_id'])}</small>"
                 status_cell = f"<span class='status status-{status_class}'>{html.escape(status_label)}</span>"
                 controls = ""
-                if user.get("role") == "planner" and not cost_changed:
+                if user.get("role") == "planner" and record_status == "review_pending":
+                    selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='withdraw_review_ids' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 进行批量撤回或导出'>"
+                elif user.get("role") == "planner" and not cost_changed:
                     if record_status in {"suggested", "conflict"}:
                         selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='submit_review_ids' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 进行批量初审'>"
                     elif record_status == "confirmed":
                         selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='publish_ids' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 批量回传藏宝阁'>"
-                    elif record_status in {"review_pending", "published"}:
+                    elif record_status == "published":
                         selection_cell = f"<input class='pricing-batch-checkbox' type='checkbox' name='export_ids' value='{record['id']}' data-export-record-id='{record['id']}' form='pricing-batch-form' aria-label='选择 {html.escape(record['style_code'] or record['product_name'], quote=True)} 导出定价资料'>"
                 elif user.get("role") == "admin" and not cost_changed:
                     selection_name = "approve_ids" if record_status == "review_pending" else "export_ids"
@@ -2278,7 +2301,7 @@ class PlanningApplication:
           const filteredActionCounts = {json.dumps(filtered_action_counts, ensure_ascii=False)};
           const filteredSelectableCount = {filtered_selectable_count};
           const exportableCount = {exportable_count};
-          const batchFieldByAction = {{'suggest': 'suggest_ids', 'submit-review': 'submit_review_ids', 'approve': 'approve_ids', 'publish': 'publish_ids'}};
+          const batchFieldByAction = {{'suggest': 'suggest_ids', 'submit-review': 'submit_review_ids', 'withdraw-review': 'withdraw_review_ids', 'approve': 'approve_ids', 'publish': 'publish_ids'}};
           const updateBatchControls = () => {{
             const enabled = batchChecks.filter((checkbox) => !checkbox.disabled);
             const selected = enabled.filter((checkbox) => checkbox.checked);
@@ -2365,6 +2388,13 @@ class PlanningApplication:
           if (batchForm) batchForm.addEventListener('submit', (event) => {{
             batchForm.querySelectorAll('.batch-row-value').forEach((input) => input.remove());
             const action = event.submitter?.value;
+            if (action === 'withdraw-review' && selectionScope?.value !== 'filtered') {{
+              const count = batchChecks.filter((checkbox) => checkbox.name === 'withdraw_review_ids' && checkbox.checked && !checkbox.disabled).length;
+              if (!count || !window.confirm(`确认撤回已选的 ${{count}} 个待复核款色吗？撤回后可修改并再次提交。`)) {{
+                event.preventDefault();
+                return;
+              }}
+            }}
             if (selectionScope?.value === 'filtered') {{
               const actionCount = Number(filteredActionCounts[action] || 0);
               const actionLabel = event.submitter?.dataset.label || '批量操作';
