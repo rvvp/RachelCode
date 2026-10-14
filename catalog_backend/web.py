@@ -5658,6 +5658,17 @@ class CatalogApplication:
     .rule-section h2 {{
       margin: 5px 0 14px;
     }}
+    .rule-section,
+    .rule-subsection {{
+      min-width: 0;
+    }}
+    .rule-subsection + .rule-subsection {{
+      margin-top: 24px;
+    }}
+    .rule-subsection h3 {{
+      margin: 0 0 12px;
+      font-size: 18px;
+    }}
     .rules-table-wrap {{
       overflow-x: auto;
       border: 1px solid var(--line);
@@ -5712,7 +5723,8 @@ class CatalogApplication:
     }}
     .rule-callout span,
     .rule-lead,
-    .rule-section > p {{
+    .rule-section > p,
+    .rule-subsection > p {{
       color: var(--muted);
       line-height: 1.7;
     }}
@@ -13788,23 +13800,93 @@ class CatalogApplication:
         trigger_labels = "、".join(
             field.label for field in PRODUCT_FIELDS if field.key in WORKFLOW_RESTART_FIELD_KEYS
         )
+        a_trigger_labels = "、".join(
+            field.label
+            for field in PRODUCT_FIELDS
+            if field.key in WORKFLOW_RESTART_FIELD_KEYS and field.key in A_STAGE_FIELD_KEYS
+        )
+        red_completion_labels = "、".join(
+            PRODUCT_FIELD_MAP[key].label
+            for key in db.completion_required_field_keys({"product_line": "red"})
+        )
+        black_completion_labels = "、".join(
+            "上新折扣" if key == "launch_price" else PRODUCT_FIELD_MAP[key].label
+            for key in db.completion_required_field_keys({"product_line": "black"})
+        )
+        black_blank_labels = "、".join(
+            field.label for field in PRODUCT_FIELDS if field.key in BLACK_LINE_BLANK_FIELD_KEYS
+        )
         content = f"""
         <header class="rules-page-heading">
           <h1>规则说明</h1>
-          <p>这里集中说明商品资料后台的工作流、字段权限和资料进入运营流程后的修改规则。页面与接口均以这些规则为准。</p>
+          <p>商品资料的字段判定、部门权限，以及红黑标线流转和修改条件。</p>
         </header>
         <section class="panel rules-panel">
           <div class="rule-section">
-            <div class="eyebrow">Product Lines</div>
-            <h2>红标线与黑标线边界</h2>
-            <div class="rule-callouts">
-              <div class="rule-callout"><strong>红标线</strong><span>沿用原有主流程。商品部在藏宝阁维护图片；品类、上新价格和上新渠道由商品企划中心维护并回传，再由商品部提交运营部。</span></div>
-              <div class="rule-callout"><strong>黑标线</strong><span>全程只在藏宝阁内完成。商品部在藏宝阁维护图片、品类、上新折扣和上新渠道；任何列表操作、召回、批量处理、接口或异常状态都不能把黑标资料送入商品企划中心。</span></div>
-              <div class="rule-callout"><strong>导入导出</strong><span>资料列表按商品线分开显示，单次 Excel 只能导入或导出一条商品线。黑标线完整导入文件必须明确标记“商品线=黑标线”，红标线与黑标线不能混合处理。</span></div>
+            <h2>字段定义</h2>
+            <div class="rule-subsection">
+              <h3>资料完成</h3>
+              <p>由系统自动计算：下列字段全部有内容时显示“Y”，缺少任一项时保持空白。空白、仅空格或未填写不算完成；图片以主图链接或图库中至少一张图片为准。Y 表示必填项已齐全，内容是否正确仍由商品部核对，不会自动提交运营部。</p>
+              <div class="rules-table-wrap">
+                <table class="rules-table">
+                  <thead><tr><th>商品线</th><th>资料完成 Y 的必填字段</th></tr></thead>
+                  <tbody>
+                    <tr><th>红标线</th><td>{html.escape(red_completion_labels)}</td></tr>
+                    <tr><th>黑标线</th><td>{html.escape(black_completion_labels)}。黑标线不要求含税价。</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <p>商品部筛选“资料完成Y”时，只列出正常资料中“A/B协作中”或“待商品部重新提交”的条目；提交后自动移出筛选结果。已提交的款式仍可显示 Y；召回回到协作或出现待重新提交提示后，满足条件的款式会再次进入筛选结果。</p>
+            </div>
+            <div class="rule-subsection">
+              <h3>状态</h3>
+              <p>由系统根据流转操作和接收记录判定。主流程有四个状态；“待商品部重新提交”是运营阶段的修订提示。“已归档”“已删除”属于资料类型，不属于主流程状态。</p>
+              <div class="rules-table-wrap">
+                <table class="rules-table">
+                  <thead><tr><th>显示内容</th><th>判定条件及含义</th></tr></thead>
+                  <tbody>
+                    <tr><th>跟单整理中</th><td>A 新建资料后，或 B 退回跟单部补充后。A 继续完善资料，尚未开启商品部协作。</td></tr>
+                    <tr><th>A/B协作中</th><td>A 开启商品部协作后，或从运营阶段召回后。A 与 B 按各自字段权限并行补充；无须 A 全部填完后才让 B 开始。</td></tr>
+                    <tr><th>待运营接收</th><td>B 确认资料齐全并提交运营部后，系统建立本次运营批次。A/B 的整体状态在尚无天猫类或唯品类账号接收时显示此状态。</td></tr>
+                    <tr><th>已接收</th><td>任意一个天猫类或唯品类账号接收当前批次后，A/B 的整体状态即为“已接收”。同款只需天猫类或唯品类任一方接收，不需等待另一方，也不需等待同类别全部账号接收。全渠道账号的接收只记录个人进度，不改变整体状态。</td></tr>
+                    <tr><th>C 的个人状态</th><td>C 页面按当前账号、本次运营批次显示：本人未接收为“待运营接收”，本人已接收为“已接收”。因此整体已接收时，其他尚未接收的运营账号仍可看到待接收。重新提交会建立新批次，旧批次的个人接收记录不能代替新批次接收。</td></tr>
+                    <tr><th>待商品部重新提交</th><td>运营阶段的最新资料与上一运营正式版本相比，触发字段发生变动时，A/B 状态栏显示此提示；原主流程节点仍保留。B 重新确认并提交后，提示清除并建立新运营批次。C 已接收账号在修订期间读取上一正式版本，尚未接收账号暂不能接收。</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="rule-subsection">
+              <h3>历时天数、版本与记录</h3>
+              <div class="rules-table-wrap">
+                <table class="rules-table">
+                  <thead><tr><th>系统字段</th><th>计算或记录条件</th></tr></thead>
+                  <tbody>
+                    <tr><th>历时天数</th><td>从资料最初创建日期起，按系统 UTC 日期计算“结束日期 − 创建日期 + 1”，创建当天为 1 天。未提交运营部时结束日期为今天；提交后截至 B 提交日，不等待 C 接收。退回跟单部或召回到 A/B 协作后恢复计时，仍从最初创建日算起，再次提交后截至本次提交日。缺少有效创建时间时显示“未开始”。</td></tr>
+                    <tr><th>修改版本</th><td>新建为 V1；业务字段实际发生修改、企划回传或历史版本恢复时生成新版本，同值保存不会因普通字段编辑新增版本。仅替换图片时更新独立图片版本，业务版本号保持不变。提交运营部建立运营批次，批次与业务版本是两种记录。</td></tr>
+                    <tr><th>发起人</th><td>记录最初新建资料的账号。A 部门其他账号接手补充、修改或流转时，发起人不变；操作日志另记实际操作账号、时间和内容。</td></tr>
+                    <tr><th>更新时间</th><td>记录资料保存或流转操作的更新时间。C 读取的是可用运营版本的更新时间；存在“待商品部重新提交”提示时，新业务内容在重新提交前不会替换 C 正在使用的正式版本。非触发字段和图片按各自更新规则同步。</td></tr>
+                    <tr><th>含税价历史</th><td>记录初始含税价，以及后续每次实际价格变动的前后值、操作账号和时间，可从“价历史”或详情页“含税价历史”查看。非触发字段更新无需重新接收时，可同步更新可用资料。</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="rule-subsection">
+              <h3>删除、归档、召回和召回提醒</h3>
+              <div class="rules-table-wrap">
+                <table class="rules-table">
+                  <thead><tr><th>功能</th><th>使用条件</th><th>操作结果及恢复</th></tr></thead>
+                  <tbody>
+                    <tr><th>删除</th><td>A 跟单部任一账号可删除 A 部门的正常资料，限“跟单整理中”或“A/B协作中”；进入运营阶段必须先召回。可单条删除，或勾选多条后使用“批量删除”。</td><td>资料变为“已删除”，保留记录，从正常列表移出。已删除资料仅管理员可恢复。B/C 无删除权限；管理员可按管理权限删除。</td></tr>
+                    <tr><th>归档</th><td>A 跟单部任一账号可批量归档 A 部门“已接收”的正常资料。管理员可归档正常资料；B/C 无归档权限。</td><td>资料变为“已归档”，从正常列表移出，保留原流程状态、版本和日志。A 任一账号可在“已归档”筛选中恢复本部门资料，管理员也可恢复；恢复后回到正常资料类型。</td></tr>
+                    <tr><th>召回</th><td>A 跟单部任一账号、B 商品部和管理员可对正常的“待运营接收”或“已接收”资料执行单条或批量召回，无需运营部同意。</td><td>立即回到“A/B协作中”，当前接收标记失效。原始发起人、历史版本、历史接收记录和实际操作账号日志保留；C 的正常列表暂不显示该款。修改后由 B 再次确认并提交，C 接收新批次。</td></tr>
+                    <tr><th>召回提醒</th><td>“待运营接收”资料召回时不提醒运营部；“已接收”资料召回时，系统只提醒实际接收过该批次的运营账号。全渠道账号实际接收过也会收到提醒。</td><td>C 点击“资料概览”的“召回提醒”可查看被召回的款号、款色、商品名称、渠道和召回时间。A/B 重新提交运营部后提醒自动关闭，需接收新批次；资料被删除或归档时提醒也关闭。</td></tr>
+                    <tr><th>批量操作</th><td>支持勾选本页、少量条目或全部筛选结果后操作。</td><td>系统逐条检查账号权限、资料类型和流程状态，不符合条件的条目自动跳过，并反馈处理数量；每条成功操作记录实际操作账号。</td></tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
           <div class="rule-section">
-            <div class="eyebrow">Roles</div>
             <h2>各部门操作范围</h2>
             <div class="rules-table-wrap">
               <table class="rules-table">
@@ -13813,46 +13895,70 @@ class CatalogApplication:
                   <tr><th>A 跟单部</th><td>跟单部资料按部门协作：任一 A 账号可补充、修改、导入更新、流转、召回、删除、归档及恢复符合流程条件的 A 部门资料。系统保留原始发起人，并记录每次实际操作账号。</td><td>不能修改商品部或企划中心负责字段；运营阶段不能直接修改触发字段；不能操作其他部门发起的资料。</td></tr>
                   <tr><th>B 商品部</th><td>在 A/B 协作中推进商品资料并维护图片。红标线的品类、上新价格和上新渠道由商品企划中心回传；黑标线的品类、上新折扣和上新渠道由 B 在藏宝阁维护。资料完成后提交运营部，发现错误时可从运营阶段召回。</td><td>不能删除或归档，也不能修改 A 阶段字段；黑标线不能发起、进入或接收任何商品企划中心流程。</td></tr>
                   <tr><th>C 运营部</th><td>按账号渠道属性查看并接收资料：天猫类覆盖天猫、天猫官、天猫奥和同款；唯品类覆盖唯品和同款。任意一个账号接收所属渠道资料后，全局状态即更新为“已接收”，不需等待同类别其他账号逐一接收；全渠道账号可记录个人接收，但不参与全局状态判断，并可查看五个渠道；账单属性仍独立授权。</td><td>不能修改资料、删除、归档或召回。</td></tr>
-                  <tr><th>总经办 / 美工部</th><td>按各自只读范围查看资料。</td><td>不能上传、修改、删除、归档或召回。</td></tr>
+                  <tr><th>总经办 / 美工部</th><td>总经办按跟单部可见范围只读查看和下载；美工部按运营部开放字段读取所有渠道的已流转资料，供详情页制作使用。</td><td>不能上传、修改、删除、归档或召回；美工部不参与账单与结算。</td></tr>
                   <tr><th>管理员</th><td>可查看并监控各部门，维护账号和系统规则，执行必要的流程及生命周期管理。</td><td>管理员操作会写入日志，正式业务仍建议由对应部门完成。</td></tr>
                 </tbody>
               </table>
             </div>
           </div>
           <div class="rule-section">
-            <div class="eyebrow">Lifecycle</div>
-            <h2>删除、归档与召回</h2>
-            <div class="rule-callouts">
-              <div class="rule-callout"><strong>删除</strong><span>A 跟单部任一账号可在“跟单整理中”或“A/B 协作中”删除 A 部门的正常资料，也可勾选多条后使用“批量删除”。系统会逐条校验流程条件，不符合条件的条目自动跳过。进入运营阶段后，必须先召回；已删除资料仅管理员可恢复。</span></div>
-              <div class="rule-callout"><strong>归档</strong><span>A 跟单部任一账号可批量归档“已接收”资料，也可在“已归档”筛选中恢复；管理员可按管理权限归档或恢复。</span></div>
-              <div class="rule-callout"><strong>召回</strong><span>A 跟单部任一账号、B 商品部和管理员可对“待运营接收”或“已接收”资料执行单条或批量召回。召回会将资料转回 A/B 协作，清除当前运营接收标记，并保留原始发起人、历史版本和实际操作账号日志。</span></div>
-              <div class="rule-callout"><strong>召回提醒</strong><span>“待运营接收”资料召回时不提醒运营部；“已接收”资料召回时，系统只提醒实际接收过该批次的运营账号，无需运营部同意。全渠道账号如实际接收过也会收到提醒，但仍不参与全局状态判断。A/B 重新提交运营部后提醒自动关闭，运营部按新批次重新接收。</span></div>
+            <h2>边界和触发规则</h2>
+            <div class="rule-subsection">
+              <h3>红标和黑标线边界</h3>
+              <div class="rules-table-wrap">
+                <table class="rules-table">
+                  <thead><tr><th>边界</th><th>红标线</th><th>黑标线</th></tr></thead>
+                  <tbody>
+                    <tr><th>资料与流转</th><td>A/B 在藏宝阁协作，B 的品类、上新价格和上新渠道经商品企划中心完成并回传，再由 B 提交运营部。</td><td>全程只在藏宝阁内完成。B 维护图片、品类、上新折扣和上新渠道，再提交运营部；黑标线资料不经过商品企划中心。</td></tr>
+                    <tr><th>价格字段</th><td>使用“上新价格”，由商品企划中心维护。</td><td>同一存储字段显示为“上新折扣”，由 B 填写大于 0、最多两位小数的折扣；例如 3.4 表示 3.4 折，不能作为金额理解。</td></tr>
+                    <tr><th>空白字段</th><td>按红标线业务维护。</td><td>{html.escape(black_blank_labels)}保持空白，不参与黑标线资料完成判定。</td></tr>
+                    <tr><th>企划边界</th><td>首次企划、召回后的重回企划判断，以及二次企划均适用。</td><td>任何列表操作、召回、批量处理或接口都不能把黑标资料送入企划中心；无重回企划判断、二次企划或企划回传节点。</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <p>页面、搜索、资料概览、导入和导出按当前商品线分别处理。单次 Excel 只能导入或导出一条商品线，不能混合红黑标；黑标线完整导入文件必须明确标记“商品线=黑标线”。同一个款色不能同时属于两条商品线。</p>
             </div>
-          </div>
-          <div class="rule-section">
-            <div class="eyebrow">Revision Policy</div>
-            <h2>运营阶段修改规则</h2>
-            <p class="rule-lead">资料进入“待运营接收”或“已接收”后，以下字段视为流程触发字段：</p>
-            <div class="trigger-field-list">{html.escape(trigger_labels)}</div>
-            <div class="rules-table-wrap rule-revision-table-wrap">
-              <table class="rules-table rule-revision-table">
-                <thead><tr><th>操作账号</th><th>可修改内容</th><th>处理规则</th></tr></thead>
-                <tbody>
-                  <tr><th>A 跟单部</th><td>可修改 A 阶段负责字段。上方列出的字段属于触发字段。</td><td>处于“待运营接收”或“已接收”时，修改触发字段前必须先使用“召回到 A/B 协作”；非触发字段可直接修改并生成新版本。</td></tr>
-                  <tr><th>B 商品部</th><td>红标线在藏宝阁维护图片，企划字段由商品企划中心维护；黑标线在藏宝阁维护图片、品类、上新折扣和上新渠道。</td><td>图片采用独立图片版本更新，不自动触发召回。发现 B 负责字段有误时，可主动召回到 A/B 协作；红标线按企划规则处理，黑标线直接在藏宝阁修正并重新提交运营部。</td></tr>
-                </tbody>
-              </table>
+            <div class="rule-subsection">
+              <h3>字段权限与 Excel 更新边界</h3>
+              <p>A/B 无论在网页编辑还是 Excel 导入，都只能改自己部门负责的字段。A 按“款色 + 本次需补充字段”导入时，系统对齐同款色的既有资料，只更新本次携带的 A 字段，未携带字段保留；未找到对应款色时新增资料，导入前需核对款色。红标线 B 在藏宝阁只维护图片，品类、上新价格和上新渠道必须在商品企划中心修改并回传；黑标线 B 可在藏宝阁维护这四项，价格填写折扣。</p>
+              <p>同一款号的不同款色可复用同一张图片；图片导入按映射关系更新。替换本地图片时，旧图片备份保留 2 天后自动清理，图片历史不作永久备份。勾选少量条目、勾选本页或选择全部筛选结果后，均可导出勾选资料或导出勾选含图片。</p>
             </div>
-            <div class="rule-callouts">
-              <div class="rule-callout"><strong>重要字段</strong><span>A 修改前请先使用“召回到 A/B 协作”；未召回时系统会拒绝保存或导入，避免运营继续使用不完整版本。</span></div>
-              <div class="rule-callout"><strong>非触发字段</strong><span>A 修改非触发字段会生成新版本并更新资料，不会要求 C 重新接收。B 当前直接可修改的是图片，图片按独立图片版本更新，不触发业务流程重走。</span></div>
-              <div class="rule-callout"><strong>企划回传</strong><span>此规则仅适用于红标线。商品企划中心回传品类、上新价格或上新渠道等变更时，系统会标记“待商品部重新提交”；B 确认后才生成新的运营版本，C 再接收新版本。黑标线无企划回传节点。</span></div>
+            <div class="rule-subsection">
+              <h3>运营阶段修改规则</h3>
+              <p class="rule-lead">适用于正常资料已经进入“待运营接收”或“已接收”后的修改。系统固定的触发字段如下；黑标线“上新价格”对应“上新折扣”，“成分(英文)”保持空白。</p>
+              <div class="trigger-field-list">{html.escape(trigger_labels)}</div>
+              <div class="rules-table-wrap rule-revision-table-wrap">
+                <table class="rules-table rule-revision-table">
+                  <thead><tr><th>修改情形</th><th>应执行的操作</th><th>系统结果</th></tr></thead>
+                  <tbody>
+                    <tr><th>A 修改触发字段</th><td>A 负责的触发字段：{html.escape(a_trigger_labels)}。修改前请先使用“召回到 A/B 协作”，再编辑或导入。</td><td>未召回时拒绝保存或导入。召回后回到协作，按商品线完成修改；B 确认并重新提交后，C 接收新批次。</td></tr>
+                    <tr><th>A 修改非触发字段</th><td>例如含税价、供应商、供应商编号、年份季节、大货到仓等 A 字段，可直接编辑或导入。</td><td>生成新业务版本，更新可用资料，流程状态及本批次接收记录保持，C 无需重新接收。含税价另记价格历史；若需重新定价，由 B 按下方企划规则处理。</td></tr>
+                    <tr><th>B 修改图片</th><td>红黑标均可直接替换图片，不要求先召回。</td><td>更新图片和独立图片版本，不自动召回、不自动重回企划，也不要求 C 重新接收。</td></tr>
+                    <tr><th>B 修改红标企划字段</th><td>品类、上新价格和上新渠道不能在藏宝阁直接改。先召回到协作，再由 B 发起重新企划，在企划中心修改并回传。</td><td>运营阶段直接回传会被拒绝。有效回传后仍处于“A/B协作中”，需 B 再次提交；C 才能接收新批次。</td></tr>
+                    <tr><th>B 修改黑标上新折扣或渠道</th><td>可先召回再修改；也可直接在运营阶段保存自己负责字段。</td><td>直接保存时，与上一正式运营版本相比有实际差异就标记“待商品部重新提交”；C 暂继续使用上一正式版本，B 确认并重新提交后才能接收新批次。改回上一正式值且不存在其他触发差异时，提示清除。</td></tr>
+                    <tr><th>B 修改黑标品类</th><td>可在藏宝阁直接修改；品类不在固定触发字段内。</td><td>更新业务版本和可用资料，本批次接收记录保持，C 无需重新接收。若与其他触发字段一起修改，按触发规则处理。</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <p>“必须先召回”表示操作者先执行召回，系统随后才允许保存该修改；“待商品部重新提交”表示修改已保存，但尚未作为新批次交给运营部。触发按实际变更判定，同值填写不算修改；字段权限仍按部门执行。</p>
             </div>
-          </div>
-          <div class="rule-section">
-            <div class="eyebrow">Audit Trail</div>
-            <h2>版本与记录</h2>
-            <p>每次资料修改、状态流转、召回、删除和归档都会写入操作日志。资料版本页用于回溯修改前后的版本；含税价另有独立历史记录，便于查询最初价格和后续调整。</p>
+            <div class="rule-subsection">
+              <h3>重回企划规则（仅红标线）</h3>
+              <p>召回是把资料退回 A/B 协作；重回企划是重新处理品类、上新价格和上新渠道。召回不会自动把资料送进企划中心，是否重走由 B 判断。</p>
+              <div class="rules-table-wrap">
+                <table class="rules-table">
+                  <thead><tr><th>条件</th><th>B 的操作</th><th>后续处理</th></tr></thead>
+                  <tbody>
+                    <tr><th>从运营阶段召回</th><td>系统标记“重回企划判断”。B 根据本次修订选择“重新进入商品企划中心”或“本次无需重走企划”，可单条或批量判断。</td><td>选择重新进入后，新企划请求在同步时进入企划中心；选择无需重走则保留原企划结果，补齐资料后提交运营部。尚未判断时不会自动生成新企划。</td></tr>
+                    <tr><th>协作中修改含税价</th><td>资料已完成过企划回传，且当前没有已发起或待判断的企划请求时，含税价实际变化会产生“重回企划判断”。B 判断是否按新成本重新定价。</td><td>变化本身不会自动重走；B 选择重新进入后才发起新企划。若资料尚未完成首次企划，按首次企划继续；已在重走流程中则继续当前请求。</td></tr>
+                    <tr><th>运营阶段修改含税价</th><td>含税价不是召回触发字段，A 可直接更新。若 B 认为需要调整企划结果，先召回，再选择重新企划。</td><td>单独修改含税价只记新版本和价格历史，不自动召回、不自动重回企划，C 不需仅因成本更新重新接收。</td></tr>
+                    <tr><th>协作中主动修改企划结果</th><td>资料已完成过首次企划，当前没有待判断或正在执行的重走请求时，B 可点击“发起二次企划”。</td><td>新请求进入企划中心；相同请求重复操作不会重复创建批次。单纯刷新或同步不会自行发起二次企划。</td></tr>
+                    <tr><th>等待企划与回传</th><td>已选择重新进入或发起二次企划后，等待本次企划完成回传，再核对资料。</td><td>回传前不能提交运营部。回传校验来源版本、企划批次、款号、款色和含税成本，资料变化时须重新同步核对；有效回传仍留在协作，由 B 确认 Y 后提交运营部，C 再接收新批次。</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <p>例如：只改材质，A 先召回，B 可判断本次无需重走企划，资料核对后重新提交；若要调整上新价格或上新渠道，则由 B 发起重新企划，完成回传后再提交运营部。黑标线两种情况均在藏宝阁内处理。</p>
+            </div>
           </div>
         </section>
         """

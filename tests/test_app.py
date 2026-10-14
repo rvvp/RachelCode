@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import tempfile
 import unittest
 from base64 import b64decode
@@ -6450,7 +6451,10 @@ class CatalogAppTests(unittest.TestCase):
 
         detail_response = self.request("/products/1", cookie=cookie)
         detail_body = detail_response["body"].decode("utf-8")
-        self.assertIn(f"历时天数</span><strong>{expected_days} 天</strong>", detail_body)
+        self.assertIn(
+            f'<span class="detail-summary-chip">历时天数 <strong>{expected_days} 天</strong></span>',
+            detail_body,
+        )
 
         api_response = self.request("/api/products", cookie=cookie)
         payload = json.loads(api_response["body"].decode("utf-8"))
@@ -6551,12 +6555,38 @@ class CatalogAppTests(unittest.TestCase):
 
         a_user = next(user for user in db.list_users(self.db_path) if user["department"] == "A")
         with db.get_connection(self.db_path) as connection:
+            with self.assertRaisesRegex(PermissionError, "请先使用“召回到 A/B 协作”"):
+                db.update_product(connection, 2, {"tag_price": 459}, a_user["id"])
+        a_cookie = self.login("a_editor", "demo123")
+        recall_response = self.request(
+            "/products/2/status",
+            method="POST",
+            body=urlencode({"status": "pending"}).encode("utf-8"),
+            cookie=a_cookie,
+        )
+        self.assertTrue(recall_response["status"].startswith("302"))
+        with db.get_connection(self.db_path) as connection:
             db.update_product(connection, 2, {"tag_price": 459}, a_user["id"])
-        restarted = db.get_product(self.db_path, 2)
-        self.assertEqual(restarted["workflow_restart_required"], 1)
-        self.assertEqual(db.completion_flag(restarted), "Y")
-        restarted_body = self.request(ready_path, cookie=b_cookie)["body"].decode("utf-8")
-        self.assertIn("毛感针织开衫", restarted_body)
+        recalled = db.get_product(self.db_path, 2)
+        self.assertEqual(recalled["status"], "pending")
+        self.assertEqual(recalled["workflow_restart_required"], 0)
+        self.assertEqual(db.completion_flag(recalled), "Y")
+        recalled_body = self.request(ready_path, cookie=b_cookie)["body"].decode("utf-8")
+        self.assertIn("毛感针织开衫", recalled_body)
+
+        black_id = self.create_black_line_product()
+        b_user = next(user for user in db.list_users(self.db_path) if user["department"] == "B")
+        with db.get_connection(self.db_path) as connection:
+            db.change_product_status(connection, black_id, "pending", a_user["id"], "开启商品部协作", "筛选测试")
+            db.change_product_status(connection, black_id, "published", b_user["id"], "提交运营部", "筛选测试")
+            db.update_product(connection, black_id, {"launch_price": 4.25}, b_user["id"])
+        revised_black = db.get_product(self.db_path, black_id)
+        self.assertEqual(revised_black["workflow_restart_required"], 1)
+        self.assertEqual(db.completion_flag(revised_black), "Y")
+        black_ready_body = self.request(ready_path + "&line=black", cookie=b_cookie)["body"].decode("utf-8")
+        self.assertIn("黑标测试商品", black_ready_body)
+        self.assertIn("待商品部重新提交", black_ready_body)
+        self.assertNotIn("毛感针织开衫", black_ready_body)
 
     def test_c_product_detail_quick_json_respects_visible_fields(self):
         cookie = self.login("c_viewer", "demo123")
@@ -8220,6 +8250,22 @@ class CatalogAppTests(unittest.TestCase):
         self.assertIn('class="rules-page-heading"', rules_body)
         self.assertNotIn("四个流程状态", rules_body)
         self.assertNotIn('class="hero"', rules_body)
+        self.assertEqual(
+            re.findall(r"<h2>(.*?)</h2>", rules_body),
+            ["字段定义", "各部门操作范围", "边界和触发规则"],
+        )
+        self.assertIn("<h3>资料完成</h3>", rules_body)
+        self.assertIn("黑标线不要求含税价", rules_body)
+        self.assertIn("提交后自动移出筛选结果", rules_body)
+        self.assertIn("C 的个人状态", rules_body)
+        self.assertIn("创建当天为 1 天", rules_body)
+        self.assertIn("提交后截至 B 提交日，不等待 C 接收", rules_body)
+        self.assertIn("仍从最初创建日算起", rules_body)
+        self.assertIn("<h3>运营阶段修改规则</h3>", rules_body)
+        self.assertIn("运营阶段直接回传会被拒绝", rules_body)
+        self.assertIn("<h3>重回企划规则（仅红标线）</h3>", rules_body)
+        self.assertIn("召回不会自动把资料送进企划中心", rules_body)
+        self.assertNotIn("商品企划中心回传品类、上新价格或上新渠道等变更时，系统会标记", rules_body)
         self.assertIn("材质", rules_body)
         self.assertIn("请先使用“召回到 A/B 协作”", rules_body)
         self.assertIn("含税价", rules_body)
