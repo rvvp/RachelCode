@@ -78,9 +78,12 @@ class PlanningCenterTests(unittest.TestCase):
         FormParser().feed(markup)
         return values
 
-    def workbook_multipart(self, workbook_bytes: bytes, filename: str = "initial-review.xlsx") -> tuple[bytes, str]:
+    def workbook_multipart(self, workbook_bytes: bytes, filename: str = "initial-review.xlsx", fields: dict | None = None) -> tuple[bytes, str]:
         boundary = "----PlanningCenterExcelTest"
-        body = (
+        body = b"".join(
+            (f"--{boundary}\r\n" f'Content-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n').encode("utf-8")
+            for key, value in (fields or {}).items()
+        ) + (
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="workbook"; filename="{filename}"\r\n'
             "Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n"
@@ -4500,6 +4503,177 @@ class PlanningCenterTests(unittest.TestCase):
             planning_db.submit_pricing_for_review(self.planning_db_path, record["id"], 639, "商品部企划员", "其他", "唯品")
             for record in records
         ]
+
+    def column_filter_products(self, count=54):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        planning_db.save_category_option(self.planning_db_path, "针织衫", "针织衫", 20)
+        products = [
+            {
+                "id": 7600 + index,
+                "style_code": f"COLUMN-{index:03d}",
+                "style_color": f"COLUMN-{index:03d}-黑",
+                "product_name": "表头筛选测试款" if index <= count else "表头筛选针织衫",
+                "season_year": "2026秋冬",
+                "supplier": "供应商乙" if index == count else "供应商甲",
+                "category": "针织衫" if index > count else "其他",
+                "actual_cost": 150,
+                "status": "pending",
+                "source_version_no": 1,
+            }
+            for index in range(count + 2)
+        ]
+        planning_db.upsert_source_products(self.planning_db_path, products)
+        return products
+
+    def test_workbench_column_filters_use_live_supplier_and_displayed_category(self):
+        products = self.column_filter_products(2)
+        records = planning_db.create_pricing_records(self.planning_db_path, products, "初审员")
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("UPDATE source_products SET supplier = '最新供应商' WHERE id = ?", (products[0]["id"],))
+            connection.execute("UPDATE pricing_records SET category = '针织衫' WHERE id = ?", (records[1]["id"],))
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        source_ids = lambda **filters: {item["id"] for item, _, _ in app.workbench_entries(**filters)}
+        self.assertEqual(source_ids(supplier="最新供应商"), {products[0]["id"]})
+        self.assertEqual(source_ids(supplier="供应商甲", filter_category="其他"), set())
+        self.assertEqual(source_ids(supplier="供应商甲", filter_category="针织衫"), {products[1]["id"], products[3]["id"]})
+        self.assertEqual(source_ids(filter_category="其他"), {products[0]["id"], products[2]["id"]})
+        self.assertEqual(source_ids(supplier="不存在"), set())
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, records[0]["id"])["supplier"], "供应商甲")
+
+    def test_workbench_column_filters_preserve_forms_pagination_and_empty_results(self):
+        products = self.column_filter_products()
+        planning_db.create_pricing_records(self.planning_db_path, products, "初审员")
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planner")
+        view = {"season_year": "2026秋冬", "status": "suggested", "search": "COLUMN-", "supplier": "供应商甲", "filter_category": "其他"}
+        page = self.wsgi_request(app, "/workbench?" + urlencode({**view, "page": 2}), cookie=cookie)["body"].decode()
+        self.assertEqual(page.count("id='pricing-row-"), 4)
+        self.assertIn("共 54 款", page)
+        self.assertIn("选择全部筛选资料（54）", page)
+        self.assertIn("name='supplier' form='pricing-column-filter-form' aria-label='筛选供应商'", page)
+        self.assertIn("name='filter_category' form='pricing-column-filter-form' aria-label='筛选品类'", page)
+        self.assertIn("class='pricing-column-filter is-filtered'", page)
+        fields = self.hidden_form_values(page, "pricing-column-filter-form")
+        self.assertEqual(fields, {key: view[key] for key in ("season_year", "status", "search")})
+        self.assertEqual(self.hidden_form_values(page, "pricing-batch-form"), {**view, "page": "2", "selection_scope": "selected"})
+        self.assertEqual(self.hidden_form_values(page, "pricing-import-form"), {f"return_{key}": str(value) for key, value in {**view, "page": 2}.items()})
+        self.assertIn(("href='/workbench?" + urlencode(view) + "'").replace("&", "&amp;"), page)
+        clear_view = {key: value for key, value in view.items() if key != "search"}
+        self.assertIn(("href='/workbench?" + urlencode(clear_view) + "'").replace("&", "&amp;"), page)
+        supplier_markup = page.split("aria-label='筛选供应商'>", 1)[1].split("</select>", 1)[0]
+        self.assertIn("供应商乙", supplier_markup)
+        category_markup = page.split("aria-label='筛选品类'>", 1)[1].split("</select>", 1)[0]
+        for option in planning_db.list_category_options(self.planning_db_path, enabled_only=True):
+            self.assertIn(f"value='{option['name']}'", category_markup)
+        empty = self.wsgi_request(app, "/workbench?" + urlencode({**view, "supplier": "不存在"}), cookie=cookie)["body"].decode()
+        self.assertNotIn("id='pricing-row-", empty)
+        self.assertIn("<option value=''>全部供应商</option>", empty)
+        self.assertIn("value='不存在' selected", empty)
+
+    def test_column_filtered_cross_page_calculation_and_initial_submission(self):
+        products = self.column_filter_products()
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planner")
+        view = {"season_year": "2026秋冬", "status": "waiting", "search": "COLUMN-", "supplier": "供应商甲", "filter_category": "其他"}
+        denied = self.wsgi_request(app, "/pricing/batch", method="POST", body=urlencode({**view, "batch_action": "suggest", "suggest_ids": products[-1]["id"]}).encode(), cookie=cookie)
+        self.assertTrue(denied["status"].startswith("400"))
+        response = self.wsgi_request(app, "/pricing/batch", method="POST", body=urlencode({**view, "batch_action": "suggest", "selection_scope": "filtered"}).encode(), cookie=cookie)
+        self.assertTrue(response["status"].startswith("302"), response["body"])
+        query = parse_qs(urlsplit(dict(response["headers"])["Location"]).query)
+        self.assertEqual({key: values[0] for key, values in query.items() if key != "notice"}, {**view, "status": "suggested"})
+        records = planning_db.list_pricing_records(self.planning_db_path)
+        self.assertEqual(len(records), 54)
+        self.assertEqual({record["source_product_id"] for record in records}, {product["id"] for product in products[:54]})
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("UPDATE pricing_records SET channel = '唯品'")
+        planning_db.create_pricing_records(self.planning_db_path, products[54:], "初审员")
+        response = self.wsgi_request(app, "/pricing/batch", method="POST", body=urlencode({**view, "status": "suggested", "batch_action": "submit-review", "selection_scope": "filtered"}).encode(), cookie=cookie)
+        self.assertTrue(response["status"].startswith("302"), response["body"])
+        records = planning_db.list_pricing_records(self.planning_db_path)
+        self.assertEqual(sum(record["status"] == "review_pending" for record in records), 54)
+        self.assertEqual(sum(record["status"] == "suggested" for record in records), 2)
+
+    def test_column_filtered_review_save_and_approval_keep_view(self):
+        records = self.pending_review_batch_records()
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planning_admin")
+        view = {"season_year": "2026秋冬", "status": "review_pending", "search": "WITHDRAW-BATCH-", "supplier": "测试供应商", "filter_category": "其他"}
+        page = self.wsgi_request(app, "/workbench?" + urlencode(view), cookie=cookie)["body"].decode()
+        self.assertIn("name='return_supplier' value='测试供应商'", page)
+        self.assertIn("name='return_filter_category' value='其他'", page)
+        fields = {f"return_{key}": value for key, value in view.items()}
+        for action in ("review-save", "approve"):
+            response = self.wsgi_request(app, f"/pricing/{records[0]['id']}/{action}", method="POST", body=urlencode({**fields, "launch_price": 649, "channel": "天猫"}).encode(), cookie=cookie)
+            self.assertTrue(response["status"].startswith("302"), response["body"])
+            location = urlsplit(dict(response["headers"])["Location"])
+            self.assertEqual({key: values[0] for key, values in parse_qs(location.query).items() if key != "notice"}, view)
+            self.assertEqual(location.fragment, f"pricing-row-{records[0]['source_product_id']}")
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, records[0]["id"])["status"], "confirmed")
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, records[1]["id"])["status"], "review_pending")
+
+    def test_column_filtered_batch_approval_and_withdrawal_exclude_other_suppliers(self):
+        records = self.pending_review_batch_records(54)
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("UPDATE source_products SET supplier = '其他供应商' WHERE id = ?", (records[-1]["source_product_id"],))
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        admin_cookie = self.login_cookie(app, "planning_admin")
+        planner_cookie = self.login_cookie(app, "planner")
+        view = {"season_year": "2026秋冬", "status": "review_pending", "supplier": "测试供应商", "filter_category": "其他"}
+        rejected = self.wsgi_request(app, "/pricing/batch", method="POST", body=urlencode({**view, "batch_action": "approve", "approve_ids": records[-1]["id"]}).encode(), cookie=admin_cookie)
+        self.assertTrue(rejected["status"].startswith("400"))
+        withdrawn = self.wsgi_request(app, "/pricing/batch", method="POST", body=urlencode({**view, "batch_action": "withdraw-review", "withdraw_review_ids": records[0]["id"]}).encode(), cookie=planner_cookie)
+        self.assertTrue(withdrawn["status"].startswith("302"), withdrawn["body"])
+        approved = self.wsgi_request(app, "/pricing/batch", method="POST", body=urlencode({**view, "batch_action": "approve", "selection_scope": "filtered"}).encode(), cookie=admin_cookie)
+        self.assertTrue(approved["status"].startswith("302"), approved["body"])
+        states = {record["id"]: record["status"] for record in planning_db.list_pricing_records(self.planning_db_path)}
+        self.assertEqual(states[records[0]["id"]], "suggested")
+        self.assertEqual(states[records[-1]["id"]], "review_pending")
+        self.assertEqual(sum(status == "confirmed" for status in states.values()), 52)
+
+    def test_column_filtered_excel_export_is_editable_and_import_keeps_filters(self):
+        products = self.column_filter_products(2)
+        records = planning_db.create_pricing_records(self.planning_db_path, products, "初审员")
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        cookie = self.login_cookie(app, "planner")
+        view = {"season_year": "2026秋冬", "status": "suggested", "search": "COLUMN-", "supplier": "供应商甲", "filter_category": "其他"}
+        for scope in ("filtered", "selected"):
+            query = {**view, "selection_scope": scope, "selected": ",".join(str(record["id"]) for record in records)}
+            exported = self.wsgi_request(app, "/pricing/export.xlsx?" + urlencode(query), cookie=cookie)
+            self.assertTrue(exported["status"].startswith("200"), exported["body"][:200])
+            workbook = load_workbook(io.BytesIO(exported["body"]))
+            sheet = workbook.active
+            self.assertEqual(sheet.max_row, 3)
+            self.assertEqual({sheet.cell(row, 6).value for row in (2, 3)}, {products[0]["style_code"], products[1]["style_code"]})
+            for worksheet in workbook.worksheets:
+                self.assertFalse(worksheet.protection.sheet)
+                self.assertTrue(all(not cell.protection.locked for row in worksheet.iter_rows() for cell in row))
+        for row in (2, 3):
+            sheet.cell(row, 16).value = 649
+            sheet.cell(row, 17).value = "天猫官"
+        edited = io.BytesIO()
+        workbook.save(edited)
+        fields = {f"return_{key}": value for key, value in view.items()}
+        body, content_type = self.workbook_multipart(edited.getvalue(), fields=fields)
+        imported = self.wsgi_request(app, "/pricing/import", method="POST", body=body, content_type=content_type, cookie=cookie)
+        self.assertTrue(imported["status"].startswith("302"), imported["body"])
+        query = parse_qs(urlsplit(dict(imported["headers"])["Location"]).query)
+        self.assertEqual({key: values[0] for key, values in query.items() if key != "notice"}, view)
+        for index, record in enumerate(records):
+            saved = planning_db.get_pricing_record(self.planning_db_path, record["id"])
+            self.assertEqual(saved["channel"], "天猫官" if index < 2 else "")
+            self.assertEqual(saved["launch_price"], 649 if index < 2 else 599)
+
+    def test_column_filtered_selected_export_matches_rematched_category(self):
+        products = self.column_filter_products(1)
+        record = planning_db.create_pricing_record(self.planning_db_path, products[0], "初审员")
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("UPDATE pricing_records SET category = '已删除品类' WHERE id = ?", (record["id"],))
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        query = {"status": "suggested", "supplier": "供应商甲", "filter_category": "其他", "selection_scope": "selected", "selected": record["id"]}
+        exported = self.wsgi_request(app, "/pricing/export.xlsx?" + urlencode(query), cookie=self.login_cookie(app, "planner"))
+        self.assertTrue(exported["status"].startswith("200"), exported["body"][:200])
+        self.assertEqual(load_workbook(io.BytesIO(exported["body"])).active["O2"].value, "其他")
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["category"], "已删除品类")
 
     def test_selected_batch_withdrawal_preserves_prices_permissions_and_view(self):
         records = self.pending_review_batch_records()

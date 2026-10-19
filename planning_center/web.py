@@ -27,6 +27,7 @@ MAX_PLANNING_IMAGE_BYTES = 20 * 1024 * 1024
 AUTOMATIC_SYNC_INTERVAL_SECONDS = 60
 AUTOMATIC_SYNC_TIMEOUT_SECONDS = 3
 LOGGER = logging.getLogger(__name__)
+WORKBENCH_FILTER_KEYS = ("season_year", "status", "search", "supplier", "filter_category")
 
 
 class PlanningApplication:
@@ -201,7 +202,7 @@ class PlanningApplication:
     def workbench_redirect_location(self, form: dict, message: str, record: dict | None = None) -> str:
         """Return to the workbench view that submitted an inline workflow action."""
         query = {}
-        for key in ("season_year", "status", "search"):
+        for key in WORKBENCH_FILTER_KEYS:
             value = str(form.get(f"return_{key}") or "").strip()
             if value:
                 query[key] = value
@@ -770,24 +771,33 @@ class PlanningApplication:
         season = str(query.get("season_year") or "").strip()
         status = str(query.get("status") or "").strip()
         search = str(query.get("search") or "").strip()
+        supplier = str(query.get("supplier") or "").strip()
+        filter_category = str(query.get("filter_category") or "").strip()
         selection_scope = str(query.get("selection_scope") or "filtered").strip()
         if selection_scope not in {"selected", "filtered"}:
             raise ValueError("导出选择范围不正确。")
         selected_ids = self.parse_export_record_ids(query.get("selected", ""))
+        entries = None
+        if selection_scope == "filtered" or supplier or filter_category:
+            entries = self.workbench_entries(
+                season, status, search, supplier=supplier, filter_category=filter_category
+            )
         if selection_scope == "selected":
             if not selected_ids:
                 raise ValueError("请先选择要导出的资料。")
+            if entries is not None:
+                visible_ids = {int(record["id"]) for _, record, _ in entries if record}
+                selected_ids = [record_id for record_id in selected_ids if record_id in visible_ids]
             rows = db.list_pricing_export_rows(
                 self.db_path,
                 season_year=season,
                 status=status,
                 record_ids=selected_ids,
-            )
+            ) if selected_ids else []
         else:
             # The workbench may contain several historical revisions for one
             # source product. Export only the latest row currently visible in
             # the selected season/status filter.
-            entries = self.workbench_entries(season, status, search)
             visible_record_ids = [int(record["id"]) for _, record, _ in entries if record]
             if len(visible_record_ids) > 5000:
                 raise ValueError("当前筛选范围超过 5000 款，请增加年份季节或定价状态筛选后再导出。")
@@ -797,6 +807,9 @@ class PlanningApplication:
                 status=status,
                 record_ids=visible_record_ids,
             ) if visible_record_ids else []
+        if entries is not None and (supplier or filter_category):
+            displayed_categories = {int(record["id"]): record["category"] for _, record, _ in entries if record}
+            rows = [{**row, "category": displayed_categories[int(row["id"])]} for row in rows]
         if not rows:
             raise ValueError("当前筛选范围没有可导出的定价资料。")
         categories = [item["name"] for item in db.list_category_options(self.db_path, enabled_only=True)]
@@ -904,7 +917,13 @@ class PlanningApplication:
             notice = f"已从 Excel 导入并保存 {updated} 款复核资料。"
         return self.redirect(
             start_response,
-            "/workbench?status=" + allowed_status + "&notice=" + self.q(notice),
+            self.workbench_redirect_location(
+                {
+                    **{f"return_{key}": storage.getfirst(f"return_{key}", "") for key in (*WORKBENCH_FILTER_KEYS, "page")},
+                    "return_status": storage.getfirst("return_status", allowed_status),
+                },
+                notice,
+            ),
         )
 
     @staticmethod
@@ -935,16 +954,29 @@ class PlanningApplication:
         )
         return any(term in searchable for term in search_terms)
 
+    @staticmethod
+    def workbench_entry_matches_columns(item: dict, record: dict | None, supplier: str, category: str) -> bool:
+        displayed_category = str((record or {}).get("category") or item.get("category_suggestion") or item.get("category") or "").strip()
+        return (
+            (not supplier or str(item.get("supplier") or "").strip() == supplier)
+            and (not category or displayed_category == category)
+        )
+
     def workbench_entries(
         self,
         season_year: str = "",
         status: str = "",
         search: str = "",
         category_options: list[dict] | None = None,
+        *,
+        supplier: str = "",
+        filter_category: str = "",
     ) -> list[tuple[dict, dict | None, str]]:
         """Return the same filtered source/record rows used by the workbench and batch APIs."""
         season = str(season_year or "").strip()
         requested_status = str(status or "").strip()
+        requested_supplier = str(supplier or "").strip()
+        requested_category = str(filter_category or "").strip()
         search_terms = self.workbench_search_terms(search)
         active_category_options = category_options or db.list_category_options(
             self.db_path,
@@ -1008,6 +1040,8 @@ class PlanningApplication:
                         record = {**record, "category": rematched_category}
             if requested_status and workflow_status != requested_status:
                 continue
+            if not self.workbench_entry_matches_columns(item, record, requested_supplier, requested_category):
+                continue
             entries.append((item, record, workflow_status))
         return entries
 
@@ -1046,13 +1080,14 @@ class PlanningApplication:
         season = str((form.get("season_year") or [""])[0]).strip()
         status_filter = str((form.get("status") or [""])[0]).strip()
         search_filter = str((form.get("search") or [""])[0]).strip()
+        column_filters = {key: str((form.get(key) or [""])[0]).strip() for key in ("supplier", "filter_category")}
         item_ids = [] if selection_scope == "filtered" else self.batch_record_ids(form.get(field_name, []))
         if selection_scope == "selected" and not item_ids:
             raise ValueError("请先勾选要处理的款式。")
 
         if action == "suggest":
             if selection_scope == "filtered":
-                entries = self.workbench_entries(season, status_filter, search_filter)
+                entries = self.workbench_entries(season, status_filter, search_filter, **column_filters)
                 # Match the page's disabled-checkbox rule: a filtered batch
                 # only includes waiting products with a positive catalog cost.
                 products = [
@@ -1064,6 +1099,13 @@ class PlanningApplication:
                 if not products:
                     raise ValueError("当前筛选范围没有待测算资料。")
             else:
+                if any(column_filters.values()):
+                    visible_ids = {
+                        int(product["id"])
+                        for product, _, _ in self.workbench_entries(season, status_filter, search_filter, **column_filters)
+                    }
+                    if any(product_id not in visible_ids for product_id in item_ids):
+                        raise ValueError("所选资料已不在当前供应商或品类筛选范围，请刷新后重新选择。")
                 latest_records = {}
                 for record in db.list_pricing_records(self.db_path):
                     latest_records.setdefault(int(record["source_product_id"]), record)
@@ -1089,7 +1131,9 @@ class PlanningApplication:
                         key: value
                         for key, value in (
                             ("status", "suggested"),
+                            ("season_year", season),
                             ("search", search_filter),
+                            *column_filters.items(),
                             ("notice", f"已批量生成 {len(created)} 款测算上新价。"),
                         )
                         if value
@@ -1098,7 +1142,7 @@ class PlanningApplication:
             )
 
         if selection_scope == "filtered":
-            entries = self.workbench_entries(season, status_filter, search_filter)
+            entries = self.workbench_entries(season, status_filter, search_filter, **column_filters)
             action_statuses = {
                 "submit-review": {"suggested", "conflict"},
                 "withdraw-review": {"review_pending"},
@@ -1122,6 +1166,14 @@ class PlanningApplication:
                 if not record:
                     raise LookupError(f"定价记录 {record_id} 不存在。")
                 records.append(record)
+            if any(column_filters.values()):
+                visible_ids = {
+                    int(record["id"])
+                    for _, record, _ in self.workbench_entries(season, status_filter, search_filter, **column_filters)
+                    if record
+                }
+                if any(int(record["id"]) not in visible_ids for record in records):
+                    raise ValueError("所选资料已不在当前供应商或品类筛选范围，请刷新后重新选择。")
 
         if action == "withdraw-review":
             withdrawn = db.withdraw_pricing_records_from_review(
@@ -1134,7 +1186,7 @@ class PlanningApplication:
                 self.workbench_redirect_location(
                     {
                         f"return_{key}": (form.get(key) or [""])[0]
-                        for key in ("season_year", "status", "search", "page")
+                        for key in (*WORKBENCH_FILTER_KEYS, "page")
                     },
                     f"已批量撤回 {len(withdrawn)} 个款色至待初审，可修改后再次提交复核。",
                 ),
@@ -1203,7 +1255,7 @@ class PlanningApplication:
                 self.workbench_redirect_location(
                     {
                         f"return_{key}": (form.get(key) or [""])[0]
-                        for key in ("season_year", "status", "search", "page")
+                        for key in (*WORKBENCH_FILTER_KEYS, "page")
                     },
                     f"已批量提交 {len(pending)} 款上新定价进入复核。",
                 ),
@@ -1249,7 +1301,9 @@ class PlanningApplication:
                         key: value
                         for key, value in (
                             ("status", "confirmed"),
+                            ("season_year", season),
                             ("search", search_filter),
+                            *column_filters.items(),
                             ("notice", f"已批量复核通过 {approved_count} 个款色。"),
                         )
                         if value
@@ -1274,6 +1328,7 @@ class PlanningApplication:
             except (LookupError, ValueError) as error:
                 failed_styles.append((style_code or record["product_name"], str(error)))
         query = {"notice": f"已批量回传 {len(published)} 个款色，均按款号整款提交。"}
+        query.update({key: value for key, value in {"season_year": season, **column_filters}.items() if value})
         if search_filter:
             query["search"] = search_filter
         if failed_styles:
@@ -1717,6 +1772,8 @@ class PlanningApplication:
         season = query.get("season_year", "")
         status = query.get("status", "")
         search = str(query.get("search") or "").strip()
+        supplier = str(query.get("supplier") or "").strip()
+        filter_category = str(query.get("filter_category") or "").strip()
         try:
             requested_page = max(1, int(query.get("page") or 1))
         except ValueError:
@@ -1731,11 +1788,26 @@ class PlanningApplication:
             if sync_error and not error:
                 error = sync_error
         category_options = db.list_category_options(self.db_path, enabled_only=True)
-        filtered_products = self.workbench_entries(
+        base_products = self.workbench_entries(
             season,
             status,
             search,
             category_options=category_options,
+        )
+        filtered_products = [
+            entry for entry in base_products
+            if self.workbench_entry_matches_columns(entry[0], entry[1], supplier, filter_category)
+        ]
+        supplier_options = sorted(
+            {str(item.get("supplier") or "").strip() for item, _, _ in base_products if str(item.get("supplier") or "").strip()}
+            | ({supplier} if supplier else set())
+        )
+        category_filter_options = [option["name"] for option in category_options]
+        if filter_category and filter_category not in category_filter_options:
+            category_filter_options.append(filter_category)
+        column_filter_context = "".join(
+            f"<input type='hidden' name='{key}' value='{html.escape(value, quote=True)}'>"
+            for key, value in (("supplier", supplier), ("filter_category", filter_category)) if value
         )
         channel_options = db.list_channel_options(self.db_path, enabled_only=True)
         workflow_labels = {
@@ -1789,6 +1861,8 @@ class PlanningApplication:
                 ("season_year", season),
                 ("status", status),
                 ("search", search),
+                ("supplier", supplier),
+                ("filter_category", filter_category),
                 ("page", current_page if current_page > 1 else ""),
             )
             if str(value)
@@ -1815,11 +1889,12 @@ class PlanningApplication:
           <input type='hidden' name='status' value='{html.escape(status, quote=True)}'>
           <input type='hidden' name='search' value='{html.escape(search, quote=True)}'>
           <input type='hidden' name='page' value='{current_page}'>
+          {column_filter_context}
           <div class='pricing-batch-actions'>{batch_buttons}</div>
         </form>"""
         export_params = {
             key: value
-            for key, value in (("season_year", season), ("status", status), ("search", search))
+            for key, value in (("season_year", season), ("status", status), ("search", search), ("supplier", supplier), ("filter_category", filter_category))
             if value
         }
         export_query = urlencode(export_params)
@@ -1832,7 +1907,7 @@ class PlanningApplication:
         import_button_label = "导入并保存初审资料" if import_status == "suggested" else "导入并保存复核资料"
         excel_import_form = (
             "<form id='pricing-import-form' method='post' action='/pricing/import' enctype='multipart/form-data'>"
-            "<label class='pricing-excel-file'><span>选择文件</span><input type='file' name='workbook' accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' required></label>"
+            f"{workbench_return_context}<label class='pricing-excel-file'><span>选择文件</span><input type='file' name='workbook' accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' required></label>"
             f"<button type='submit'>{import_button_label}</button></form>"
             if user.get("role") in {"planner", "admin"} and can_import_filtered_excel
             else ""
@@ -1890,6 +1965,20 @@ class PlanningApplication:
         for key, label, classes in pricing_columns:
             class_attr = f" class='{html.escape(classes, quote=True)}'" if classes else ""
             label_markup = "<span class='visually-hidden'>选择</span>" if key == "select" else html.escape(label)
+            if key in {"supplier", "category"}:
+                field_name, selected, options = (
+                    ("supplier", supplier, supplier_options) if key == "supplier"
+                    else ("filter_category", filter_category, category_filter_options)
+                )
+                label_markup += (
+                    f"<select class='pricing-column-filter{' is-filtered' if selected else ''}' name='{field_name}' form='pricing-column-filter-form' aria-label='筛选{label}'>"
+                    f"<option value=''>全部{label}</option>"
+                    + "".join(
+                        f"<option value='{html.escape(value, quote=True)}' {'selected' if value == selected else ''}>{html.escape(value)}</option>"
+                        for value in options
+                    )
+                    + "</select>"
+                )
             pricing_header_cells.append(
                 f"<th{class_attr} data-column-key='{key}'>{label_markup}"
                 f"<span class='column-resize-handle' title='拖动调整列宽' role='separator' "
@@ -2075,6 +2164,10 @@ class PlanningApplication:
                 params["status"] = status
             if search:
                 params["search"] = search
+            if supplier:
+                params["supplier"] = supplier
+            if filter_category:
+                params["filter_category"] = filter_category
             if target_page > 1:
                 params["page"] = target_page
             return "/workbench" + ("?" + urlencode(params) if params else "")
@@ -2126,7 +2219,7 @@ class PlanningApplication:
         </nav>"""
         clear_search_params = {
             key: value
-            for key, value in (("season_year", season), ("status", status))
+            for key, value in (("season_year", season), ("status", status), ("supplier", supplier), ("filter_category", filter_category))
             if value
         }
         clear_search_href = "/workbench" + (
@@ -2142,15 +2235,25 @@ class PlanningApplication:
             <label><span>搜索款号 / 款色</span><input type='search' name='search' value='{html.escape(search, quote=True)}' placeholder='可输入多个，逗号、空格或换行分隔' autocomplete='off'></label>
             <input type='hidden' name='season_year' value='{html.escape(season, quote=True)}'>
             <input type='hidden' name='status' value='{html.escape(status, quote=True)}'>
+            {column_filter_context}
             <button class='primary' type='submit'>搜索</button>
             {clear_search_link}
           </form>
         """
-        filter_search_hidden = f"<input type='hidden' name='search' value='{html.escape(search, quote=True)}'>"
+        filter_search_hidden = f"<input type='hidden' name='search' value='{html.escape(search, quote=True)}'>" + column_filter_context
+        column_filter_form = (
+            "<form id='pricing-column-filter-form' method='get' action='/workbench' hidden>"
+            + "".join(
+                f"<input type='hidden' name='{key}' value='{html.escape(value, quote=True)}'>"
+                for key, value in (("season_year", season), ("status", status), ("search", search)) if value
+            )
+            + "</form>"
+        )
         content = f"""
         <section class='page-heading'><div><div class='eyebrow'>NEW ARRIVAL PRICING</div><h1>上新审核工作台</h1><p>所有款色集中在一张定价资料与审核卡片中，按条目完成规则匹配、初审、复核和回传。</p></div>{catalog_sync_action}</section>
         {self.alert(error, 'error') if error else ''}
         {self.alert(toolbar_message, 'success') if toolbar_message else ''}
+        {column_filter_form}
         <section class='workbench-toolbar'>
           <div class='workbench-search-wrap'>{search_form}</div>
           <form class='workbench-filter' method='get' action='/workbench'>{filter_search_hidden}<label>年份季节<select name='season_year'><option value=''>全部季节</option>{''.join(f"<option value='{html.escape(value, quote=True)}' {'selected' if value == season else ''}>{html.escape(value)}</option>" for value in seasons)}</select></label><label>定价状态<select name='status'><option value=''>全部状态</option><option value='waiting' {'selected' if status == 'waiting' else ''}>待计算</option><option value='suggested' {'selected' if status == 'suggested' else ''}>待初审</option><option value='review_pending' {'selected' if status == 'review_pending' else ''}>待复核</option><option value='confirmed' {'selected' if status == 'confirmed' else ''}>复核通过，待回传</option><option value='published' {'selected' if status == 'published' else ''}>已回传</option><option value='conflict' {'selected' if status == 'conflict' else ''}>版本冲突</option></select></label><button class='primary' type='submit'>筛选</button></form>
@@ -2260,6 +2363,9 @@ class PlanningApplication:
             document.addEventListener('pointercancel', stopResize);
           }}
           const batchForm = document.querySelector('#pricing-batch-form');
+          document.querySelectorAll('.pricing-column-filter').forEach((select) => {{
+            select.addEventListener('change', () => select.form?.requestSubmit());
+          }});
           const imageDialog = document.querySelector('#product-image-dialog');
           const imageDialogImage = document.querySelector('#product-image-dialog-image');
           const imageDialogTitle = document.querySelector('#product-image-dialog-title');
@@ -2499,7 +2605,7 @@ class PlanningApplication:
             syncApprovalState();
           }});
           updateBatchControls();
-          document.querySelectorAll('.pricing-table form, #pricing-batch-form').forEach((form) => {{
+          document.querySelectorAll('.pricing-table form, #pricing-batch-form, #pricing-column-filter-form').forEach((form) => {{
             form.addEventListener('submit', () => {{
               sessionStorage.setItem(storageKey, JSON.stringify({{
                 pageX: window.scrollX,
@@ -2951,6 +3057,7 @@ class PlanningApplication:
         @media(max-width:900px){.workbench-toolbar{align-items:flex-start;flex-wrap:wrap}.workbench-filter{width:100%;margin-left:0}.workbench-filter label{flex:1}.workbench-filter select{width:100%}}
         @media(max-width:620px){.workbench-toolbar-summary{min-width:0;flex-wrap:wrap}.workbench-search{align-items:stretch;flex-direction:column}.workbench-search label,.workbench-search input,.workbench-search button,.workbench-search .button{width:100%}.workbench-filter{align-items:stretch;flex-direction:column}.workbench-filter label,.workbench-filter select,.workbench-filter button{width:100%}.pricing-pagination{justify-content:space-between;padding:10px 18px}.pricing-pagination>span:not(.button){text-align:center}.pagination-link{white-space:nowrap}}
         .pricing-batch-form{margin:0;padding:0;border:0;background:transparent}.pricing-batch-inline{display:flex;align-items:center;min-width:0}.pricing-batch-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;min-width:0}.pricing-selection-toolbar{display:flex;align-items:center;justify-content:space-between;gap:18px;min-height:66px;padding:9px 24px;border-top:1px solid var(--line);background:#f7f9f7}.pricing-selection-controls{display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap}.pricing-selection-controls>label{display:flex;align-items:center;gap:7px;font-weight:600;white-space:nowrap}.pricing-selection-controls>span{color:var(--muted);font-size:12px;white-space:nowrap}.pricing-selection-controls input,.pricing-select-cell input{width:16px;height:16px;margin:0;accent-color:var(--deep)}.pricing-excel-toolbar{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));align-items:stretch;gap:8px;flex:0 1 620px;min-width:0;min-height:0;padding:0;border:0;background:transparent}.pricing-excel-toolbar>a{grid-column:1;display:flex;align-items:center;justify-content:center;min-width:0;text-align:center}.pricing-excel-toolbar>form{grid-column:2 / span 2;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch;gap:8px;min-width:0;margin:0}.pricing-excel-toolbar>form button{width:100%;white-space:nowrap}.pricing-excel-file{display:flex;align-items:center;gap:7px;min-width:0;width:100%;padding:7px 9px;border:1px solid #cbd5ce;border-radius:4px;background:#fff;color:var(--ink);font-size:12px;white-space:nowrap;overflow:hidden}.pricing-excel-file span{flex:0 0 auto}.pricing-excel-file input{width:100%;min-width:0;padding:0;border:0;background:transparent;font:inherit;color:var(--muted);overflow:hidden}.pricing-excel-note{grid-column:1 / -1;color:var(--muted);font-size:11px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pagination-number,.pagination-current{min-width:28px;text-align:center;padding-left:7px;padding-right:7px}.pagination-current{background:var(--deep);border-color:var(--deep);color:#fff;pointer-events:none}.pagination-ellipsis{padding:0 2px;color:var(--muted);font-size:12px}.pricing-pagination{flex-wrap:wrap;gap:6px}.workbench-filter button{background:var(--deep);border-color:var(--deep);color:#fff}.catalog-sync-form{display:flex;flex-direction:column;align-items:flex-end;gap:0}.catalog-sync-form .sync-condition-note{text-align:right}.sync-condition-note{display:block;margin-top:7px;color:var(--muted);font-size:11px;line-height:1.45;max-width:560px}
+        .pricing-table .pricing-column-filter{display:block;width:100%;min-width:0;max-width:100%;height:30px;margin-top:6px;padding:4px 18px 4px 6px;border:1px solid #cfd8d1;border-radius:3px;background:#fff;color:#202421;font-size:12px;font-weight:500;line-height:1.4;cursor:pointer;text-overflow:ellipsis}.pricing-table .pricing-column-filter.is-filtered{border-color:var(--deep);background:#edf5ef;color:var(--deep);font-weight:700}.pricing-table .pricing-column-filter:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         @media(max-width:900px){.pricing-batch-inline{flex-basis:100%;justify-content:flex-end}.pricing-batch-actions{flex-wrap:wrap;justify-content:flex-end}.pricing-selection-toolbar{align-items:flex-start;flex-direction:column}.pricing-excel-toolbar{width:100%;flex-basis:auto}}
         @media(max-width:620px){.pricing-batch-inline{width:100%;justify-content:flex-start}.pricing-batch-actions{width:100%;justify-content:flex-start;overflow-x:auto}.pricing-selection-toolbar{padding:10px 18px}.pricing-excel-toolbar{grid-template-columns:1fr;width:100%}.pricing-excel-toolbar>a,.pricing-excel-toolbar>form{grid-column:1}.pricing-excel-toolbar>form{grid-template-columns:1fr}.pricing-excel-note{white-space:normal}}
         """
