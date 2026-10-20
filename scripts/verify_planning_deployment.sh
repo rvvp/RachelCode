@@ -41,5 +41,10 @@ for attempt in range(1, int(count) + 1):
             raise SystemExit(f"ERROR 商品企划中心第 {attempt} 次验证失败: {key}={payload.get(key)!r}，期望 {value!r}")
     if not isinstance(payload.get("worker_pid"), int) or payload["worker_pid"] <= 0:
         raise SystemExit("ERROR 商品企划中心未返回有效进程编号。")
+    if payload.get("features", {}).get("rotation_phase1") is not True:
+        raise SystemExit("ERROR 货品轮转一期未加载。")
+    rotation = payload.get("rotation", {})
+    if rotation.get("schema_ready") is not True or rotation.get("migration_backup_verified") is not True:
+        raise SystemExit("ERROR 货品轮转数据结构或升级前备份未通过验证。")
 print(f"OK 商品企划中心连续 {count} 次验证通过: {PLANNING_RELEASE_COMMIT} / {PLANNING_SOURCE_FINGERPRINT}")
 PY

@@ -83,6 +83,10 @@ def verify_password(password: str, stored: str) -> bool:
 def init_db(db_path: str | Path, *, seed_demo: bool = True, bootstrap_admin: dict | None = None) -> None:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Additive rotation migration takes a verified, never-pruned SQLite backup
+    # before touching an existing database, including on production startup.
+    from planning_center.rotation import ensure_schema
+    ensure_schema(path)
     with get_connection(path) as connection:
         # Keep normal reads responsive while a sync, Excel import, or batch
         # workflow update is writing to the planning database.

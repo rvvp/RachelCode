@@ -333,6 +333,8 @@ class CatalogApplication:
                 return self.handle_api(environ, start_response, user, query)
             if path == "/api/internal/planning/products" and method in {"GET", "POST"}:
                 return self.handle_planning_products_api(environ, start_response, query)
+            if path == "/api/internal/planning/rotation-products" and method == "GET":
+                return self.handle_rotation_products_api(environ, start_response, query)
             if path.startswith("/api/internal/planning/products/") and path.endswith("/image") and method == "GET":
                 product_id_text = path[len("/api/internal/planning/products/") : -len("/image")].strip("/")
                 if product_id_text.isdigit():
@@ -1786,6 +1788,19 @@ class CatalogApplication:
         if not supplied:
             supplied = str(environ.get("HTTP_X_PLANNING_TOKEN") or "").strip()
         return bool(supplied and secrets.compare_digest(supplied, self.planning_api_token))
+
+    def handle_rotation_products_api(self, environ, start_response, query):
+        if not self.planning_api_token:
+            return self.json_error_response(start_response, "not_configured", "商品企划内部接口尚未配置 Token。", "503 Service Unavailable")
+        if not self.planning_api_authorized(environ):
+            return self.json_error_response(start_response, "unauthorized", "需要有效的商品企划内部 Token。", "401 Unauthorized")
+        from catalog_backend.rotation import catalog_page
+        try:
+            after = max(0, int(query.get("after") or 0))
+            limit = min(1000, max(1, int(query.get("limit") or 500)))
+        except (TypeError, ValueError):
+            return self.json_error_response(start_response, "invalid_cursor", "分页编号不正确。")
+        return self.json_response(start_response, catalog_page(self.db_path, after, limit))
 
     def handle_planning_products_api(self, environ, start_response, query):
         if not self.planning_api_token:

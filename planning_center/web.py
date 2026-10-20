@@ -21,6 +21,7 @@ from planning_center import db
 from planning_center.excel import initial_review_workbook_bytes, parse_initial_review_workbook
 from planning_center.release import PLANNING_RELEASE_COMMIT, PLANNING_RELEASE_GENERATION, PLANNING_SOURCE_FINGERPRINT
 from catalog_backend.uploads import detect_image_content_type
+from planning_center.rotation_web import RotationViews
 
 SESSIONS: dict[str, int] = {}
 MAX_PLANNING_IMAGE_BYTES = 20 * 1024 * 1024
@@ -30,7 +31,7 @@ LOGGER = logging.getLogger(__name__)
 WORKBENCH_FILTER_KEYS = ("season_year", "status", "search", "supplier", "filter_category")
 
 
-class PlanningApplication:
+class PlanningApplication(RotationViews):
     def __init__(self, db_path: str | Path, catalog_api_url: str, catalog_api_token: str = ""):
         self.db_path = str(db_path)
         self.catalog_api_url = str(catalog_api_url or "http://127.0.0.1:8765").rstrip("/")
@@ -62,6 +63,8 @@ class PlanningApplication:
                     "release_generation": PLANNING_RELEASE_GENERATION,
                     "source_fingerprint": PLANNING_SOURCE_FINGERPRINT,
                     "worker_pid": os.getpid(),
+                    "features": {"rotation_phase1": True},
+                    "rotation": self.rotation_readiness(),
                 })
             if path == "/login":
                 if method == "GET":
@@ -71,6 +74,8 @@ class PlanningApplication:
                 return self.handle_logout(environ, start_response)
             if not user:
                 return self.redirect(start_response, "/login")
+            if path == "/rotation" or path.startswith("/rotation/"):
+                return self.handle_rotation(environ, start_response, user, path, method, parsed_query)
             if path == "/profile/password":
                 if method == "GET":
                     return self.html_response(start_response, self.render_password_change(user, query))
@@ -1691,6 +1696,8 @@ class PlanningApplication:
         return self.shell("品类企划", content, user, "category-planning")
 
     def render_system_rules(self, user: dict) -> str:
+        # Rotation has a separate detailed policy page so initial review rules
+        # stay intact and each workflow remains explicitly scoped.
         content = """
         <section class='page-heading system-rules-heading'><div><div class='eyebrow'>SYSTEM WORKFLOW RULES</div><h1>系统规则</h1><p>统一说明藏宝阁与商品企划中心之间的同步、审核、变更和回传边界。</p></div><span class='system-rules-readonly'>只读说明</span></section>
         <section class='system-rules-intro' aria-label='系统边界概览'>
@@ -1699,6 +1706,7 @@ class PlanningApplication:
           <div><span>03</span><strong>只回传三个字段</strong><p>回传仅更新上新价格、上新渠道和品类，其他来源字段不得覆盖。</p></div>
         </section>
         <nav class='system-rules-index' aria-label='系统规则目录'>
+          <a href='/rotation/rules'>货品轮转规则</a>
           <a href='#initial-sync'>首次同步</a><a href='#review-flow'>审核流程</a><a href='#source-changes'>资料变动</a><a href='#second-planning'>二次企划</a><a href='#image-rule'>图片替换</a><a href='#publication-rule'>回传校验</a><a href='#history-rule'>版本与历史</a>
         </nav>
         <section class='panel system-rule-section' id='initial-sync'>
@@ -3000,6 +3008,7 @@ class PlanningApplication:
 
     def shell(self, title: str, content: str, user: dict, current: str) -> str:
         nav_items = [("dashboard", "/dashboard", "企划总览"), ("category-planning", "/category-planning", "品类企划"), ("workbench", "/workbench", "上新审核"), ("rules", "/rules", "商品规则"), ("system-rules", "/system-rules", "系统规则"), ("stats", "/stats", "价格带统计")]
+        nav_items.insert(3, ("rotation", "/rotation", "货品轮转"))
         if user.get("role") == "admin":
             nav_items.append(("accounts", "/accounts", "账号管理"))
         nav_items.append(("settings", "/settings", "连接设置"))
