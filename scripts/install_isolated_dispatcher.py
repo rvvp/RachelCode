@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""One-time, root-only installation. Does not restart any business website.
+
+Run from a transferred, reviewed scripts directory, NOT through a git hook.
+Existing shared code, venv, business databases and uploads are never modified.
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import time
+
+from isolated_release import (APPS, AUTOMATION, CONFIG, ROOT, VERSION, ReleaseError,
+                              atomic_write, attest, health, identity, lock, run)
+
+
+WRAPPER = '#!/bin/sh\nset -eu\nexec /usr/bin/python3 /opt/rachelcode/automation/isolated-v1/isolated_release.py "$@"\n'
+
+
+def install():
+    if os.geteuid() != 0:
+        raise ReleaseError("root required to install reviewed dispatcher")
+    if sys.version_info < (3, 9):
+        raise ReleaseError("server dispatcher requires Python 3.9 or later")
+    if CONFIG.exists():
+        raise ReleaseError("isolation config already exists; review installed state instead of overwriting")
+    before = {app: identity(app) for app in APPS}
+    baseline = {app: health(app) for app in APPS}
+    # No business requests are used here other than three small health reads.
+    for app, state in before.items():
+        if state["WorkingDirectory"] != "/opt/rachelcode/app":
+            raise ReleaseError("unexpected existing runtime directory: " + app)
+    with lock(AUTOMATION / "deploy.lock"):
+        pending = run("systemctl", "list-units", "--all", "--plain", "--no-legend", "rachel-auto-deploy-*.service")
+        if any(" running " in line or " activating " in line for line in pending.splitlines()):
+            raise ReleaseError("legacy deployment is still running")
+        old_verify = run("systemctl", "show", "rachel-catalog-post-release-verify.service", "--property=ActiveState", "--value")
+        if old_verify not in {"inactive", "failed"}:
+            raise ReleaseError("legacy delayed verifier is still running")
+        backup = AUTOMATION / "isolation-backups" / time.strftime("%Y%m%d-%H%M%S")
+        backup.mkdir(parents=True, mode=0o700)
+        for name in ("deploy.sh", "verify_release.py", "webhook_server.py"):
+            shutil.copy2(AUTOMATION / name, backup / name)
+        atomic_write(backup / "baseline.json", json.dumps({"services": before, "health": baseline}, indent=2), 0o600)
+        # Pause the deployment listener only, not any of the three websites.
+        # This prevents an old shell job being read while replacing its entrypoint.
+        run("systemctl", "stop", "rachel-deploy-webhook")
+        try:
+            # If installation stops halfway, future pushes remain blocked;
+            # never leave the unsafe legacy dispatcher available for fallback.
+            atomic_write(AUTOMATION / "deploy.sh", "#!/bin/sh\necho 'RELEASE_BLOCKED isolation installation incomplete' >&2\nexit 78\n", 0o755)
+            run("systemctl", "disable", "--now", "rachel-catalog-post-release-verify.timer")
+            installed = AUTOMATION / VERSION
+            installed.mkdir(mode=0o755, exist_ok=False)
+            source = Path(__file__).resolve().parent
+            for name in ("isolated_release.py", "release_scope.py"):
+                atomic_write(installed / name, (source / name).read_bytes())
+            CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            env_source = ROOT / "app/.env"
+            env_lines = env_source.read_text().splitlines() if env_source.exists() else []
+            # Planning gets only its own settings. No credential is printed.
+            planning_lines = [line for line in env_lines if line.strip().startswith("PLANNING_")]
+            env_path = CONFIG.parent / "planning.env"
+            if env_path.exists():
+                raise ReleaseError("planning config already exists; refusing overwrite")
+            atomic_write(env_path, "\n".join(planning_lines) + "\n", 0o600)
+            # systemd (root) reads EnvironmentFile before changing service user.
+            frozen = run(ROOT / "venv/bin/python", "-c",
+                         "import importlib.metadata as m; print('\\n'.join(sorted(d.metadata['Name']+'=='+d.version for d in m.distributions())))")
+            atomic_write(CONFIG.parent / "planning-requirements.lock", frozen + "\n")
+            config = {"version": VERSION, "apps": {app: {
+                "enabled": app == "planning", "baseline_commit": baseline[app]["release_commit"],
+                "baseline_generation": baseline[app]["release_generation"],
+                "workers": 8 if app == "catalog" else 1} for app in APPS}}
+            (ROOT / "planning/releases").mkdir(parents=True, exist_ok=True)
+            atomic_write(CONFIG, json.dumps(config, indent=2) + "\n", 0o600)
+            atomic_write(AUTOMATION / "deploy.sh", WRAPPER, 0o755)
+            proof = attest(config)
+            if proof["services"] != before:
+                raise ReleaseError("business service identity changed during installation")
+            atomic_write(backup / "installed-proof.json", json.dumps(proof, indent=2), 0o600)
+            print(json.dumps({"installed": VERSION, "backup": str(backup), "proof": proof}, sort_keys=True))
+        finally:
+            # Never reinstate the unsafe all-site dispatcher on an install error.
+            run("systemctl", "start", "rachel-deploy-webhook")
+
+
+if __name__ == "__main__":
+    install()
