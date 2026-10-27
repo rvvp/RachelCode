@@ -179,13 +179,20 @@ class IsolatedReleaseTests(unittest.TestCase):
         def fake_git(*args):
             return {("branch", "--show-current"): "main", ("status", "--porcelain"): "",
                     ("rev-parse", "HEAD"): NEW, ("rev-list", "--count", NEW): "9"}[args]
-        with patch.object(sys, "argv", ["publish", "--app", "planning", "tests.test_planning"]), \
-                patch.object(publisher, "git", side_effect=fake_git) as commands, \
-                patch.object(publisher, "attestation", side_effect=release.ReleaseError("SSH unavailable")), \
-                redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(publisher.main(), 1)
-            self.assertIn("SSH unavailable", errors.getvalue())
-            self.assertFalse(any("push" in call.args for call in commands.call_args_list))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "deploy").mkdir()
+            for app in release.APPS:
+                (root / "deploy/release-plan.json").write_text(json.dumps(plan(app)))
+                with self.subTest(app=app), \
+                        patch.object(publisher, "ROOT", root), \
+                        patch.object(sys, "argv", ["publish", "--app", app, "tests.test_app"]), \
+                        patch.object(publisher, "git", side_effect=fake_git) as commands, \
+                        patch.object(publisher, "attestation", side_effect=release.ReleaseError("SSH unavailable")), \
+                        redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(publisher.main(), 1)
+                    self.assertIn("SSH unavailable", errors.getvalue())
+                    self.assertFalse(any("push" in call.args for call in commands.call_args_list))
 
     def exercise_dispatch(self, root, *, stale=False, staging_failure=False, verification_failure=False):
         automation = root / "automation"

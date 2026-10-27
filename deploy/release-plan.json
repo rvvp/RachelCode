@@ -1,27 +1,20 @@
 {
   "schema": 1,
-  "application": "planning",
+  "application": "catalog",
   "base_commit": "384a59cc351a7e18a98b30f3c3b9da98e53c2231",
-  "repository_base_commit": "384a59cc351a7e18a98b30f3c3b9da98e53c2231",
+  "repository_base_commit": "02495a934f2ff447b60cf4a1011d9bae966c8ba0",
   "database_migration": false,
   "reviewed_paths": [
-    "catalog_backend/release.py",
-    "scripts/activate_production_release.sh",
-    "scripts/publish_verified_release.sh",
     "scripts/release_scope.py",
     "scripts/isolated_release.py",
     "scripts/install_isolated_dispatcher.py",
     "scripts/migrate_isolated_app.py",
     "scripts/publish_isolated_release.py",
-    "tests/test_release.py",
-    "tests/test_release_boundaries.py",
     "tests/test_isolated_release.py",
-    "tests/test_isolated_migration.py",
     "deploy/release-plan.json",
     "deploy/systemd/rachel-catalog.service",
     "deploy/systemd/rachel-replenishment.service",
-    "deploy/systemd/rachel-planning.service",
-    ".gitea/workflows/catalog-post-release-verification.yml"
+    "deploy/systemd/rachel-planning.service"
   ],
-  "reason": "Record separately verified Catalog and Replenishment private-runtime migrations; finish Planning-only sandbox hardening. Preserve each application's existing business data and independent accepted version."
+  "reason": "Catalog-only desktop full-width layout with 36px side margins. Reviewed infrastructure snapshots since Catalog's accepted release retain the installed isolated dispatcher, private service paths and per-app sandbox; they are not installed or run by this code-only release. No schema, dependency or business workflow changes; Planning and Replenishment keep their accepted runtimes."
 }

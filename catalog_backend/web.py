@@ -8952,10 +8952,17 @@ class CatalogApplication:
         font-size: 28px;
       }}
     }}
+    @media (min-width: 901px) {{
+      .shell-workspace {{
+        max-width: none;
+        padding-left: 36px;
+        padding-right: 36px;
+      }}
+    }}
   </style>
 </head>
 <body>
-  <div class="shell">
+  <div class="shell{' shell-workspace' if user else ''}">
     {nav}
     {monitor_toolbar}
     {back_link}
