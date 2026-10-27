@@ -27,6 +27,8 @@ def install():
         raise ReleaseError("server dispatcher requires Python 3.9 or later")
     if CONFIG.exists():
         raise ReleaseError("isolation config already exists; review installed state instead of overwriting")
+    # Source transfer paths must not create a runtime dependent on a temporary
+    # checkout. Only the reviewed dispatcher files are installed below.
     before = {app: identity(app) for app in APPS}
     baseline = {app: health(app) for app in APPS}
     # No business requests are used here other than three small health reads.
@@ -69,7 +71,7 @@ def install():
             atomic_write(env_path, "\n".join(planning_lines) + "\n", 0o600)
             # systemd (root) reads EnvironmentFile before changing service user.
             frozen = run(ROOT / "venv/bin/python", "-c",
-                         "import importlib.metadata as m; print('\\n'.join(sorted(d.metadata['Name']+'=='+d.version for d in m.distributions())))")
+                         "import importlib.metadata as m; print('\\n'.join(sorted({d.metadata['Name']+'=='+d.version for d in m.distributions() if d.metadata['Name'].lower() not in {'pip','setuptools','wheel'}})))")
             atomic_write(CONFIG.parent / "planning-requirements.lock", frozen + "\n")
             config = {"version": VERSION, "apps": {app: {
                 "enabled": app == "planning", "baseline_commit": baseline[app]["release_commit"],

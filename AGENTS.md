@@ -21,22 +21,18 @@ Each requested application change normally follows a verified release pipeline:
 5. After targeted public verification passes, back up the same commit to
    `github/main`. A backup commit does not mean every app runs that commit.
 
-SAFETY HOLD (2026-10-27): the installed server Webhook still invokes a shared
-deployment script that stops all three services and can restore their databases.
-Do not push to origin, rerun that script, or bypass the local safety gates until
-the server dispatcher and per-app activation/rollback isolation are installed
-and safely verified. Do local implementation, tests, and read-only diagnostics
-instead; report the release as BLOCKED, not completed. The legacy all-site
-activation entrypoint is permanently disabled. The new
-`publish_verified_release.sh --app planning ...` entrypoint attests the installed
-server dispatcher before pushing; until installation succeeds it must block.
-Removing the hold requires actual server evidence,
-not merely updating a local script or toggling an environment variable.
+SERVER ISOLATION (2026-10-27 14:50 CST): the reviewed isolated-v1 dispatcher was
+installed and attested without restarting any business service. Only Planning
+is enabled. The old all-site activator remains permanently disabled. Every
+release still requires installed-file hash attestation before an origin push;
+missing/mismatched proof blocks publication. Do not bypass this gate or restore
+the retired shared deployer. Installation evidence is retained under
+`/opt/rachelcode/automation/isolation-backups/20261027-145045`.
 
 ## Independent release implementation
 
 `scripts/isolated_release.py` is designed to be installed and pinned outside
-application releases; installation is still pending. It requires an explicit single-app `deploy/release-plan.json`, a
+application releases; that installation has been verified. It requires an explicit single-app `deploy/release-plan.json`, a
 matching `Release-App: <app>` commit trailer, the target's currently accepted
 base commit, and reviewed shared/infrastructure paths. Missing/stale plans,
 unapproved apps, schema changes and dependency-lock changes fail closed.
