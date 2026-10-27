@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 SERVICE_NAME="${CATALOG_SERVICE_NAME:-rachel-catalog}"
 SERVICE_FILE="${CATALOG_SERVICE_FILE:-/etc/systemd/system/${SERVICE_NAME}.service}"
 REPLENISH_SERVICE_NAME="${REPLENISH_SERVICE_NAME:-rachel-replenishment}"
@@ -18,11 +18,29 @@ PLANNING_LOCAL_URL="${PLANNING_LOCAL_URL:-http://127.0.0.1:8785}"
 PLANNING_PUBLIC_URL="${PLANNING_PUBLIC_URL:-http://203.205.90.232:8785}"
 VENV_DIR="${CATALOG_VENV_DIR:-/opt/rachelcode/venv}"
 
-# Direct Git deployments can retain an untracked manifest from an older
-# release. Refresh it before calculating the expected public version.
+fail() {
+  echo "ERROR $*" >&2
+  exit 1
+}
+
+if [ "$(uname -s)" != "Linux" ]; then
+  fail "正式服务器激活脚本只能在 Linux 服务器上运行。"
+fi
+
+# A webhook can reach activation after a failed or stale checkout update.
+# Synchronize only a clean main branch, and never reset divergent server state.
 GIT_ROOT="$(git -C "$ROOT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
-if [ "$GIT_ROOT" = "$ROOT_DIR" ]; then
-  GIT_RELEASE_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
+if [ -n "$GIT_ROOT" ]; then
+  [ "$GIT_ROOT" = "$ROOT_DIR" ] || fail "激活脚本不在 Git 工作区根目录，拒绝使用不确定的代码路径。"
+  GIT_RELEASE_COMMIT="$(PYTHONPATH="$ROOT_DIR" python3 -c '
+import sys
+from catalog_backend.release import ReleaseCheckoutError, sync_checkout_to_origin_main
+try:
+    print(sync_checkout_to_origin_main(sys.argv[1], sys.argv[2] or None))
+except ReleaseCheckoutError as exc:
+    raise SystemExit(f"ERROR {exc}")
+' "$ROOT_DIR" "${CATALOG_EXPECTED_RELEASE_COMMIT:-}")" || fail "无法将服务器工作区安全同步到 origin/main。"
+  echo "服务器工作区已对齐 origin/main: $GIT_RELEASE_COMMIT"
   GIT_RELEASE_GENERATION="$(git -C "$ROOT_DIR" rev-list --count HEAD 2>/dev/null || true)"
   if [[ "$GIT_RELEASE_COMMIT" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
     printf '%s\n' "$GIT_RELEASE_COMMIT" | tr '[:upper:]' '[:lower:]' > "$ROOT_DIR/.release-commit"
@@ -32,6 +50,10 @@ if [ "$GIT_ROOT" = "$ROOT_DIR" ]; then
     printf '%s\n' "$GIT_RELEASE_GENERATION" > "$ROOT_DIR/.release-generation"
     chmod 0644 "$ROOT_DIR/.release-generation"
   fi
+elif [ -n "${CATALOG_EXPECTED_RELEASE_COMMIT:-}" ]; then
+  PACKAGE_COMMIT="$(tr -d '[:space:]' < "$ROOT_DIR/.release-commit" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  EXPECTED_RELEASE_COMMIT="$(printf '%s' "$CATALOG_EXPECTED_RELEASE_COMMIT" | tr '[:upper:]' '[:lower:]')"
+  [ "$PACKAGE_COMMIT" = "$EXPECTED_RELEASE_COMMIT" ] || fail "发布包提交号与自动发布任务要求的不一致。"
 fi
 
 EXPECTED_BUILD="$(sed -n 's/^CATALOG_BUILD_VERSION = "\([^"]*\)"/\1/p' "$ROOT_DIR/catalog_backend/web.py" | head -n 1)"
@@ -39,25 +61,17 @@ EXPECTED_SOURCE="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_p
 EXPECTED_COMMIT="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("catalog_backend/release.py")["CATALOG_RELEASE_COMMIT"])')"
 EXPECTED_GENERATION="$(cd "$ROOT_DIR" && python3 -c 'import runpy; print(runpy.run_path("catalog_backend/release.py")["CATALOG_RELEASE_GENERATION"])')"
 
-if [ "$(uname -s)" != "Linux" ]; then
-  echo "ERROR 正式服务器激活脚本只能在 Linux 服务器上运行。" >&2
-  exit 1
-fi
 if [ ! -x "$VENV_DIR/bin/python" ]; then
-  echo "ERROR 未找到正式环境 Python: $VENV_DIR/bin/python" >&2
-  exit 1
+  fail "未找到正式环境 Python: $VENV_DIR/bin/python"
 fi
 if [ ! -x "$VENV_DIR/bin/gunicorn" ]; then
-  echo "ERROR 未找到 Gunicorn: $VENV_DIR/bin/gunicorn" >&2
-  exit 1
+  fail "未找到 Gunicorn: $VENV_DIR/bin/gunicorn"
 fi
 if [ "$EXPECTED_COMMIT" = "unknown" ]; then
-  echo "ERROR 无法确定待发布提交号，拒绝激活无法追溯的代码。" >&2
-  exit 1
+  fail "无法确定待发布提交号，拒绝激活无法追溯的代码。"
 fi
 if ! [[ "$EXPECTED_GENERATION" =~ ^[1-9][0-9]*$ ]]; then
-  echo "ERROR 无法确定待发布版本序号，拒绝激活可能乱序的代码。" >&2
-  exit 1
+  fail "无法确定待发布版本序号，拒绝激活可能乱序的代码。"
 fi
 
 run_root() {

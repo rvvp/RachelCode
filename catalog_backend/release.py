@@ -26,6 +26,79 @@ def _normalized_generation(value: object) -> int | None:
     return generation if generation > 0 else None
 
 
+class ReleaseCheckoutError(RuntimeError):
+    pass
+
+
+def sync_checkout_to_origin_main(
+    root_dir: str | Path,
+    expected_commit: str | None = None,
+) -> str:
+    """Fast-forward a clean production checkout to origin/main and return its SHA."""
+    root = Path(root_dir).resolve()
+
+    def git(*args: str, allow_failure: bool = False) -> subprocess.CompletedProcess[str]:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), *args],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=180,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ReleaseCheckoutError(f"git {' '.join(args)} failed: {exc}") from exc
+        if result.returncode and not allow_failure:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown git error"
+            raise ReleaseCheckoutError(f"git {' '.join(args)} failed: {detail}")
+        return result
+
+    checkout_root = git("rev-parse", "--show-toplevel").stdout.strip()
+    if not checkout_root or Path(checkout_root).resolve() != root:
+        raise ReleaseCheckoutError("activation path is not the Git checkout root")
+
+    branch = git("branch", "--show-current").stdout.strip()
+    if branch != "main":
+        raise ReleaseCheckoutError(f"production checkout is on {branch or 'detached HEAD'}, expected main")
+
+    status = git("status", "--porcelain").stdout.strip()
+    if status:
+        raise ReleaseCheckoutError("production checkout has local changes; refusing to overwrite them")
+
+    pinned_commit = _normalized_commit(expected_commit)
+    if expected_commit and not pinned_commit:
+        raise ReleaseCheckoutError("expected release commit is not a valid Git SHA")
+
+    git("fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    target_commit = _normalized_commit(git("rev-parse", "refs/remotes/origin/main").stdout)
+    if not target_commit:
+        raise ReleaseCheckoutError("origin/main did not provide a valid Git SHA")
+    if pinned_commit and target_commit != pinned_commit:
+        raise ReleaseCheckoutError(
+            f"origin/main is {target_commit}, not expected release {pinned_commit}"
+        )
+
+    current_commit = _normalized_commit(git("rev-parse", "HEAD").stdout)
+    if not current_commit:
+        raise ReleaseCheckoutError("production checkout HEAD is not a valid Git SHA")
+    if current_commit != target_commit:
+        is_fast_forward = git(
+            "merge-base", "--is-ancestor", current_commit, target_commit, allow_failure=True
+        )
+        if is_fast_forward.returncode != 0:
+            raise ReleaseCheckoutError(
+                f"production HEAD {current_commit} is not an ancestor of origin/main {target_commit}"
+            )
+        git("merge", "--ff-only", target_commit)
+
+    activated_commit = _normalized_commit(git("rev-parse", "HEAD").stdout)
+    if activated_commit != target_commit:
+        raise ReleaseCheckoutError(
+            f"checkout is {activated_commit or 'unknown'} after sync, expected {target_commit}"
+        )
+    return target_commit
+
+
 def catalog_release_commit(root_dir: str | Path | None = None) -> str:
     """Return the repository commit represented by this deployed release."""
     root = Path(root_dir).resolve() if root_dir else Path(__file__).resolve().parent.parent
