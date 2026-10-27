@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Test -> attest installed isolation -> origin -> target acceptance -> GitHub."""
+"""Test -> origin readiness -> origin push -> server receipt/public -> GitHub.
+
+Routine releases never SSH to the server. Its fixed dispatcher performs all
+isolation checks and reports authenticated, exact-commit receipts to origin.
+"""
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
 import time
 
-from isolated_release import (APPLICATIONS, APPS, PACKAGES, ReleaseError, VERSION,
+from isolated_release import (APPLICATIONS, APPS, PACKAGES, ReleaseError,
                               validate_plan, review_paths, health)
+from release_status import (OriginStatus, StatusError, manifest, manifest_digest,
+                            readiness, verify_receipt, wait_receipt)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -28,21 +32,6 @@ def run(*args, timeout=180):
 
 def git(*args):
     return run("git", *args)
-
-
-def attestation():
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10"]
-    if os.environ.get("SSH_CONTROL_PATH"):
-        command += ["-S", os.environ["SSH_CONTROL_PATH"]]
-    command += ["root@203.205.90.232", "/usr/bin/python3 /opt/rachelcode/automation/isolated-v1/isolated_release.py --attest"]
-    proof = json.loads(run(*command, timeout=30))
-    if proof.get("version") != VERSION:
-        raise ReleaseError("server isolation version mismatch")
-    for name in ("isolated_release.py", "release_scope.py", "migrate_isolated_app.py"):
-        digest = hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest()
-        if proof.get("installed_hashes", {}).get(name) != digest:
-            raise ReleaseError("server isolation not installed or source differs: " + name)
-    return proof
 
 
 def verify_payload(app, payload, expected):
@@ -69,25 +58,30 @@ def main():
         plan = json.loads((ROOT / "deploy/release-plan.json").read_text())
         if plan.get("application") != args.app:
             raise ReleaseError("--app differs from reviewed release plan")
-        proof = attestation()  # BEFORE any origin push.
-        live = health(args.app, public=True)
-        base = live.get("release_commit")
-        paths = review_paths(plan, base, sha, git)
-        validate_plan(plan, git("show", "-s", "--format=%B", sha), paths, base, proof["enabled_apps"])
-        protected = {app: identity for app, identity in proof["services"].items() if app != args.app}
-        git("diff-tree", "--check", sha + "^", sha)
         print("运行本地测试，目标：" + args.app, flush=True)
         compile_paths = [path for path in PACKAGES[args.app] if (ROOT / path).is_dir() or path.endswith(".py")]
         subprocess.run([sys.executable, "-m", "compileall", "-q", *compile_paths], cwd=ROOT, check=True)
         subprocess.run([sys.executable, "-m", "unittest", "tests.test_release_boundaries",
-                        "tests.test_isolated_release", "tests.test_isolated_migration", "tests.test_release", *args.tests], cwd=ROOT, check=True)
+                        "tests.test_isolated_release", "tests.test_release_status",
+                        "tests.test_isolated_migration", "tests.test_release", *args.tests], cwd=ROOT, check=True)
         for remote in ("origin", "github"):
             git("fetch", "--quiet", remote, "main")
             git("merge-base", "--is-ancestor", remote + "/main", sha)
+        origin = git("ls-remote", "origin", "refs/heads/main").split()[0]
+        # This proof is posted by the installed server dispatcher after checking
+        # its root-pinned manifest. No root credential or server connection here.
+        client = OriginStatus()
+        digest = manifest_digest(manifest(ROOT / "scripts"))
+        proof = readiness(client, origin, digest, args.app)  # BEFORE origin push.
+        live = health(args.app, public=True)
+        base = plan["base_commit"] if origin == sha else live.get("release_commit")
+        paths = review_paths(plan, base, sha, git)
+        validate_plan(plan, git("show", "-s", "--format=%B", sha), paths, base, proof["apps"].split(","))
+        git("diff", "--check", plan.get("repository_base_commit", base), sha)
         # Never advance GitHub as a workaround for failed deployment.
         print("推送 origin/main；仅激活 " + args.app, flush=True)
         if ("repository_base_commit" in plan
-                and git("ls-remote", "origin", "refs/heads/main").split()[0] != plan["repository_base_commit"]):
+                and origin not in {plan["repository_base_commit"], sha}):
             raise ReleaseError("origin differs from the reviewed repository base")
         git("push", "origin", sha + ":refs/heads/main")
         if git("ls-remote", "origin", "refs/heads/main").split()[0] != sha:
@@ -97,6 +91,7 @@ def main():
         prefix = {"planning": "PLANNING", "catalog": "CATALOG", "replenishment": "REPLENISHMENT"}[args.app]
         expected = {"release_commit": sha, "release_generation": generation,
                     "source_fingerprint": getattr(module, prefix + "_SOURCE_FINGERPRINT")}
+        wait_receipt(client, args.app, sha, expected, digest)
         deadline = time.monotonic() + 600
         while True:
             try:
@@ -106,38 +101,19 @@ def main():
                 if time.monotonic() >= deadline:
                     raise ReleaseError("target public release timed out; GitHub unchanged")
                 time.sleep(10)
-        after = attestation()
-        if {app: item for app, item in after["services"].items() if app != args.app} != protected:
-            raise ReleaseError("non-target service identity changed; GitHub unchanged")
-        # Server acceptance is required in addition to a single public response.
-        ssh = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]
-        if os.environ.get("SSH_CONTROL_PATH"):
-            ssh += ["-S", os.environ["SSH_CONTROL_PATH"]]
-        ssh += ["root@203.205.90.232", "test -f /opt/rachelcode/" + args.app + "/state.json && "
-                "/usr/bin/python3 -c 'import json; print(json.load(open(\"/opt/rachelcode/" + args.app + "/state.json\"))[\"accepted_commit\"])'"]
-        accepted = ""
-        for _ in range(10):
-            try:
-                accepted = run(*ssh, timeout=30)
-            except ReleaseError:
-                accepted = ""
-            if accepted == sha:
-                break
-            time.sleep(2)
-        if accepted != sha:
-            raise ReleaseError("server has not accepted target release")
         # Multiple public samples, target only; other sites keep accepted versions.
         for _ in range(3):
             verify_payload(args.app, health(args.app, public=True), expected)
             time.sleep(1)
         if git("ls-remote", "origin", "refs/heads/main").split()[0] != sha:
             raise ReleaseError("origin advanced during acceptance")
+        verify_receipt(client.latest(sha, "isolated-release/" + args.app), sha, expected, digest)
         print("目标公网验收通过；备份同一提交到 github/main", flush=True)
         git("push", "github", sha + ":refs/heads/main")
         if git("ls-remote", "github", "refs/heads/main").split()[0] != sha:
             raise ReleaseError("GitHub backup commit mismatch")
         print("OK " + args.app + ": origin、目标公网、github = " + sha, flush=True)
-    except (OSError, ValueError, subprocess.SubprocessError, ReleaseError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError, ReleaseError, StatusError) as exc:
         print("RELEASE_BLOCKED " + str(exc), file=sys.stderr)
         return 1
     return 0

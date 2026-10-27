@@ -161,7 +161,7 @@ class IsolatedReleaseTests(unittest.TestCase):
                 publisher.verify_payload("planning", dict(payload, **{key: value}), expected)
 
     def test_server_code_is_python39_compatible_and_contains_no_restore_path(self):
-        for name in ["isolated_release.py", "release_scope.py", "install_isolated_dispatcher.py"]:
+        for name in ["isolated_release.py", "release_scope.py", "install_isolated_dispatcher.py", "release_status.py"]:
             source = (ROOT / "scripts" / name).read_text()
             ast.parse(source, feature_version=(3, 9))
             self.assertNotIn("sqlite3.connect", source)
@@ -175,10 +175,11 @@ class IsolatedReleaseTests(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 78)
 
-    def test_unavailable_server_attestation_blocks_before_origin_and_github_push(self):
+    def test_unavailable_origin_isolation_proof_blocks_before_any_push(self):
         def fake_git(*args):
             return {("branch", "--show-current"): "main", ("status", "--porcelain"): "",
-                    ("rev-parse", "HEAD"): NEW, ("rev-list", "--count", NEW): "9"}[args]
+                    ("rev-parse", "HEAD"): NEW, ("rev-list", "--count", NEW): "9",
+                    ("ls-remote", "origin", "refs/heads/main"): OLD}.get(args, "")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "deploy").mkdir()
@@ -188,10 +189,13 @@ class IsolatedReleaseTests(unittest.TestCase):
                         patch.object(publisher, "ROOT", root), \
                         patch.object(sys, "argv", ["publish", "--app", app, "tests.test_app"]), \
                         patch.object(publisher, "git", side_effect=fake_git) as commands, \
-                        patch.object(publisher, "attestation", side_effect=release.ReleaseError("SSH unavailable")), \
+                        patch.object(publisher.subprocess, "run"), \
+                        patch.object(publisher, "OriginStatus"), \
+                        patch.object(publisher, "manifest", return_value={name: "a" * 64 for name in release.FILES}), \
+                        patch.object(publisher, "readiness", side_effect=release.StatusError("origin proof unavailable")), \
                         redirect_stderr(io.StringIO()) as errors:
                     self.assertEqual(publisher.main(), 1)
-                    self.assertIn("SSH unavailable", errors.getvalue())
+                    self.assertIn("origin proof unavailable", errors.getvalue())
                     self.assertFalse(any("push" in call.args for call in commands.call_args_list))
 
     def exercise_dispatch(self, root, *, stale=False, staging_failure=False, verification_failure=False):
@@ -217,12 +221,16 @@ class IsolatedReleaseTests(unittest.TestCase):
             stack.enter_context(patch.object(release, "ROOT", root))
             stack.enter_context(patch.object(release, "AUTOMATION", automation))
             stack.enter_context(patch.object(release, "SYSTEMD_DIR", root / "systemd"))
+            stack.enter_context(patch.object(release, "attest", return_value={
+                "enabled_apps": ["planning"], "installed_hashes": {name: "a" * 64 for name in release.FILES}}))
+            stack.enter_context(patch.object(release, "OriginStatus"))
             stack.enter_context(patch.object(release, "git", side_effect=fake_git))
             stack.enter_context(patch.object(release, "health", return_value={"release_commit": OLD, "status": "ok", "db_exists": True}))
             stack.enter_context(patch.object(release, "identity", side_effect=lambda app: protected[app]))
             commands = stack.enter_context(patch.object(release, "run", return_value=""))
             staging = stack.enter_context(patch.object(release, "stage", return_value=(stage_dir, stage_dir.parent / "venv/bin/python", expected)))
-            verifier = stack.enter_context(patch.object(release, "verify_target", return_value={"workers": [2]}))
+            verifier = stack.enter_context(patch.object(release, "verify_target", return_value={
+                "workers": [2], "protected_after": {app: protected[app] for app in release.APPS if app != "planning"}}))
             if staging_failure:
                 staging.side_effect = release.ReleaseError("candidate preflight failed")
             if verification_failure:

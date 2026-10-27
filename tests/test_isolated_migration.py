@@ -131,7 +131,9 @@ class IsolatedMigrationTests(unittest.TestCase):
         metadata = {"schema": 1, "application": "catalog", "base_commit": OLD,
                     "repository_base_commit": PARENT, "reviewed_paths": [], "database_migration": False}
         def git(*args):
-            if args[0] == "rev-parse": return PARENT
+            if args[:2] == ("rev-list", "--reverse"): return NEW
+            if args[0] == "show": return "Release-App: catalog"
+            if args[0] == "log": return "catalog_backend/web.py\nAPPLICATION_BOUNDARIES.md"
             if args[0] == "diff":
                 return "catalog_backend/web.py" if "--" in args else "catalog_backend/web.py\nAPPLICATION_BOUNDARIES.md"
             return ""
@@ -144,7 +146,9 @@ class IsolatedMigrationTests(unittest.TestCase):
         metadata = {"application": "replenishment", "base_commit": OLD, "repository_base_commit": PARENT,
                     "reviewed_paths": []}
         def git(*args):
-            if args[0] == "rev-parse": return PARENT
+            if args[:2] == ("rev-list", "--reverse"): return NEW
+            if args[0] == "show": return "Release-App: replenishment"
+            if args[0] == "log": return "README.md"
             if args[0] == "diff": return "catalog_backend/release.py" if "--" in args else "README.md"
             return ""
         with self.assertRaisesRegex(release.ReleaseError, "dependency needs explicit review"):
@@ -152,9 +156,9 @@ class IsolatedMigrationTests(unittest.TestCase):
         metadata["reviewed_paths"] = ["catalog_backend/release.py"]
         self.assertEqual(release.review_paths(metadata, OLD, NEW, git), ["README.md"])
 
-    def test_repository_base_cannot_skip_unreviewed_commits(self):
+    def test_repository_push_range_must_be_linear_without_hidden_merge_history(self):
         metadata = {"application": "catalog", "repository_base_commit": OLD}
-        with self.assertRaisesRegex(release.ReleaseError, "immediate parent"):
+        with self.assertRaisesRegex(release.ReleaseError, "linear"):
             release.review_paths(metadata, OLD, NEW, lambda *args: PARENT)
 
     def test_every_app_has_a_separate_write_boundary_and_graceful_stop(self):

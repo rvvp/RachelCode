@@ -13,5 +13,6 @@ jobs:
       - name: Independent server acceptance owns production verification
         run: |
           echo 'Production verification is performed by the installed isolated dispatcher and local publisher.'
+          echo 'Server isolation/acceptance receipts use origin commit statuses; routine releases require no SSH.'
           echo 'A repository commit does not require Catalog, Planning and Replenishment to run the same SHA.'
           echo 'This workflow does not contact, restart or roll back any production application.'

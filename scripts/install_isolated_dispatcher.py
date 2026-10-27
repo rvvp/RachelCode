@@ -15,11 +15,21 @@ import sys
 import time
 
 from isolated_release import (APPS, AUTOMATION, CONFIG, ROOT, VERSION, ReleaseError,
-                              atomic_write, attest, health, identity, lock, run, runtime_pointers)
+                              atomic_write, attest, health, identity, lock, run)
+from release_status import FILES, OriginStatus, READY, manifest, post_ready
 
 
 WRAPPER = '#!/bin/sh\nset -eu\nexec /usr/bin/python3 /opt/rachelcode/automation/isolated-v1/isolated_release.py "$@"\n'
-FILES = ("isolated_release.py", "release_scope.py", "migrate_isolated_app.py")
+
+def status_preflight():
+    """Verify origin status write permission before touching the dispatcher."""
+    client = OriginStatus(repository=AUTOMATION / "repository.git", askpass=AUTOMATION / "git-askpass.sh")
+    env = os.environ.copy()
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_ASKPASS=str(AUTOMATION / "git-askpass.sh"))
+    origin = run("git", "--git-dir", AUTOMATION / "repository.git", "ls-remote", "origin",
+                 "refs/heads/main", env=env).split()[0]
+    client.post(origin, READY, "pending", "Installing reviewed automatic isolation receipts; business sites unchanged")
+    return client, origin
 
 
 def upgrade():
@@ -36,8 +46,9 @@ def upgrade():
         if not (source / name).is_file():
             raise ReleaseError("reviewed dispatcher source incomplete")
     with lock(AUTOMATION / "deploy.lock"):
+        client, origin = status_preflight()
         backup = AUTOMATION / "isolation-backups" / (time.strftime("%Y%m%d-%H%M%S") + "-dispatcher")
-        backup.mkdir(mode=0o700)
+        backup.mkdir(parents=True, mode=0o700)
         for name in FILES:
             if (installed / name).exists():
                 shutil.copy2(installed / name, backup / name)
@@ -53,12 +64,17 @@ def upgrade():
                     app_dir = ROOT / app / "releases" / state["accepted_commit"] / "app"
                     if before[app]["WorkingDirectory"] != str(app_dir):
                         raise ReleaseError("accepted service runtime differs from state")
-                    runtime_pointers(app, app_dir)
+                    # Upgrade the dispatcher only, not any app's runtime pointer.
+                    if (ROOT / app / "current").resolve() != app_dir.resolve():
+                        raise ReleaseError("accepted runtime pointer differs from state")
+            config["installed_hashes"] = manifest(installed)
+            atomic_write(CONFIG, json.dumps(config, indent=2) + "\n", 0o600)
             atomic_write(AUTOMATION / "deploy.sh", WRAPPER, 0o755)
             proof = attest(config)
             if proof["services"] != before:
                 raise ReleaseError("business service identity changed during dispatcher upgrade")
             atomic_write(backup / "installed-proof.json", json.dumps(proof, indent=2), 0o600)
+            post_ready(client, origin, proof)
             print(json.dumps({"upgraded": VERSION, "backup": str(backup), "proof": proof}, sort_keys=True))
         finally:
             run("systemctl", "start", "rachel-deploy-webhook")
@@ -80,6 +96,7 @@ def install():
         if state["WorkingDirectory"] != "/opt/rachelcode/app":
             raise ReleaseError("unexpected existing runtime directory: " + app)
     with lock(AUTOMATION / "deploy.lock"):
+        client, origin = status_preflight()
         pending = run("systemctl", "list-units", "--all", "--plain", "--no-legend", "rachel-auto-deploy-*.service")
         if any(" running " in line or " activating " in line for line in pending.splitlines()):
             raise ReleaseError("legacy deployment is still running")
@@ -121,6 +138,7 @@ def install():
                 "enabled": app == "planning", "baseline_commit": baseline[app]["release_commit"],
                 "baseline_generation": baseline[app]["release_generation"],
                 "workers": 8 if app == "catalog" else 1} for app in APPS}}
+            config["installed_hashes"] = manifest(installed)
             (ROOT / "planning/releases").mkdir(parents=True, exist_ok=True)
             atomic_write(CONFIG, json.dumps(config, indent=2) + "\n", 0o600)
             atomic_write(AUTOMATION / "deploy.sh", WRAPPER, 0o755)
@@ -128,6 +146,7 @@ def install():
             if proof["services"] != before:
                 raise ReleaseError("business service identity changed during installation")
             atomic_write(backup / "installed-proof.json", json.dumps(proof, indent=2), 0o600)
+            post_ready(client, origin, proof)
             print(json.dumps({"installed": VERSION, "backup": str(backup), "proof": proof}, sort_keys=True))
         finally:
             # Never reinstate the unsafe all-site dispatcher on an install error.

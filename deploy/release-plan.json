@@ -7,7 +7,16 @@
   "reviewed_paths": [
     "catalog_backend/web.py",
     "tests/test_isolated_release.py",
+    "tests/test_isolated_migration.py",
+    "tests/test_release_status.py",
+    "scripts/release_status.py",
+    "scripts/isolated_release.py",
+    "scripts/install_isolated_dispatcher.py",
+    "scripts/publish_isolated_release.py",
+    "scripts/publish_verified_release.sh",
+    "scripts/release_scope.py",
+    ".gitea/workflows/catalog-post-release-verification.yml",
     "deploy/release-plan.json"
   ],
-  "reason": "Planning-only fix: group style publications by current active A/B sources instead of withdrawn color history. Keep historical pricing intact, reject stale withdrawn-color actions, and retain completeness, version, cost and atomic-publication checks. No schema or dependency changes. Reviewed intervening bundled catalog_backend/web.py snapshot changes only desktop layout; it does not change the internal API or authorize Catalog deployment. The isolated-release test fixture and release-plan snapshots are reviewed infrastructure, not server installer changes. Catalog and Replenishment retain their accepted runtimes and processes."
+  "reason": "Planning-only release includes the pending withdrawn-color publication fix, preserving history and completeness/version/cost/atomic checks. Reviewed control-plane change restores routine no-SSH publishing: root-pinned server dispatcher performs isolation checks, posts exact-commit origin receipts; local publisher requires receipt plus target public health before GitHub backup. Requires a separately reviewed one-time dispatcher upgrade, never self-installation from a push. Review EVERY linear commit from repository_base_commit, including intermediate paths, while retaining the full target-runtime delta gate. Bundled catalog_backend/web.py differences are desktop layout only and do not authorize Catalog deployment or change the internal API. No schema, dependency-lock, app config, data or upload changes. Catalog and Replenishment retain their accepted runtimes and processes."
 }

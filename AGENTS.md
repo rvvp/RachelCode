@@ -2,6 +2,11 @@
 
 ## Server SSH Access — Read Before Connecting
 
+Routine application releases MUST NOT use SSH, request a server password, or
+read server files directly. Use the origin commit-status receipts described
+below. SSH is reserved for an explicitly scoped infrastructure installation
+or an incident that cannot be resolved through the automated release evidence.
+
 Verified on 2026-10-27: server `203.205.90.232`, SSH port `22`, account `root`.
 User preference: before starting server access for each new task/session, ask
 the user for the current password. Do not retrieve passwords from earlier
@@ -18,8 +23,8 @@ task. For a fresh connection, create a private temporary directory with
 `mktemp -d /tmp/rachel-ssh.XXXXXX`; use its `control` path with
 `ssh -tt -F /dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=yes -o ControlMaster=yes -o ControlPersist=1800 -o ControlPath=<private-directory>/control root@203.205.90.232`.
 Replace the path placeholder; do not reuse an expired historical socket path.
-Keep the authenticated connection until the task is finished. For release
-scripts, pass that socket through `SSH_CONTROL_PATH`.
+Keep the authenticated connection until that exceptional task is finished.
+Routine release scripts do not use `SSH_CONTROL_PATH` or a root connection.
 
 The verified PAM policy is `pam_faillock deny=3 even_deny_root unlock_time=60`:
 three failed authentications can lock root for 60 seconds. External failed
@@ -41,8 +46,9 @@ Each requested application change normally follows a verified release pipeline:
    tests and code-format checks. Shared code requires dependency assessment.
 2. Commit only source, tests and reviewed deployment/documentation changes;
    never include runtime data or credentials.
-3. Publish the exact commit to `origin/main` ONLY after proving the server
-   dispatcher isolates the authorized application(s). A repository push is
+3. Publish the exact commit to `origin/main` ONLY after checking the installed
+   dispatcher readiness receipt on origin matches the reviewed manifest.
+   The SERVER performs isolation checks automatically. A repository push is
    itself a production action because the Webhook can trigger deployment.
 4. Deploy, restart, verify, or roll back ONLY the explicitly targeted app.
    Verify that app's exact commit, source fingerprint and current workers.
@@ -56,8 +62,9 @@ consistent database backups and initialization rehearsals on private copies.
 All THREE apps now have private source snapshots, venvs, config files, offline
 dependency caches, acceptance records and runtime pointers. The old all-site
 activator remains permanently disabled. Every
-release still requires installed-file hash attestation before an origin push;
-missing/mismatched proof blocks publication. Do not bypass this gate or restore
+release still requires installed-file hash attestation before an origin push,
+obtained through authenticated origin commit statuses, not routine SSH.
+Missing/mismatched proof blocks publication. Do not bypass this gate or restore
 the retired shared deployer. Installation evidence is retained under
 `/opt/rachelcode/automation/isolation-backups/20261027-145045`.
 
@@ -87,7 +94,9 @@ Release invocation after installation and attestation:
 
 Use `--app catalog` or `--app replenishment` for those websites. A release plan
 must use the target app's accepted `base_commit`; `repository_base_commit` is the
-candidate's exact immediate parent and must still equal origin/main before push.
+last origin/main commit before this push. A linear range of up to 50 local
+commits is allowed only when EVERY commit names the same Release-App and ALL
+changed paths in that range are reviewed (including subsequently reverted files).
 The latter scopes this push independently of intervening other-app releases;
 the target's full runtime delta is still checked for schema/dependency changes
 and explicitly reviewed bundled/shared dependencies. Do not silently drop
@@ -96,6 +105,32 @@ intervening runtime changes from review.
 Never call the retired all-site activator. Never bypass the installed-hash
 attestation just to advance origin or GitHub. The server's acceptance record
 and unchanged non-target service identities are required before code backup.
+
+## Automatic server isolation and acceptance receipts
+
+Daily flow: local tests -> origin/main -> automatic target-only server deploy
+and isolation checks -> authenticated origin receipt + target public /healthz
+verification -> same SHA to github/main. No routine server login.
+
+The fixed dispatcher compares its files to a root-owned installed manifest,
+rejects cross-app stop/restart dependencies and stale or out-of-scope plans,
+and verifies the target's complete worker set and unchanged non-target process
+identities. Failure rolls back only target code, never a business database.
+
+The server writes `isolated-release/dispatcher` readiness and
+`isolated-release/<app>` acceptance statuses to the exact origin commit.
+Acceptance binds the SHA, generation, source fingerprint, worker count,
+two unchanged protected apps, and dispatcher manifest digest. The local script
+requires the latest successful receipt AND public target health before GitHub
+backup. Missing, pending, failed, mismatched or timed-out evidence blocks backup.
+GitHub neither deploys nor verifies production. Do not expose a root-command
+HTTP endpoint or give ordinary code pushes permission to replace the dispatcher.
+
+Changing the pinned dispatcher requires a separate, reviewed one-time installer
+upgrade. That operation may briefly pause only the Webhook listener; it must
+leave all three business services, app configs, databases and uploads untouched.
+Until that upgrade and its readiness receipt are verified, the new local
+publisher must stop before origin, not silently fall back to SSH or old deployers.
 
 Never push to `github` before the public verification passes. A failed local
 test, origin push, deployment, or public verification stops the pipeline and

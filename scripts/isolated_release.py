@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import fcntl
-import hashlib
 import io
 import json
 import os
@@ -23,6 +22,8 @@ import time
 from urllib.request import Request, urlopen
 
 from release_scope import APPS, classify_path
+from release_status import (FILES, OriginStatus, StatusError, manifest,
+                            post_accepted, post_ready)
 
 
 VERSION = "isolated-v1"
@@ -117,10 +118,24 @@ def review_paths(plan, base, sha, git_command=None):
     scope_base = plan.get("repository_base_commit", base)
     valid_sha(scope_base)
     if "repository_base_commit" in plan:
-        if git_command("rev-parse", sha + "^") != scope_base:
-            raise ReleaseError("repository base must be the candidate's immediate parent")
+        git_command("merge-base", "--is-ancestor", scope_base, sha)
         git_command("merge-base", "--is-ancestor", base, scope_base)
-    current_paths = git_command("diff", "--name-only", "--no-renames", scope_base, sha).splitlines()
+        if git_command("rev-list", "--min-parents=2", scope_base + ".." + sha):
+            raise ReleaseError("reviewed push must be linear, without merge commits")
+        # Review EVERY commit, including files later reverted. One push may
+        # contain several local commits, but cannot smuggle another app's work.
+        commits = git_command("rev-list", "--reverse", scope_base + ".." + sha).splitlines()
+        if not commits or len(commits) > 50:
+            raise ReleaseError("invalid reviewed push range")
+        for commit in commits:
+            message = git_command("show", "-s", "--format=%B", valid_sha(commit))
+            trailers = [line for line in message.splitlines() if line.startswith("Release-App:")]
+            if trailers != ["Release-App: " + plan["application"]]:
+                raise ReleaseError("every commit in this push must authorize the same target")
+        current_paths = sorted(set(git_command("log", "--format=", "--name-only", "--no-renames",
+                                               scope_base + ".." + sha).splitlines()) - {""})
+    else:
+        current_paths = git_command("diff", "--name-only", "--no-renames", scope_base, sha).splitlines()
     app = plan["application"]
     runtime_paths = git_command("diff", "--name-only", "--no-renames", base, sha, "--", *PACKAGES[app]).splitlines()
     # All runtime changes are reviewed too, including shared snapshots that
@@ -335,6 +350,8 @@ def deploy(sha, config):
     valid_sha(sha)
     # Same lock used by the retired dispatcher: queued legacy jobs cannot race.
     with lock(AUTOMATION / "deploy.lock"):
+        proof = attest(config)
+        client = OriginStatus(repository=AUTOMATION / "repository.git", askpass=AUTOMATION / "git-askpass.sh")
         env = os.environ.copy()
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_ASKPASS"] = str(AUTOMATION / "git-askpass.sh")
@@ -346,43 +363,73 @@ def deploy(sha, config):
         app = plan.get("application")
         if app not in APPS:
             raise ReleaseError("unknown target")
-        cfg = config["apps"].get(app, {})
-        state_path = ROOT / app / "state.json"
-        state = json.loads(state_path.read_text()) if state_path.exists() else {
-            "accepted_commit": cfg.get("baseline_commit"), "generation": cfg.get("baseline_generation")}
-        if state["accepted_commit"] == sha:
-            print("ALREADY_ACCEPTED " + app + " " + sha)
-            return
-        base = valid_sha(state["accepted_commit"])
-        git("merge-base", "--is-ancestor", base, sha)
-        paths = review_paths(plan, base, sha)
-        validate_plan(plan, git("show", "-s", "--format=%B", sha), paths, base,
-                      [name for name, item in config["apps"].items() if item.get("enabled") is True])
-        generation = int(git("rev-list", "--count", sha))
-        if generation <= state["generation"]:
-            raise ReleaseError("candidate is not newer than accepted target release")
-        prior = health(app)
-        if (prior.get("release_commit") != base or prior.get("status") != "ok"
-                or not prior.get("db_exists")):
-            raise ReleaseError("target runtime and accepted release disagree")
-        protected = {name: identity(name) for name in APPS if name != app}
-        identity(app)
-        app_dir, python, expected = stage(app, sha, generation, cfg)
-        assert_protected(protected, app)
-        # Staging may take minutes; recheck source ordering just before activation.
-        run("git", "--git-dir", AUTOMATION / "repository.git", "fetch", "--quiet", "origin",
-            "+refs/heads/main:refs/remotes/origin/main", env=env)
-        if git("rev-parse", "refs/remotes/origin/main") != sha:
-            raise ReleaseError("newer origin push arrived during staging")
-        dropin = SYSTEMD_DIR / (SERVICES[app] + ".service.d/90-isolated-release.conf")
-        evidence = activation(app, dropin, dropin_text(app, app_dir, python, sha, generation,
-                              expected["workers"]), lambda: verify_target(app, expected, protected))
-        state.update(accepted_commit=sha, generation=generation, source_fingerprint=expected["source_fingerprint"],
-                     runtime=str(app_dir), protected_before=protected, acceptance=evidence,
-                     accepted_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        atomic_write(state_path, json.dumps(state, indent=2) + "\n")
-        runtime_pointers(app, app_dir)
-        print("ACCEPTED " + app + " " + sha + " " + expected["source_fingerprint"])
+        if app not in proof["enabled_apps"]:
+            raise ReleaseError("target not enabled")
+        post_ready(client, sha, proof)
+        client.post(sha, "isolated-release/" + app, "pending", "Server checks target scope and isolation")
+        try:
+            return deploy_target(sha, config, plan, proof, client, env)
+        except (OSError, ValueError, subprocess.SubprocessError, ReleaseError, StatusError):
+            # No configuration, business data or command output in origin.
+            try:
+                client.post(sha, "isolated-release/" + app, "failure", "Target release blocked; inspect server release evidence")
+            except StatusError:
+                pass  # Local publisher still fails closed on missing success.
+            raise
+
+
+def deploy_target(sha, config, plan, proof, client, env):
+    """Called only while holding deploy.lock and after installed attestation."""
+    app = plan["application"]
+    cfg = config["apps"].get(app, {})
+    state_path = ROOT / app / "state.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {
+        "accepted_commit": cfg.get("baseline_commit"), "generation": cfg.get("baseline_generation")}
+    if state["accepted_commit"] == sha:
+        # Duplicate webhook / retry after status API outage: recheck live
+        # workers and the original non-target identities, without restart.
+        protected = state.get("protected_before", {})
+        expected = dict(release_commit=sha, release_generation=state["generation"],
+                        source_fingerprint=state["source_fingerprint"], workers=cfg.get("workers", 1))
+        evidence = verify_target(app, expected, protected)
+        runtime_pointers(app, Path(state["runtime"]))
+        post_accepted(client, app, sha, expected, proof, evidence, protected)
+        print("ALREADY_ACCEPTED " + app + " " + sha)
+        return
+    base = valid_sha(state["accepted_commit"])
+    git("merge-base", "--is-ancestor", base, sha)
+    paths = review_paths(plan, base, sha)
+    validate_plan(plan, git("show", "-s", "--format=%B", sha), paths, base,
+                  [name for name, item in config["apps"].items() if item.get("enabled") is True])
+    generation = int(git("rev-list", "--count", sha))
+    if generation <= state["generation"]:
+        raise ReleaseError("candidate is not newer than accepted target release")
+    prior = health(app)
+    if (prior.get("release_commit") != base or prior.get("status") != "ok"
+            or not prior.get("db_exists")):
+        raise ReleaseError("target runtime and accepted release disagree")
+    protected = {name: identity(name) for name in APPS if name != app}
+    identity(app)
+    app_dir, python, expected = stage(app, sha, generation, cfg)
+    assert_protected(protected, app)
+    # Staging may take minutes; recheck source ordering just before activation.
+    run("git", "--git-dir", AUTOMATION / "repository.git", "fetch", "--quiet", "origin",
+        "+refs/heads/main:refs/remotes/origin/main", env=env)
+    if git("rev-parse", "refs/remotes/origin/main") != sha:
+        raise ReleaseError("newer origin push arrived during staging")
+    dropin = SYSTEMD_DIR / (SERVICES[app] + ".service.d/90-isolated-release.conf")
+    evidence = activation(app, dropin, dropin_text(app, app_dir, python, sha, generation,
+                          expected["workers"]), lambda: verify_target(app, expected, protected))
+    state.update(accepted_commit=sha, generation=generation, source_fingerprint=expected["source_fingerprint"],
+                 runtime=str(app_dir), protected_before=protected, acceptance=evidence,
+                 accepted_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    atomic_write(state_path, json.dumps(state, indent=2) + "\n")
+    runtime_pointers(app, app_dir)
+    # Saving a state file or seeing one new worker is insufficient. Only
+    # attest successful full-worker verification and unchanged other apps.
+    assert_protected(protected, app)
+    post_accepted(client, app, sha, expected, proof, evidence, protected)
+    print("ACCEPTED " + app + " " + sha + " " + expected["source_fingerprint"])
 
 
 def attest(config):
@@ -398,8 +445,9 @@ def attest(config):
                            "--property=PartOf,BindsTo,PropagatesStopTo", "--no-pager")
         if any(SERVICES[other] in dependencies for other in APPS if other != app):
             raise ReleaseError("cross-application systemd stop/restart dependency: " + app)
-    hashes = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-              for name in ("isolated_release.py", "release_scope.py", "migrate_isolated_app.py")}
+    hashes = manifest(AUTOMATION / VERSION)
+    if config.get("installed_hashes") != hashes:
+        raise ReleaseError("installed dispatcher differs from pinned reviewed manifest")
     return {"version": VERSION, "installed_hashes": hashes,
             "enabled_apps": [name for name, cfg in config["apps"].items() if cfg.get("enabled") is True],
             "services": {app: identity(app) for app in APPS}}
@@ -419,9 +467,8 @@ def main():
         else:
             if not args.commit:
                 raise ReleaseError("exact commit required")
-            attest(config)
             deploy(args.commit, config)
-    except (OSError, ValueError, subprocess.SubprocessError, ReleaseError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError, ReleaseError, StatusError) as exc:
         print("RELEASE_BLOCKED " + str(exc), file=sys.stderr)
         return 1
     return 0
