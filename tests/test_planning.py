@@ -33,6 +33,24 @@ class PlanningCenterTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_desktop_workspace_uses_full_width_without_changing_mobile_layout(self):
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test")
+        css = app.css()
+        self.assertIn("@media(min-width:901px){.app-shell>header{padding-left:24px;padding-right:24px}", css)
+        self.assertIn(".app-shell>.main{max-width:none;margin:0;padding-left:24px;padding-right:24px}", css)
+        self.assertIn(".app-shell>footer{max-width:none;margin:0;padding-left:24px;padding-right:24px}", css)
+        self.assertIn(".app-shell>header>nav>a{flex:0 0 auto;white-space:nowrap}", css)
+        self.assertIn(".main{padding:28px 18px 45px}", css)
+        self.assertIn(".main{padding-left:13px;padding-right:13px}", css)
+        self.assertIn(".pricing-table[data-resizable-columns]{table-layout:fixed", css)
+        self.assertIn(".pricing-table[data-resizable-columns] .pricing-image-cell{left:var(--select-column-width)", css)
+        user = {"role": "admin", "display_name": "企划管理员"}
+        for current in ("dashboard", "workbench", "stats", "rules", "accounts"):
+            with self.subTest(page=current):
+                page = app.shell("布局检查", "<section>现有业务内容</section>", user, current)
+                self.assertIn("<main class='main'><section>现有业务内容</section></main>", page)
+                self.assertIn(".app-shell>.main{max-width:none", page)
+
     def wsgi_request(self, app, path, method="GET", body=b"", content_type="application/x-www-form-urlencoded", cookie="", authorization="", planning_image_source=""):
         environ = {}
         setup_testing_defaults(environ)

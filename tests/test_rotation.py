@@ -210,7 +210,7 @@ class RotationTests(unittest.TestCase):
         bad = self.wsgi_request(self.app, "/rotation/sync", method="POST", cookie=cookie)
         self.assertTrue(bad["status"].startswith("403"))
         self.sync(self.source())
-        rows = self.rows()
+        rows = rot.candidates(self.path, {"min_days": 70})
         form = dict(csrf=self.app.rotation_csrf(self.planner), criteria=json.dumps({"min_days": 70}), scope="filtered", target="唯品", signature=rot.fingerprint(rows))
         response = self.wsgi_request(self.app, "/rotation/create", method="POST", cookie=cookie, body=urlencode(form).encode())
         self.assertEqual(dict(response["headers"])["Location"], "/rotation/1")
