@@ -6,6 +6,12 @@ Routine application releases MUST NOT use SSH, request a server password, or
 read server files directly. Use the origin commit-status receipts described
 below. SSH is reserved for an explicitly scoped infrastructure installation
 or an incident that cannot be resolved through the automated release evidence.
+Before proposing server access, exhaust the relevant local code/tests, origin
+branch and commit statuses, Webhook/CI evidence available through the repository,
+and bounded public target health checks. Explain the concrete missing evidence
+or infrastructure change and obtain the user's authorization for that exceptional
+access. Do not use server login as a routine diagnostic shortcut or repeatedly
+retry authentication. A failed login does not authorize changing SSH/PAM policy.
 
 Verified on 2026-10-27: server `203.205.90.232`, SSH port `22`, account `root`.
 User preference: before starting server access for each new task/session, ask
