@@ -23,13 +23,32 @@ WRAPPER = '#!/bin/sh\nset -eu\nexec /usr/bin/python3 /opt/rachelcode/automation/
 
 def status_preflight():
     """Verify origin status write permission before touching the dispatcher."""
-    client = OriginStatus(repository=AUTOMATION / "repository.git", askpass=AUTOMATION / "git-askpass.sh")
+    client = OriginStatus(credential_file=CONFIG.parent / "origin-status.json")
     env = os.environ.copy()
     env.update(GIT_TERMINAL_PROMPT="0", GIT_ASKPASS=str(AUTOMATION / "git-askpass.sh"))
     origin = run("git", "--git-dir", AUTOMATION / "repository.git", "ls-remote", "origin",
                  "refs/heads/main", env=env).split()[0]
     client.post(origin, READY, "pending", "Installing reviewed automatic isolation receipts; business sites unchanged")
     return client, origin
+
+
+def provision_status_credential():
+    """One-time stdin-only setup for a dedicated origin write:repository token.
+
+    Never use the root login password, overwrite the read-only Git credential,
+    or print the received token. Application services cannot read this file.
+    """
+    if os.geteuid() != 0:
+        raise ReleaseError("root required")
+    path = CONFIG.parent / "origin-status.json"
+    if path.exists():
+        raise ReleaseError("status credential already exists; refusing overwrite")
+    values = json.loads(sys.stdin.read(16384))
+    if (set(values) != {"username", "password"} or any(
+            not isinstance(value, str) or not value or "\n" in value for value in values.values())):
+        raise ReleaseError("invalid dedicated status credential")
+    atomic_write(path, json.dumps(values) + "\n", 0o600)
+    print("Dedicated origin status credential installed; read-only Git credential unchanged")
 
 
 def upgrade():
@@ -156,5 +175,9 @@ def install():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upgrade", action="store_true", help="Upgrade reviewed dispatcher only; no business service restart")
+    parser.add_argument("--provision-status-credential", action="store_true", help="Read a dedicated origin token from stdin; no site changes")
     args = parser.parse_args()
-    upgrade() if args.upgrade else install()
+    if args.provision_status_credential:
+        provision_status_credential()
+    else:
+        upgrade() if args.upgrade else install()

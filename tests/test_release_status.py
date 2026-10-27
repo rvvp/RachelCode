@@ -62,6 +62,32 @@ class StatusTests(unittest.TestCase):
                 client.request("/statuses/" + NEW)
             self.assertEqual(str(error.exception), "origin status API HTTP 403")
 
+    def test_server_uses_separate_root_only_status_token_without_git_password_helper(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "origin-status.json"
+            path.write_text(json.dumps(dict(username="writer", password="test-status-token")))
+            with patch.object(receipts.Path, "lstat", return_value=SimpleNamespace(
+                    st_mode=0o100600, st_uid=0)), patch.object(receipts.subprocess, "run") as helper:
+                client = receipts.OriginStatus(credential_file=path)
+                self.assertTrue(client._authorization.startswith("Basic "))
+                helper.assert_not_called()
+            for mode, uid in [(0o100644, 0), (0o100600, 501), (0o120600, 0)]:
+                with patch.object(receipts.Path, "lstat", return_value=SimpleNamespace(st_mode=mode, st_uid=uid)), \
+                        self.assertRaises(receipts.StatusError):
+                    receipts.OriginStatus(credential_file=path)
+
+    def test_one_time_status_token_setup_never_changes_git_read_credential_or_prints_token(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(installer, "CONFIG", Path(temp) / "isolation.json"), \
+                patch.object(installer.os, "geteuid", return_value=0), \
+                patch.object(sys, "stdin", io.StringIO(json.dumps(dict(username="writer", password="fake-token")))), \
+                redirect_stdout(io.StringIO()) as output:
+            installer.provision_status_credential()
+            self.assertNotIn("fake-token", output.getvalue())
+            path = Path(temp) / "origin-status.json"
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            with self.assertRaisesRegex(release.ReleaseError, "refusing overwrite"):
+                installer.provision_status_credential()
+
     def test_latest_status_never_reuses_old_success_and_paginates(self):
         client = object.__new__(receipts.OriginStatus)
         older = dict(accepted(), id=10)

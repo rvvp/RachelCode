@@ -351,7 +351,7 @@ def deploy(sha, config):
     # Same lock used by the retired dispatcher: queued legacy jobs cannot race.
     with lock(AUTOMATION / "deploy.lock"):
         proof = attest(config)
-        client = OriginStatus(repository=AUTOMATION / "repository.git", askpass=AUTOMATION / "git-askpass.sh")
+        client = OriginStatus(credential_file=CONFIG.parent / "origin-status.json")
         env = os.environ.copy()
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_ASKPASS"] = str(AUTOMATION / "git-askpass.sh")

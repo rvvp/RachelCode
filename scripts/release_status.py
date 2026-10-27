@@ -1,7 +1,8 @@
 """Authenticated origin commit-status receipts; no SSH or new server endpoint.
 
-Credentials stay in memory and come from the existing Git credential helper
-(server: its installed askpass). Neither credentials nor HTTP bodies are logged.
+Local credentials come from the existing Git helper. The server uses a dedicated
+root-only origin status token; its Git fetch credential stays read-only.
+Neither credentials nor HTTP bodies are logged.
 Python 3.9+, standard library only.
 """
 from __future__ import annotations
@@ -12,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import time
 from urllib.error import HTTPError, URLError
@@ -51,7 +53,16 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 class OriginStatus:
-    def __init__(self, *, repository=None, askpass="/usr/bin/false"):
+    def __init__(self, *, repository=None, askpass="/usr/bin/false", credential_file=None):
+        if credential_file is not None:
+            path = Path(credential_file)
+            metadata = path.lstat()
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+                    or stat.S_IMODE(metadata.st_mode) != 0o600):
+                raise StatusError("origin status credential must be a root-owned 0600 file")
+            values = json.loads(path.read_text())
+            self._initialize(values)
+            return
         env = os.environ.copy()
         env.update(GIT_TERMINAL_PROMPT="0", GIT_ASKPASS=str(askpass))
         command = ["git"]
@@ -66,6 +77,13 @@ class OriginStatus:
         values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
         if result.returncode or not values.get("username") or not values.get("password"):
             raise StatusError("origin status credentials unavailable")
+        self._initialize(values)
+
+    def _initialize(self, values):
+        if (not isinstance(values, dict) or not isinstance(values.get("username"), str)
+                or not isinstance(values.get("password"), str)
+                or not values["username"] or not values["password"]):
+            raise StatusError("invalid origin status credentials")
         self._authorization = "Basic " + base64.b64encode(
             (values["username"] + ":" + values["password"]).encode()).decode()
         self._opener = build_opener(NoRedirect())

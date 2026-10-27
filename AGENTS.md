@@ -27,10 +27,13 @@ input. Never put passwords in commands, files, logs, or Git.
 First check and reuse any authenticated SSH ControlMaster from the current
 task. For a fresh connection, create a private temporary directory with
 `mktemp -d /tmp/rachel-ssh.XXXXXX`; use its `control` path with
-`ssh -tt -F /dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=yes -o ControlMaster=yes -o ControlPersist=1800 -o ControlPath=<private-directory>/control root@203.205.90.232`.
+`ssh -F /dev/null -M -S <private-directory>/control -o ControlPersist=900 -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 -o ServerAliveInterval=20 -o StrictHostKeyChecking=yes root@203.205.90.232`.
 Replace the path placeholder; do not reuse an expired historical socket path.
 Keep the authenticated connection until that exceptional task is finished.
 Routine release scripts do not use `SSH_CONTROL_PATH` or a root connection.
+This exact method succeeded again at 18:16 on 2026-10-27. Use the tool's
+`tty: true`; a forced remote `-tt` is unnecessary. Successful login does not
+prove which earlier failures came from PAM lockout; do not infer password errors.
 
 The verified PAM policy is `pam_faillock deny=3 even_deny_root unlock_time=60`:
 three failed authentications can lock root for 60 seconds. External failed
@@ -137,6 +140,13 @@ upgrade. That operation may briefly pause only the Webhook listener; it must
 leave all three business services, app configs, databases and uploads untouched.
 Until that upgrade and its readiness receipt are verified, the new local
 publisher must stop before origin, not silently fall back to SSH or old deployers.
+The one-time receipt upgrade was installed and attested at 18:21 on 2026-10-27,
+with all three business process identities unchanged. Evidence is retained at
+`/opt/rachelcode/automation/isolation-backups/20261027-182144-dispatcher`.
+The server uses a dedicated origin `write:repository` status token in a root-owned
+0600 `/etc/rachelcode/origin-status.json`; the existing Git fetch token remains
+read-only. No root login password or local Git credential is stored there.
+Never print this token or copy it into app config, release packages or Git.
 
 Never push to `github` before the public verification passes. A failed local
 test, origin push, deployment, or public verification stops the pipeline and
