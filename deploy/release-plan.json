@@ -1,7 +1,8 @@
 {
   "schema": 1,
   "application": "planning",
-  "base_commit": "832bd92876b25c7f961c2c59f259c56b562599b0",
+  "base_commit": "384a59cc351a7e18a98b30f3c3b9da98e53c2231",
+  "repository_base_commit": "384a59cc351a7e18a98b30f3c3b9da98e53c2231",
   "database_migration": false,
   "reviewed_paths": [
     "catalog_backend/release.py",
@@ -10,12 +11,17 @@
     "scripts/release_scope.py",
     "scripts/isolated_release.py",
     "scripts/install_isolated_dispatcher.py",
+    "scripts/migrate_isolated_app.py",
     "scripts/publish_isolated_release.py",
     "tests/test_release.py",
     "tests/test_release_boundaries.py",
     "tests/test_isolated_release.py",
+    "tests/test_isolated_migration.py",
     "deploy/release-plan.json",
+    "deploy/systemd/rachel-catalog.service",
+    "deploy/systemd/rachel-replenishment.service",
+    "deploy/systemd/rachel-planning.service",
     ".gitea/workflows/catalog-post-release-verification.yml"
   ],
-  "reason": "Isolate Planning release and activate pending desktop width fix. Catalog and Replenishment retain their accepted code, processes, environments and data."
+  "reason": "Record separately verified Catalog and Replenishment private-runtime migrations; finish Planning-only sandbox hardening. Preserve each application's existing business data and independent accepted version."
 }

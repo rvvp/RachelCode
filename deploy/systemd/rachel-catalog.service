@@ -7,7 +7,8 @@ Wants=network-online.target
 Type=simple
 User=rachelcode
 Group=rachelcode
-WorkingDirectory=/opt/rachelcode/app
+WorkingDirectory=/opt/rachelcode/catalog/current
+EnvironmentFile=/etc/rachelcode/catalog.env
 Environment=PYTHONUNBUFFERED=1
 Environment=CATALOG_BRAND_MARK=Sienna
 Environment=CATALOG_DB=/data/rachelcode/catalog/catalog.db
@@ -21,16 +22,17 @@ Environment=CATALOG_IMPORT_TASK_WAIT_SECONDS=120
 Environment=CATALOG_EXPORT_SLOTS=4
 Environment=CATALOG_IMAGE_EXPORT_SLOTS=2
 Environment=CATALOG_HEAVY_TASK_WAIT_SECONDS=900
-ExecStart=/opt/rachelcode/venv/bin/gunicorn --chdir /opt/rachelcode/app --bind 0.0.0.0:8765 --workers 8 --threads 4 --worker-class gthread --timeout 1800 --graceful-timeout 30 --keep-alive 5 --max-requests 1000 --max-requests-jitter 100 --worker-tmp-dir /dev/shm catalog_wsgi:application
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/rachelcode/catalog/venv/bin/gunicorn --chdir /opt/rachelcode/catalog/current --bind 0.0.0.0:8765 --workers 8 --threads 4 --worker-class gthread --timeout 1800 --graceful-timeout 30 --keep-alive 5 --max-requests 1000 --max-requests-jitter 100 --worker-tmp-dir /dev/shm catalog_wsgi:application
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=20
+TimeoutStopSec=130
 UMask=0027
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
-ProtectSystem=full
-ReadWritePaths=/data/rachelcode
+ProtectSystem=strict
+ReadWritePaths=/data/rachelcode/catalog
 
 [Install]
 WantedBy=multi-user.target

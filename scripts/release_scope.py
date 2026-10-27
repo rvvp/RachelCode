@@ -57,7 +57,8 @@ def classify_path(path: str) -> dict:
         kind, owners, consumers = "app-source", [APP_FILES[path]], []
     elif (path in {"requirements.txt", ".env.example"}
           or path.startswith(("scripts/", "deploy/", ".gitea/", "launchd/"))
-          or path in {"tests/test_release.py", "tests/test_release_boundaries.py", "tests/test_isolated_release.py"}):
+          or path in {"tests/test_release.py", "tests/test_release_boundaries.py", "tests/test_isolated_release.py",
+                      "tests/test_isolated_migration.py"}):
         kind, owners, consumers = "release-infrastructure", [], list(APPS)
     elif path.endswith(".md") or path == ".gitignore":
         kind, owners, consumers = "documentation", [], []

@@ -7,20 +7,22 @@ Wants=network-online.target
 Type=simple
 User=rachelcode
 Group=rachelcode
-WorkingDirectory=/opt/rachelcode/app
+WorkingDirectory=/opt/rachelcode/replenishment/current
+EnvironmentFile=/etc/rachelcode/replenishment.env
 Environment=PYTHONUNBUFFERED=1
 Environment=REPLENISH_PUBLIC_BASE_URL=https://sienna.tiger8.com.cn
 Environment=REPLENISH_RUNTIME_MODE=production
-ExecStart=/opt/rachelcode/venv/bin/python /opt/rachelcode/app/replenishment_app.py --host 0.0.0.0 --port 8877 --db /data/rachelcode/replenishment/replenishment.db --no-seed-demo --scheduler
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/rachelcode/replenishment/venv/bin/python /opt/rachelcode/replenishment/current/replenishment_app.py --host 0.0.0.0 --port 8877 --db /data/rachelcode/replenishment/replenishment.db --no-seed-demo --scheduler
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=20
+TimeoutStopSec=130
 UMask=0027
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
-ProtectSystem=full
-ReadWritePaths=/data/rachelcode
+ProtectSystem=strict
+ReadWritePaths=/data/rachelcode/replenishment
 
 [Install]
 WantedBy=multi-user.target

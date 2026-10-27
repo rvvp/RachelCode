@@ -7,23 +7,25 @@
 旧全站激活入口永久禁用；新发布入口要求 `--app` 并在推送前核验服务器隔离。
 服务器脚本不会因为仓库推送自动改变；每次发布都须核验其安装哈希。
 
-请先阅读 `APPLICATION_BOUNDARIES.md` 与 `AGENTS.md`。2026-10-27 14:50已验证
-分发器安装期间三站身份不变，仅启用企划；目标发布仍须完成完整公网验收。
+请先阅读 `APPLICATION_BOUNDARIES.md` 与 `AGENTS.md`。2026-10-27 已逐站完成
+企划、货品监控、藏宝阁私有运行环境迁移；分发器升级本身不重启业务站。
 下文的同 SHA 三站验收、共享目录整体激活属于历史机制，不再作为有效操作步骤。
 
 ### 当前唯一允许的发布流程
 
-1. 一次性受控安装 `scripts/install_isolated_dispatcher.py`，取得三站进程不变的
-   安装证明。本轮只启用 planning；其他两站保持原环境，不能顺便迁移。
+1. 三站已安装并启用独立发布，不要重复迁移或重新安装。每次发布前取得
+   当前安装哈希与三站进程证明；基础设施升级须单独审查并备份。
 2. 更新 `deploy/release-plan.json`，使用目标上一次验收提交作为 base，列明
-   共享依赖/基础设施审查路径，确认无数据库/依赖变更。
-3. 完成本地测试和格式检查，提交时添加 `Release-App: planning` 尾注。
-4. 执行 `scripts/publish_verified_release.sh --app planning tests.test_planning tests.test_rotation`。
+   `repository_base_commit` 填本次提交直接父提交，列明共享依赖/基础设施
+   审查路径，确认无数据库/依赖变更。不能忽略目标包中历史依赖变更。
+3. 完成本地测试和格式检查，提交时添加 `Release-App: <目标>` 尾注。
+4. 执行 `scripts/publish_verified_release.sh --app <目标> <相关unittest>`，
+   例如企划使用 `--app planning tests.test_planning tests.test_rotation`。
    SSH 复用连接可通过 `SSH_CONTROL_PATH` 指定，不在文件或命令行保存密码。
 5. 脚本在 origin 推送之前检查已安装分发器哈希、启用目标、三站进程和健康版本。
-6. 服务器只切换企划独立代码/venv，保留原 DB 路径、账号、规则、资料和图片。
-   失败只回退企划代码；不恢复任何业务数据库。
-7. 企划公网 SHA/指纹、当前工作进程、服务器验收记录通过，另外两站进程/启动
+6. 服务器只切换所选网站独立代码/venv，保留原 DB 路径、账号、规则、资料和图片。
+   失败只回退所选网站代码；不恢复任何业务数据库。
+7. 目标公网 SHA/指纹、当前工作进程、服务器验收记录通过，另外两站进程/启动
    时间/工作目录未变后，才把同一 SHA 推送 GitHub。
 
 以下旧版部署段落仅作历史记录，**不得执行其中共享激活或无 `--app` 的发布命令**。

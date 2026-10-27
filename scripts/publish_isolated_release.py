@@ -13,7 +13,7 @@ import sys
 import time
 
 from isolated_release import (APPLICATIONS, APPS, PACKAGES, ReleaseError, VERSION,
-                              validate_plan, validate_code_only_paths, health)
+                              validate_plan, review_paths, health)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -38,7 +38,7 @@ def attestation():
     proof = json.loads(run(*command, timeout=30))
     if proof.get("version") != VERSION:
         raise ReleaseError("server isolation version mismatch")
-    for name in ("isolated_release.py", "release_scope.py"):
+    for name in ("isolated_release.py", "release_scope.py", "migrate_isolated_app.py"):
         digest = hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest()
         if proof.get("installed_hashes", {}).get(name) != digest:
             raise ReleaseError("server isolation not installed or source differs: " + name)
@@ -72,21 +72,23 @@ def main():
         proof = attestation()  # BEFORE any origin push.
         live = health(args.app, public=True)
         base = live.get("release_commit")
-        paths = git("diff", "--name-only", "--no-renames", base, sha).splitlines()
+        paths = review_paths(plan, base, sha, git)
         validate_plan(plan, git("show", "-s", "--format=%B", sha), paths, base, proof["enabled_apps"])
-        validate_code_only_paths(paths)
         protected = {app: identity for app, identity in proof["services"].items() if app != args.app}
         git("diff-tree", "--check", sha + "^", sha)
         print("运行本地测试，目标：" + args.app, flush=True)
         compile_paths = [path for path in PACKAGES[args.app] if (ROOT / path).is_dir() or path.endswith(".py")]
         subprocess.run([sys.executable, "-m", "compileall", "-q", *compile_paths], cwd=ROOT, check=True)
         subprocess.run([sys.executable, "-m", "unittest", "tests.test_release_boundaries",
-                        "tests.test_isolated_release", "tests.test_release", *args.tests], cwd=ROOT, check=True)
+                        "tests.test_isolated_release", "tests.test_isolated_migration", "tests.test_release", *args.tests], cwd=ROOT, check=True)
         for remote in ("origin", "github"):
             git("fetch", "--quiet", remote, "main")
             git("merge-base", "--is-ancestor", remote + "/main", sha)
         # Never advance GitHub as a workaround for failed deployment.
         print("推送 origin/main；仅激活 " + args.app, flush=True)
+        if ("repository_base_commit" in plan
+                and git("ls-remote", "origin", "refs/heads/main").split()[0] != plan["repository_base_commit"]):
+            raise ReleaseError("origin differs from the reviewed repository base")
         git("push", "origin", sha + ":refs/heads/main")
         if git("ls-remote", "origin", "refs/heads/main").split()[0] != sha:
             raise ReleaseError("origin commit changed")

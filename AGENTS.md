@@ -21,9 +21,12 @@ Each requested application change normally follows a verified release pipeline:
 5. After targeted public verification passes, back up the same commit to
    `github/main`. A backup commit does not mean every app runs that commit.
 
-SERVER ISOLATION (2026-10-27 14:50 CST): the reviewed isolated-v1 dispatcher was
-installed and attested without restarting any business service. Only Planning
-is enabled. The old all-site activator remains permanently disabled. Every
+SERVER ISOLATION (2026-10-27): the reviewed isolated-v1 dispatcher is installed.
+Catalog and Replenishment were subsequently enrolled one at a time, after
+consistent database backups and initialization rehearsals on private copies.
+All THREE apps now have private source snapshots, venvs, config files, offline
+dependency caches, acceptance records and runtime pointers. The old all-site
+activator remains permanently disabled. Every
 release still requires installed-file hash attestation before an origin push;
 missing/mismatched proof blocks publication. Do not bypass this gate or restore
 the retired shared deployer. Installation evidence is retained under
@@ -37,16 +40,29 @@ matching `Release-App: <app>` commit trailer, the target's currently accepted
 base commit, and reviewed shared/infrastructure paths. Missing/stale plans,
 unapproved apps, schema changes and dependency-lock changes fail closed.
 
-The first rollout enables ONLY Planning. Catalog and Replenishment keep their
-existing processes and shared legacy runtime untouched. Do not enable or migrate
-them without a separate scoped rollout. Future application source snapshots
+All three applications are now enabled, but every release still targets exactly
+ONE application. Enabling all apps is never authorization for a combined restart.
+Future application source snapshots
 and virtual environments are private per release; code rollback never restores
 database backups. Installation changes only deployment infrastructure and may
 briefly pause the webhook listener; it must not restart any business service.
+App migration is a separate authorized operation via
+`scripts/migrate_isolated_app.py --app <catalog|replenishment> prepare|activate`.
+Do not rerun migration against an already enrolled app. Existing DB, upload,
+credential-key, browser-profile and report paths remain unchanged.
+Each app's systemd sandbox permits persistent writes only to its own data root.
 
 Release invocation after installation and attestation:
 
 `scripts/publish_verified_release.sh --app planning tests.test_planning tests.test_rotation`
+
+Use `--app catalog` or `--app replenishment` for those websites. A release plan
+must use the target app's accepted `base_commit`; `repository_base_commit` is the
+candidate's exact immediate parent and must still equal origin/main before push.
+The latter scopes this push independently of intervening other-app releases;
+the target's full runtime delta is still checked for schema/dependency changes
+and explicitly reviewed bundled/shared dependencies. Do not silently drop
+intervening runtime changes from review.
 
 Never call the retired all-site activator. Never bypass the installed-hash
 attestation just to advance origin or GitHub. The server's acceptance record

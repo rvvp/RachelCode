@@ -111,6 +111,33 @@ def validate_code_only_paths(paths):
         raise ReleaseError("dependency constraints changed; review the target's private lock before release")
 
 
+def review_paths(plan, base, sha, git_command=None):
+    """Separate this push's scope from intervening releases of other apps."""
+    git_command = git_command or git
+    scope_base = plan.get("repository_base_commit", base)
+    valid_sha(scope_base)
+    if "repository_base_commit" in plan:
+        if git_command("rev-parse", sha + "^") != scope_base:
+            raise ReleaseError("repository base must be the candidate's immediate parent")
+        git_command("merge-base", "--is-ancestor", base, scope_base)
+    current_paths = git_command("diff", "--name-only", "--no-renames", scope_base, sha).splitlines()
+    app = plan["application"]
+    runtime_paths = git_command("diff", "--name-only", "--no-renames", base, sha, "--", *PACKAGES[app]).splitlines()
+    # All runtime changes are reviewed too, including shared snapshots that
+    # were introduced while only a different application was being published.
+    validate_code_only_paths(runtime_paths)
+    reviewed = plan.get("reviewed_paths", [])
+    for path in runtime_paths:
+        item = classify_path(path)
+        if item["kind"] in {"forbidden-runtime", "unmapped"}:
+            raise ReleaseError("forbidden runtime snapshot path: " + path)
+        if item["kind"] in {"shared-source", "release-infrastructure"} and path not in reviewed:
+            raise ReleaseError("runtime dependency needs explicit review: " + path)
+        if item["kind"] == "app-source" and item["owners"] != [app] and path not in reviewed:
+            raise ReleaseError("bundled dependency needs explicit review: " + path)
+    return current_paths
+
+
 def safe_extract(blob, destination):
     with tarfile.open(fileobj=io.BytesIO(blob)) as archive:
         for member in archive.getmembers():
@@ -186,8 +213,11 @@ def dropin_text(app, app_dir, python, sha, generation, workers=1):
     command = " ".join(service_command(app, app_dir, python, workers))
     return ("[Service]\nWorkingDirectory=%s\nExecStart=\nExecStart=%s\nEnvironmentFile=\n"
             "EnvironmentFile=/etc/rachelcode/%s.env\n"
-            "Environment=CATALOG_RELEASE_COMMIT=%s CATALOG_RELEASE_GENERATION=%s\n" %
-            (app_dir, command, app, sha, generation))
+            "Environment=CATALOG_RELEASE_COMMIT=%s CATALOG_RELEASE_GENERATION=%s\n"
+            "Environment=PYTHONDONTWRITEBYTECODE=1\n"
+            "ProtectSystem=strict\nReadWritePaths=\nReadWritePaths=/data/rachelcode/%s\n"
+            "TimeoutStopSec=130\n" %
+            (app_dir, command, app, sha, generation, app))
 
 
 def activation(app, dropin, content, verify):
@@ -206,6 +236,21 @@ def activation(app, dropin, content, verify):
         run("systemctl", "daemon-reload")
         run("systemctl", "restart", SERVICES[app])
         raise
+
+
+def runtime_pointers(app, app_dir):
+    """Stable code and venv aliases; services still pin exact release paths."""
+    app_dir = Path(app_dir)
+    valid_sha(app_dir.parent.name)
+    if app_dir != ROOT / app / "releases" / app_dir.parent.name / "app":
+        raise ReleaseError("runtime pointer is outside the target release root")
+    for name, destination in (("current", app_dir), ("venv", app_dir.parent / "venv")):
+        pointer = ROOT / app / name
+        if pointer.exists() and not pointer.is_symlink():
+            raise ReleaseError("refusing to overwrite a real runtime directory")
+        temporary = pointer.with_name("." + name + "-" + app_dir.parent.name)
+        temporary.symlink_to(destination)
+        os.replace(temporary, pointer)
 
 
 def verify_target(app, expected, protected, timeout=120):
@@ -310,10 +355,9 @@ def deploy(sha, config):
             return
         base = valid_sha(state["accepted_commit"])
         git("merge-base", "--is-ancestor", base, sha)
-        paths = git("diff", "--name-only", "--no-renames", base, sha).splitlines()
+        paths = review_paths(plan, base, sha)
         validate_plan(plan, git("show", "-s", "--format=%B", sha), paths, base,
                       [name for name, item in config["apps"].items() if item.get("enabled") is True])
-        check_no_schema_change(app, base, sha)
         generation = int(git("rev-list", "--count", sha))
         if generation <= state["generation"]:
             raise ReleaseError("candidate is not newer than accepted target release")
@@ -337,10 +381,7 @@ def deploy(sha, config):
                      runtime=str(app_dir), protected_before=protected, acceptance=evidence,
                      accepted_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         atomic_write(state_path, json.dumps(state, indent=2) + "\n")
-        pointer = ROOT / app / "current"
-        temporary = pointer.with_name(".current-" + sha)
-        temporary.symlink_to(app_dir)
-        os.replace(temporary, pointer)
+        runtime_pointers(app, app_dir)
         print("ACCEPTED " + app + " " + sha + " " + expected["source_fingerprint"])
 
 
@@ -358,7 +399,7 @@ def attest(config):
         if any(SERVICES[other] in dependencies for other in APPS if other != app):
             raise ReleaseError("cross-application systemd stop/restart dependency: " + app)
     hashes = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-              for name in ("isolated_release.py", "release_scope.py")}
+              for name in ("isolated_release.py", "release_scope.py", "migrate_isolated_app.py")}
     return {"version": VERSION, "installed_hashes": hashes,
             "enabled_apps": [name for name, cfg in config["apps"].items() if cfg.get("enabled") is True],
             "services": {app: identity(app) for app in APPS}}

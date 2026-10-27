@@ -6,6 +6,7 @@ Existing shared code, venv, business databases and uploads are never modified.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -14,10 +15,53 @@ import sys
 import time
 
 from isolated_release import (APPS, AUTOMATION, CONFIG, ROOT, VERSION, ReleaseError,
-                              atomic_write, attest, health, identity, lock, run)
+                              atomic_write, attest, health, identity, lock, run, runtime_pointers)
 
 
 WRAPPER = '#!/bin/sh\nset -eu\nexec /usr/bin/python3 /opt/rachelcode/automation/isolated-v1/isolated_release.py "$@"\n'
+FILES = ("isolated_release.py", "release_scope.py", "migrate_isolated_app.py")
+
+
+def upgrade():
+    """Replace reviewed control-plane code, leaving app/config/data intact."""
+    if os.geteuid() != 0:
+        raise ReleaseError("root required")
+    config = json.loads(CONFIG.read_text())
+    if config.get("version") != VERSION:
+        raise ReleaseError("unexpected installed dispatcher version")
+    before = {app: identity(app) for app in APPS}
+    installed = AUTOMATION / VERSION
+    source = Path(__file__).resolve().parent
+    for name in FILES:
+        if not (source / name).is_file():
+            raise ReleaseError("reviewed dispatcher source incomplete")
+    with lock(AUTOMATION / "deploy.lock"):
+        backup = AUTOMATION / "isolation-backups" / (time.strftime("%Y%m%d-%H%M%S") + "-dispatcher")
+        backup.mkdir(mode=0o700)
+        for name in FILES:
+            if (installed / name).exists():
+                shutil.copy2(installed / name, backup / name)
+        shutil.copy2(CONFIG, backup / CONFIG.name)
+        run("systemctl", "stop", "rachel-deploy-webhook")
+        try:
+            atomic_write(AUTOMATION / "deploy.sh", "#!/bin/sh\necho 'RELEASE_BLOCKED reviewed dispatcher upgrade incomplete' >&2\nexit 78\n", 0o755)
+            for name in FILES:
+                atomic_write(installed / name, (source / name).read_bytes())
+            for app in APPS:
+                if config["apps"][app].get("enabled"):
+                    state = json.loads((ROOT / app / "state.json").read_text())
+                    app_dir = ROOT / app / "releases" / state["accepted_commit"] / "app"
+                    if before[app]["WorkingDirectory"] != str(app_dir):
+                        raise ReleaseError("accepted service runtime differs from state")
+                    runtime_pointers(app, app_dir)
+            atomic_write(AUTOMATION / "deploy.sh", WRAPPER, 0o755)
+            proof = attest(config)
+            if proof["services"] != before:
+                raise ReleaseError("business service identity changed during dispatcher upgrade")
+            atomic_write(backup / "installed-proof.json", json.dumps(proof, indent=2), 0o600)
+            print(json.dumps({"upgraded": VERSION, "backup": str(backup), "proof": proof}, sort_keys=True))
+        finally:
+            run("systemctl", "start", "rachel-deploy-webhook")
 
 
 def install():
@@ -58,7 +102,7 @@ def install():
             installed = AUTOMATION / VERSION
             installed.mkdir(mode=0o755, exist_ok=False)
             source = Path(__file__).resolve().parent
-            for name in ("isolated_release.py", "release_scope.py"):
+            for name in FILES:
                 atomic_write(installed / name, (source / name).read_bytes())
             CONFIG.parent.mkdir(parents=True, exist_ok=True)
             env_source = ROOT / "app/.env"
@@ -91,4 +135,7 @@ def install():
 
 
 if __name__ == "__main__":
-    install()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--upgrade", action="store_true", help="Upgrade reviewed dispatcher only; no business service restart")
+    args = parser.parse_args()
+    upgrade() if args.upgrade else install()
