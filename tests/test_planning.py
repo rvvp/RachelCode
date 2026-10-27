@@ -530,6 +530,130 @@ class PlanningCenterTests(unittest.TestCase):
             {"published"},
         )
 
+    def prepare_reduced_color_style(self, *, removed_status="confirmed", lifecycle="deleted"):
+        planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
+        a_user = next(user for user in catalog_db.list_users(self.catalog_db_path) if user["department"] == "A")
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            product_ids = []
+            for color in ("880", "770", "220"):
+                product_id = catalog_db.create_product(
+                    connection,
+                    {
+                        "season_year": "2026秋冬", "style_code": "REDUCED-COLORS",
+                        "style_color": f"REDUCED-COLORS-{color}", "product_name": "删减颜色测试大衣",
+                        "supplier": "删色供应商", "tax_included_price": 580,
+                        "image_url": f"https://example.com/{color}.jpg",
+                    },
+                    int(a_user["id"]), "A",
+                )
+                connection.execute("UPDATE products SET status = 'pending' WHERE id = ?", (product_id,))
+                product_ids.append(product_id)
+        sources = [catalog_db.planning_source_payloads(self.catalog_db_path, product_id)[0] for product_id in product_ids]
+        planning_db.synchronize_source_products(self.planning_db_path, sources)
+        records = [planning_db.create_pricing_record(self.planning_db_path, source, "初审员") for source in sources]
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("UPDATE pricing_records SET status = 'confirmed', category = '其他', channel = '天猫', launch_price = 2099")
+            connection.execute("UPDATE pricing_records SET status = ? WHERE id = ?", (removed_status, records[2]["id"]))
+        with catalog_db.get_connection(self.catalog_db_path) as connection:
+            catalog_db.change_product_lifecycle(connection, sources[2]["id"], lifecycle, int(a_user["id"]), "测试删减颜色", "三色减为两色")
+        catalog_app = CatalogApplication(self.catalog_db_path, Path(self.temp.name) / "uploads", planning_api_token="planning-secret")
+        sync = self.wsgi_request(
+            catalog_app, "/api/internal/planning/products?" + urlencode({"known_ids": ",".join(map(str, product_ids))}),
+            authorization="Bearer planning-secret",
+        )
+        self.assertTrue(sync["status"].startswith("200"))
+        sync_payload = json.loads(sync["body"])
+        app = PlanningApplication(self.planning_db_path, "http://catalog.test", "planning-secret")
+        items, withdrawn_ids, image_updates = app.catalog_sync_details(sync_payload)
+        planning_db.synchronize_source_products(self.planning_db_path, items, withdrawn_ids=withdrawn_ids, image_updates=image_updates)
+        self.assertEqual(planning_db.get_source_product(self.planning_db_path, sources[2]["id"])["lifecycle_status"], "withdrawn")
+        return app, catalog_app, sources, records
+
+    def reduced_color_publication_fixture(self, *, removed_status="confirmed", lifecycle="deleted", batch=False):
+        app, catalog_app, sources, records = self.prepare_reduced_color_style(removed_status=removed_status, lifecycle=lifecycle)
+        product_ids = [source["id"] for source in sources]
+        cookie = self.login_cookie(app, "planner")
+        before = {source["id"]: catalog_db.get_product(self.catalog_db_path, source["id"]) for source in sources}
+        removed_record_before = planning_db.get_pricing_record(self.planning_db_path, records[2]["id"])
+        calls = []
+
+        def publish_to_catalog(request, timeout):
+            self.assertTrue(request.full_url.endswith("/api/internal/planning/style-publications"))
+            payload = json.loads(request.data)
+            calls.append(payload)
+            response = self.wsgi_request(catalog_app, "/api/internal/planning/style-publications", method="POST", body=request.data, content_type="application/json", authorization="Bearer planning-secret")
+            self.assertTrue(response["status"].startswith("200"), response["body"].decode())
+            return io.BytesIO(response["body"])
+
+        with patch("planning_center.web.urlopen", side_effect=publish_to_catalog):
+            if batch:
+                response = self.wsgi_request(app, "/pricing/batch", method="POST", body=urlencode({"batch_action": "publish", "selection_scope": "filtered", "status": "confirmed", "search": "REDUCED-COLORS"}).encode(), cookie=cookie)
+            else:
+                response = self.wsgi_request(app, f"/pricing/{records[0]['id']}/publish", method="POST", cookie=cookie)
+        self.assertTrue(response["status"].startswith("302"))
+        location = unquote(dict(response["headers"])["Location"])
+        self.assertNotIn("error=", location)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual({item["source_product_id"] for item in calls[0]["publications"]}, set(product_ids[:2]))
+        for source, record in zip(sources[:2], records[:2]):
+            self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, record["id"])["status"], "published")
+            after = catalog_db.get_product(self.catalog_db_path, source["id"])
+            self.assertEqual((after["launch_price"], after["launch_channel"], after["category"]), (2099, "天猫", "其他"))
+            for key in ("style_code", "style_color", "tax_included_price", "image_url", "supplier", "season_year", "product_name"):
+                self.assertEqual(after[key], before[source["id"]][key])
+        self.assertEqual(catalog_db.get_product(self.catalog_db_path, sources[2]["id"]), before[sources[2]["id"]])
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, records[2]["id"]), removed_record_before)
+
+    def test_deleted_color_does_not_block_remaining_style_publication(self):
+        self.reduced_color_publication_fixture()
+
+    def test_deleted_unreviewed_color_does_not_block_remaining_style_publication(self):
+        self.reduced_color_publication_fixture(removed_status="suggested")
+
+    def test_archived_color_does_not_block_filtered_batch_style_publication(self):
+        self.reduced_color_publication_fixture(lifecycle="archived", batch=True)
+
+    def test_active_color_without_pricing_still_blocks_whole_style(self):
+        app, _, sources, records = self.prepare_reduced_color_style()
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("DELETE FROM pricing_records WHERE id = ?", (records[1]["id"],))
+        with patch("planning_center.web.urlopen") as remote:
+            with self.assertRaisesRegex(ValueError, "尚未生成定价记录"):
+                app.publish_pricing_style(records[0], {"display_name": "初审员"})
+        remote.assert_not_called()
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, records[0]["id"])["status"], "confirmed")
+
+    def test_active_unreviewed_color_still_blocks_whole_style(self):
+        app, _, sources, records = self.prepare_reduced_color_style()
+        with planning_db.get_connection(self.planning_db_path) as connection:
+            connection.execute("UPDATE pricing_records SET status = 'review_pending' WHERE id = ?", (records[1]["id"],))
+        with patch("planning_center.web.urlopen") as remote:
+            with self.assertRaisesRegex(ValueError, "尚未完成复核"):
+                app.publish_pricing_style(records[0], {"display_name": "初审员"})
+        remote.assert_not_called()
+
+    def test_withdrawn_color_cannot_publish_via_stale_link_or_payload(self):
+        app, _, _, records = self.prepare_reduced_color_style()
+        user = {"display_name": "初审员"}
+        before = planning_db.get_pricing_record(self.planning_db_path, records[2]["id"])
+        with patch("planning_center.web.urlopen") as remote:
+            for operation in (app.publish_pricing_style, app.pricing_publication_payload):
+                with self.subTest(operation=operation.__name__):
+                    with self.assertRaisesRegex(ValueError, "已退出当前上新审核范围"):
+                        operation(records[2], user)
+        remote.assert_not_called()
+        self.assertEqual(planning_db.get_pricing_record(self.planning_db_path, records[2]["id"]), before)
+
+    def test_restored_color_must_rejoin_whole_style_review(self):
+        app, _, sources, records = self.prepare_reduced_color_style(removed_status="suggested")
+        # A subsequent eligible sync restores this same stable source ID.
+        planning_db.synchronize_source_products(self.planning_db_path, [sources[2]])
+        self.assertEqual(planning_db.get_source_product(self.planning_db_path, sources[2]["id"])["lifecycle_status"], "active")
+        with patch("planning_center.web.urlopen") as remote:
+            with self.assertRaisesRegex(ValueError, "尚未完成复核"):
+                app.publish_pricing_style(records[0], {"display_name": "初审员"})
+        remote.assert_not_called()
+
     def test_sync_repairs_legacy_partial_publication_states(self):
         planning_db.save_category_cost_rule(self.planning_db_path, "2026秋冬", None, 700, 4)
         approved_source = {

@@ -1,5 +1,34 @@
 # Repository Workflow
 
+## Server SSH Access — Read Before Connecting
+
+Verified on 2026-10-27: server `203.205.90.232`, SSH port `22`, account `root`.
+User preference: before starting server access for each new task/session, ask
+the user for the current password. Do not retrieve passwords from earlier
+conversations or stored files, and do not persist the supplied password. Within
+that same authorized task, reuse its authenticated connection instead of
+asking again for every command.
+The successful method is an interactive PTY with password authentication, not
+an assumed SSH key or jump host. Use `exec_command` with `tty: true`, wait for
+the password prompt, and enter the authorized credential through terminal
+input. Never put passwords in commands, files, logs, or Git.
+
+First check and reuse any authenticated SSH ControlMaster from the current
+task. For a fresh connection, create a private temporary directory with
+`mktemp -d /tmp/rachel-ssh.XXXXXX`; use its `control` path with
+`ssh -tt -F /dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=yes -o ControlMaster=yes -o ControlPersist=1800 -o ControlPath=<private-directory>/control root@203.205.90.232`.
+Replace the path placeholder; do not reuse an expired historical socket path.
+Keep the authenticated connection until the task is finished. For release
+scripts, pass that socket through `SSH_CONTROL_PATH`.
+
+The verified PAM policy is `pam_faillock deny=3 even_deny_root unlock_time=60`:
+three failed authentications can lock root for 60 seconds. External failed
+attempts have also been observed. A single `Permission denied` is NOT evidence
+that the supplied password is invalid. Do not rapidly retry; allow at least
+60 seconds before one controlled retry. Prefer existing-session diagnostics
+when available. Do not disable host-key checks, change SSH/PAM policy, reset
+passwords, or install root keys just to work around a temporary lockout.
+
 ## Release Policy
 
 Catalog (Cangbaoge), Planning, and Replenishment are THREE INDEPENDENT

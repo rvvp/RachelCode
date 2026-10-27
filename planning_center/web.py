@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 
 from planning_center import db
 from planning_center.excel import initial_review_workbook_bytes, parse_initial_review_workbook
+from planning_center.publication import current_style_publication_records
 from planning_center.release import PLANNING_RELEASE_COMMIT, PLANNING_RELEASE_GENERATION, PLANNING_SOURCE_FINGERPRINT
 from catalog_backend.uploads import detect_image_content_type
 from planning_center.rotation_web import RotationViews
@@ -1377,6 +1378,7 @@ class PlanningApplication(RotationViews):
         source = db.get_source_product(self.db_path, int(record["source_product_id"])) or {}
         if not source:
             raise LookupError("回传前找不到对应的藏宝阁来源资料。")
+        self.require_active_publication_source(source)
         if int(source.get("source_version_no") or 0) != int(record.get("source_version_no") or 0):
             raise ValueError("来源资料版本已变化，请先重新同步藏宝阁后再回传。")
         source_cost = db.source_cost_value(source)
@@ -1417,15 +1419,20 @@ class PlanningApplication(RotationViews):
             "operator_name": user.get("display_name", "商品企划中心"),
         }
 
+    @staticmethod
+    def require_active_publication_source(source: dict) -> None:
+        if source.get("lifecycle_status") != "active" or source.get("status") != "pending":
+            raise ValueError("该款色已退出当前上新审核范围，不能回传；历史审核记录保留。请刷新工作台后操作当前有效款色。")
+
     def publish_pricing_style(self, record: dict, user: dict) -> list[dict]:
         source = db.get_source_product(self.db_path, int(record["source_product_id"]))
         if not source:
             raise LookupError("对应的藏宝阁来源资料不存在。")
+        self.require_active_publication_source(source)
         style_code = str(source.get("style_code") or "").strip()
         if not style_code:
             raise ValueError("当前资料缺少款号，不能执行整款回传。")
-        style_records = db.list_latest_style_pricing_records(self.db_path, style_code)
-        source_count = db.count_style_source_products(self.db_path, style_code)
+        style_records, source_count = current_style_publication_records(self.db_path, style_code)
         if len(style_records) != source_count:
             raise ValueError("同款仍有款色尚未生成定价记录，请先完成全部款色的测算、初审和复核。")
         unfinished = [
@@ -1758,7 +1765,7 @@ class PlanningApplication(RotationViews):
           <ul class='system-rule-list'>
             <li>系统以藏宝阁内部商品 ID 作为稳定主键，款号、款色用于展示和回传前的二次核对，不使用名称文本代替主键。</li>
             <li>回传时校验来源版本和当前企划批次，使用唯一回传记录号保证重复点击不会重复写入。</li>
-            <li>同款号所有颜色使用一个事务回传；任一颜色缺少资料、尚未复核或校验失败时，藏宝阁不会写入该款任何新结果。</li>
+            <li>同款号当前有效颜色使用一个事务回传；任一有效颜色缺少资料、尚未复核或校验失败时，藏宝阁不会写入该款任何新结果。已在藏宝阁删除、归档或退出审核范围的颜色，同步确认后不再参与整款回传，也不阻挡其他有效颜色；其历史审核记录仍然保留。</li>
             <li>发现来源版本、商品身份或批次不一致时停止回传，保留当前资料并显示明确错误，不用旧资料覆盖藏宝阁新资料。</li>
           </ul>
         </section>
