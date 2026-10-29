@@ -1955,6 +1955,7 @@ class CatalogApplication:
             payload = self.parse_json_body(environ)
             with db.get_connection(self.db_path) as connection:
                 actor_id = db.get_or_create_planning_service_user(connection)
+                self.prepare_approved_legacy_publications(connection, [product_id])
                 result = db.publish_planning_price(connection, product_id, payload, actor_id)
             if result.get("status") == "already_published":
                 return self.json_response(start_response, result, "200 OK")
@@ -1979,6 +1980,10 @@ class CatalogApplication:
                 raise ValueError("整款回传必须提供款色资料列表。")
             with db.get_connection(self.db_path) as connection:
                 actor_id = db.get_or_create_planning_service_user(connection)
+                self.prepare_approved_legacy_publications(
+                    connection,
+                    [int(item.get("source_product_id") or 0) for item in publications if isinstance(item, dict)],
+                )
                 result = db.publish_planning_style(
                     connection,
                     style_code,
@@ -1992,6 +1997,45 @@ class CatalogApplication:
             code = getattr(error, "code", "invalid_request")
             status = "409 Conflict" if code == "version_conflict" else "400 Bad Request"
             return self.json_error_response(start_response, code, str(error), status)
+
+    @staticmethod
+    def prepare_approved_legacy_publications(connection, product_ids: list[int]) -> None:
+        """Bridge approved legacy requests into the existing first-publication path.
+
+        Some early records were recalled and explicitly approved to re-enter
+        planning before Catalog had recorded their first successful callback.
+        The approval is authoritative, but the lower-level first-publication
+        guard expects ``initial`` when no publication history exists. Normalize
+        only that exact combination inside the same transaction as publication;
+        any later validation failure rolls this update back automatically.
+        """
+        for product_id in {int(value) for value in product_ids if int(value) > 0}:
+            row = connection.execute(
+                """
+                SELECT status, lifecycle_status, product_line, planning_reentry_state, planning_request_no
+                FROM products
+                WHERE id = ?
+                """,
+                (product_id,),
+            ).fetchone()
+            if not row:
+                continue
+            if (
+                row["status"] == "pending"
+                and row["lifecycle_status"] == "active"
+                and normalize_product_line(row["product_line"]) == "red"
+                and str(row["planning_reentry_state"] or "initial") == "approved"
+                and int(row["planning_request_no"] or 0) > 0
+                and not db.product_has_planning_publication(connection, product_id)
+            ):
+                connection.execute(
+                    """
+                    UPDATE products
+                    SET planning_reentry_state = 'initial'
+                    WHERE id = ? AND planning_reentry_state = 'approved'
+                    """,
+                    (product_id,),
+                )
 
     def handle_healthz(self, environ, start_response):
         db_exists = Path(self.db_path).exists()
@@ -2489,7 +2533,18 @@ class CatalogApplication:
                             "黑标线资料只在藏宝阁流转，不进入商品企划中心。",
                         )
                         continue
-                    if product.get("status") != "pending" or str(product.get("planning_reentry_state") or "initial") != "decision_pending":
+                    reentry_state = str(product.get("planning_reentry_state") or "initial")
+                    if (
+                        action == "submit_to_planning_selected"
+                        and product.get("status") == "pending"
+                        and reentry_state == "approved"
+                    ):
+                        # Repeating “重回企划” after the first successful click is
+                        # an idempotent no-op. Count it as handled so operators do
+                        # not mistake an already-approved request for a failed one.
+                        updated += 1
+                        continue
+                    if product.get("status") != "pending" or reentry_state != "decision_pending":
                         skipped += 1
                         self.append_bulk_skip_reason(skip_reasons, product, "资料不在待判定是否重走商品企划节点。")
                         continue

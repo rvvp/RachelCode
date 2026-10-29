@@ -1,22 +1,18 @@
 {
   "schema": 1,
-  "application": "planning",
-  "base_commit": "02495a934f2ff447b60cf4a1011d9bae966c8ba0",
-  "repository_base_commit": "f77ffe8454cae0d5022dc99985afbd166021fafe",
+  "application": "catalog",
+  "base_commit": "f77ffe8454cae0d5022dc99985afbd166021fafe",
+  "repository_base_commit": "d77fbecc842da0ac83c175d0f9ffc5e0c11e0d05",
   "database_migration": false,
   "reviewed_paths": [
     "catalog_backend/web.py",
-    "tests/test_isolated_release.py",
-    "tests/test_isolated_migration.py",
-    "tests/test_release_status.py",
-    "scripts/release_status.py",
-    "scripts/isolated_release.py",
     "scripts/install_isolated_dispatcher.py",
+    "scripts/isolated_release.py",
     "scripts/publish_isolated_release.py",
     "scripts/publish_verified_release.sh",
     "scripts/release_scope.py",
-    ".gitea/workflows/catalog-post-release-verification.yml",
+    "scripts/release_status.py",
     "deploy/release-plan.json"
   ],
-  "reason": "Planning-only release includes the pending withdrawn-color publication fix, preserving history and completeness/version/cost/atomic checks. Reviewed control-plane change restores routine no-SSH publishing: root-pinned server dispatcher performs isolation checks, posts exact-commit origin receipts; local publisher requires receipt plus target public health before GitHub backup. Requires a separately reviewed one-time dispatcher upgrade, never self-installation from a push. Review EVERY linear commit from repository_base_commit, including intermediate paths, while retaining the full target-runtime delta gate. Bundled catalog_backend/web.py differences are desktop layout only and do not authorize Catalog deployment or change the internal API. No schema, dependency-lock, app config, data or upload changes. Catalog and Replenishment retain their accepted runtimes and processes."
+  "reason": "Catalog-only code release fixes an approved re-entry deadlock for legacy products whose first planning callback was not recorded. The API normalizes only active red-line A/B collaboration records that are already approved, have a positive planning request number, and have no publication history; the normalization and all existing version, cost, identity, three-field and whole-style atomic checks execute in one transaction. Repeated department-B approval is idempotent and does not increment the request batch. No schema, dependency, app configuration, business data or upload migration. Planning and Replenishment retain their accepted runtimes and processes. Intervening isolated-release scripts are reviewed bundled Catalog runtime dependencies already installed and attested by the pinned dispatcher; this application push does not replace dispatcher infrastructure."
 }

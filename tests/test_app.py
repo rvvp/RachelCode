@@ -91,6 +91,86 @@ class CatalogAppTests(unittest.TestCase):
         headers = dict(response["headers"])
         return headers["Set-Cookie"].split(";", 1)[0]
 
+    @staticmethod
+    def planning_publication_payload(source: dict, **overrides) -> dict:
+        payload = {
+            "publication_id": f"PC-CATALOG-TEST-{source['id']}",
+            "source_product_id": int(source["id"]),
+            "source_version_no": int(source.get("source_version_no") or source.get("current_version_no") or 1),
+            "source_style_code": str(source.get("style_code") or ""),
+            "source_style_color": str(source.get("style_color") or ""),
+            "source_cost": source.get("tax_included_price"),
+            "planning_request_no": int(source.get("planning_request_no") or 0),
+            "category": "连衣裙",
+            "launch_channel": "唯品",
+            "launch_price": 599,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_approved_legacy_reentry_can_publish_and_repeat_approval_is_idempotent(self):
+        self.app = CatalogApplication(
+            self.db_path,
+            self.upload_dir,
+            planning_api_token="planning-secret",
+        )
+        source = next(item for item in db.list_products(self.db_path) if item["status"] == "pending")
+        b_user = next(user for user in db.list_users(self.db_path) if user["username"] == "b_editor")
+        with db.get_connection(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE products
+                SET planning_reentry_state = 'decision_pending', planning_reentry_reason = 'recall'
+                WHERE id = ?
+                """,
+                (source["id"],),
+            )
+            db.decide_planning_reentry(connection, source["id"], "approve", b_user["id"])
+
+        approved = db.get_product(self.db_path, source["id"])
+        self.assertEqual(approved["planning_reentry_state"], "approved")
+        self.assertEqual(approved["planning_request_no"], 1)
+
+        b_cookie = self.login("b_editor", "demo123")
+        repeated = self.request(
+            "/products/bulk",
+            method="POST",
+            body=urlencode(
+                {
+                    "bulk_action": "submit_to_planning_selected",
+                    "product_ids": str(source["id"]),
+                    "return_to": "/products?marker=planning_reentry",
+                }
+            ).encode(),
+            cookie=b_cookie,
+        )
+        self.assertTrue(repeated["status"].startswith("302"))
+        repeat_location = unquote_plus(dict(repeated["headers"])["Location"])
+        self.assertIn("成功 1 条，跳过 0 条", repeat_location)
+        repeated_product = db.get_product(self.db_path, source["id"])
+        self.assertEqual(repeated_product["planning_reentry_state"], "approved")
+        self.assertEqual(repeated_product["planning_request_no"], 1)
+
+        publication = self.planning_publication_payload(
+            approved,
+            publication_id="PC-APPROVED-NO-LEGACY-PUBLICATION",
+        )
+        response = self.request(
+            "/api/internal/planning/style-publications",
+            method="POST",
+            body=json.dumps(
+                {"style_code": approved["style_code"], "publications": [publication]}
+            ).encode(),
+            content_type="application/json",
+            authorization="Bearer planning-secret",
+        )
+
+        self.assertTrue(response["status"].startswith("200"))
+        published = db.get_product(self.db_path, source["id"])
+        self.assertEqual(published["planning_reentry_state"], "initial")
+        self.assertEqual(published["planning_request_no"], 1)
+        self.assertEqual(published["launch_price"], publication["launch_price"])
+
     def create_c_operator(
         self,
         username: str,
